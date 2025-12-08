@@ -344,6 +344,22 @@ print(f"  Gamma (batch effects):  {model.E_gamma.shape}")
 print(f"    - Mean: {model.E_gamma.mean():.4f}")
 print(f"    - Std:  {model.E_gamma.std():.4f}")
 
+# Display spike-and-slab sparsity if available
+if hasattr(model, 'rho_beta') and hasattr(model, 'rho_v'):
+    threshold = 0.5
+    beta_active = model.rho_beta > threshold
+    v_active = model.rho_v > threshold
+    
+    print(f"\n[SPIKE-AND-SLAB SPARSITY]")
+    print(f"  Beta (genes):")
+    print(f"    - Active: {beta_active.sum()}/{model.rho_beta.size} ({(1-beta_active.mean())*100:.1f}%)")
+    print(f"    - Sparsity: {(1-beta_active.mean())*100:.1f}%")
+    print(f"    - Active per factor: {beta_active.sum(axis=0)}")
+    print(f"  V (classification weights):")
+    print(f"    - Active: {v_active.sum()}/{model.rho_v.size} ({(1-v_active.mean())*100:.1f}%)")
+    print(f"    - Sparsity: {(1-v_active.mean())*100:.1f}%")
+    print(f"    - Active per factor: {v_active.sum(axis=0)}")
+
 print(f"\nLocal Parameters (sample-specific):")
 print(f"  Theta (training):   {model.E_theta.shape}")
 print(f"    - Mean: {model.E_theta.mean():.4f}")

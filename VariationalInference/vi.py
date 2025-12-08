@@ -20,7 +20,12 @@ class VI:
         lambda_eta: float = 1.5,
         sigma_v: float = 0.1,
         sigma_gamma: float = 0.1,
-        random_state: int = 42
+        random_state: int = 42,
+        # Spike-and-slab parameters
+        pi_v: float = 0.5,  # Prior probability of v being active
+        pi_beta: float = 0.5,  # Prior probability of beta being active
+        spike_variance_v: float = 1e-6,  # Variance for spike in v
+        spike_value_beta: float = 1e-6  # Small value for spike in beta
     ):
         self.d = n_factors
         self.alpha_theta = alpha_theta
@@ -33,6 +38,12 @@ class VI:
         self.sigma_gamma = sigma_gamma
         self.rng = np.random.RandomState(random_state)
         self.regression_weight = 0.01
+        
+        # Spike-and-slab parameters
+        self.pi_v = pi_v
+        self.pi_beta = pi_beta
+        self.spike_variance_v = spike_variance_v
+        self.spike_value_beta = spike_value_beta
         
     def _initialize_parameters(self, X: np.ndarray, y: np.ndarray, X_aux: np.ndarray):
         """Initialize variational parameters with data-driven initialization."""
@@ -76,9 +87,17 @@ class VI:
         scale_factors = 0.5 + 0.5 * np.arange(self.kappa) / self.kappa
         self.mu_v = base * scale_factors[:, np.newaxis]
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
+        
+        # Initialize spike-and-slab indicators for v
+        # rho_v[k, ell] = q(s_v_kell = 1) - probability that v_kell is active (slab)
+        self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
 
         self.mu_gamma = 0.01 * self.rng.randn(self.kappa, self.p_aux)
         self.Sigma_gamma = np.tile(np.eye(self.p_aux)[np.newaxis, :, :], (self.kappa, 1, 1))
+        
+        # Initialize spike-and-slab indicators for beta
+        # rho_beta[j, ell] = q(s_beta_jell = 1) - probability that beta_jell is active (slab)
+        self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
         
         # Initialize Jaakola-Jordan auxiliary parameters with better starting values
         self.zeta = np.ones((self.n, self.kappa)) * 0.1
@@ -89,8 +108,11 @@ class VI:
         self.E_theta = self.a_theta / self.b_theta
         self.E_log_theta = digamma(self.a_theta) - np.log(self.b_theta)
         
-        self.E_beta = self.a_beta / self.b_beta
-        self.E_log_beta = digamma(self.a_beta) - np.log(self.b_beta)
+        # Spike-and-slab for beta: E[beta] = rho * E[beta | slab] + (1-rho) * spike_value
+        self.E_beta_slab = self.a_beta / self.b_beta
+        self.E_log_beta_slab = digamma(self.a_beta) - np.log(self.b_beta)
+        self.E_beta = self.rho_beta * self.E_beta_slab + (1 - self.rho_beta) * self.spike_value_beta
+        self.E_log_beta = self.rho_beta * self.E_log_beta_slab + (1 - self.rho_beta) * np.log(self.spike_value_beta + 1e-10)
         
         self.E_xi = self.a_xi / self.b_xi
         self.E_log_xi = digamma(self.a_xi) - np.log(self.b_xi)
@@ -98,8 +120,12 @@ class VI:
         self.E_eta = self.a_eta / self.b_eta
         self.E_log_eta = digamma(self.a_eta) - np.log(self.b_eta)
         
+        # Spike-and-slab for v: E[v] = rho * E[v | slab] + (1-rho) * 0
+        self.E_v_slab = self.mu_v
+        self.E_v = self.rho_v[:, :, np.newaxis] * self.mu_v[:, :, np.newaxis]
+        self.E_v = self.E_v.squeeze(-1)  # Remove extra dimension
+        
         # Normal distributions: expectations are just the means
-        self.E_v = self.mu_v
         self.E_gamma = self.mu_gamma
         
     def _lambda_jj(self, zeta: np.ndarray) -> np.ndarray:
@@ -179,6 +205,112 @@ class VI:
         self.b_beta = np.clip(self.b_beta, 1e-6, 1e6)
         self.a_beta = np.clip(self.a_beta, 1.01, 1e6)
     
+    def _update_rho_beta(self, z: np.ndarray):
+        """
+        Update spike-and-slab indicators for beta.
+        
+        rho_beta[j, ell] = q(s_beta_jell = 1)
+        
+        Using mean-field approximation:
+        log rho/(1-rho) = E[log p(z, beta | s=1)] - E[log p(z, beta | s=0)] + log(pi/(1-pi))
+        """
+        for j in range(self.p):
+            for ell in range(self.d):
+                # Log probability under slab (active)
+                # E[log p(z_ijℓ | s=1)] + E[log p(beta_jℓ | s=1, eta)]
+                log_prob_slab = 0.0
+                
+                # Contribution from Poisson likelihood
+                for i in range(self.n):
+                    if z[i, j, ell] > 1e-10:
+                        log_prob_slab += z[i, j, ell] * self.E_log_beta_slab[j, ell]
+                        log_prob_slab -= self.E_theta[i, ell] * self.E_beta_slab[j, ell]
+                
+                # Contribution from Gamma prior
+                log_prob_slab += (self.alpha_beta - 1) * self.E_log_beta_slab[j, ell]
+                log_prob_slab -= self.E_eta[j] * self.E_beta_slab[j, ell]
+                
+                # Log probability under spike (inactive)
+                log_prob_spike = 0.0
+                
+                # Contribution from Poisson likelihood with spike value
+                for i in range(self.n):
+                    if z[i, j, ell] > 1e-10:
+                        log_prob_spike += z[i, j, ell] * np.log(self.spike_value_beta + 1e-10)
+                        log_prob_spike -= self.E_theta[i, ell] * self.spike_value_beta
+                
+                # Prior contribution
+                log_odds = log_prob_slab - log_prob_spike + np.log(self.pi_beta / (1 - self.pi_beta + 1e-10))
+                
+                # Convert to probability using sigmoid
+                self.rho_beta[j, ell] = expit(log_odds)
+                
+    def _update_rho_v(self, y: np.ndarray, X_aux: np.ndarray):
+        """
+        Update spike-and-slab indicators for v.
+        
+        rho_v[k, ell] = q(s_v_kell = 1)
+        
+        Using mean-field approximation:
+        log rho/(1-rho) = E[log p(y, v | s=1)] - E[log p(y, v | s=0)] + log(pi/(1-pi))
+        """
+        for k in range(self.kappa):
+            y_k = y[:, k] if y.ndim > 1 else y
+            lam = self._lambda_jj(self.zeta[:, k])
+            
+            for ell in range(self.d):
+                # Log probability under slab (active): v_kell ~ N(mu, Sigma)
+                log_prob_slab = 0.0
+                
+                # Contribution from Bernoulli likelihood (via Jaakola-Jordan bound)
+                for i in range(self.n):
+                    # E[A_ik] when v_kell is active
+                    mask = np.ones(self.d, dtype=bool)
+                    mask[ell] = False
+                    E_A_active = self.E_theta[i, ell] * self.mu_v[k, ell]
+                    if mask.any():
+                        E_A_active += self.E_theta[i, mask] @ self.mu_v[k, mask]
+                    E_A_active += X_aux[i] @ self.E_gamma[k]
+                    
+                    # Second moment contribution
+                    E_A_sq_active = E_A_active**2
+                    E_v_sq_ell = self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]
+                    E_A_sq_active += (self.a_theta[i, ell] / self.b_theta[i, ell]**2) * E_v_sq_ell
+                    
+                    log_prob_slab += (y_k[i] - 0.5) * E_A_active - lam[i] * E_A_sq_active
+                
+                # Contribution from Normal prior
+                log_prob_slab -= 0.5 * np.log(2 * np.pi * self.sigma_v**2)
+                log_prob_slab -= 0.5 * (self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]) / self.sigma_v**2
+                
+                # Log probability under spike (inactive): v_kell = 0
+                log_prob_spike = 0.0
+                
+                # Contribution from Bernoulli likelihood when v_kell = 0
+                for i in range(self.n):
+                    # E[A_ik] when v_kell is inactive (=0)
+                    mask = np.ones(self.d, dtype=bool)
+                    mask[ell] = False
+                    E_A_inactive = 0.0
+                    if mask.any():
+                        E_A_inactive = self.E_theta[i, mask] @ self.mu_v[k, mask]
+                    E_A_inactive += X_aux[i] @ self.E_gamma[k]
+                    
+                    E_A_sq_inactive = E_A_inactive**2
+                    # No variance contribution from v_kell since it's 0
+                    
+                    log_prob_spike += (y_k[i] - 0.5) * E_A_inactive - lam[i] * E_A_sq_inactive
+                
+                # Prior contribution (spike has density at 0, represented by very small variance)
+                log_prob_spike -= 0.5 * np.log(2 * np.pi * self.spike_variance_v)
+                # At v=0: -0.5 * 0^2 / spike_variance_v = 0
+                
+                # Compute log odds
+                log_odds = log_prob_slab - log_prob_spike + np.log(self.pi_v / (1 - self.pi_v + 1e-10))
+                
+                # Convert to probability using sigmoid
+                self.rho_v[k, ell] = expit(log_odds)
+    
     def _update_xi(self):
         """Update xi using coordinate ascent."""
         self.a_xi = np.full(self.n, self.alpha_xi + self.d * self.alpha_theta)
@@ -192,7 +324,7 @@ class VI:
         self.b_eta = np.clip(self.b_eta, 1e-6, 1e6)
     
     def _update_v(self, y: np.ndarray, X_aux: np.ndarray):
-        """Update v using coordinate ascent (vectorized)."""
+        """Update v using coordinate ascent (vectorized) with spike-and-slab."""
         for k in range(self.kappa):
             y_k = y[:, k] if y.ndim > 1 else y
             lam = self._lambda_jj(self.zeta[:, k])
@@ -322,7 +454,7 @@ class VI:
         elbo_components['E[log p(theta,xi)]'] = elbo_theta_xi
         
         # =====================================================================
-        # E[log p(β | η)] and E[log p(η)]
+        # E[log p(β | η)] and E[log p(η)] with spike-and-slab
         # =====================================================================
         elbo_beta_eta = 0.0
         for j in range(self.p):
@@ -331,23 +463,49 @@ class VI:
             elbo_beta_eta -= self.lambda_eta * self.E_eta[j]
             elbo_beta_eta += self.alpha_eta * np.log(self.lambda_eta) - gammaln(self.alpha_eta)
             
-            # E[log p(β_j | η_j)]
+            # E[log p(β_j | η_j, s_beta)] with spike-and-slab
             for ell in range(self.d):
-                elbo_beta_eta += (self.alpha_beta - 1) * self.E_log_beta[j, ell]
-                elbo_beta_eta += self.alpha_beta * self.E_log_eta[j]
-                elbo_beta_eta -= self.E_eta[j] * self.E_beta[j, ell]
-                elbo_beta_eta -= gammaln(self.alpha_beta)
+                # Slab component (when s_beta = 1)
+                slab_contrib = (self.alpha_beta - 1) * self.E_log_beta_slab[j, ell]
+                slab_contrib += self.alpha_beta * self.E_log_eta[j]
+                slab_contrib -= self.E_eta[j] * self.E_beta_slab[j, ell]
+                slab_contrib -= gammaln(self.alpha_beta)
+                
+                # Weighted by probability of being in slab
+                elbo_beta_eta += self.rho_beta[j, ell] * slab_contrib
+                
+                # Prior on indicator: E[log p(s_beta)]
+                if self.rho_beta[j, ell] > 1e-10:
+                    elbo_beta_eta += self.rho_beta[j, ell] * np.log(self.pi_beta + 1e-10)
+                if (1 - self.rho_beta[j, ell]) > 1e-10:
+                    elbo_beta_eta += (1 - self.rho_beta[j, ell]) * np.log(1 - self.pi_beta + 1e-10)
         elbo += elbo_beta_eta
         elbo_components['E[log p(beta,eta)]'] = elbo_beta_eta
         
         # =====================================================================
-        # E[log p(v)] and E[log p(γ)]
+        # E[log p(v)] and E[log p(γ)] with spike-and-slab for v
         # =====================================================================
         elbo_v_gamma = 0.0
         for k in range(self.kappa):
-            # E[log p(v_k)]
-            elbo_v_gamma -= 0.5 * self.d * np.log(2 * np.pi * self.sigma_v**2)
-            elbo_v_gamma -= 0.5 * (np.sum(self.mu_v[k]**2) + np.trace(self.Sigma_v[k])) / self.sigma_v**2
+            # E[log p(v_k | s_v)] with spike-and-slab
+            for ell in range(self.d):
+                # Slab component (when s_v = 1): N(0, σ²_v)
+                slab_contrib = -0.5 * np.log(2 * np.pi * self.sigma_v**2)
+                slab_contrib -= 0.5 * (self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]) / self.sigma_v**2
+                
+                # Spike component (when s_v = 0): N(0, spike_variance_v)
+                spike_contrib = -0.5 * np.log(2 * np.pi * self.spike_variance_v)
+                spike_contrib -= 0.5 * (self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]) / self.spike_variance_v
+                
+                # Weighted combination
+                elbo_v_gamma += self.rho_v[k, ell] * slab_contrib
+                elbo_v_gamma += (1 - self.rho_v[k, ell]) * spike_contrib
+                
+                # Prior on indicator: E[log p(s_v)]
+                if self.rho_v[k, ell] > 1e-10:
+                    elbo_v_gamma += self.rho_v[k, ell] * np.log(self.pi_v + 1e-10)
+                if (1 - self.rho_v[k, ell]) > 1e-10:
+                    elbo_v_gamma += (1 - self.rho_v[k, ell]) * np.log(1 - self.pi_v + 1e-10)
             
             # E[log p(γ_k)]
             elbo_v_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
@@ -414,6 +572,26 @@ class VI:
                 entropy_gamma += 0.5 * (self.p_aux * (1 + np.log(2 * np.pi)) + logdet)
         elbo += entropy_gamma
         elbo_components['H[q(gamma)]'] = entropy_gamma
+        
+        # Entropy of q(s_beta) - Bernoulli entropy
+        entropy_s_beta = 0.0
+        for j in range(self.p):
+            for ell in range(self.d):
+                rho = self.rho_beta[j, ell]
+                if rho > 1e-10 and rho < 1 - 1e-10:
+                    entropy_s_beta -= rho * np.log(rho) + (1 - rho) * np.log(1 - rho)
+        elbo += entropy_s_beta
+        elbo_components['H[q(s_beta)]'] = entropy_s_beta
+        
+        # Entropy of q(s_v) - Bernoulli entropy
+        entropy_s_v = 0.0
+        for k in range(self.kappa):
+            for ell in range(self.d):
+                rho = self.rho_v[k, ell]
+                if rho > 1e-10 and rho < 1 - 1e-10:
+                    entropy_s_v -= rho * np.log(rho) + (1 - rho) * np.log(1 - rho)
+        elbo += entropy_s_v
+        elbo_components['H[q(s_v)]'] = entropy_s_v
         
         if debug:
             print(f"\n  === Iteration {iteration} ELBO Breakdown ===")
@@ -537,6 +715,9 @@ class VI:
             self.b_beta = (damping_factors['beta'] * self.b_beta + 
                         (1 - damping_factors['beta']) * b_beta_old)
             
+            # Update spike-and-slab indicators for beta (no damping)
+            self._update_rho_beta(z)
+            
             # ============================================
             # Update xi with damping
             # ============================================
@@ -578,6 +759,9 @@ class VI:
                         (1 - damping_factors['v']) * mu_v_old)
             self.Sigma_v = (damping_factors['v'] * self.Sigma_v + 
                         (1 - damping_factors['v']) * Sigma_v_old)
+            
+            # Update spike-and-slab indicators for v (no damping)
+            self._update_rho_v(y, X_aux)
             
             # ============================================
             # Update gamma with damping

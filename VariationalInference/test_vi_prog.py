@@ -55,7 +55,7 @@ def create_test_subset(X, y, X_aux, n_samples=300, n_genes=1000, random_state=42
     return X_sub, y_sub, X_aux_sub, top_genes
 
 
-def quick_diagnostic(model, stage_name="model", verbose=True):
+def quick_diagnostic(model, stage_name="model", verbose=True, threshold=0.5):
     """
     Fast diagnostic checks after training.
     
@@ -89,7 +89,36 @@ def quick_diagnostic(model, stage_name="model", verbose=True):
     if v_unique < model.kappa:
         issues.append(f"V-WEIGHT WARNING: Only {v_unique} unique values for {model.kappa} programs")
     
-    # 2. CONVERGENCE CHECK
+    # 2. SPARSITY CHECK (for spike-and-slab)
+    if hasattr(model, 'rho_beta') and hasattr(model, 'rho_v'):
+        if verbose:
+            print(f"\n[SPIKE-AND-SLAB SPARSITY]")
+        
+        # Beta sparsity
+        beta_active = model.rho_beta > threshold
+        beta_sparsity = 1.0 - beta_active.mean()
+        
+        # V sparsity
+        v_active = model.rho_v > threshold
+        v_sparsity = 1.0 - v_active.mean()
+        
+        if verbose:
+            print(f"  Beta (genes):")
+            print(f"    Active: {beta_active.sum()}/{model.rho_beta.size} ({(1-beta_sparsity)*100:.1f}%)")
+            print(f"    Sparse: {beta_sparsity*100:.1f}%")
+            print(f"    Active per factor: {beta_active.sum(axis=0)}")
+            print(f"  V (classification weights):")
+            print(f"    Active: {v_active.sum()}/{model.rho_v.size} ({(1-v_sparsity)*100:.1f}%)")
+            print(f"    Sparse: {v_sparsity*100:.1f}%")
+            print(f"    Active per factor: {v_active.sum(axis=0)}")
+        
+        # Check if sparsity is too extreme
+        if beta_sparsity > 0.95:
+            issues.append(f"WARNING: Beta extremely sparse ({beta_sparsity*100:.1f}%)")
+        if v_sparsity > 0.95:
+            issues.append(f"WARNING: V extremely sparse ({v_sparsity*100:.1f}%)")
+    
+    # 3. CONVERGENCE CHECK
     if verbose:
         print(f"\n[CONVERGENCE CHECK]")
     
@@ -312,7 +341,7 @@ def run_test_stage(
     # Plot ELBO
     plot_elbo_trajectory(model, stage_name, output_dir)
     
-    # Save results summary
+    # Save results summary with sparsity info
     results = {
         'stage_name': stage_name,
         'n_samples': n_samples,
@@ -331,6 +360,23 @@ def run_test_stage(
         },
         'final_elbo': model.elbo_history_[-1][1] if model.elbo_history_ else None,
     }
+    
+    # Add sparsity info if spike-and-slab is used
+    if hasattr(model, 'rho_beta') and hasattr(model, 'rho_v'):
+        threshold = 0.5
+        beta_active = model.rho_beta > threshold
+        v_active = model.rho_v > threshold
+        
+        results['sparsity_info'] = {
+            'beta_active_count': int(beta_active.sum()),
+            'beta_total': int(model.rho_beta.size),
+            'beta_sparsity': float(1.0 - beta_active.mean()),
+            'beta_active_per_factor': beta_active.sum(axis=0).tolist(),
+            'v_active_count': int(v_active.sum()),
+            'v_total': int(model.rho_v.size),
+            'v_sparsity': float(1.0 - v_active.mean()),
+            'v_active_per_factor': v_active.sum(axis=0).tolist(),
+        }
     
     result_path = output_dir / f'{stage_name.lower().replace(" ", "_")}_results.pkl'
     with open(result_path, 'wb') as f:

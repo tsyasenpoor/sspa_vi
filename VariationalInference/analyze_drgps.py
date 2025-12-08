@@ -1,11 +1,47 @@
-
-
 import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 import seaborn as sns
+
+
+def get_sparsity_info(model, threshold=0.5):
+    """
+    Extract sparsity information from spike-and-slab model.
+    
+    Parameters:
+    -----------
+    model : VI
+        Trained VI model with spike-and-slab priors
+    threshold : float
+        Probability threshold for considering a parameter "active"
+        
+    Returns:
+    --------
+    info : dict or None
+        Dictionary containing sparsity statistics, or None if model doesn't have spike-and-slab
+    """
+    if not hasattr(model, 'rho_beta') or not hasattr(model, 'rho_v'):
+        return None
+    
+    beta_active = model.rho_beta > threshold
+    v_active = model.rho_v > threshold
+    
+    info = {
+        'beta_active': beta_active,
+        'beta_sparsity': 1.0 - beta_active.mean(),
+        'beta_active_per_factor': beta_active.sum(axis=0),
+        'beta_active_per_gene': beta_active.sum(axis=1),
+        'v_active': v_active,
+        'v_sparsity': 1.0 - v_active.mean(),
+        'v_active_per_factor': v_active.sum(axis=0),
+        'v_active_per_class': v_active.sum(axis=1),
+        'rho_beta': model.rho_beta,
+        'rho_v': model.rho_v,
+    }
+    
+    return info
 
 
 def load_model_and_genes(model_path, data_dir='/labs/Aguiar/SSPA_BRAY/BRay/ctrl_sspa_test'):
@@ -254,6 +290,28 @@ def main(model_path, output_dir=None):
     
     # Analyze v-weights
     v = analyze_v_weights(model)
+    
+    # Compute and display sparsity information if spike-and-slab is used
+    sparsity_info = get_sparsity_info(model, threshold=0.5)
+    if sparsity_info is not None:
+        print(f"\n{'='*60}")
+        print("SPIKE-AND-SLAB SPARSITY ANALYSIS")
+        print(f"{'='*60}")
+        
+        beta_active = sparsity_info['beta_active']
+        v_active = sparsity_info['v_active']
+        
+        print(f"\nBeta (Gene Programs):")
+        print(f"  Active elements: {beta_active.sum()}/{sparsity_info['rho_beta'].size}")
+        print(f"  Sparsity: {(1 - beta_active.mean())*100:.1f}%")
+        print(f"  Active per factor: {beta_active.sum(axis=0)}")
+        print(f"  Active per gene: min={beta_active.sum(axis=1).min()}, max={beta_active.sum(axis=1).max()}")
+        
+        print(f"\nV (Classification Weights):")
+        print(f"  Active elements: {v_active.sum()}/{sparsity_info['rho_v'].size}")
+        print(f"  Sparsity: {(1 - v_active.mean())*100:.1f}%")
+        print(f"  Active per factor: {v_active.sum(axis=0)}")
+        print(f"  Active per class: {v_active.sum(axis=1)}")
     
     # Create plots
     print(f"\n{'='*60}")

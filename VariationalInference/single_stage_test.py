@@ -174,6 +174,20 @@ def main():
     else:
         print(f"  ✓ Good variance")
     
+    # Sparsity check (for spike-and-slab)
+    if hasattr(model, 'rho_beta') and hasattr(model, 'rho_v'):
+        threshold = 0.5
+        beta_active = model.rho_beta > threshold
+        v_active = model.rho_v > threshold
+        
+        print(f"\n[SPIKE-AND-SLAB SPARSITY]")
+        print(f"  Beta:")
+        print(f"    Active: {beta_active.sum()}/{model.rho_beta.size} ({(1-beta_active.mean())*100:.1f}% sparse)")
+        print(f"    Active per factor: {beta_active.sum(axis=0)}")
+        print(f"  V:")
+        print(f"    Active: {v_active.sum()}/{model.rho_v.size} ({(1-v_active.mean())*100:.1f}% sparse)")
+        print(f"    Active per factor: {v_active.sum(axis=0)}")
+    
     # Convergence check
     if len(model.elbo_history_) > 2:
         elbo_vals = np.array([e[1] for e in model.elbo_history_])
@@ -216,6 +230,23 @@ def main():
         'elbo_history': model.elbo_history_,
         'final_elbo': model.elbo_history_[-1][1] if model.elbo_history_ else None,
     }
+    
+    # Add sparsity info if spike-and-slab is used
+    if hasattr(model, 'rho_beta') and hasattr(model, 'rho_v'):
+        threshold = 0.5
+        beta_active = model.rho_beta > threshold
+        v_active = model.rho_v > threshold
+        
+        results['sparsity_info'] = {
+            'beta_active_count': int(beta_active.sum()),
+            'beta_total': int(model.rho_beta.size),
+            'beta_sparsity': float(1.0 - beta_active.mean()),
+            'beta_active_per_factor': beta_active.sum(axis=0).tolist(),
+            'v_active_count': int(v_active.sum()),
+            'v_total': int(model.rho_v.size),
+            'v_sparsity': float(1.0 - v_active.mean()),
+            'v_active_per_factor': v_active.sum(axis=0).tolist(),
+        }
     
     # Save results
     result_path = output_dir / 'results.pkl'
