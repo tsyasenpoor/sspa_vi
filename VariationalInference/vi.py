@@ -72,7 +72,9 @@ class VI:
         self.b_eta = np.ones(self.p) * self.lambda_eta
         
         # Initialize Normal parameters - small values near zero
-        self.mu_v = 0.01 * self.rng.randn(self.kappa, self.d)
+        base = self.rng.randn(self.kappa, self.d)
+        scale_factors = 0.2 + 0.3 * np.arange(self.kappa) / self.kappa
+        self.mu_v = base * scale_factors[:, np.newaxis]
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
 
         self.mu_gamma = 0.01 * self.rng.randn(self.kappa, self.p_aux)
@@ -211,7 +213,7 @@ class VI:
             try:
                 self.Sigma_v[k] = np.linalg.inv(prec)
                 self.mu_v[k] = self.Sigma_v[k] @ mean_contrib
-                self.mu_v[k] = np.clip(self.mu_v[k], -3, 3)
+                self.mu_v[k] = np.clip(self.mu_v[k], -10, 10)
             except np.linalg.LinAlgError:
                 pass
     
