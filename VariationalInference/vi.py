@@ -73,7 +73,7 @@ class VI:
         
         # Initialize Normal parameters - small values near zero
         base = self.rng.randn(self.kappa, self.d)
-        scale_factors = 0.2 + 0.3 * np.arange(self.kappa) / self.kappa
+        scale_factors = 0.5 + 0.5 * np.arange(self.kappa) / self.kappa
         self.mu_v = base * scale_factors[:, np.newaxis]
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
 

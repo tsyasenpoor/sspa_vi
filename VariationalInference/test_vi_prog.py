@@ -1,3 +1,8 @@
+"""
+Progressive Testing Script for VI Implementation
+Tests on increasingly larger subsets to catch bugs early before full run.
+"""
+
 import numpy as np
 import pickle
 import time
@@ -12,8 +17,14 @@ from vi import VI
 from load_data_vi import load_control_data
 
 
-
 def create_test_subset(X, y, X_aux, n_samples=300, n_genes=1000, random_state=42):
+    """
+    Create smaller dataset preserving characteristics.
+    
+    Strategy:
+    - Sample cells randomly
+    - Keep high-variance genes (most informative)
+    """
     rng = np.random.RandomState(random_state)
     
     # 1. Sample cells (rows)
@@ -45,6 +56,16 @@ def create_test_subset(X, y, X_aux, n_samples=300, n_genes=1000, random_state=42
 
 
 def quick_diagnostic(model, stage_name="model", verbose=True):
+    """
+    Fast diagnostic checks after training.
+    
+    Returns:
+    --------
+    passed : bool
+        True if all checks pass
+    issues : list
+        List of detected issues
+    """
     issues = []
     
     if verbose:
@@ -103,7 +124,12 @@ def quick_diagnostic(model, stage_name="model", verbose=True):
         print(f"  E[theta]: [{theta_min:.4f}, {theta_max:.4f}]")
         print(f"  E[beta]:  [{beta_min:.4f}, {beta_max:.4f}]")
         print(f"  E[v]:     [{model.E_v.min():.4f}, {model.E_v.max():.4f}]")
-        print(f"  E[gamma]: [{model.E_gamma.min():.4f}, {model.E_gamma.max():.4f}]")
+        
+        # Check if E_gamma exists and is not empty
+        if hasattr(model, 'E_gamma') and model.E_gamma.size > 0:
+            print(f"  E[gamma]: [{model.E_gamma.min():.4f}, {model.E_gamma.max():.4f}]")
+        else:
+            print(f"  E[gamma]: [empty]")
     
     # Check for extreme values
     if theta_max > 1e6 or beta_max > 1e6:
@@ -118,7 +144,16 @@ def quick_diagnostic(model, stage_name="model", verbose=True):
     has_nan_theta = np.isnan(model.E_theta).any()
     has_nan_beta = np.isnan(model.E_beta).any()
     has_nan_v = np.isnan(model.mu_v).any()
-    has_nan_gamma = np.isnan(model.mu_gamma).any()
+    
+    # Check E_gamma only if it exists and is not empty
+    has_nan_gamma = False
+    if hasattr(model, 'E_gamma') and model.E_gamma.size > 0:
+        has_nan_gamma = np.isnan(model.E_gamma).any()
+    
+    # Check mu_gamma only if it exists and is not empty
+    has_nan_mu_gamma = False
+    if hasattr(model, 'mu_gamma') and model.mu_gamma.size > 0:
+        has_nan_mu_gamma = np.isnan(model.mu_gamma).any()
     
     has_inf_theta = np.isinf(model.E_theta).any()
     has_inf_beta = np.isinf(model.E_beta).any()
@@ -127,11 +162,18 @@ def quick_diagnostic(model, stage_name="model", verbose=True):
         print(f"  NaN in theta:  {has_nan_theta}")
         print(f"  NaN in beta:   {has_nan_beta}")
         print(f"  NaN in v:      {has_nan_v}")
-        print(f"  NaN in gamma:  {has_nan_gamma}")
+        if hasattr(model, 'E_gamma') and model.E_gamma.size > 0:
+            print(f"  NaN in E_gamma: {has_nan_gamma}")
+        else:
+            print(f"  NaN in E_gamma: [empty]")
+        if hasattr(model, 'mu_gamma') and model.mu_gamma.size > 0:
+            print(f"  NaN in mu_gamma: {has_nan_mu_gamma}")
+        else:
+            print(f"  NaN in mu_gamma: [empty]")
         print(f"  Inf in theta:  {has_inf_theta}")
         print(f"  Inf in beta:   {has_inf_beta}")
     
-    if has_nan_theta or has_nan_beta or has_nan_v or has_nan_gamma:
+    if has_nan_theta or has_nan_beta or has_nan_v or has_nan_gamma or has_nan_mu_gamma:
         issues.append("CRITICAL: NaN values detected")
     if has_inf_theta or has_inf_beta:
         issues.append("CRITICAL: Inf values detected")
@@ -158,6 +200,7 @@ def quick_diagnostic(model, stage_name="model", verbose=True):
         print(f"{'='*60}\n")
     
     return passed, issues
+
 
 
 def plot_elbo_trajectory(model, stage_name, output_dir):
@@ -269,7 +312,7 @@ def run_test_stage(
     # Plot ELBO
     plot_elbo_trajectory(model, stage_name, output_dir)
     
-    # Save results
+    # Save results summary
     results = {
         'stage_name': stage_name,
         'n_samples': n_samples,
@@ -293,6 +336,12 @@ def run_test_stage(
     with open(result_path, 'wb') as f:
         pickle.dump(results, f)
     print(f"\n  Saved results: {result_path}")
+    
+    # Save full model for inspection
+    model_path = output_dir / f'{stage_name.lower().replace(" ", "_")}_model.pkl'
+    with open(model_path, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"  Saved model: {model_path}")
     
     return passed, model, time_taken
 
@@ -335,7 +384,7 @@ def main():
             'n_samples': 100,
             'n_genes': 500,
             'n_factors': 5,
-            'max_iter': 50,
+            'max_iter': 200,
             'elbo_freq': 5,
             'description': 'Quick smoke test (~5 min)'
         },
@@ -344,7 +393,7 @@ def main():
             'n_samples': 300,
             'n_genes': 1000,
             'n_factors': 10,
-            'max_iter': 100,
+            'max_iter': 300,
             'elbo_freq': 10,
             'description': 'Verify convergence (~15 min)'
         },
@@ -353,7 +402,7 @@ def main():
             'n_samples': 600,
             'n_genes': 2000,
             'n_factors': 15,
-            'max_iter': 150,
+            'max_iter': 500,
             'elbo_freq': 10,
             'description': 'Verify quality (~30 min)'
         },
