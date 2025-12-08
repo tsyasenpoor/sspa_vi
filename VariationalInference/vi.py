@@ -22,8 +22,8 @@ class VI:
         sigma_gamma: float = 0.1,
         random_state: int = 42,
         # Spike-and-slab parameters
-        pi_v: float = 0.5,  # Prior probability of v being active
-        pi_beta: float = 0.5,  # Prior probability of beta being active
+        pi_v: float = 0.05,  # Prior probability of v being active
+        pi_beta: float = 0.05,  # Prior probability of beta being active
         spike_variance_v: float = 1e-6,  # Variance for spike in v
         spike_value_beta: float = 1e-6  # Small value for spike in beta
     ):
