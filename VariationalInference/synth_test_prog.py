@@ -138,7 +138,26 @@ def train_and_evaluate(X_train, y_train, X_aux_train, X_test, y_test, X_aux_test
     elapsed = time.time() - start
     
     print(f"\n✓ Training completed in {elapsed:.1f}s ({elapsed/60:.1f} min)")
-    
+
+    # Check if spike-and-slab indicators are collapsing
+    print("rho_beta stats:", model.rho_beta.min(), model.rho_beta.max(), model.rho_beta.mean())
+    print("rho_v stats:", model.rho_v.min(), model.rho_v.max(), model.rho_v.mean())
+
+    # Check regression signal
+    logits = model.E_theta @ model.E_v.T + X_aux_train @ model.E_gamma.T
+    print("Logit range:", logits.min(), logits.max(), logits.std())
+
+    # Test with pi_v=1.0, pi_beta=1.0 to disable spike-and-slab
+    model_test = VI(n_factors=n_factors, sigma_v=0.1, sigma_gamma=0.1,
+                    pi_v=1.0, pi_beta=1.0,
+                    random_state=42)
+    model_test.fit(X_train, y_train, X_aux_train,
+                   max_iter=max_iter,
+                   elbo_freq=10,
+                   verbose=True,
+                   min_iter=20,
+                   patience=3)
+
     # Evaluate gene recovery
     print(f"\n{'='*70}")
     print("GENE RECOVERY ANALYSIS")

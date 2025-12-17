@@ -18,11 +18,11 @@ class VI:
         alpha_eta: float = 2.0,
         lambda_xi: float = 1.5,
         lambda_eta: float = 1.5,
-        sigma_v: float = 0.1,
-        sigma_gamma: float = 0.1,
+        sigma_v: float = 1.0,  # Increased from 0.1 - wider slab prior
+        sigma_gamma: float = 1.0,  # Increased from 0.1
         random_state: int = 42,
         # Spike-and-slab parameters
-        pi_v: float = 0.05,  # Prior probability of v being active
+        pi_v: float = 0.5,  # Prior probability of v being active (increased from 0.05)
         pi_beta: float = 0.05,  # Prior probability of beta being active
         spike_variance_v: float = 1e-6,  # Variance for spike in v
         spike_value_beta: float = 1e-6  # Small value for spike in beta
@@ -90,7 +90,8 @@ class VI:
         
         # Initialize spike-and-slab indicators for v
         # rho_v[k, ell] = q(s_v_kell = 1) - probability that v_kell is active (slab)
-        self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
+        # Initialize at 0.5 to let data decide
+        self.rho_v = np.ones((self.kappa, self.d)) * 0.5
 
         self.mu_gamma = 0.01 * self.rng.randn(self.kappa, self.p_aux)
         self.Sigma_gamma = np.tile(np.eye(self.p_aux)[np.newaxis, :, :], (self.kappa, 1, 1))
@@ -122,12 +123,70 @@ class VI:
         
         # Spike-and-slab for v: E[v] = rho * E[v | slab] + (1-rho) * 0
         self.E_v_slab = self.mu_v
-        self.E_v = self.rho_v[:, :, np.newaxis] * self.mu_v[:, :, np.newaxis]
-        self.E_v = self.E_v.squeeze(-1)  # Remove extra dimension
-        
+        self.E_v = self.rho_v * self.mu_v  
         # Normal distributions: expectations are just the means
         self.E_gamma = self.mu_gamma
+    
+    def get_sparse_beta(self, threshold: float = 0.5) -> np.ndarray:
+        """
+        Get sparse version of E[beta] by thresholding spike-and-slab indicators.
         
+        Parameters:
+        -----------
+        threshold : float
+            Probability threshold for inclusion. If rho_beta > threshold, 
+            use slab value; otherwise set to 0.
+            
+        Returns:
+        --------
+        E_beta_sparse : np.ndarray, shape (p, d)
+            Sparse expected values of beta
+        """
+        return np.where(self.rho_beta > threshold, self.E_beta_slab, 0.0)
+    
+    def get_sparse_v(self, threshold: float = 0.5) -> np.ndarray:
+        """
+        Get sparse version of E[v] by thresholding spike-and-slab indicators.
+        
+        Parameters:
+        -----------
+        threshold : float
+            Probability threshold for inclusion. If rho_v > threshold,
+            use slab value; otherwise set to 0.
+            
+        Returns:
+        --------
+        E_v_sparse : np.ndarray, shape (kappa, d)
+            Sparse expected values of v
+        """
+        return np.where(self.rho_v > threshold, self.mu_v, 0.0)
+    
+    def get_active_factors(self, threshold: float = 0.5) -> dict:
+        """
+        Get indices of active factors for each outcome.
+        
+        Parameters:
+        -----------
+        threshold : float
+            Probability threshold for considering a factor active.
+            
+        Returns:
+        --------
+        active : dict
+            Dictionary with keys 'beta' and 'v', containing lists of active indices.
+        """
+        active_beta = [np.where(self.rho_beta[:, ell] > threshold)[0] 
+                       for ell in range(self.d)]
+        active_v = [np.where(self.rho_v[k, :] > threshold)[0] 
+                    for k in range(self.kappa)]
+        
+        return {
+            'beta': active_beta,  # List of arrays: active genes per factor
+            'v': active_v,        # List of arrays: active factors per outcome
+            'n_active_beta': sum(len(a) for a in active_beta),
+            'n_active_v': sum(len(a) for a in active_v)
+        }
+    
     def _lambda_jj(self, zeta: np.ndarray) -> np.ndarray:
         """Jaakola-Jordan lambda function."""
         result = np.zeros_like(zeta)
@@ -207,108 +266,100 @@ class VI:
     
     def _update_rho_beta(self, z: np.ndarray):
         """
-        Update spike-and-slab indicators for beta.
+        Update spike-and-slab indicators for beta (vectorized).
         
         rho_beta[j, ell] = q(s_beta_jell = 1)
         
-        Using mean-field approximation:
-        log rho/(1-rho) = E[log p(z, beta | s=1)] - E[log p(z, beta | s=0)] + log(pi/(1-pi))
+        Log-odds for each (j, ell):
+        log p(data | s=1) - log p(data | s=0) 
+          = sum_i [ z_ijℓ * (E[log β_slab] - log(spike_value)) 
+                  - E[θ_iℓ] * (E[β_slab] - spike_value) ]
         """
-        for j in range(self.p):
-            for ell in range(self.d):
-                # Log probability under slab (active)
-                # E[log p(z_ijℓ | s=1)] + E[log p(beta_jℓ | s=1, eta)]
-                log_prob_slab = 0.0
-                
-                # Contribution from Poisson likelihood
-                for i in range(self.n):
-                    if z[i, j, ell] > 1e-10:
-                        log_prob_slab += z[i, j, ell] * self.E_log_beta_slab[j, ell]
-                        log_prob_slab -= self.E_theta[i, ell] * self.E_beta_slab[j, ell]
-                
-                # Contribution from Gamma prior
-                log_prob_slab += (self.alpha_beta - 1) * self.E_log_beta_slab[j, ell]
-                log_prob_slab -= self.E_eta[j] * self.E_beta_slab[j, ell]
-                
-                # Log probability under spike (inactive)
-                log_prob_spike = 0.0
-                
-                # Contribution from Poisson likelihood with spike value
-                for i in range(self.n):
-                    if z[i, j, ell] > 1e-10:
-                        log_prob_spike += z[i, j, ell] * np.log(self.spike_value_beta + 1e-10)
-                        log_prob_spike -= self.E_theta[i, ell] * self.spike_value_beta
-                
-                # Prior contribution
-                log_odds = log_prob_slab - log_prob_spike + np.log(self.pi_beta / (1 - self.pi_beta + 1e-10))
-                
-                # Convert to probability using sigmoid
-                self.rho_beta[j, ell] = expit(log_odds)
+        # Sum of latent counts over samples: shape (p, d)
+        z_sum = np.sum(z, axis=0)  # sum over i
+        
+        # Sum of E[theta] over samples: shape (d,)
+        theta_sum = np.sum(self.E_theta, axis=0)  # sum over i
+        
+        # Log-likelihood difference: slab vs spike
+        # Slab contribution: z_ijℓ * E[log β_slab] - E[θ_iℓ] * E[β_slab]
+        # Spike contribution: z_ijℓ * log(spike_value) - E[θ_iℓ] * spike_value
+        
+        log_spike_value = np.log(self.spike_value_beta + 1e-10)
+        
+        # Difference in log-likelihood (vectorized over j, ell)
+        ll_diff = z_sum * (self.E_log_beta_slab - log_spike_value)  # (p, d)
+        ll_diff -= theta_sum[np.newaxis, :] * (self.E_beta_slab - self.spike_value_beta)  # (p, d)
+        
+        # Prior contribution: log(pi / (1 - pi))
+        log_prior_odds = np.log(self.pi_beta / (1 - self.pi_beta + 1e-10))
+        
+        # Log odds
+        log_odds = ll_diff + log_prior_odds
+        
+        # Convert to probability using sigmoid, with clipping for stability
+        log_odds = np.clip(log_odds, -20, 20)
+        self.rho_beta = expit(log_odds)
                 
     def _update_rho_v(self, y: np.ndarray, X_aux: np.ndarray):
         """
-        Update spike-and-slab indicators for v.
+        Update spike-and-slab indicators for v (vectorized).
         
         rho_v[k, ell] = q(s_v_kell = 1)
         
-        Using mean-field approximation:
-        log rho/(1-rho) = E[log p(y, v | s=1)] - E[log p(y, v | s=0)] + log(pi/(1-pi))
+        For each (k, ell), compute log-odds comparing:
+        - Slab: v_kell ~ N(mu_v[k,ell], Sigma_v[k,ell,ell])
+        - Spike: v_kell = 0
         """
         for k in range(self.kappa):
             y_k = y[:, k] if y.ndim > 1 else y
-            lam = self._lambda_jj(self.zeta[:, k])
+            lam = self._lambda_jj(self.zeta[:, k])  # (n,)
+            
+            # Compute base linear predictor without v contribution: x_aux @ gamma
+            base_pred = X_aux @ self.E_gamma[k]  # (n,)
             
             for ell in range(self.d):
-                # Log probability under slab (active): v_kell ~ N(mu, Sigma)
-                log_prob_slab = 0.0
+                # Contribution from other dimensions of v (excluding ell)
+                mask = np.ones(self.d, dtype=bool)
+                mask[ell] = False
+                other_contrib = self.E_theta[:, mask] @ self.E_v[k, mask]  # (n,)
                 
-                # Contribution from Bernoulli likelihood (via Jaakola-Jordan bound)
-                for i in range(self.n):
-                    # E[A_ik] when v_kell is active
-                    mask = np.ones(self.d, dtype=bool)
-                    mask[ell] = False
-                    E_A_active = self.E_theta[i, ell] * self.mu_v[k, ell]
-                    if mask.any():
-                        E_A_active += self.E_theta[i, mask] @ self.mu_v[k, mask]
-                    E_A_active += X_aux[i] @ self.E_gamma[k]
-                    
-                    # Second moment contribution
-                    E_A_sq_active = E_A_active**2
-                    E_v_sq_ell = self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]
-                    E_A_sq_active += (self.a_theta[i, ell] / self.b_theta[i, ell]**2) * E_v_sq_ell
-                    
-                    log_prob_slab += (y_k[i] - 0.5) * E_A_active - lam[i] * E_A_sq_active
+                # E[A_ik] when v_kell is ACTIVE (slab)
+                E_A_active = self.E_theta[:, ell] * self.mu_v[k, ell] + other_contrib + base_pred
                 
-                # Contribution from Normal prior
-                log_prob_slab -= 0.5 * np.log(2 * np.pi * self.sigma_v**2)
-                log_prob_slab -= 0.5 * (self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]) / self.sigma_v**2
+                # E[A_ik] when v_kell is INACTIVE (spike, v_kell = 0)
+                E_A_inactive = other_contrib + base_pred
                 
-                # Log probability under spike (inactive): v_kell = 0
-                log_prob_spike = 0.0
+                # Second moment terms
+                E_v_sq_ell = self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]
+                E_theta_sq = self.E_theta[:, ell]**2 + self.a_theta[:, ell] / (self.b_theta[:, ell]**2)
                 
-                # Contribution from Bernoulli likelihood when v_kell = 0
-                for i in range(self.n):
-                    # E[A_ik] when v_kell is inactive (=0)
-                    mask = np.ones(self.d, dtype=bool)
-                    mask[ell] = False
-                    E_A_inactive = 0.0
-                    if mask.any():
-                        E_A_inactive = self.E_theta[i, mask] @ self.mu_v[k, mask]
-                    E_A_inactive += X_aux[i] @ self.E_gamma[k]
-                    
-                    E_A_sq_inactive = E_A_inactive**2
-                    # No variance contribution from v_kell since it's 0
-                    
-                    log_prob_spike += (y_k[i] - 0.5) * E_A_inactive - lam[i] * E_A_sq_inactive
+                # E[A^2] for active case (includes variance from v_kell)
+                E_A_sq_active = E_A_active**2 + E_theta_sq * self.Sigma_v[k, ell, ell]
                 
-                # Prior contribution (spike has density at 0, represented by very small variance)
-                log_prob_spike -= 0.5 * np.log(2 * np.pi * self.spike_variance_v)
-                # At v=0: -0.5 * 0^2 / spike_variance_v = 0
+                # E[A^2] for inactive case
+                E_A_sq_inactive = E_A_inactive**2
                 
-                # Compute log odds
-                log_odds = log_prob_slab - log_prob_spike + np.log(self.pi_v / (1 - self.pi_v + 1e-10))
+                # Log-likelihood contribution from Bernoulli (JJ bound) - vectorized over samples
+                # log p(y | active) = sum_i [(y_i - 0.5) * E[A_active] - lambda * E[A^2_active]]
+                ll_active = np.sum((y_k - 0.5) * E_A_active - lam * E_A_sq_active)
+                ll_inactive = np.sum((y_k - 0.5) * E_A_inactive - lam * E_A_sq_inactive)
                 
-                # Convert to probability using sigmoid
+                # Prior contribution
+                # Slab: N(0, sigma_v^2) - penalize large values
+                # Only include the quadratic penalty, not normalizing constants
+                # (they cancel out in proper spike-and-slab with point mass spike)
+                prior_slab = -0.5 * E_v_sq_ell / self.sigma_v**2
+                
+                # Spike: point mass at 0 - no penalty since v=0 exactly
+                prior_spike = 0.0
+                
+                # Log odds: likelihood ratio + prior ratio + prior on indicator
+                log_odds = (ll_active - ll_inactive) + (prior_slab - prior_spike)
+                log_odds += np.log(self.pi_v / (1 - self.pi_v + 1e-10))
+                
+                # Clip for numerical stability
+                log_odds = np.clip(log_odds, -20, 20)
                 self.rho_v[k, ell] = expit(log_odds)
     
     def _update_xi(self):
@@ -819,13 +870,15 @@ class VI:
                 print(f"  E[theta]: [{self.E_theta.min():.4f}, {self.E_theta.max():.4f}]")
                 print(f"  E[beta]:  [{self.E_beta.min():.4f}, {self.E_beta.max():.4f}]")
                 print(f"  E[v]:     [{self.E_v.min():.4f}, {self.E_v.max():.4f}]")
-                if self.E_gamma.size > 0:  # Check if E_gamma is not empty
-                    if self.E_gamma.size > 0:
-                        print(f"  E[gamma]: [{self.E_gamma.min():.4f}, {self.E_gamma.max():.4f}]")
-            else:
-                print(f"  E[gamma]: (empty array)")
+                if self.E_gamma.size > 0:
+                    print(f"  E[gamma]: [{self.E_gamma.min():.4f}, {self.E_gamma.max():.4f}]")
+                else:
+                    print(f"  E[gamma]: (empty array)")
                 print(f"  a_theta:  [{self.a_theta.min():.4f}, {self.a_theta.max():.4f}]")
                 print(f"  b_theta:  [{self.b_theta.min():.4f}, {self.b_theta.max():.4f}]")
+                print(f"Spike-and-slab indicators:")
+                print(f"  rho_beta: [{self.rho_beta.min():.4f}, {self.rho_beta.max():.4f}], mean={self.rho_beta.mean():.4f}")
+                print(f"  rho_v:    [{self.rho_v.min():.4f}, {self.rho_v.max():.4f}], mean={self.rho_v.mean():.4f}")
                 if adaptive_damping:
                     print(f"Damping factors:")
                     print(f"  theta={damping_factors['theta']:.3f}, "
@@ -988,7 +1041,9 @@ class VI:
         X_aux: np.ndarray,
         max_iter: int = 50,
         tol: float = 1e-4,
-        verbose: bool = False
+        verbose: bool = False,
+        use_sparse: bool = False,
+        sparse_threshold: float = 0.5
     ) -> np.ndarray:
         """
         Predict probabilities for new samples.
@@ -1008,6 +1063,11 @@ class VI:
             Convergence tolerance for theta updates
         verbose : bool
             Whether to print progress
+        use_sparse : bool
+            If True, use thresholded sparse versions of v for prediction.
+            This provides exact sparsity rather than soft sparsity.
+        sparse_threshold : float
+            Threshold for sparsity (only used if use_sparse=True)
             
         Returns:
         --------
@@ -1017,9 +1077,15 @@ class VI:
         # Infer theta for new samples using learned global parameters
         E_theta_new, _, _ = self.infer_theta(X, max_iter=max_iter, tol=tol, verbose=verbose)
         
+        # Get v values (sparse or soft)
+        if use_sparse:
+            E_v_pred = self.get_sparse_v(threshold=sparse_threshold)
+        else:
+            E_v_pred = self.E_v
+        
         # Compute linear predictions and probabilities
         # A_ik = θ_i^T v_k + x_i^aux^T γ_k
-        linear_pred = E_theta_new @ self.E_v.T + X_aux @ self.E_gamma.T
+        linear_pred = E_theta_new @ E_v_pred.T + X_aux @ self.E_gamma.T
         probs = expit(linear_pred)
         
         return probs
