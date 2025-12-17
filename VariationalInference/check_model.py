@@ -147,7 +147,10 @@ def check_saved_model(model_path, gene_programs_path=None):
         print(f"  E[v]:     [{model.E_v.min():.4f}, {model.E_v.max():.4f}]")
     
     if hasattr(model, 'E_gamma'):
-        print(f"  E[gamma]: [{model.E_gamma.min():.4f}, {model.E_gamma.max():.4f}]")
+        if model.E_gamma.size == 0:
+            print(f"  E[gamma]: (empty array - no covariates)")
+        else:
+            print(f"  E[gamma]: [{model.E_gamma.min():.4f}, {model.E_gamma.max():.4f}]")
     
     # =====================================================================
     # CHECK 4: NUMERICAL STABILITY

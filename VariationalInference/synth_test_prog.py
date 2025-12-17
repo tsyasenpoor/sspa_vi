@@ -105,8 +105,15 @@ def compute_recovery_metrics(model, ground_truth, top_k=50):
 
 
 def train_and_evaluate(X_train, y_train, X_aux_train, X_test, y_test, X_aux_test,
-                       ground_truth, stage_name, n_factors, max_iter):
-    """Train model and evaluate recovery."""
+                       ground_truth, stage_name, n_factors, max_iter, pi_beta=0.3):
+    """Train model and evaluate recovery.
+    
+    Parameters:
+    -----------
+    pi_beta : float
+        Probability that beta entry is non-zero (1 - sparsity).
+        Default 0.3 means ~70% of beta entries are zero (sparse).
+    """
     print(f"\n{'='*70}")
     print(f"{stage_name}")
     print(f"{'='*70}")
@@ -115,8 +122,11 @@ def train_and_evaluate(X_train, y_train, X_aux_train, X_test, y_test, X_aux_test
     print(f"Disease: train={np.sum(y_train==1)}, test={np.sum(y_test==1)}")
     
     # Train
-    print(f"\nTraining ({n_factors} factors, {max_iter} iters)...")
-    model = VI(n_factors=n_factors, sigma_v=0.1, sigma_gamma=0.1, random_state=42)
+    print(f"\nTraining ({n_factors} factors, {max_iter} iters, pi_beta={pi_beta:.2f})...")
+    # Spike-and-slab prior: pi_beta controls sparsity (probability of non-zero)
+    model = VI(n_factors=n_factors, sigma_v=0.1, sigma_gamma=0.1, 
+               pi_beta=pi_beta,
+               random_state=42)
     
     start = time.time()
     model.fit(X_train, y_train, X_aux_train, 
@@ -142,17 +152,23 @@ def train_and_evaluate(X_train, y_train, X_aux_train, X_test, y_test, X_aux_test
     print(f"  F1 score:     {metrics['f1']:.3f}")
     print(f"  V-weight:     {metrics['v_weight']:.4f}")
     
-    # Predict on test set
+    # Predict on train and test sets
     print(f"\n{'='*70}")
-    print("TEST SET PREDICTION")
+    print("PREDICTIONS")
     print(f"{'='*70}")
     
     from sklearn.metrics import roc_auc_score
     
-    probs = model.predict_proba(X_test, X_aux_test, verbose=False)
-    auc = roc_auc_score(y_test.ravel(), probs.ravel())
+    print("Computing train predictions...")
+    train_probs = model.predict_proba(X_train, X_aux_train, verbose=False)
+    train_auc = roc_auc_score(y_train.ravel(), train_probs.ravel())
     
-    print(f"Test AUC: {auc:.3f}")
+    print("Computing test predictions...")
+    test_probs = model.predict_proba(X_test, X_aux_test, verbose=False)
+    test_auc = roc_auc_score(y_test.ravel(), test_probs.ravel())
+    
+    print(f"Train AUC: {train_auc:.3f}")
+    print(f"Test AUC: {test_auc:.3f}")
     
     # V-weight statistics
     v_std = model.mu_v.std()
@@ -168,10 +184,17 @@ def train_and_evaluate(X_train, y_train, X_aux_train, X_test, y_test, X_aux_test
         'f1': metrics['f1'],
         'precision': metrics['precision'],
         'recall': metrics['recall'],
-        'auc': auc,
+        'train_auc': train_auc,
+        'test_auc': test_auc,
         'best_factor': best_factor,
         'v_weight': metrics['v_weight'],
-        'final_elbo': model.elbo_history_[-1][1] if model.elbo_history_ else None
+        'final_elbo': model.elbo_history_[-1][1] if model.elbo_history_ else None,
+        'model': model,  # Include full model object
+        # Predictions for exploration
+        'train_probs': train_probs,
+        'train_labels': y_train,
+        'test_probs': test_probs,
+        'test_labels': y_test
     }
 
 
@@ -202,30 +225,35 @@ def main(data_dir, n_stages=3):
     print(f"Disease samples: {np.sum(y_train==1)} train, {np.sum(y_test==1)} test")
     
     # Define stages
+    # pi_beta = 0.3 means 70% of beta entries are zero (sparse prior)
     all_stages = [
         {
             'name': 'Stage 1: Small',
             'n_samples': 300,
             'n_factors': 15,
             'max_iter': 100,
+            'pi_beta': 0.3,  # 70% sparsity
         },
         {
             'name': 'Stage 2: Medium',
             'n_samples': 600,
             'n_factors': 20,
             'max_iter': 150,
+            'pi_beta': 0.3,  # 70% sparsity
         },
         {
             'name': 'Stage 3: Large',
             'n_samples': 900,
             'n_factors': 20,
             'max_iter': 150,
+            'pi_beta': 0.3,  # 70% sparsity
         },
         {
             'name': 'Stage 4: Full',
             'n_samples': X_train.shape[0],
             'n_factors': 20,
             'max_iter': 200,
+            'pi_beta': 0.3,  # 70% sparsity
         }
     ]
     
@@ -247,15 +275,50 @@ def main(data_dir, n_stages=3):
             ground_truth,
             stage['name'],
             stage['n_factors'],
-            stage['max_iter']
+            stage['max_iter'],
+            pi_beta=stage.get('pi_beta', 0.3)  # Default to 0.3 (70% sparsity)
         )
         
         results.append(result)
         
-        # Save results
-        results_path = output_dir / f'{stage["name"].lower().replace(" ", "_")}_results.pkl'
+        # Save results and model
+        stage_name_safe = stage["name"].lower().replace(" ", "_")
+        results_path = output_dir / f'{stage_name_safe}_results.pkl'
+        model_path = output_dir / f'{stage_name_safe}_model.pkl'
+        
         with open(results_path, 'wb') as f:
             pickle.dump(result, f)
+        
+        # Save trained model with all parameters
+        model_data = {
+            'model': result.get('model'),  # Full model object
+            'E_beta': result['model'].E_beta if 'model' in result else None,
+            'E_theta': result['model'].E_theta if 'model' in result else None,
+            'mu_v': result['model'].mu_v if 'model' in result else None,
+            'sigma_v': result['model'].sigma_v if 'model' in result else None,
+            'mu_gamma': result['model'].mu_gamma if 'model' in result else None,
+            'sigma_gamma': result['model'].sigma_gamma if 'model' in result else None,
+            'elbo_history': result['model'].elbo_history_ if 'model' in result else None,
+            'stage_info': {
+                'name': stage['name'],
+                'n_samples': stage['n_samples'],
+                'n_factors': stage['n_factors'],
+                'max_iter': stage['max_iter']
+            },
+            # Predictions for exploration
+            'train_probs': result.get('train_probs'),
+            'train_labels': result.get('train_labels'),
+            'test_probs': result.get('test_probs'),
+            'test_labels': result.get('test_labels'),
+            'train_auc': result.get('train_auc'),
+            'test_auc': result.get('test_auc')
+        }
+        
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        print(f"✓ Results saved to: {results_path}")
+        print(f"✓ Model saved to: {model_path}")
         
         # Check if we should continue
         if result['f1'] < 0.2:
@@ -274,10 +337,10 @@ def main(data_dir, n_stages=3):
     print("PROGRESSIVE VALIDATION SUMMARY")
     print(f"{'='*70}")
     
-    print(f"\n{'Stage':<20} {'Samples':<10} {'Time':<10} {'F1':<8} {'AUC':<8}")
+    print(f"\n{'Stage':<20} {'Samples':<10} {'Time':<10} {'F1':<8} {'Test AUC':<10}")
     print("-"*70)
     for r in results:
-        print(f"{r['stage']:<20} {r['n_samples']:<10} {r['time']/60:>6.1f}m   {r['f1']:<8.3f} {r['auc']:<8.3f}")
+        print(f"{r['stage']:<20} {r['n_samples']:<10} {r['time']/60:>6.1f}m   {r['f1']:<8.3f} {r['test_auc']:<10.3f}")
     
     print(f"\n{'='*70}")
     
