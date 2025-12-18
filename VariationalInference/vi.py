@@ -977,42 +977,45 @@ class VI:
     def infer_theta(
         self,
         X: np.ndarray,
+        X_aux: np.ndarray,
         max_iter: int = 50,
         tol: float = 1e-4,
         verbose: bool = False,
-        match_training_variance: bool = True
+        use_regression: bool = True
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Infer theta (sample-specific factors) for new samples using learned global parameters.
 
-        This is used for validation/test sets where we need to infer local parameters
-        given the learned global parameters (beta, upsilon).
+        This performs proper variational inference using ALL learned global parameters:
+        - beta, eta: for the count model (X | theta, beta)
+        - v, gamma: for the classification model (y | theta, v, gamma)
 
-        The posterior for theta given observed counts X and learned beta is:
-        θ_iℓ | X_i, β ~ Gamma(α_θ + Σⱼ z_ijℓ, ξ_i + Σⱼ β_jℓ)
+        For new samples, y is LATENT (unknown). We jointly infer theta and predict y
+        using coordinate ascent:
+        1. Initialize theta from X (count model only)
+        2. Compute E[y] = σ(θ @ v + x_aux @ γ) - predicted probability
+        3. Update theta using both count model AND regression with E[y] as soft label
+        4. Update auxiliary parameters (xi, zeta)
+        5. Repeat until convergence
 
-        where z_ijℓ are the latent count allocations and ξ_i is also inferred.
-
-        IMPORTANT: During training, theta is influenced by BOTH the count model (X) AND
-        the classification model (y) through the regression contribution term. During
-        inference, we only have X, so the inferred theta tends to have lower variance
-        than training theta. The `match_training_variance` option addresses this by
-        scaling the inferred theta to match training theta variance per factor.
+        This is more principled than just using X alone, because it incorporates
+        the learned classification structure into the theta inference.
 
         Parameters:
         -----------
         X : np.ndarray, shape (n_new, p)
             Gene expression count matrix for new samples
+        X_aux : np.ndarray, shape (n_new, p_aux)
+            Auxiliary features for new samples
         max_iter : int
             Maximum iterations for inference
         tol : float
             Convergence tolerance for theta updates
         verbose : bool
             Whether to print progress
-        match_training_variance : bool (default=True)
-            If True, scale inferred theta to match training theta variance per factor.
-            This is important because training theta is influenced by classification
-            while inference theta is not, leading to lower variance without this fix.
+        use_regression : bool (default=True)
+            If True, include regression contribution using E[y] as soft label.
+            If False, only use count model (original behavior).
 
         Returns:
         --------
@@ -1029,69 +1032,111 @@ class VI:
             raise RuntimeError("Model must be fitted before inferring theta for new samples")
 
         # Initialize theta parameters for new samples based on data scale
-        # Use row sums to get a sense of library size per sample
         row_sums = X.sum(axis=1, keepdims=True) + 1e-6
-
-        # Initialize a_theta based on data: spread counts across factors
         a_theta_new = self.alpha_theta + (row_sums / self.d) * np.ones((1, self.d))
 
-        # Initialize xi parameters (these will be updated in the loop)
-        # xi_i ~ Gamma(alpha_xi + d * alpha_theta, lambda_xi + sum_ell theta_iell)
+        # Initialize xi parameters
         a_xi_new = np.full(n_new, self.alpha_xi + self.d * self.alpha_theta)
-        b_xi_new = np.full(n_new, self.lambda_xi)  # Will be updated based on theta
+        b_xi_new = np.full(n_new, self.lambda_xi)
 
         # Use learned E_beta to compute the beta sum per factor
         beta_sum_per_factor = np.sum(self.E_beta, axis=0)  # shape (d,)
 
-        # Initialize b_theta using initial xi estimate
+        # Initialize b_theta
         E_xi_new = a_xi_new / b_xi_new
         b_theta_new = E_xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
+
+        # Initialize zeta (JJ auxiliary parameter) for new samples
+        zeta_new = np.ones((n_new, self.kappa)) * 0.5
 
         if verbose:
             print(f"Inferring theta for {n_new} new samples...")
             print(f"  Library sizes: min={row_sums.min():.0f}, max={row_sums.max():.0f}, mean={row_sums.mean():.0f}")
-            print(f"  Initial E[theta] range: [{(a_theta_new/b_theta_new).min():.4f}, {(a_theta_new/b_theta_new).max():.4f}]")
+            print(f"  Using regression contribution: {use_regression}")
 
-        # Coordinate ascent to jointly infer theta and xi
+        # Coordinate ascent to jointly infer theta, xi, and predict y
         for iteration in range(max_iter):
-            # Store old values for convergence check
             a_theta_old = a_theta_new.copy()
 
             # Compute expectations
             E_theta_new = a_theta_new / b_theta_new
             E_log_theta_new = digamma(a_theta_new) - np.log(b_theta_new)
 
-            # Allocate counts using expected log parameters
-            # log φ_ijℓ = E[log θ_iℓ] + E[log β_jℓ]
+            # ============================================
+            # Count model: allocate counts and update theta shape
+            # ============================================
             log_phi = E_log_theta_new[:, np.newaxis, :] + self.E_log_beta[np.newaxis, :, :]
             log_phi_normalized = log_phi - logsumexp(log_phi, axis=2, keepdims=True)
             phi = np.exp(log_phi_normalized)
-
-            # Expected latent counts: z_ijℓ = x_ij * φ_ijℓ
             z_new = X[:, :, np.newaxis] * phi
 
-            # Update theta parameters
-            # Shape: α_θ + Σ_j z_ijℓ
+            # Shape parameter from count model
             a_theta_new = self.alpha_theta + np.sum(z_new, axis=1)
 
-            # Update xi parameters (same as in training)
-            # a_xi_i = alpha_xi + d * alpha_theta (constant)
+            # ============================================
+            # Update xi
+            # ============================================
             a_xi_new = np.full(n_new, self.alpha_xi + self.d * self.alpha_theta)
-            # b_xi_i = lambda_xi + sum_ell E[theta_iell]
             b_xi_new = self.lambda_xi + np.sum(E_theta_new, axis=1)
             b_xi_new = np.clip(b_xi_new, 1e-6, 1e6)
-
-            # Compute E[xi] for theta update
             E_xi_new = a_xi_new / b_xi_new
 
-            # Rate: ξ_i + Σ_j E[β_jℓ]
+            # ============================================
+            # Rate parameter: base from count model
+            # ============================================
             b_theta_new = E_xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
+
+            # ============================================
+            # Regression contribution using E[y] as soft label
+            # ============================================
+            if use_regression:
+                for k in range(self.kappa):
+                    # Compute E[A] = theta @ v + x_aux @ gamma
+                    E_A = E_theta_new @ self.E_v[k] + X_aux @ self.E_gamma[k]
+
+                    # E[y] = sigma(E[A]) - soft label (predicted probability)
+                    E_y = expit(E_A)
+
+                    # Update zeta (JJ auxiliary parameter)
+                    E_A_sq = E_A**2
+                    E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
+                    Var_theta = a_theta_new / (b_theta_new**2)
+                    E_A_sq += (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
+                    zeta_new[:, k] = np.sqrt(np.maximum(E_A_sq, 1e-10))
+
+                    # Lambda for JJ bound
+                    lam = self._lambda_jj(zeta_new[:, k])
+
+                    # Add regression contribution to b_theta (same as training)
+                    for ell in range(self.d):
+                        mask = np.ones(self.d, dtype=bool)
+                        mask[ell] = False
+                        E_C = E_theta_new[:, mask] @ self.E_v[k, mask] + X_aux @ self.E_gamma[k]
+
+                        E_v_sq_ell = self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]
+
+                        # Use E[y] instead of observed y
+                        regression_contrib = (
+                            -(E_y - 0.5) * self.E_v[k, ell]
+                            + 2 * lam * self.E_v[k, ell] * E_C
+                            + 2 * lam * E_theta_new[:, ell] * E_v_sq_ell
+                        )
+
+                        b_theta_new[:, ell] += self.regression_weight * regression_contrib
+
             b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
+            a_theta_new = np.clip(a_theta_new, 1.01, 1e6)
 
             # Check convergence
             max_change = np.max(np.abs(a_theta_new - a_theta_old))
             if verbose and iteration % 10 == 0:
-                print(f"  Iteration {iteration + 1}/{max_iter}, max_change: {max_change:.6f}")
+                E_theta_tmp = a_theta_new / b_theta_new
+                if use_regression:
+                    E_y_tmp = expit(E_theta_tmp @ self.E_v[0] + X_aux @ self.E_gamma[0])
+                    print(f"  Iter {iteration + 1}/{max_iter}, max_change: {max_change:.6f}, "
+                          f"E[y] range: [{E_y_tmp.min():.3f}, {E_y_tmp.max():.3f}]")
+                else:
+                    print(f"  Iter {iteration + 1}/{max_iter}, max_change: {max_change:.6f}")
 
             if max_change < tol:
                 if verbose:
@@ -1102,40 +1147,10 @@ class VI:
         E_theta_new = a_theta_new / b_theta_new
 
         if verbose:
-            print(f"  Final E[theta] range (before scaling): [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
-            print(f"  Final E[theta] std (before scaling): {E_theta_new.std():.4f}")
-
-        # Match training theta variance if requested
-        # This is crucial because training theta is influenced by classification (y)
-        # while inference theta is only from counts (X), leading to lower variance
-        if match_training_variance and hasattr(self, 'E_theta'):
-            # Compute per-factor statistics from training theta
-            train_mean = self.E_theta.mean(axis=0)  # (d,)
-            train_std = self.E_theta.std(axis=0)    # (d,)
-
-            # Compute per-factor statistics from inferred theta
-            infer_mean = E_theta_new.mean(axis=0)   # (d,)
-            infer_std = E_theta_new.std(axis=0)     # (d,)
-
-            # Scale inferred theta to match training variance per factor
-            # theta_scaled = train_mean + (theta - infer_mean) * (train_std / infer_std)
-            # This preserves the relative ordering of samples within each factor
-            scale_factors = np.where(infer_std > 1e-6, train_std / infer_std, 1.0)
-
-            # Cap scale factors to prevent extreme scaling (between 0.5 and 5.0)
-            scale_factors = np.clip(scale_factors, 0.5, 5.0)
-
-            E_theta_new = train_mean + (E_theta_new - infer_mean) * scale_factors
-
-            # Ensure theta stays positive (it should be since it comes from Gamma)
-            E_theta_new = np.maximum(E_theta_new, 1e-6)
-
-            if verbose:
-                print(f"  Variance matching applied:")
-                print(f"    Train theta std: {self.E_theta.std():.4f}")
-                print(f"    Scale factors (capped): min={scale_factors.min():.2f}, max={scale_factors.max():.2f}, mean={scale_factors.mean():.2f}")
-                print(f"  Final E[theta] range (after scaling): [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
-                print(f"  Final E[theta] std (after scaling): {E_theta_new.std():.4f}")
+            print(f"  Final E[theta] range: [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
+            print(f"  Final E[theta] std: {E_theta_new.std():.4f}")
+            if hasattr(self, 'E_theta'):
+                print(f"  Training E[theta] std: {self.E_theta.std():.4f}")
 
         return E_theta_new, a_theta_new, b_theta_new
     
@@ -1148,16 +1163,17 @@ class VI:
         verbose: bool = False,
         use_sparse: bool = False,
         sparse_threshold: float = 0.5,
-        match_training_variance: bool = True,
-        calibrate_logits: bool = False,
-        X_train: np.ndarray = None,
-        X_aux_train: np.ndarray = None
+        use_regression: bool = True
     ) -> np.ndarray:
         """
         Predict probabilities for new samples.
 
-        Uses the learned global parameters (beta, upsilon) to infer sample-specific
-        factors (theta) and compute classification probabilities.
+        Uses the learned global parameters (beta, v, gamma, eta) to infer
+        sample-specific factors (theta) and compute classification probabilities.
+
+        The inference now uses proper variational updates that incorporate both:
+        - Count model: X | theta, beta
+        - Classification model: y | theta, v, gamma (with y treated as latent)
 
         Parameters:
         -----------
@@ -1176,18 +1192,10 @@ class VI:
             This provides exact sparsity rather than soft sparsity.
         sparse_threshold : float
             Threshold for sparsity (only used if use_sparse=True)
-        match_training_variance : bool (default=True)
-            If True, scale inferred theta to match training theta variance.
-            This addresses the issue where inference theta has lower variance
-            than training theta (which is influenced by classification).
-        calibrate_logits : bool (default=False)
-            If True, calibrate logits to match training logit distribution.
-            Requires X_train and X_aux_train to be provided.
-            This is an alternative/complementary approach to match_training_variance.
-        X_train : np.ndarray, optional
-            Training gene expression matrix (required if calibrate_logits=True)
-        X_aux_train : np.ndarray, optional
-            Training auxiliary features (required if calibrate_logits=True)
+        use_regression : bool (default=True)
+            If True, include regression contribution in theta inference using
+            E[y] as soft label. This is more principled and should give better
+            predictions. If False, only use count model (original behavior).
 
         Returns:
         --------
@@ -1197,10 +1205,11 @@ class VI:
         # Infer theta for new samples using learned global parameters
         E_theta_new, _, _ = self.infer_theta(
             X,
+            X_aux,
             max_iter=max_iter,
             tol=tol,
             verbose=verbose,
-            match_training_variance=match_training_variance
+            use_regression=use_regression
         )
 
         # Get v values (sparse or soft)
@@ -1212,30 +1221,6 @@ class VI:
         # Compute linear predictions and probabilities
         # A_ik = θ_i^T v_k + x_i^aux^T γ_k
         linear_pred = E_theta_new @ E_v_pred.T + X_aux @ self.E_gamma.T
-
-        # Optional: calibrate logits to match training distribution
-        if calibrate_logits:
-            if X_train is None or X_aux_train is None:
-                raise ValueError("calibrate_logits=True requires X_train and X_aux_train")
-
-            # Compute training logits using stored E_theta
-            train_logits = self.E_theta @ E_v_pred.T + X_aux_train @ self.E_gamma.T
-
-            # Calibrate: match mean and std of training logits
-            train_mean = train_logits.mean()
-            train_std = train_logits.std()
-            new_mean = linear_pred.mean()
-            new_std = linear_pred.std()
-
-            if new_std > 1e-6:
-                linear_pred = train_mean + (linear_pred - new_mean) * (train_std / new_std)
-
-            if verbose:
-                print(f"Logit calibration applied:")
-                print(f"  Training logits: mean={train_mean:.4f}, std={train_std:.4f}")
-                print(f"  Before calibration: mean={new_mean:.4f}, std={new_std:.4f}")
-                print(f"  After calibration: mean={linear_pred.mean():.4f}, std={linear_pred.std():.4f}")
-
         probs = expit(linear_pred)
 
         if verbose:
