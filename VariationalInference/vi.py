@@ -18,11 +18,11 @@ class VI:
         alpha_eta: float = 2.0,
         lambda_xi: float = 1.5,
         lambda_eta: float = 1.5,
-        sigma_v: float = 1.0,  # Increased from 0.1 - wider slab prior
-        sigma_gamma: float = 1.0,  # Increased from 0.1
+        sigma_v: float = 0.2,  # Strong regularization to prevent v explosion
+        sigma_gamma: float = 0.5,  # Moderate regularization
         random_state: int = 42,
         # Spike-and-slab parameters
-        pi_v: float = 0.5,  # Prior probability of v being active (increased from 0.05)
+        pi_v: float = 0.2,  # Prior probability of v being active - assume sparsity
         pi_beta: float = 0.05,  # Prior probability of beta being active
         spike_variance_v: float = 1e-6,  # Variance for spike in v
         spike_value_beta: float = 1e-6  # Small value for spike in beta
@@ -82,10 +82,9 @@ class VI:
         self.a_eta = self.alpha_eta + 0.1 * self.rng.exponential(size=self.p)
         self.b_eta = np.ones(self.p) * self.lambda_eta
         
-        # Initialize Normal parameters - small values near zero
-        base = self.rng.randn(self.kappa, self.d)
-        scale_factors = 0.5 + 0.5 * np.arange(self.kappa) / self.kappa
-        self.mu_v = base * scale_factors[:, np.newaxis]
+        # Initialize Normal parameters - very small values to prevent early explosion
+        # Start conservative and let data drive v up slowly
+        self.mu_v = 0.01 * self.rng.randn(self.kappa, self.d)
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
         
         # Initialize spike-and-slab indicators for v
@@ -394,11 +393,25 @@ class VI:
                            (X_aux @ self.E_gamma[k])[:, np.newaxis]).sum(axis=0)
             
             try:
-                self.Sigma_v[k] = np.linalg.inv(prec)
+                # Add regularization to prevent ill-conditioning
+                prec_reg = prec + 1e-4 * np.eye(self.d)
+                self.Sigma_v[k] = np.linalg.inv(prec_reg)
+
+                # Check if variance is exploding
+                diag_variance = np.diag(self.Sigma_v[k])
+                if np.any(diag_variance > 10.0):
+                    # Variance too large - use stronger regularization
+                    prec_reg = prec + 1e-3 * np.eye(self.d)
+                    self.Sigma_v[k] = np.linalg.inv(prec_reg)
+
                 self.mu_v[k] = self.Sigma_v[k] @ mean_contrib
-                # Clip to prevent extreme values that cause rho_v oscillation
-                self.mu_v[k] = np.clip(self.mu_v[k], -3, 3)
+
+                # Strict clipping to prevent ELBO explosion
+                # Limit to [-1.5, 1.5] which allows meaningful classification
+                # while preventing huge prior penalties
+                self.mu_v[k] = np.clip(self.mu_v[k], -1.5, 1.5)
             except np.linalg.LinAlgError:
+                # Keep previous values if inversion fails
                 pass
     
     def _update_gamma(self, y: np.ndarray, X_aux: np.ndarray):
@@ -674,10 +687,10 @@ class VI:
         patience: int = 3,  # Stop if no significant improvement for this many ELBO checks
         verbose: bool = True,
         # Damping parameters
-        theta_damping: float = 0.5,  # Heavy damping for theta (most unstable)
-        beta_damping: float = 0.7,   # Moderate damping for beta
-        v_damping: float = 0.6,      # Moderate damping for v
-        gamma_damping: float = 0.6,  # Moderate damping for gamma
+        theta_damping: float = 0.3,  # Very conservative damping for theta
+        beta_damping: float = 0.5,   # Conservative damping for beta
+        v_damping: float = 0.2,      # VERY conservative damping for v (most critical)
+        gamma_damping: float = 0.4,  # Conservative damping for gamma
         xi_damping: float = 0.8,     # Light damping for xi
         eta_damping: float = 0.8,    # Light damping for eta
         adaptive_damping: bool = True,  # Adjust damping based on ELBO
@@ -809,11 +822,18 @@ class VI:
             Sigma_v_old = self.Sigma_v.copy()
             
             self._update_v(y, X_aux)
-            
-            # Apply damping
-            self.mu_v = (damping_factors['v'] * self.mu_v + 
+
+            # Clip update magnitude to prevent single-iteration jumps
+            # This prevents v from jumping by more than max_v_update per iteration
+            max_v_update = 0.3  # Maximum change in v per iteration
+            v_update = self.mu_v - mu_v_old
+            v_update_clipped = np.clip(v_update, -max_v_update, max_v_update)
+            self.mu_v = mu_v_old + v_update_clipped
+
+            # Apply damping on top of gradient clipping
+            self.mu_v = (damping_factors['v'] * self.mu_v +
                         (1 - damping_factors['v']) * mu_v_old)
-            self.Sigma_v = (damping_factors['v'] * self.Sigma_v + 
+            self.Sigma_v = (damping_factors['v'] * self.Sigma_v +
                         (1 - damping_factors['v']) * Sigma_v_old)
             
             # Update spike-and-slab indicators for v (with damping to prevent oscillation)
