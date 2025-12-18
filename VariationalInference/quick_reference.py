@@ -12,16 +12,16 @@ from VariationalInference.vi import VI
 
 
 # Load data
-df = pd.read_pickle(os.path.join(base_dir, 'ctrl_sspa_test/df.pkl'))
-features = pd.read_pickle(os.path.join(base_dir, 'ctrl_sspa_test/features.pkl'))
-train_df = pd.read_csv(os.path.join(base_dir, 'ctrl_sspa_test/train_data_full_genes.csv'), index_col=0)
+df = pd.read_pickle(os.path.join(base_dir, 'sspa_test/df.pkl'))
+features = pd.read_pickle(os.path.join(base_dir, 'sspa_test/features.pkl'))
+train_df = pd.read_csv(os.path.join(base_dir, 'sspa_test/train_data_full_genes.csv'), index_col=0)
 
 # Load splits
-with open(os.path.join(base_dir, 'ctrl_sspa_test/data_split_cell_ids.json'), 'r') as f:
+with open(os.path.join(base_dir, 'sspa_test/data_split_cell_ids.json'), 'r') as f:
     splits = json.load(f)
 
 # Load gene list
-with open(os.path.join(base_dir, 'ctrl_sspa_test/gene_list.txt'), 'r') as f:
+with open(os.path.join(base_dir, 'sspa_test/gene_list.txt'), 'r') as f:
     gene_list = [line.strip() for line in f]
 
 print(f"Training cells: {len(splits['train'])}")
@@ -71,7 +71,7 @@ print("Training VI Model")
 print("="*80)
 
 model = VI(
-    n_factors=20,
+    n_factors=50,
     alpha_theta=0.5,   # Loose prior on theta (allow high variance)
     alpha_beta=2.0,    # TIGHT: Keep beta regularized to prevent explosion
     alpha_xi=2.0,
@@ -84,7 +84,7 @@ model.fit(
     X=X_train,
     y=y_train,
     X_aux=X_aux_train,
-    max_iter=100,
+    max_iter=200,
     tol=10.0,
     rel_tol=2e-4,
     elbo_freq=10,

@@ -254,3 +254,6 @@ synthetic_superstrong/y_train.pkl
 synthetic_superstrong/y_val.pkl
 synthetic_superstrong/progressive_validation/stage_1:_small_model.pkl
 synthetic_superstrong/progressive_validation/stage_1:_small_results.pkl
+anal.html
+theta_train_val_test_comparison.png
+val_test_probability_distributions.png

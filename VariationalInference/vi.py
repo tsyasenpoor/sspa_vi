@@ -396,7 +396,8 @@ class VI:
             try:
                 self.Sigma_v[k] = np.linalg.inv(prec)
                 self.mu_v[k] = self.Sigma_v[k] @ mean_contrib
-                self.mu_v[k] = np.clip(self.mu_v[k], -10, 10)
+                # Clip to prevent extreme values that cause rho_v oscillation
+                self.mu_v[k] = np.clip(self.mu_v[k], -3, 3)
             except np.linalg.LinAlgError:
                 pass
     
@@ -766,8 +767,12 @@ class VI:
             self.b_beta = (damping_factors['beta'] * self.b_beta + 
                         (1 - damping_factors['beta']) * b_beta_old)
             
-            # Update spike-and-slab indicators for beta (no damping)
+            # Update spike-and-slab indicators for beta (with damping)
+            rho_beta_old = self.rho_beta.copy()
             self._update_rho_beta(z)
+            # Apply damping to rho_beta
+            rho_beta_damping = 0.5
+            self.rho_beta = rho_beta_damping * self.rho_beta + (1 - rho_beta_damping) * rho_beta_old
             
             # ============================================
             # Update xi with damping
@@ -811,8 +816,12 @@ class VI:
             self.Sigma_v = (damping_factors['v'] * self.Sigma_v + 
                         (1 - damping_factors['v']) * Sigma_v_old)
             
-            # Update spike-and-slab indicators for v (no damping)
+            # Update spike-and-slab indicators for v (with damping to prevent oscillation)
+            rho_v_old = self.rho_v.copy()
             self._update_rho_v(y, X_aux)
+            # Apply heavy damping to rho_v to prevent oscillation
+            rho_v_damping = 0.3  # Only accept 30% of the update
+            self.rho_v = rho_v_damping * self.rho_v + (1 - rho_v_damping) * rho_v_old
             
             # ============================================
             # Update gamma with damping
@@ -951,12 +960,17 @@ class VI:
         max_iter: int = 50,
         tol: float = 1e-4,
         verbose: bool = False
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Infer theta (sample-specific factors) for new samples using learned global parameters.
         
         This is used for validation/test sets where we need to infer local parameters
         given the learned global parameters (beta, upsilon).
+        
+        The posterior for theta given observed counts X and learned beta is:
+        θ_iℓ | X_i, β ~ Gamma(α_θ + Σⱼ z_ijℓ, ξ_i + Σⱼ β_jℓ)
+        
+        where z_ijℓ are the latent count allocations.
         
         Parameters:
         -----------
@@ -983,16 +997,31 @@ class VI:
         if not hasattr(self, 'E_beta'):
             raise RuntimeError("Model must be fitted before inferring theta for new samples")
         
-        # Initialize theta parameters for new samples
-        # Use mean of training theta as starting point
-        a_theta_new = np.tile(self.a_theta.mean(axis=0), (n_new, 1))
-        b_theta_new = np.tile(self.b_theta.mean(axis=0), (n_new, 1))
+        # Initialize theta parameters for new samples based on data scale
+        # Use row sums to get a sense of library size per sample
+        row_sums = X.sum(axis=1, keepdims=True) + 1e-6
         
-        # Use mean of training xi for rate parameter initialization
-        E_xi_mean = self.E_xi.mean()
+        # Initialize a_theta based on data: spread counts across factors
+        a_theta_new = self.alpha_theta + (row_sums / self.d) * np.ones((1, self.d))
+        
+        # Initialize b_theta: this is the key fix
+        # Rate = xi + sum_j beta_jl for each factor l
+        # Use learned E_beta to compute the rate
+        beta_sum_per_factor = np.sum(self.E_beta, axis=0)  # shape (d,)
+        
+        # Also infer per-sample xi based on library size
+        # For new samples, estimate xi from the data
+        # xi controls the overall scale of theta
+        # Higher library size -> larger theta expected -> larger xi rate
+        mean_library_size = row_sums.mean()
+        xi_new = self.lambda_xi * (row_sums / mean_library_size).flatten()  # (n_new,)
+        
+        b_theta_new = xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
         
         if verbose:
             print(f"Inferring theta for {n_new} new samples...")
+            print(f"  Library sizes: min={row_sums.min():.0f}, max={row_sums.max():.0f}, mean={row_sums.mean():.0f}")
+            print(f"  Initial E[theta] range: [{(a_theta_new/b_theta_new).min():.4f}, {(a_theta_new/b_theta_new).max():.4f}]")
         
         # Coordinate ascent to infer theta
         for iteration in range(max_iter):
@@ -1016,8 +1045,9 @@ class VI:
             # Shape: α_θ + Σ_j z_ijℓ
             a_theta_new = self.alpha_theta + np.sum(z_new, axis=1)
             
-            # Rate: E[ξ] + Σ_j E[β_jℓ]
-            b_theta_new = E_xi_mean + np.sum(self.E_beta, axis=0)[np.newaxis, :]
+            # Rate: ξ_i + Σ_j E[β_jℓ]
+            # This is now sample-specific through xi_new
+            b_theta_new = xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
             b_theta_new = np.maximum(b_theta_new, 1e-10)
             
             # Check convergence
@@ -1032,6 +1062,10 @@ class VI:
         
         # Final expectations
         E_theta_new = a_theta_new / b_theta_new
+        
+        if verbose:
+            print(f"  Final E[theta] range: [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
+            print(f"  Final E[theta] per-factor means: {E_theta_new.mean(axis=0)}")
         
         return E_theta_new, a_theta_new, b_theta_new
     
