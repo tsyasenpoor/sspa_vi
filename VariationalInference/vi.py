@@ -963,15 +963,15 @@ class VI:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Infer theta (sample-specific factors) for new samples using learned global parameters.
-        
+
         This is used for validation/test sets where we need to infer local parameters
         given the learned global parameters (beta, upsilon).
-        
+
         The posterior for theta given observed counts X and learned beta is:
         θ_iℓ | X_i, β ~ Gamma(α_θ + Σⱼ z_ijℓ, ξ_i + Σⱼ β_jℓ)
-        
-        where z_ijℓ are the latent count allocations.
-        
+
+        where z_ijℓ are the latent count allocations and ξ_i is also inferred.
+
         Parameters:
         -----------
         X : np.ndarray, shape (n_new, p)
@@ -982,7 +982,7 @@ class VI:
             Convergence tolerance for theta updates
         verbose : bool
             Whether to print progress
-            
+
         Returns:
         --------
         E_theta_new : np.ndarray, shape (n_new, d)
@@ -993,80 +993,87 @@ class VI:
             Rate parameters of theta posterior (for uncertainty quantification)
         """
         n_new = X.shape[0]
-        
+
         if not hasattr(self, 'E_beta'):
             raise RuntimeError("Model must be fitted before inferring theta for new samples")
-        
+
         # Initialize theta parameters for new samples based on data scale
         # Use row sums to get a sense of library size per sample
         row_sums = X.sum(axis=1, keepdims=True) + 1e-6
-        
+
         # Initialize a_theta based on data: spread counts across factors
         a_theta_new = self.alpha_theta + (row_sums / self.d) * np.ones((1, self.d))
-        
-        # Initialize b_theta: this is the key fix
-        # Rate = xi + sum_j beta_jl for each factor l
-        # Use learned E_beta to compute the rate
+
+        # Initialize xi parameters (these will be updated in the loop)
+        # xi_i ~ Gamma(alpha_xi + d * alpha_theta, lambda_xi + sum_ell theta_iell)
+        a_xi_new = np.full(n_new, self.alpha_xi + self.d * self.alpha_theta)
+        b_xi_new = np.full(n_new, self.lambda_xi)  # Will be updated based on theta
+
+        # Use learned E_beta to compute the beta sum per factor
         beta_sum_per_factor = np.sum(self.E_beta, axis=0)  # shape (d,)
-        
-        # Also infer per-sample xi based on library size
-        # For new samples, estimate xi from the data
-        # xi controls the overall scale of theta
-        # Higher library size -> larger theta expected -> larger xi rate
-        mean_library_size = row_sums.mean()
-        xi_new = self.lambda_xi * (row_sums / mean_library_size).flatten()  # (n_new,)
-        
-        b_theta_new = xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
-        
+
+        # Initialize b_theta using initial xi estimate
+        E_xi_new = a_xi_new / b_xi_new
+        b_theta_new = E_xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
+
         if verbose:
             print(f"Inferring theta for {n_new} new samples...")
             print(f"  Library sizes: min={row_sums.min():.0f}, max={row_sums.max():.0f}, mean={row_sums.mean():.0f}")
             print(f"  Initial E[theta] range: [{(a_theta_new/b_theta_new).min():.4f}, {(a_theta_new/b_theta_new).max():.4f}]")
-        
-        # Coordinate ascent to infer theta
+
+        # Coordinate ascent to jointly infer theta and xi
         for iteration in range(max_iter):
             # Store old values for convergence check
             a_theta_old = a_theta_new.copy()
-            
+
             # Compute expectations
             E_theta_new = a_theta_new / b_theta_new
             E_log_theta_new = digamma(a_theta_new) - np.log(b_theta_new)
-            
+
             # Allocate counts using expected log parameters
             # log φ_ijℓ = E[log θ_iℓ] + E[log β_jℓ]
             log_phi = E_log_theta_new[:, np.newaxis, :] + self.E_log_beta[np.newaxis, :, :]
             log_phi_normalized = log_phi - logsumexp(log_phi, axis=2, keepdims=True)
             phi = np.exp(log_phi_normalized)
-            
+
             # Expected latent counts: z_ijℓ = x_ij * φ_ijℓ
             z_new = X[:, :, np.newaxis] * phi
-            
+
             # Update theta parameters
             # Shape: α_θ + Σ_j z_ijℓ
             a_theta_new = self.alpha_theta + np.sum(z_new, axis=1)
-            
+
+            # Update xi parameters (same as in training)
+            # a_xi_i = alpha_xi + d * alpha_theta (constant)
+            a_xi_new = np.full(n_new, self.alpha_xi + self.d * self.alpha_theta)
+            # b_xi_i = lambda_xi + sum_ell E[theta_iell]
+            b_xi_new = self.lambda_xi + np.sum(E_theta_new, axis=1)
+            b_xi_new = np.clip(b_xi_new, 1e-6, 1e6)
+
+            # Compute E[xi] for theta update
+            E_xi_new = a_xi_new / b_xi_new
+
             # Rate: ξ_i + Σ_j E[β_jℓ]
-            # This is now sample-specific through xi_new
-            b_theta_new = xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
-            b_theta_new = np.maximum(b_theta_new, 1e-10)
-            
+            b_theta_new = E_xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
+            b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
+
             # Check convergence
             max_change = np.max(np.abs(a_theta_new - a_theta_old))
             if verbose and iteration % 10 == 0:
                 print(f"  Iteration {iteration + 1}/{max_iter}, max_change: {max_change:.6f}")
-            
+
             if max_change < tol:
                 if verbose:
                     print(f"  Converged after {iteration + 1} iterations")
                 break
-        
+
         # Final expectations
         E_theta_new = a_theta_new / b_theta_new
-        
+
         if verbose:
             print(f"  Final E[theta] range: [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
             print(f"  Final E[theta] per-factor means: {E_theta_new.mean(axis=0)}")
-        
+
         return E_theta_new, a_theta_new, b_theta_new
     
     def predict_proba(
