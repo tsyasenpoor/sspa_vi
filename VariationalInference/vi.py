@@ -979,7 +979,8 @@ class VI:
         X: np.ndarray,
         max_iter: int = 50,
         tol: float = 1e-4,
-        verbose: bool = False
+        verbose: bool = False,
+        match_training_variance: bool = True
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Infer theta (sample-specific factors) for new samples using learned global parameters.
@@ -992,6 +993,12 @@ class VI:
 
         where z_ijℓ are the latent count allocations and ξ_i is also inferred.
 
+        IMPORTANT: During training, theta is influenced by BOTH the count model (X) AND
+        the classification model (y) through the regression contribution term. During
+        inference, we only have X, so the inferred theta tends to have lower variance
+        than training theta. The `match_training_variance` option addresses this by
+        scaling the inferred theta to match training theta variance per factor.
+
         Parameters:
         -----------
         X : np.ndarray, shape (n_new, p)
@@ -1002,6 +1009,10 @@ class VI:
             Convergence tolerance for theta updates
         verbose : bool
             Whether to print progress
+        match_training_variance : bool (default=True)
+            If True, scale inferred theta to match training theta variance per factor.
+            This is important because training theta is influenced by classification
+            while inference theta is not, leading to lower variance without this fix.
 
         Returns:
         --------
@@ -1091,27 +1102,63 @@ class VI:
         E_theta_new = a_theta_new / b_theta_new
 
         if verbose:
-            print(f"  Final E[theta] range: [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
-            print(f"  Final E[theta] per-factor means: {E_theta_new.mean(axis=0)}")
+            print(f"  Final E[theta] range (before scaling): [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
+            print(f"  Final E[theta] std (before scaling): {E_theta_new.std():.4f}")
+
+        # Match training theta variance if requested
+        # This is crucial because training theta is influenced by classification (y)
+        # while inference theta is only from counts (X), leading to lower variance
+        if match_training_variance and hasattr(self, 'E_theta'):
+            # Compute per-factor statistics from training theta
+            train_mean = self.E_theta.mean(axis=0)  # (d,)
+            train_std = self.E_theta.std(axis=0)    # (d,)
+
+            # Compute per-factor statistics from inferred theta
+            infer_mean = E_theta_new.mean(axis=0)   # (d,)
+            infer_std = E_theta_new.std(axis=0)     # (d,)
+
+            # Scale inferred theta to match training variance per factor
+            # theta_scaled = train_mean + (theta - infer_mean) * (train_std / infer_std)
+            # This preserves the relative ordering of samples within each factor
+            scale_factors = np.where(infer_std > 1e-6, train_std / infer_std, 1.0)
+
+            # Cap scale factors to prevent extreme scaling (between 0.5 and 5.0)
+            scale_factors = np.clip(scale_factors, 0.5, 5.0)
+
+            E_theta_new = train_mean + (E_theta_new - infer_mean) * scale_factors
+
+            # Ensure theta stays positive (it should be since it comes from Gamma)
+            E_theta_new = np.maximum(E_theta_new, 1e-6)
+
+            if verbose:
+                print(f"  Variance matching applied:")
+                print(f"    Train theta std: {self.E_theta.std():.4f}")
+                print(f"    Scale factors (capped): min={scale_factors.min():.2f}, max={scale_factors.max():.2f}, mean={scale_factors.mean():.2f}")
+                print(f"  Final E[theta] range (after scaling): [{E_theta_new.min():.4f}, {E_theta_new.max():.4f}]")
+                print(f"  Final E[theta] std (after scaling): {E_theta_new.std():.4f}")
 
         return E_theta_new, a_theta_new, b_theta_new
     
     def predict_proba(
-        self, 
-        X: np.ndarray, 
+        self,
+        X: np.ndarray,
         X_aux: np.ndarray,
         max_iter: int = 50,
         tol: float = 1e-4,
         verbose: bool = False,
         use_sparse: bool = False,
-        sparse_threshold: float = 0.5
+        sparse_threshold: float = 0.5,
+        match_training_variance: bool = True,
+        calibrate_logits: bool = False,
+        X_train: np.ndarray = None,
+        X_aux_train: np.ndarray = None
     ) -> np.ndarray:
         """
         Predict probabilities for new samples.
-        
+
         Uses the learned global parameters (beta, upsilon) to infer sample-specific
         factors (theta) and compute classification probabilities.
-        
+
         Parameters:
         -----------
         X : np.ndarray, shape (n_new, p)
@@ -1129,25 +1176,70 @@ class VI:
             This provides exact sparsity rather than soft sparsity.
         sparse_threshold : float
             Threshold for sparsity (only used if use_sparse=True)
-            
+        match_training_variance : bool (default=True)
+            If True, scale inferred theta to match training theta variance.
+            This addresses the issue where inference theta has lower variance
+            than training theta (which is influenced by classification).
+        calibrate_logits : bool (default=False)
+            If True, calibrate logits to match training logit distribution.
+            Requires X_train and X_aux_train to be provided.
+            This is an alternative/complementary approach to match_training_variance.
+        X_train : np.ndarray, optional
+            Training gene expression matrix (required if calibrate_logits=True)
+        X_aux_train : np.ndarray, optional
+            Training auxiliary features (required if calibrate_logits=True)
+
         Returns:
         --------
         probs : np.ndarray, shape (n_new, kappa)
             Predicted probabilities for each class
         """
         # Infer theta for new samples using learned global parameters
-        E_theta_new, _, _ = self.infer_theta(X, max_iter=max_iter, tol=tol, verbose=verbose)
-        
+        E_theta_new, _, _ = self.infer_theta(
+            X,
+            max_iter=max_iter,
+            tol=tol,
+            verbose=verbose,
+            match_training_variance=match_training_variance
+        )
+
         # Get v values (sparse or soft)
         if use_sparse:
             E_v_pred = self.get_sparse_v(threshold=sparse_threshold)
         else:
             E_v_pred = self.E_v
-        
+
         # Compute linear predictions and probabilities
         # A_ik = θ_i^T v_k + x_i^aux^T γ_k
         linear_pred = E_theta_new @ E_v_pred.T + X_aux @ self.E_gamma.T
+
+        # Optional: calibrate logits to match training distribution
+        if calibrate_logits:
+            if X_train is None or X_aux_train is None:
+                raise ValueError("calibrate_logits=True requires X_train and X_aux_train")
+
+            # Compute training logits using stored E_theta
+            train_logits = self.E_theta @ E_v_pred.T + X_aux_train @ self.E_gamma.T
+
+            # Calibrate: match mean and std of training logits
+            train_mean = train_logits.mean()
+            train_std = train_logits.std()
+            new_mean = linear_pred.mean()
+            new_std = linear_pred.std()
+
+            if new_std > 1e-6:
+                linear_pred = train_mean + (linear_pred - new_mean) * (train_std / new_std)
+
+            if verbose:
+                print(f"Logit calibration applied:")
+                print(f"  Training logits: mean={train_mean:.4f}, std={train_std:.4f}")
+                print(f"  Before calibration: mean={new_mean:.4f}, std={new_std:.4f}")
+                print(f"  After calibration: mean={linear_pred.mean():.4f}, std={linear_pred.std():.4f}")
+
         probs = expit(linear_pred)
-        
+
+        if verbose:
+            print(f"Predicted probabilities: min={probs.min():.4f}, max={probs.max():.4f}, mean={probs.mean():.4f}")
+
         return probs
 
