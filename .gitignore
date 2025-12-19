@@ -257,3 +257,8 @@ synthetic_superstrong/progressive_validation/stage_1:_small_results.pkl
 anal.html
 theta_train_val_test_comparison.png
 val_test_probability_distributions.png
+sspa_bcell/data_split_cell_ids.json
+sspa_bcell/df.pkl
+sspa_bcell/features.pkl
+sspa_bcell/gene_list.txt
+sspa_bcell/train_data_full_genes.csv

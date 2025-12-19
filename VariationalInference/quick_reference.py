@@ -12,16 +12,16 @@ from VariationalInference.vi import VI
 
 
 # Load data
-df = pd.read_pickle(os.path.join(base_dir, 'sspa_test/df.pkl'))
-features = pd.read_pickle(os.path.join(base_dir, 'sspa_test/features.pkl'))
-train_df = pd.read_csv(os.path.join(base_dir, 'sspa_test/train_data_full_genes.csv'), index_col=0)
+df = pd.read_pickle(os.path.join(base_dir, 'sspa_bcell/df.pkl'))
+features = pd.read_pickle(os.path.join(base_dir, 'sspa_bcell/features.pkl'))
+train_df = pd.read_csv(os.path.join(base_dir, 'sspa_bcell/train_data_full_genes.csv'), index_col=0)
 
 # Load splits
-with open(os.path.join(base_dir, 'sspa_test/data_split_cell_ids.json'), 'r') as f:
+with open(os.path.join(base_dir, 'sspa_bcell/data_split_cell_ids.json'), 'r') as f:
     splits = json.load(f)
 
 # Load gene list
-with open(os.path.join(base_dir, 'sspa_test/gene_list.txt'), 'r') as f:
+with open(os.path.join(base_dir, 'sspa_bcell/gene_list.txt'), 'r') as f:
     gene_list = [line.strip() for line in f]
 
 print(f"Training cells: {len(splits['train'])}")
@@ -133,7 +133,7 @@ y_val_pred = (y_val_proba_pos > 0.5).astype(int)
 # Method 2: Explicit theta inference (if you need the latent factors)
 print("\nInferring theta for validation set (for analysis)...")
 E_theta_val, a_theta_val, b_theta_val = model.infer_theta(
-    X_val, max_iter=100, tol=1e-4, verbose=True
+    X_val, X_aux_val, max_iter=100, tol=1e-4, verbose=True
 )
 print(f"  E_theta_val shape: {E_theta_val.shape}")
 print(f"  Theta mean: {E_theta_val.mean():.4f}")
@@ -232,7 +232,7 @@ print(f"    - Shape: {E_theta_val.shape} (samples x programs)")
 
 # Infer and save test theta
 print("\n  Inferring theta for test set...")
-E_theta_test, _, _ = model.infer_theta(X_test, max_iter=500, tol=1e-4, verbose=False)
+E_theta_test, _, _ = model.infer_theta(X_test, X_aux_test, max_iter=500, tol=1e-4, verbose=False)
 theta_test_df = pd.DataFrame(
     E_theta_test,
     index=df.loc[df.index.isin(splits['test'])].index,
