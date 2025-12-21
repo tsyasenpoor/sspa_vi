@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import os
 import sys
+import gc
 from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
 import optuna
 from optuna.visualization import plot_optimization_history, plot_param_importances
@@ -66,9 +67,9 @@ def prepare_matrices(df, features, cell_ids, gene_list):
     df_subset = df_subset.loc[common_idx]
     features_subset = features_subset.loc[common_idx]
 
-    # Extract matrices
-    X = df_subset[gene_list].values
-    X_aux = np.zeros((X.shape[0], 0))  # No auxiliary features
+    # Extract matrices - use float32 to reduce memory by 50%
+    X = df_subset[gene_list].values.astype(np.float32)
+    X_aux = np.zeros((X.shape[0], 0), dtype=np.float32)  # No auxiliary features
     y_col = 't2dm' if 't2dm' in features_subset.columns else features_subset.columns[0]
     y = features_subset[y_col].values.astype(int)
 
@@ -95,8 +96,10 @@ def objective(trial, X_train, X_aux_train, y_train, X_val, X_aux_val, y_val, arg
 
     # Suggest hyperparameters with reasonable ranges
     hyperparams = {
-        # Number of latent factors
-        'n_factors': trial.suggest_int('n_factors', 20, 100, step=10),
+        # Number of latent factors - reduced range to save memory
+        # With 9791 genes: n_factors=500 creates ~5M element matrices
+        # Original range 50-1500 was too memory-intensive
+        'n_factors': trial.suggest_int('n_factors', 25, 300, step=25),
 
         # Gamma prior parameters (shape parameters - typically 0.1 to 10)
         'alpha_theta': trial.suggest_float('alpha_theta', 0.1, 5.0, log=True),
@@ -191,10 +194,16 @@ def objective(trial, X_train, X_aux_train, y_train, X_val, X_aux_val, y_val, arg
         print(f"  AUC: {val_auc:.4f}")
         print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}" if model.elbo_history_ else "  Final ELBO: N/A")
 
+        # Clean up model to free memory
+        del model
+        gc.collect()
+
         return val_f1
 
     except Exception as e:
         print(f"\n❌ Trial {trial.number} failed with error: {str(e)}")
+        # Clean up on failure too
+        gc.collect()
         # Return a very low score for failed trials
         return 0.0
 
