@@ -1,14 +1,27 @@
-import pickle  
+"""
+BRAY LAB SPECIFIC: Data Loading and Preprocessing
+===================================================
+
+This module is specific to Bray Lab's data formats and paths.
+For generic VI data loading, see: data_loader.py
+
+Contains functions for:
+- Loading Bray Lab specific datasets (AJM, NAP, etc.)
+- Pathway-to-Ensembl conversion for seed genes
+- Cytokine and antigen presentation scoring
+"""
+
+import pickle
 import mygene
 from gseapy import read_gmt
 import numpy as np
 import pandas as pd
 import os
-from .utils import *
-from .config import *
+from .utils import save_cache, load_cache, to_dense_array
+from .bray_config import *
 
 
-# cytoseeds_csv_path = "/mnt/research/aguiarlab/proj/SSPA-BRAY/BRay/BRAY_FileTransfer/Seed genes/CYTOBEAM_Cytokines_KEGGPATHWAY_addedMif.csv"
+# Bray Lab specific seed gene paths
 cytoseeds_csv_path = "/labs/Aguiar/SSPA_BRAY/BRay/BRAY_FileTransfer/Seed genes/CYTOBEAM_Cytokines_KEGGPATHWAY_addedMif.csv"
 CYTOSEEDS_df = pd.read_csv(cytoseeds_csv_path)
 CYTOSEEDS = CYTOSEEDS_df['V4'].tolist() #173

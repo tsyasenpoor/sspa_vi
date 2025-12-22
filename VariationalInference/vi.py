@@ -1,14 +1,83 @@
+"""
+Variational Inference Model for Single-Cell Analysis
+=====================================================
+
+This module implements a Poisson Factor Model with spike-and-slab priors
+for discovering gene programs from single-cell RNA-seq data.
+
+Key Features:
+- Hierarchical Poisson factorization for count data
+- Spike-and-slab sparsity on gene loadings (beta) and classification weights (v)
+- Integrated classification model for phenotype prediction
+- Coordinate ascent variational inference with adaptive damping
+
+Usage:
+    from VariationalInference.vi import VI
+
+    model = VI(n_factors=50)  # Uses random initialization by default
+    model.fit(X, y, X_aux)
+    predictions = model.predict_proba(X_new, X_aux_new)
+"""
+
 import numpy as np
 from scipy.special import digamma, gammaln, expit, logsumexp
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Union
 import pandas as pd
-from sklearn.model_selection import train_test_split
-# from .utils import *
-# from .data import *
-# from .config import *
+
 
 class VI:
-    
+    """
+    Variational Inference model for gene program discovery and classification.
+
+    Parameters
+    ----------
+    n_factors : int
+        Number of latent gene programs to discover.
+    alpha_theta : float, default=2.0
+        Prior shape parameter for sample-specific factor activities.
+    alpha_beta : float, default=2.0
+        Prior shape parameter for gene loadings.
+    alpha_xi : float, default=2.0
+        Prior shape parameter for sample depth correction.
+    alpha_eta : float, default=2.0
+        Prior shape parameter for gene scaling factors.
+    lambda_xi : float, default=1.5
+        Prior rate parameter for sample depth correction.
+    lambda_eta : float, default=1.5
+        Prior rate parameter for gene scaling factors.
+    sigma_v : float, default=0.2
+        Prior standard deviation for classification weights (regularization).
+    sigma_gamma : float, default=0.5
+        Prior standard deviation for auxiliary feature effects.
+    random_state : int or None, default=None
+        Random seed for reproducibility. If None (default), uses true random
+        initialization from system entropy - recommended for scientific experiments.
+        Set to an integer for reproducible results during debugging/testing.
+    pi_v : float, default=0.2
+        Prior probability of classification weights being active (slab).
+    pi_beta : float, default=0.05
+        Prior probability of gene loadings being active (slab).
+    spike_variance_v : float, default=1e-6
+        Variance for spike component of v (near-zero).
+    spike_value_beta : float, default=1e-6
+        Value for spike component of beta (near-zero).
+
+    Attributes
+    ----------
+    E_theta : ndarray of shape (n_samples, n_factors)
+        Expected sample-specific factor activities after fitting.
+    E_beta : ndarray of shape (n_genes, n_factors)
+        Expected gene loadings after fitting.
+    E_v : ndarray of shape (n_outcomes, n_factors)
+        Expected classification weights after fitting.
+    elbo_history_ : list of tuples
+        History of (iteration, ELBO) values during training.
+    training_time_ : float
+        Total training time in seconds.
+    seed_used_ : int or None
+        The random seed used for initialization (None if truly random).
+    """
+
     def __init__(
         self,
         n_factors: int,
@@ -18,14 +87,13 @@ class VI:
         alpha_eta: float = 2.0,
         lambda_xi: float = 1.5,
         lambda_eta: float = 1.5,
-        sigma_v: float = 0.2,  # Strong regularization to prevent v explosion
-        sigma_gamma: float = 0.5,  # Moderate regularization
-        random_state: int = 42,
-        # Spike-and-slab parameters
-        pi_v: float = 0.2,  # Prior probability of v being active - assume sparsity
-        pi_beta: float = 0.05,  # Prior probability of beta being active
-        spike_variance_v: float = 1e-6,  # Variance for spike in v
-        spike_value_beta: float = 1e-6  # Small value for spike in beta
+        sigma_v: float = 0.2,
+        sigma_gamma: float = 0.5,
+        random_state: Optional[int] = None,
+        pi_v: float = 0.2,
+        pi_beta: float = 0.05,
+        spike_variance_v: float = 1e-6,
+        spike_value_beta: float = 1e-6
     ):
         self.d = n_factors
         self.alpha_theta = alpha_theta
@@ -36,7 +104,17 @@ class VI:
         self.lambda_eta = lambda_eta
         self.sigma_v = sigma_v
         self.sigma_gamma = sigma_gamma
-        self.rng = np.random.RandomState(random_state)
+
+        # Random state handling: None = true randomization for scientific experiments
+        if random_state is None:
+            # Use system entropy for true randomization
+            self.rng = np.random.default_rng()
+            self.seed_used_ = None
+        else:
+            # Use provided seed for reproducibility
+            self.rng = np.random.default_rng(random_state)
+            self.seed_used_ = random_state
+
         self.regression_weight = 0.01
         
         # Spike-and-slab parameters
@@ -58,8 +136,8 @@ class VI:
         total_sum = X.sum() + 1e-6
         
         # Normalize and add small random perturbation
-        theta_init = (row_sums / self.d) * (1 + 0.1 * self.rng.randn(self.n, self.d))
-        beta_init = (col_sums.T / self.d) * (1 + 0.1 * self.rng.randn(self.p, self.d))
+        theta_init = (row_sums / self.d) * (1 + 0.1 * self.rng.standard_normal((self.n, self.d)))
+        beta_init = (col_sums.T / self.d) * (1 + 0.1 * self.rng.standard_normal((self.p, self.d)))
         
         # Clip to ensure positive values
         theta_init = np.maximum(theta_init, 0.1)
@@ -76,15 +154,15 @@ class VI:
         self.a_beta = (beta_init**2) / (variance_scale * beta_init**2) + self.alpha_beta
         self.b_beta = beta_init / (variance_scale * beta_init**2) + 0.1
         
-        self.a_xi = self.alpha_xi + 0.1 * self.rng.exponential(size=self.n)
+        self.a_xi = self.alpha_xi + 0.1 * self.rng.exponential(scale=1.0, size=self.n)
         self.b_xi = np.ones(self.n) * self.lambda_xi
-        
-        self.a_eta = self.alpha_eta + 0.1 * self.rng.exponential(size=self.p)
+
+        self.a_eta = self.alpha_eta + 0.1 * self.rng.exponential(scale=1.0, size=self.p)
         self.b_eta = np.ones(self.p) * self.lambda_eta
-        
+
         # Initialize Normal parameters - very small values to prevent early explosion
         # Start conservative and let data drive v up slowly
-        self.mu_v = 0.01 * self.rng.randn(self.kappa, self.d)
+        self.mu_v = 0.01 * self.rng.standard_normal((self.kappa, self.d))
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
         
         # Initialize spike-and-slab indicators for v
@@ -92,7 +170,7 @@ class VI:
         # Initialize at 0.5 to let data decide
         self.rho_v = np.ones((self.kappa, self.d)) * 0.5
 
-        self.mu_gamma = 0.01 * self.rng.randn(self.kappa, self.p_aux)
+        self.mu_gamma = 0.01 * self.rng.standard_normal((self.kappa, self.p_aux))
         self.Sigma_gamma = np.tile(np.eye(self.p_aux)[np.newaxis, :, :], (self.kappa, 1, 1))
         
         # Initialize spike-and-slab indicators for beta

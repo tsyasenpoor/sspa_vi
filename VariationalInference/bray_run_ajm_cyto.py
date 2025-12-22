@@ -1,5 +1,9 @@
 """
-AJM Cytokine Dataset Preprocessing and Variational Inference Pipeline
+BRAY LAB SPECIFIC: AJM Cytokine Dataset Pipeline
+==================================================
+
+This module is specific to Bray Lab's AJM dataset analysis.
+For generic VI usage, see: data_loader.py, cli.py, quick_reference.py
 
 This module prepares the AJM dataset for binary classification using variational inference.
 
@@ -13,7 +17,7 @@ WORKFLOW:
 5. Split data:
    - Training: Full gene expression of cells in group 1 (label 0) + group 2 (label 1)
    - Test/Validation: Remaining cells from ALL timepoints (0hr, 3hr, 6hr, 24hr, 48hr, 72hr)
-   
+
 MODEL TRAINING:
 - Input: Full gene expression matrix (all protein-coding genes, NOT restricted to cyto seeds)
 - Output: Binary labels (0 or 1)
