@@ -2,24 +2,31 @@
 Generic Configuration for Variational Inference
 ================================================
 
-This module provides a flexible configuration system for the VI model
+This module provides a flexible configuration system for both VI and SVI models
 that can be used with any single-cell dataset.
 
 Usage:
-    from VariationalInference.config import VIConfig
+    from VariationalInference.config import VIConfig, SVIConfig
 
-    # Use defaults
+    # Use VI defaults
     config = VIConfig(n_factors=50)
+
+    # Use SVI defaults
+    config = SVIConfig(n_factors=50, batch_size=128)
 
     # Load from JSON
     config = VIConfig.from_json('my_config.json')
 
     # Create model from config
-    model = VI(**config.model_params())
+    from VariationalInference.vi import VI
+    from VariationalInference.svi import SVI
+
+    model = VI(**config.model_params())  # for VIConfig
+    model = SVI(**config.model_params())  # for SVIConfig
 """
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 import json
 
@@ -300,6 +307,199 @@ class VIConfig:
         return VIConfig.from_dict(d)
 
 
+@dataclass
+class SVIConfig:
+    """
+    Configuration for SVI (Stochastic Variational Inference) model and training.
+
+    This dataclass holds all hyperparameters for running SVI experiments.
+    SVI is preferred for large datasets as it processes mini-batches instead
+    of the full dataset.
+
+    Parameters
+    ----------
+    n_factors : int
+        Number of latent gene programs to discover. Required.
+
+    SVI-Specific Parameters
+    -----------------------
+    batch_size : int, default=128
+        Size of mini-batches for stochastic updates.
+    learning_rate : float, default=0.01
+        Initial learning rate for global parameter updates.
+    learning_rate_decay : float, default=0.75
+        Decay exponent (kappa) for learning rate schedule.
+    learning_rate_delay : float, default=1.0
+        Delay parameter (tau) for learning rate schedule.
+    local_iterations : int, default=5
+        Number of iterations to optimize local parameters per mini-batch.
+
+    Model Hyperparameters (Same as VI)
+    ----------------------------------
+    alpha_theta, alpha_beta, alpha_xi, alpha_eta : float, default=2.0
+    lambda_xi, lambda_eta : float, default=1.5
+    sigma_v : float, default=0.2
+    sigma_gamma : float, default=0.5
+    pi_v : float, default=0.2
+    pi_beta : float, default=0.05
+
+    Training Parameters
+    -------------------
+    max_epochs : int, default=100
+        Maximum number of epochs (passes through data).
+    elbo_freq : int, default=10
+        Compute ELBO every N mini-batch iterations.
+    min_epochs : int, default=10
+        Minimum epochs before checking convergence.
+    patience : int, default=5
+        Early stopping patience.
+    tol : float, default=10.0
+        Absolute ELBO tolerance.
+    rel_tol : float, default=2e-4
+        Relative ELBO tolerance.
+    """
+
+    # Required
+    n_factors: int
+
+    # SVI-specific parameters
+    batch_size: int = 128
+    learning_rate: float = 0.01
+    learning_rate_decay: float = 0.75
+    learning_rate_delay: float = 1.0
+    local_iterations: int = 5
+
+    # Model hyperparameters (same as VI)
+    alpha_theta: float = 2.0
+    alpha_beta: float = 2.0
+    alpha_xi: float = 2.0
+    alpha_eta: float = 2.0
+    lambda_xi: float = 1.5
+    lambda_eta: float = 1.5
+    sigma_v: float = 0.2
+    sigma_gamma: float = 0.5
+    pi_v: float = 0.2
+    pi_beta: float = 0.05
+    spike_variance_v: float = 1e-6
+    spike_value_beta: float = 1e-6
+
+    # Training parameters
+    max_epochs: int = 100
+    elbo_freq: int = 10
+    min_epochs: int = 10
+    patience: int = 5
+    tol: float = 10.0
+    rel_tol: float = 2e-4
+
+    # Data parameters
+    label_column: str = 't2dm'
+    aux_columns: Optional[List[str]] = None
+    train_ratio: float = 0.7
+    val_ratio: float = 0.15
+    min_cells_expressing: float = 0.02
+
+    # Output parameters
+    output_dir: Optional[str] = None
+    cache_dir: Optional[str] = None
+    verbose: bool = True
+    debug: bool = False
+
+    # Random state
+    random_state: Optional[int] = None
+
+    def __post_init__(self):
+        """Validate configuration."""
+        if self.n_factors < 1:
+            raise ValueError("n_factors must be at least 1")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        if not 0 < self.learning_rate_decay <= 1:
+            raise ValueError("learning_rate_decay must be in (0, 1]")
+        if not 0 < self.train_ratio < 1:
+            raise ValueError("train_ratio must be between 0 and 1")
+        if not 0 < self.val_ratio < 1:
+            raise ValueError("val_ratio must be between 0 and 1")
+        if self.train_ratio + self.val_ratio >= 1:
+            raise ValueError("train_ratio + val_ratio must be less than 1")
+
+    def model_params(self) -> Dict[str, Any]:
+        """
+        Get parameters for SVI model constructor.
+
+        Returns
+        -------
+        dict
+            Parameters to pass to SVI.__init__()
+        """
+        return {
+            'n_factors': self.n_factors,
+            'batch_size': self.batch_size,
+            'learning_rate': self.learning_rate,
+            'learning_rate_decay': self.learning_rate_decay,
+            'learning_rate_delay': self.learning_rate_delay,
+            'local_iterations': self.local_iterations,
+            'alpha_theta': self.alpha_theta,
+            'alpha_beta': self.alpha_beta,
+            'alpha_xi': self.alpha_xi,
+            'alpha_eta': self.alpha_eta,
+            'lambda_xi': self.lambda_xi,
+            'lambda_eta': self.lambda_eta,
+            'sigma_v': self.sigma_v,
+            'sigma_gamma': self.sigma_gamma,
+            'random_state': self.random_state,
+            'pi_v': self.pi_v,
+            'pi_beta': self.pi_beta,
+            'spike_variance_v': self.spike_variance_v,
+            'spike_value_beta': self.spike_value_beta,
+        }
+
+    def training_params(self) -> Dict[str, Any]:
+        """
+        Get parameters for SVI.fit() method.
+
+        Returns
+        -------
+        dict
+            Parameters to pass to SVI.fit()
+        """
+        return {
+            'max_epochs': self.max_epochs,
+            'elbo_freq': self.elbo_freq,
+            'min_epochs': self.min_epochs,
+            'patience': self.patience,
+            'tol': self.tol,
+            'rel_tol': self.rel_tol,
+            'verbose': self.verbose,
+            'debug': self.debug,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to dictionary."""
+        return asdict(self)
+
+    def to_json(self, path: str) -> None:
+        """Save configuration to JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'SVIConfig':
+        """Create config from dictionary."""
+        return cls(**d)
+
+    @classmethod
+    def from_json(cls, path: str) -> 'SVIConfig':
+        """Load configuration from JSON file."""
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
+
+    def copy(self, **updates) -> 'SVIConfig':
+        """Create a copy of this config with optional updates."""
+        d = self.to_dict()
+        d.update(updates)
+        return SVIConfig.from_dict(d)
+
+
 # Preset configurations for common use cases
 PRESETS = {
     'default': VIConfig(n_factors=50),
@@ -333,8 +533,36 @@ PRESETS = {
     ),
 }
 
+# SVI presets
+SVI_PRESETS = {
+    'default': SVIConfig(n_factors=50, batch_size=128),
 
-def get_preset(name: str) -> VIConfig:
+    'small': SVIConfig(
+        n_factors=20,
+        batch_size=64,
+        max_epochs=50,
+        min_epochs=5,
+    ),
+
+    'large': SVIConfig(
+        n_factors=100,
+        batch_size=256,
+        max_epochs=200,
+        min_epochs=20,
+    ),
+
+    'fast': SVIConfig(
+        n_factors=50,
+        batch_size=256,
+        max_epochs=50,
+        elbo_freq=20,
+        min_epochs=5,
+        patience=3,
+    ),
+}
+
+
+def get_preset(name: str, method: str = 'vi') -> Union[VIConfig, SVIConfig]:
     """
     Get a preset configuration by name.
 
@@ -342,17 +570,27 @@ def get_preset(name: str) -> VIConfig:
     ----------
     name : str
         Preset name. One of: 'default', 'small', 'large', 'conservative', 'fast'
+    method : str, default='vi'
+        Inference method. Either 'vi' for batch VI or 'svi' for stochastic VI.
 
     Returns
     -------
-    VIConfig
+    VIConfig or SVIConfig
         Configuration object.
 
     Examples
     --------
-    >>> config = get_preset('fast')
+    >>> config = get_preset('fast', method='vi')
     >>> model = VI(**config.model_params())
+
+    >>> config = get_preset('fast', method='svi')
+    >>> model = SVI(**config.model_params())
     """
-    if name not in PRESETS:
-        raise ValueError(f"Unknown preset '{name}'. Available: {list(PRESETS.keys())}")
-    return PRESETS[name].copy()
+    if method.lower() == 'svi':
+        if name not in SVI_PRESETS:
+            raise ValueError(f"Unknown SVI preset '{name}'. Available: {list(SVI_PRESETS.keys())}")
+        return SVI_PRESETS[name].copy()
+    else:
+        if name not in PRESETS:
+            raise ValueError(f"Unknown VI preset '{name}'. Available: {list(PRESETS.keys())}")
+        return PRESETS[name].copy()

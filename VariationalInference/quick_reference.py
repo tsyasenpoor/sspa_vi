@@ -3,18 +3,27 @@
 Quick Reference: Variational Inference for Single-Cell Analysis
 ================================================================
 
-This script demonstrates the complete VI workflow for gene program discovery
+This script demonstrates the complete VI/SVI workflow for gene program discovery
 and phenotype classification from single-cell RNA-seq data.
 
 USAGE:
 ------
-    # Basic usage with required arguments
+    # Basic usage with batch VI (default)
     python quick_reference.py --data /path/to/data.h5ad --n-factors 50
 
-    # Full example with all options
+    # Use Stochastic VI (SVI) for large datasets
     python quick_reference.py \
         --data /path/to/data.h5ad \
         --n-factors 50 \
+        --method svi \
+        --batch-size 128 \
+        --max-epochs 100
+
+    # Full example with VI
+    python quick_reference.py \
+        --data /path/to/data.h5ad \
+        --n-factors 50 \
+        --method vi \
         --max-iter 200 \
         --label-column t2dm \
         --aux-columns Sex \
@@ -25,7 +34,7 @@ WORKFLOW:
 ---------
 1. Load and preprocess h5ad data (gene expression)
 2. Create random train/val/test splits
-3. Train VI model with specified parameters
+3. Train VI or SVI model with specified parameters
 4. Evaluate on validation and test sets
 5. Save results (model, gene programs, predictions)
 
@@ -72,6 +81,15 @@ def parse_args() -> argparse.Namespace:
         help='Number of latent gene programs to discover'
     )
 
+    # Method selection
+    parser.add_argument(
+        '--method', '-m',
+        type=str,
+        choices=['vi', 'svi'],
+        default='vi',
+        help='Inference method: vi (batch) or svi (stochastic). Use svi for large datasets.'
+    )
+
     # Data options
     parser.add_argument(
         '--label-column',
@@ -99,24 +117,56 @@ def parse_args() -> argparse.Namespace:
         help='Path to gene annotation CSV for protein-coding filter'
     )
 
-    # Training options
+    # VI Training options
     parser.add_argument(
         '--max-iter',
         type=int,
         default=200,
-        help='Maximum training iterations'
+        help='Maximum training iterations (VI only)'
     )
     parser.add_argument(
         '--min-iter',
         type=int,
         default=50,
-        help='Minimum iterations before checking convergence'
+        help='Minimum iterations before checking convergence (VI only)'
     )
     parser.add_argument(
         '--patience',
         type=int,
         default=5,
         help='Early stopping patience'
+    )
+
+    # SVI-specific options
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=128,
+        help='Mini-batch size for SVI (only used with --method svi)'
+    )
+    parser.add_argument(
+        '--max-epochs',
+        type=int,
+        default=100,
+        help='Maximum epochs for SVI (only used with --method svi)'
+    )
+    parser.add_argument(
+        '--min-epochs',
+        type=int,
+        default=10,
+        help='Minimum epochs before convergence check for SVI'
+    )
+    parser.add_argument(
+        '--learning-rate',
+        type=float,
+        default=0.01,
+        help='Initial learning rate for SVI'
+    )
+    parser.add_argument(
+        '--learning-rate-decay',
+        type=float,
+        default=0.75,
+        help='Learning rate decay exponent (kappa) for SVI'
     )
 
     # Output options
@@ -149,19 +199,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def main():
-    """Main function demonstrating the VI workflow."""
+    """Main function demonstrating the VI/SVI workflow."""
     # =========================================================================
     # STEP 1: Parse Arguments
     # =========================================================================
     args = parse_args()
 
+    use_svi = args.method.lower() == 'svi'
+    method_name = "STOCHASTIC VARIATIONAL INFERENCE" if use_svi else "VARIATIONAL INFERENCE"
+
     print("=" * 80)
-    print("VARIATIONAL INFERENCE - QUICK REFERENCE")
+    print(f"{method_name} - QUICK REFERENCE")
     print("=" * 80)
     print(f"\nConfiguration:")
+    print(f"  Method:       {'SVI (Stochastic)' if use_svi else 'VI (Batch)'}")
     print(f"  Data:         {args.data}")
     print(f"  n_factors:    {args.n_factors}")
-    print(f"  max_iter:     {args.max_iter}")
+    if use_svi:
+        print(f"  batch_size:   {args.batch_size}")
+        print(f"  max_epochs:   {args.max_epochs}")
+        print(f"  learning_rate:{args.learning_rate}")
+    else:
+        print(f"  max_iter:     {args.max_iter}")
     print(f"  label_column: {args.label_column}")
     print(f"  aux_columns:  {args.aux_columns}")
     print(f"  random_seed:  {args.seed if args.seed else 'None (random)'}")
@@ -171,6 +230,7 @@ def main():
     # STEP 2: Import Modules
     # =========================================================================
     from VariationalInference.vi import VI
+    from VariationalInference.svi import SVI
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
         compute_metrics, save_results, print_model_summary
@@ -218,44 +278,75 @@ def main():
     print(f"  Label dist:     {np.bincount(y_train)}")
 
     # =========================================================================
-    # STEP 4: Train VI Model
+    # STEP 4: Train Model (VI or SVI)
     # =========================================================================
     print("\n" + "=" * 80)
-    print("Training VI Model")
+    print(f"Training {'SVI' if use_svi else 'VI'} Model")
     print("=" * 80)
 
-    # Create model with true random initialization (no fixed seed by default)
-    model = VI(
-        n_factors=args.n_factors,
-        alpha_theta=0.5,   # Loose prior on theta
-        alpha_beta=2.0,    # Tight prior on beta
-        alpha_xi=2.0,
-        lambda_xi=2.0,
-        sigma_v=2.0,       # Regularization for classification weights
-        sigma_gamma=1.0,   # Regularization for auxiliary effects
-        random_state=args.seed  # None = random, or pass seed for reproducibility
-    )
+    if use_svi:
+        # Create SVI model for stochastic training
+        model = SVI(
+            n_factors=args.n_factors,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            learning_rate_decay=args.learning_rate_decay,
+            alpha_theta=0.5,   # Loose prior on theta
+            alpha_beta=2.0,    # Tight prior on beta
+            alpha_xi=2.0,
+            lambda_xi=2.0,
+            sigma_v=2.0,       # Regularization for classification weights
+            sigma_gamma=1.0,   # Regularization for auxiliary effects
+            random_state=args.seed
+        )
 
-    # Train with adaptive damping
-    model.fit(
-        X=X_train,
-        y=y_train,
-        X_aux=X_aux_train,
-        max_iter=args.max_iter,
-        tol=10.0,
-        rel_tol=2e-4,
-        elbo_freq=10,
-        min_iter=args.min_iter,
-        patience=args.patience,
-        verbose=True,
-        theta_damping=0.8,
-        beta_damping=0.8,
-        v_damping=0.7,
-        gamma_damping=0.7,
-        xi_damping=0.9,
-        eta_damping=0.9,
-        debug=args.debug
-    )
+        # Train with SVI
+        model.fit(
+            X=X_train,
+            y=y_train,
+            X_aux=X_aux_train,
+            max_epochs=args.max_epochs,
+            tol=10.0,
+            rel_tol=2e-4,
+            elbo_freq=10,
+            min_epochs=args.min_epochs,
+            patience=args.patience,
+            verbose=True,
+            debug=args.debug
+        )
+    else:
+        # Create batch VI model
+        model = VI(
+            n_factors=args.n_factors,
+            alpha_theta=0.5,   # Loose prior on theta
+            alpha_beta=2.0,    # Tight prior on beta
+            alpha_xi=2.0,
+            lambda_xi=2.0,
+            sigma_v=2.0,       # Regularization for classification weights
+            sigma_gamma=1.0,   # Regularization for auxiliary effects
+            random_state=args.seed  # None = random, or pass seed for reproducibility
+        )
+
+        # Train with adaptive damping
+        model.fit(
+            X=X_train,
+            y=y_train,
+            X_aux=X_aux_train,
+            max_iter=args.max_iter,
+            tol=10.0,
+            rel_tol=2e-4,
+            elbo_freq=10,
+            min_iter=args.min_iter,
+            patience=args.patience,
+            verbose=True,
+            theta_damping=0.8,
+            beta_damping=0.8,
+            v_damping=0.7,
+            gamma_damping=0.7,
+            xi_damping=0.9,
+            eta_damping=0.9,
+            debug=args.debug
+        )
 
     print("\nTraining complete!")
     print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
@@ -313,12 +404,13 @@ def main():
     print("=" * 80)
 
     output_dir = Path(args.output_dir)
+    prefix = 'svi' if use_svi else 'vi'
     saved_files = save_results(
         model=model,
         output_dir=output_dir,
         gene_list=gene_list,
         splits=splits,
-        prefix='vi',
+        prefix=prefix,
         compress=True
     )
 
@@ -330,8 +422,8 @@ def main():
         index=splits['val'],
         columns=[f"GP{k+1}" for k in range(model.d)]
     )
-    theta_val_df.to_csv(output_dir / 'vi_theta_val.csv.gz', compression='gzip')
-    print(f"Saved validation theta to {output_dir / 'vi_theta_val.csv.gz'}")
+    theta_val_df.to_csv(output_dir / f'{prefix}_theta_val.csv.gz', compression='gzip')
+    print(f"Saved validation theta to {output_dir / f'{prefix}_theta_val.csv.gz'}")
 
     # Test theta
     E_theta_test, _, _ = model.infer_theta(X_test, X_aux_test, max_iter=100, tol=1e-4)
@@ -340,8 +432,8 @@ def main():
         index=splits['test'],
         columns=[f"GP{k+1}" for k in range(model.d)]
     )
-    theta_test_df.to_csv(output_dir / 'vi_theta_test.csv.gz', compression='gzip')
-    print(f"Saved test theta to {output_dir / 'vi_theta_test.csv.gz'}")
+    theta_test_df.to_csv(output_dir / f'{prefix}_theta_test.csv.gz', compression='gzip')
+    print(f"Saved test theta to {output_dir / f'{prefix}_theta_test.csv.gz'}")
 
     # Predictions
     val_pred_df = pd.DataFrame({
@@ -350,7 +442,7 @@ def main():
         'pred_prob': y_val_proba.ravel(),
         'pred_label': y_val_pred
     })
-    val_pred_df.to_csv(output_dir / 'vi_val_predictions.csv.gz', compression='gzip', index=False)
+    val_pred_df.to_csv(output_dir / f'{prefix}_val_predictions.csv.gz', compression='gzip', index=False)
 
     test_pred_df = pd.DataFrame({
         'cell_id': splits['test'],
@@ -358,7 +450,7 @@ def main():
         'pred_prob': y_test_proba.ravel(),
         'pred_label': y_test_pred
     })
-    test_pred_df.to_csv(output_dir / 'vi_test_predictions.csv.gz', compression='gzip', index=False)
+    test_pred_df.to_csv(output_dir / f'{prefix}_test_predictions.csv.gz', compression='gzip', index=False)
     print(f"Saved predictions to {output_dir}")
 
     # =========================================================================
@@ -380,13 +472,13 @@ def main():
     print(f"\nSaved files:")
     for name, path in saved_files.items():
         print(f"  - {path}")
-    print(f"  - {output_dir / 'vi_theta_val.csv.gz'}")
-    print(f"  - {output_dir / 'vi_theta_test.csv.gz'}")
-    print(f"  - {output_dir / 'vi_val_predictions.csv.gz'}")
-    print(f"  - {output_dir / 'vi_test_predictions.csv.gz'}")
+    print(f"  - {output_dir / f'{prefix}_theta_val.csv.gz'}")
+    print(f"  - {output_dir / f'{prefix}_theta_test.csv.gz'}")
+    print(f"  - {output_dir / f'{prefix}_val_predictions.csv.gz'}")
+    print(f"  - {output_dir / f'{prefix}_test_predictions.csv.gz'}")
 
     print(f"\nNext steps:")
-    print("  1. Load gene programs: pd.read_csv('vi_gene_programs.csv.gz')")
+    print(f"  1. Load gene programs: pd.read_csv('{prefix}_gene_programs.csv.gz')")
     print("  2. Identify top genes per program and run pathway enrichment")
     print("  3. Load theta matrices to analyze sample-level program activity")
     print("  4. Correlate theta values with phenotypes/outcomes")
