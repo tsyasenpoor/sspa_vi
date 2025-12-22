@@ -1,132 +1,560 @@
-import pickle  
-import mygene
-from gseapy import read_gmt
+"""
+Utility Functions for Variational Inference
+=============================================
+
+This module provides generic utility functions for the VI pipeline.
+
+Functions:
+- Caching: save_cache, load_cache
+- Array utilities: to_dense_array
+- Normalization: size_factor_normalize
+- Metrics: compute_metrics
+- Results handling: save_results, load_model
+- Analysis: get_top_genes_per_program
+"""
+
+import pickle
+import gzip
+import json
 import numpy as np
-import scipy.sparse as sp
 import pandas as pd
-import os
+import scipy.sparse as sp
 from pathlib import Path
-from .config import *
+from typing import Optional, Dict, Any, List, Tuple, Union
+import os
 
 
-def save_cache(data, cache_file):
+# =============================================================================
+# Caching Utilities
+# =============================================================================
+
+def save_cache(data: Any, cache_file: Union[str, Path]) -> None:
+    """
+    Save data to a pickle cache file.
+
+    Parameters
+    ----------
+    data : any
+        Data to cache.
+    cache_file : str or Path
+        Path to cache file.
+    """
+    cache_file = Path(cache_file)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+
     with open(cache_file, 'wb') as f:
         pickle.dump(data, f)
     print(f"Saved cached data to {cache_file}")
 
-def load_cache(cache_file):
-    if os.path.exists(cache_file):
+
+def load_cache(cache_file: Union[str, Path]) -> Optional[Any]:
+    """
+    Load data from a pickle cache file.
+
+    Parameters
+    ----------
+    cache_file : str or Path
+        Path to cache file.
+
+    Returns
+    -------
+    data or None
+        Cached data if file exists, None otherwise.
+    """
+    cache_file = Path(cache_file)
+    if cache_file.exists():
         print(f"Loading cached data from {cache_file}")
         with open(cache_file, 'rb') as f:
             return pickle.load(f)
     return None
 
-def filter_protein_coding_genes(data, gene_annotation_path):
-    gene_annotation = pd.read_csv(gene_annotation_path)
-    gene_annotation = gene_annotation.set_index('GeneName')
-    protein_coding_genes = gene_annotation[
-        gene_annotation['Genetype'] == 'protein_coding'
-    ].index.tolist()
-    
-    common_genes = [g for g in data.gene_names if g in protein_coding_genes]
-    
-    print(f"Total genes: {len(data.gene_names)}")
-    print(f"Protein-coding genes found: {len(common_genes)}")
-    print(f"Filtered out: {len(data.gene_names) - len(common_genes)} non-protein-coding genes")
-    
-    filtered_data = data.subset_genes(common_genes)
-    return filtered_data
 
-def QCscRNAsizeFactorNormOnly(X):
+# =============================================================================
+# Array Utilities
+# =============================================================================
 
-    X = X.astype(float)
+def to_dense_array(X: Union[np.ndarray, sp.spmatrix]) -> np.ndarray:
+    """
+    Convert sparse matrix to dense array.
 
-    if sp.issparse(X):
-        UMI_counts_per_cell = np.array(X.sum(axis=1)).flatten()
-    else:  
-        UMI_counts_per_cell = X.sum(axis=1)
+    Parameters
+    ----------
+    X : ndarray or sparse matrix
+        Input array or sparse matrix.
 
-    median_UMI = np.median(UMI_counts_per_cell)
-    scaling_factors = median_UMI / UMI_counts_per_cell
-    scaling_factors[np.isinf(scaling_factors)] = 0  
-
-    if sp.issparse(X):
-        scaling_matrix = sp.diags(scaling_factors)
-        X = scaling_matrix @ X  
-    else:
-        X = X * scaling_factors[:, np.newaxis]  
-
-    return X
-
-
-def to_dense_array(X):
+    Returns
+    -------
+    ndarray
+        Dense numpy array.
+    """
     if sp.issparse(X):
         return X.toarray()
     return np.asarray(X)
 
-def create_gene_id_mapping(target_format='ensembl', species='mouse', use_cache=True):
+
+# =============================================================================
+# Normalization
+# =============================================================================
+
+def size_factor_normalize(X: Union[np.ndarray, sp.spmatrix]) -> np.ndarray:
     """
-    Create mapping between gene symbols and other ID formats (e.g., Ensembl).
-    
-    Args:
-        target_format: Target ID format ('ensembl' or 'symbol')
-        species: Species name (default: 'mouse')
-        use_cache: Whether to use cached mapping if available
-        
-    Returns:
-        Dictionary mapping from symbol to target format
+    Normalize by library size (size factor normalization).
+
+    Scales each cell so that its total counts equal the median across cells.
+
+    Parameters
+    ----------
+    X : ndarray or sparse matrix
+        Count matrix (cells x genes).
+
+    Returns
+    -------
+    ndarray
+        Normalized matrix.
     """
-    # Check cache first
-    cache_file = CACHE_DIR / f"gene_mapping_{species}_{target_format}.pkl"
-    
-    if use_cache and cache_file.exists():
-        print(f"Loading gene mapping from cache: {cache_file}")
-        with open(cache_file, 'rb') as f:
-            return pickle.load(f)
-    
-    # Load all unique genes from seed files to create comprehensive mapping
-    cyto_genes = pd.read_csv(cytoseeds_csv_path)['V4'].tolist()
-    ap_genes = pd.read_csv(apseeds_csv_path)['x'].tolist()
-    ig_genes = pd.read_csv(igseeds_csv_path)['Symbol'].tolist()
-    all_genes = list(set(cyto_genes + ap_genes + ig_genes))
-    
-    print(f"Creating gene ID mapping for {len(all_genes)} unique genes...")
-    
-    mg = mygene.MyGeneInfo()
-    gene_info = mg.querymany(all_genes, 
-                            scopes='symbol,ensembl.gene', 
-                            fields='symbol,ensembl.gene', 
-                            species=species, 
-                            returnall=True)
-    
-    gene_mapping = {}
-    
-    for gene in gene_info['out']:
-        if 'symbol' in gene and 'ensembl' in gene:
-            symbol = gene['symbol']
-            # Handle both dict and list formats for ensembl field
-            if isinstance(gene['ensembl'], dict):
-                ensembl_id = gene['ensembl'].get('gene')
-            elif isinstance(gene['ensembl'], list) and len(gene['ensembl']) > 0:
-                ensembl_id = gene['ensembl'][0].get('gene')
-            else:
-                continue
-            
-            if target_format.lower() == 'ensembl':
-                gene_mapping[symbol] = ensembl_id
-            elif target_format.lower() == 'symbol':
-                gene_mapping[ensembl_id] = symbol
-    
-    print(f"Mapped {len(gene_mapping)} genes to {target_format}")
-    
-    # Cache the mapping
-    if use_cache:
-        with open(cache_file, 'wb') as f:
-            pickle.dump(gene_mapping, f)
-        print(f"Saved gene mapping to cache: {cache_file}")
-    
-    return gene_mapping
+    X = X.astype(float)
+
+    if sp.issparse(X):
+        UMI_counts_per_cell = np.array(X.sum(axis=1)).flatten()
+    else:
+        UMI_counts_per_cell = X.sum(axis=1)
+
+    median_UMI = np.median(UMI_counts_per_cell)
+    scaling_factors = median_UMI / UMI_counts_per_cell
+    scaling_factors[np.isinf(scaling_factors)] = 0
+
+    if sp.issparse(X):
+        scaling_matrix = sp.diags(scaling_factors)
+        X = scaling_matrix @ X
+        X = X.toarray()
+    else:
+        X = X * scaling_factors[:, np.newaxis]
+
+    return X
 
 
+# Alias for backward compatibility
+QCscRNAsizeFactorNormOnly = size_factor_normalize
 
 
+# =============================================================================
+# Metrics
+# =============================================================================
+
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_proba: Optional[np.ndarray] = None
+) -> Dict[str, float]:
+    """
+    Compute classification metrics.
+
+    Parameters
+    ----------
+    y_true : ndarray
+        True labels.
+    y_pred : ndarray
+        Predicted labels.
+    y_proba : ndarray, optional
+        Predicted probabilities for positive class.
+
+    Returns
+    -------
+    dict
+        Dictionary of metric names to values.
+    """
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score,
+        f1_score, roc_auc_score, average_precision_score,
+        confusion_matrix
+    )
+
+    metrics = {
+        'accuracy': accuracy_score(y_true, y_pred),
+        'precision': precision_score(y_true, y_pred, zero_division=0),
+        'recall': recall_score(y_true, y_pred, zero_division=0),
+        'f1': f1_score(y_true, y_pred, zero_division=0),
+    }
+
+    if y_proba is not None:
+        try:
+            metrics['auc'] = roc_auc_score(y_true, y_proba)
+            metrics['average_precision'] = average_precision_score(y_true, y_proba)
+        except ValueError:
+            # Handle case where only one class is present
+            metrics['auc'] = float('nan')
+            metrics['average_precision'] = float('nan')
+
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    if cm.shape == (2, 2):
+        metrics['tn'] = int(cm[0, 0])
+        metrics['fp'] = int(cm[0, 1])
+        metrics['fn'] = int(cm[1, 0])
+        metrics['tp'] = int(cm[1, 1])
+
+    return metrics
+
+
+# =============================================================================
+# Model I/O
+# =============================================================================
+
+def save_model(model: Any, path: Union[str, Path]) -> None:
+    """
+    Save trained VI model to pickle file.
+
+    Parameters
+    ----------
+    model : VI
+        Trained model instance.
+    path : str or Path
+        Path to save file.
+    """
+    with open(path, 'wb') as f:
+        pickle.dump(model, f)
+    print(f"Saved model to {path}")
+
+
+def load_model(path: Union[str, Path]) -> Any:
+    """
+    Load trained VI model from pickle file.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to saved model.
+
+    Returns
+    -------
+    VI
+        Loaded model instance.
+    """
+    with open(path, 'rb') as f:
+        model = pickle.load(f)
+    print(f"Loaded model from {path}")
+    return model
+
+
+# =============================================================================
+# Results Saving
+# =============================================================================
+
+def save_results(
+    model: Any,
+    output_dir: Union[str, Path],
+    gene_list: List[str],
+    splits: Dict[str, List[str]],
+    prefix: str = 'vi',
+    save_model: bool = True,
+    compress: bool = True
+) -> Dict[str, Path]:
+    """
+    Save VI model results to files.
+
+    Parameters
+    ----------
+    model : VI
+        Trained model instance.
+    output_dir : str or Path
+        Directory to save results.
+    gene_list : list of str
+        List of gene names.
+    splits : dict
+        Dictionary with train/val/test cell ID lists.
+    prefix : str, default='vi'
+        Prefix for output files.
+    save_model : bool, default=True
+        Whether to save the full model pickle.
+    compress : bool, default=True
+        Whether to compress CSV files with gzip.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping result types to file paths.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_files = {}
+    ext = '.csv.gz' if compress else '.csv'
+    compression = 'gzip' if compress else None
+
+    # Save model
+    if save_model:
+        model_path = output_dir / f'{prefix}_model.pkl'
+        with open(model_path, 'wb') as f:
+            pickle.dump(model, f)
+        saved_files['model'] = model_path
+        print(f"Saved model to {model_path}")
+
+    # Save gene programs (beta matrix)
+    beta_df = pd.DataFrame(
+        model.E_beta.T,  # Transpose: programs x genes
+        index=[f"GP{k+1}" for k in range(model.d)],
+        columns=gene_list
+    )
+
+    # Add classification weights if available
+    if hasattr(model, 'E_v'):
+        for k in range(model.kappa):
+            beta_df.insert(0, f'v_weight_class{k}', model.E_v[k])
+
+    beta_path = output_dir / f'{prefix}_gene_programs{ext}'
+    beta_df.to_csv(beta_path, compression=compression)
+    saved_files['gene_programs'] = beta_path
+    print(f"Saved gene programs to {beta_path}")
+
+    # Save training theta
+    if hasattr(model, 'E_theta'):
+        theta_train_df = pd.DataFrame(
+            model.E_theta,
+            index=splits['train'],
+            columns=[f"GP{k+1}" for k in range(model.d)]
+        )
+        theta_path = output_dir / f'{prefix}_theta_train{ext}'
+        theta_train_df.to_csv(theta_path, compression=compression)
+        saved_files['theta_train'] = theta_path
+        print(f"Saved training theta to {theta_path}")
+
+    # Save summary
+    summary = {
+        'hyperparameters': {
+            'n_factors': model.d,
+            'alpha_theta': model.alpha_theta,
+            'alpha_beta': model.alpha_beta,
+            'sigma_v': model.sigma_v,
+            'sigma_gamma': model.sigma_gamma,
+            'pi_v': model.pi_v,
+            'pi_beta': model.pi_beta,
+        },
+        'data_shapes': {
+            'n_genes': len(gene_list),
+            'n_train': len(splits['train']),
+            'n_val': len(splits['val']),
+            'n_test': len(splits['test']),
+        },
+        'training': {
+            'training_time': getattr(model, 'training_time_', None),
+            'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') else None,
+            'n_iterations': model.elbo_history_[-1][0] if hasattr(model, 'elbo_history_') else None,
+        }
+    }
+
+    if hasattr(model, 'elbo_history_'):
+        summary['elbo_history'] = model.elbo_history_
+
+    summary_path = output_dir / f'{prefix}_summary.json'
+    if compress:
+        summary_path = output_dir / f'{prefix}_summary.json.gz'
+        with gzip.open(summary_path, 'wt') as f:
+            json.dump(summary, f, indent=2)
+    else:
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+
+    saved_files['summary'] = summary_path
+    print(f"Saved summary to {summary_path}")
+
+    return saved_files
+
+
+# =============================================================================
+# Analysis Utilities
+# =============================================================================
+
+def get_top_genes_per_program(
+    model: Any,
+    gene_list: List[str],
+    n_top: int = 10,
+    threshold: float = 0.5
+) -> Dict[str, List[Tuple[str, float]]]:
+    """
+    Get top genes for each gene program.
+
+    Parameters
+    ----------
+    model : VI
+        Trained model with E_beta attribute.
+    gene_list : list of str
+        List of gene names corresponding to beta rows.
+    n_top : int, default=10
+        Number of top genes to return per program.
+    threshold : float, default=0.5
+        Spike-and-slab threshold for considering genes active.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping program names to lists of (gene, loading) tuples.
+    """
+    results = {}
+
+    for k in range(model.d):
+        program_name = f"GP{k+1}"
+
+        # Get gene loadings for this program
+        loadings = model.E_beta[:, k]
+
+        # Apply spike-and-slab threshold if available
+        if hasattr(model, 'rho_beta'):
+            active_mask = model.rho_beta[:, k] > threshold
+            loadings = loadings * active_mask
+
+        # Get top genes
+        top_indices = np.argsort(loadings)[::-1][:n_top]
+        top_genes = [(gene_list[i], float(loadings[i])) for i in top_indices]
+
+        results[program_name] = top_genes
+
+    return results
+
+
+def get_active_programs(
+    model: Any,
+    threshold: float = 0.5
+) -> Dict[str, Any]:
+    """
+    Get summary of active genes and factors based on spike-and-slab.
+
+    Parameters
+    ----------
+    model : VI
+        Trained model with rho_beta and rho_v attributes.
+    threshold : float, default=0.5
+        Threshold for considering an indicator active.
+
+    Returns
+    -------
+    dict
+        Summary statistics about active components.
+    """
+    results = {}
+
+    if hasattr(model, 'rho_beta'):
+        active_beta = model.rho_beta > threshold
+        results['beta'] = {
+            'n_active': int(active_beta.sum()),
+            'n_total': model.rho_beta.size,
+            'sparsity': float(1 - active_beta.mean()),
+            'active_per_program': [int(active_beta[:, k].sum()) for k in range(model.d)]
+        }
+
+    if hasattr(model, 'rho_v'):
+        active_v = model.rho_v > threshold
+        results['v'] = {
+            'n_active': int(active_v.sum()),
+            'n_total': model.rho_v.size,
+            'sparsity': float(1 - active_v.mean()),
+            'active_per_class': [int(active_v[k].sum()) for k in range(model.kappa)]
+        }
+
+    return results
+
+
+def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> None:
+    """
+    Print a summary of the trained model.
+
+    Parameters
+    ----------
+    model : VI
+        Trained model instance.
+    gene_list : list of str, optional
+        List of gene names for displaying top genes.
+    """
+    print("\n" + "=" * 60)
+    print("MODEL SUMMARY")
+    print("=" * 60)
+
+    print(f"\nHyperparameters:")
+    print(f"  n_factors: {model.d}")
+    print(f"  alpha_theta: {model.alpha_theta}")
+    print(f"  alpha_beta: {model.alpha_beta}")
+    print(f"  sigma_v: {model.sigma_v}")
+    print(f"  pi_v: {model.pi_v}")
+    print(f"  pi_beta: {model.pi_beta}")
+
+    if hasattr(model, 'seed_used_'):
+        print(f"  random_state: {model.seed_used_} {'(random)' if model.seed_used_ is None else ''}")
+
+    print(f"\nLearned Parameters:")
+    print(f"  E[beta] shape: {model.E_beta.shape}")
+    print(f"    range: [{model.E_beta.min():.4f}, {model.E_beta.max():.4f}]")
+    print(f"    mean: {model.E_beta.mean():.4f}")
+
+    if hasattr(model, 'E_v'):
+        print(f"  E[v] shape: {model.E_v.shape}")
+        print(f"    range: [{model.E_v.min():.4f}, {model.E_v.max():.4f}]")
+
+    if hasattr(model, 'E_theta'):
+        print(f"  E[theta] shape: {model.E_theta.shape}")
+        print(f"    range: [{model.E_theta.min():.4f}, {model.E_theta.max():.4f}]")
+
+    # Sparsity info
+    active_info = get_active_programs(model)
+    if active_info:
+        print(f"\nSparsity (threshold=0.5):")
+        if 'beta' in active_info:
+            print(f"  Beta: {active_info['beta']['sparsity']*100:.1f}% sparse")
+            print(f"    Active: {active_info['beta']['n_active']}/{active_info['beta']['n_total']}")
+        if 'v' in active_info:
+            print(f"  V: {active_info['v']['sparsity']*100:.1f}% sparse")
+            print(f"    Active: {active_info['v']['n_active']}/{active_info['v']['n_total']}")
+
+    # Training info
+    if hasattr(model, 'elbo_history_') and model.elbo_history_:
+        print(f"\nTraining:")
+        print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
+        print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
+        if hasattr(model, 'training_time_'):
+            print(f"  Time: {model.training_time_:.2f}s")
+
+    # Top genes per program
+    if gene_list is not None:
+        top_genes = get_top_genes_per_program(model, gene_list, n_top=5)
+        most_influential = np.argmax(np.abs(model.E_v[0])) if hasattr(model, 'E_v') else 0
+        print(f"\nTop 5 genes in most influential program (GP{most_influential + 1}):")
+        for gene, loading in top_genes[f'GP{most_influential + 1}']:
+            print(f"    {gene}: {loading:.4f}")
+
+    print("=" * 60)
+
+
+# =============================================================================
+# Protein Coding Filter (generic version)
+# =============================================================================
+
+def filter_protein_coding_genes(
+    gene_list: List[str],
+    gene_annotation: pd.DataFrame,
+    gene_id_col: str = 'GeneID',
+    type_col: str = 'Genetype'
+) -> List[str]:
+    """
+    Filter gene list to keep only protein-coding genes.
+
+    Parameters
+    ----------
+    gene_list : list of str
+        List of gene IDs to filter.
+    gene_annotation : pd.DataFrame
+        Gene annotation DataFrame.
+    gene_id_col : str, default='GeneID'
+        Column name for gene IDs.
+    type_col : str, default='Genetype'
+        Column name for gene type.
+
+    Returns
+    -------
+    list of str
+        Filtered list of protein-coding genes.
+    """
+    protein_coding = gene_annotation[
+        gene_annotation[type_col] == 'protein_coding'
+    ][gene_id_col].tolist()
+
+    filtered = [g for g in gene_list if g in protein_coding]
+    print(f"Filtered to {len(filtered)}/{len(gene_list)} protein-coding genes")
+    return filtered

@@ -1,3 +1,14 @@
+"""
+BRAY LAB SPECIFIC: AJM Antigen Presentation Dataset Pipeline
+==============================================================
+
+This module is specific to Bray Lab's AJM dataset analysis.
+For generic VI usage, see: data_loader.py, cli.py, quick_reference.py
+
+This module prepares the AJM dataset for antigen presentation (AP) analysis
+using variational inference with seed gene-based scoring.
+"""
+
 import pickle
 import numpy as np
 import pandas as pd
