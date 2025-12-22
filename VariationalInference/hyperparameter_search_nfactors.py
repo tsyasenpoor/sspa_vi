@@ -6,10 +6,20 @@ which controls the number of latent gene programs in the VI model.
 
 Strategy:
 - Random sampling in log-space for better coverage
-- Early stopping within each trial to save time
+- Early stopping within each trial to save time (50 max iters vs 200 for full training)
+- Different random seeds per trial for exploration of initialization space
 - Checkpointing to resume interrupted searches
 - Lightweight validation metrics (AUC only)
 - Parallel-friendly design (run multiple instances)
+
+Speed optimizations for hyperparameter search:
+- Reduced max iterations (50 vs 200) - we only need relative ranking, not perfect convergence
+- Reduced min iterations (15 vs 50) - faster early stopping
+- Tighter patience (3 vs 5) - quit non-promising configs sooner
+- More frequent ELBO checks (every 5 vs 10 iters) - catch early stopping earlier
+- Each trial uses different random seed for diverse initializations
+
+Expected speedup: ~3-5x faster per trial compared to full training
 """
 
 import json
@@ -53,8 +63,8 @@ def evaluate_n_factors(
     X_train, y_train, X_aux_train,
     X_val, y_val, X_aux_val,
     trial_id,
-    max_training_iter=150,
-    early_stop_patience=5
+    max_training_iter=50,  # Reduced for faster hyperparameter search
+    early_stop_patience=3   # Reduced patience for faster trials
 ):
     """
     Train model with specific n_factors and evaluate on validation set.
@@ -69,6 +79,8 @@ def evaluate_n_factors(
     print(f"{'='*80}")
     
     # Fixed hyperparameters (you can adjust these based on your previous best config)
+    # NOTE: Each trial uses a different random_state to explore different initialization points
+    # This helps ensure we're not just finding a local optimum for one initialization
     model = VI(
         n_factors=n_factors,
         alpha_theta=0.5,
@@ -77,7 +89,7 @@ def evaluate_n_factors(
         lambda_xi=2.0,
         sigma_v=2.0,
         sigma_gamma=1.0,
-        random_state=42 + trial_id  # Different seed per trial
+        random_state=42 + trial_id  # Different seed per trial for diverse exploration
     )
     
     # Train with early stopping
@@ -89,8 +101,8 @@ def evaluate_n_factors(
             max_iter=max_training_iter,
             tol=10.0,
             rel_tol=2e-4,
-            elbo_freq=10,
-            min_iter=30,  # Reduced for faster trials
+            elbo_freq=5,     # Check more frequently for early stopping
+            min_iter=15,     # Reduced minimum iterations for faster trials
             patience=early_stop_patience,
             verbose=False,  # Reduce output during search
             theta_damping=0.8,
@@ -117,7 +129,7 @@ def evaluate_n_factors(
     
     # Evaluate on validation set
     try:
-        y_val_proba = model.predict_proba(X_val, X_aux_val, max_iter=100, verbose=False)
+        y_val_proba = model.predict_proba(X_val, X_aux_val, max_iter=50, verbose=False)  # Reduced from 100
         val_auc = roc_auc_score(y_val, y_val_proba.ravel())
         
     except Exception as e:
