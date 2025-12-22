@@ -214,6 +214,7 @@ class DataLoader:
         Filter to keep only protein-coding genes.
 
         Requires gene_annotation_path to be set.
+        Uses the gene annotation file structure with 'Genename', 'GeneID', and 'Genetype' columns.
 
         Returns
         -------
@@ -227,17 +228,32 @@ class DataLoader:
         if self.raw_df is None:
             raise ValueError("Must load expression data first")
 
-        self._log("Filtering for protein-coding genes...")
+        self._log(f"Loading gene annotation from {self.gene_annotation_path}...")
         gene_annotation = pd.read_csv(self.gene_annotation_path)
-
+        
+        # Set Genename as index if it exists
+        if 'Genename' in gene_annotation.columns:
+            gene_annotation = gene_annotation.set_index('Genename')
+        
+        self._log(f"Loaded annotation for {len(gene_annotation)} genes")
+        
+        # Convert annotation gene names to Ensembl IDs if needed
+        gene_names = gene_annotation.index.tolist()
+        converter = self._get_gene_converter()
+        gene_annotation_ensembl_map, _ = converter.symbols_to_ensembl(gene_names, species=self.species)
+        
+        self._log("Filtering for protein-coding genes...")
+        
         # Handle different possible column names
         gene_id_col = 'GeneID' if 'GeneID' in gene_annotation.columns else 'gene_id'
         type_col = 'Genetype' if 'Genetype' in gene_annotation.columns else 'gene_type'
-
+        
+        # Get protein-coding genes (using Ensembl IDs)
         protein_coding_genes = gene_annotation[
             gene_annotation[type_col] == 'protein_coding'
         ][gene_id_col].tolist()
 
+        # Find common genes between data and protein-coding annotation
         common_genes = self.raw_df.columns.intersection(protein_coding_genes)
         n_before = self.raw_df.shape[1]
         self.raw_df = self.raw_df[common_genes]
