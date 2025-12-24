@@ -249,16 +249,41 @@ class DataLoader:
         type_col = 'Genetype' if 'Genetype' in gene_annotation.columns else 'gene_type'
         
         # Get protein-coding genes (using Ensembl IDs)
-        protein_coding_genes = gene_annotation[
+        protein_coding_genes = set(gene_annotation[
             gene_annotation[type_col] == 'protein_coding'
-        ][gene_id_col].tolist()
+        ][gene_id_col].tolist())
 
-        # Find common genes between data and protein-coding annotation
-        common_genes = self.raw_df.columns.intersection(protein_coding_genes)
-        n_before = self.raw_df.shape[1]
-        self.raw_df = self.raw_df[common_genes]
+        # Get all genes in annotation
+        all_annotation_genes = set(gene_annotation[gene_id_col].tolist())
+        
+        # Find genes in data
+        genes_in_data = set(self.raw_df.columns)
+        n_before = len(genes_in_data)
+        
+        # Find genes not in annotation (these will be removed)
+        genes_not_in_annotation = genes_in_data - all_annotation_genes
+        if genes_not_in_annotation:
+            self._log(f"WARNING: {len(genes_not_in_annotation)} genes in data are not in annotation - removing them")
+            self._log(f"  Examples: {list(genes_not_in_annotation)[:10]}")
+        
+        # Find non-protein-coding genes in data
+        genes_in_annotation = genes_in_data & all_annotation_genes
+        non_protein_coding_in_data = genes_in_annotation - protein_coding_genes
+        if non_protein_coding_in_data:
+            self._log(f"Removing {len(non_protein_coding_in_data)} non-protein-coding genes")
+            # Show some examples with their types
+            examples = list(non_protein_coding_in_data)[:10]
+            for gene_id in examples:
+                gene_type = gene_annotation[gene_annotation[gene_id_col] == gene_id][type_col].iloc[0]
+                self._log(f"  {gene_id}: {gene_type}")
+        
+        # Keep only protein-coding genes
+        protein_coding_in_data = genes_in_data & protein_coding_genes
+        self.raw_df = self.raw_df[list(protein_coding_in_data)]
 
-        self._log(f"Filtered to {len(common_genes)} protein-coding genes (from {n_before})")
+        self._log(f"Filtered to {len(protein_coding_in_data)} protein-coding genes (from {n_before})")
+        self._log(f"  Removed {len(genes_not_in_annotation)} genes not in annotation")
+        self._log(f"  Removed {len(non_protein_coding_in_data)} non-protein-coding genes")
         return self.raw_df
 
     def filter_zero_genes(self) -> pd.DataFrame:
