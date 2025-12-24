@@ -251,10 +251,12 @@ class DataLoader:
 
         self._log("Filtering for protein-coding genes...")
         type_col = 'Genetype' if 'Genetype' in gene_annotation.columns else 'gene_type'
-        protein_coding_genes = set(gene_annotation[
-            gene_annotation[type_col] == 'protein_coding'
-        ][geneid_col].tolist())
-        all_annotation_genes = set(gene_annotation[geneid_col].tolist())
+
+        # Use the converted index (which matches the data gene format) instead of the GeneID column
+        # This ensures both data and annotation genes are in the same format (e.g., human Ensembl IDs)
+        protein_coding_mask = gene_annotation[type_col] == 'protein_coding'
+        protein_coding_genes = set(gene_annotation[protein_coding_mask].index.tolist())
+        all_annotation_genes = set(gene_annotation.index.tolist())
         genes_in_data = set(self.raw_df.columns)
         n_before = len(genes_in_data)
         genes_not_in_annotation = genes_in_data - all_annotation_genes
@@ -267,8 +269,9 @@ class DataLoader:
             self._log(f"Removing {len(non_protein_coding_in_data)} non-protein-coding genes")
             examples = list(non_protein_coding_in_data)[:10]
             for gene_id in examples:
-                gene_type = gene_annotation[gene_annotation[geneid_col] == gene_id][type_col].iloc[0]
-                self._log(f"  {gene_id}: {gene_type}")
+                if gene_id in gene_annotation.index:
+                    gene_type = gene_annotation.loc[gene_id, type_col]
+                    self._log(f"  {gene_id}: {gene_type}")
         protein_coding_in_data = genes_in_data & protein_coding_genes
         self.raw_df = self.raw_df[list(protein_coding_in_data)]
         self._log(f"Filtered to {len(protein_coding_in_data)} protein-coding genes (from {n_before})")
