@@ -237,50 +237,40 @@ class DataLoader:
         
         self._log(f"Loaded annotation for {len(gene_annotation)} genes")
         
-        # Convert annotation gene names to Ensembl IDs if needed
+        # Convert annotation gene names to Ensembl IDs if needed (index)
         gene_names = gene_annotation.index.tolist()
         converter = self._get_gene_converter()
         gene_annotation_ensembl_map, _ = converter.symbols_to_ensembl(gene_names, species=self.species)
-        
+        gene_annotation.index = [gene_annotation_ensembl_map.get(g, g) for g in gene_annotation.index]
+
+        # Also convert the 'GeneID' column to Ensembl IDs if it exists
+        geneid_col = 'GeneID' if 'GeneID' in gene_annotation.columns else 'gene_id'
+        if geneid_col in gene_annotation.columns:
+            geneid_ensembl_map, _ = converter.symbols_to_ensembl(gene_annotation[geneid_col].tolist(), species=self.species)
+            gene_annotation[geneid_col] = [geneid_ensembl_map.get(g, g) for g in gene_annotation[geneid_col]]
+
         self._log("Filtering for protein-coding genes...")
-        
-        # Handle different possible column names
-        gene_id_col = 'GeneID' if 'GeneID' in gene_annotation.columns else 'gene_id'
         type_col = 'Genetype' if 'Genetype' in gene_annotation.columns else 'gene_type'
-        
-        # Get protein-coding genes (using Ensembl IDs)
         protein_coding_genes = set(gene_annotation[
             gene_annotation[type_col] == 'protein_coding'
-        ][gene_id_col].tolist())
-
-        # Get all genes in annotation
-        all_annotation_genes = set(gene_annotation[gene_id_col].tolist())
-        
-        # Find genes in data
+        ][geneid_col].tolist())
+        all_annotation_genes = set(gene_annotation[geneid_col].tolist())
         genes_in_data = set(self.raw_df.columns)
         n_before = len(genes_in_data)
-        
-        # Find genes not in annotation (these will be removed)
         genes_not_in_annotation = genes_in_data - all_annotation_genes
         if genes_not_in_annotation:
             self._log(f"WARNING: {len(genes_not_in_annotation)} genes in data are not in annotation - removing them")
             self._log(f"  Examples: {list(genes_not_in_annotation)[:10]}")
-        
-        # Find non-protein-coding genes in data
         genes_in_annotation = genes_in_data & all_annotation_genes
         non_protein_coding_in_data = genes_in_annotation - protein_coding_genes
         if non_protein_coding_in_data:
             self._log(f"Removing {len(non_protein_coding_in_data)} non-protein-coding genes")
-            # Show some examples with their types
             examples = list(non_protein_coding_in_data)[:10]
             for gene_id in examples:
-                gene_type = gene_annotation[gene_annotation[gene_id_col] == gene_id][type_col].iloc[0]
+                gene_type = gene_annotation[gene_annotation[geneid_col] == gene_id][type_col].iloc[0]
                 self._log(f"  {gene_id}: {gene_type}")
-        
-        # Keep only protein-coding genes
         protein_coding_in_data = genes_in_data & protein_coding_genes
         self.raw_df = self.raw_df[list(protein_coding_in_data)]
-
         self._log(f"Filtered to {len(protein_coding_in_data)} protein-coding genes (from {n_before})")
         self._log(f"  Removed {len(genes_not_in_annotation)} genes not in annotation")
         self._log(f"  Removed {len(non_protein_coding_in_data)} non-protein-coding genes")
