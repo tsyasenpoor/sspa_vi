@@ -435,6 +435,24 @@ class SVI:
 
         return a_beta_hat, b_beta_hat
 
+    def _compute_intermediate_beta_from_suffstats(self, z_sum_over_samples: np.ndarray,
+                                                   E_theta, scale_factor: float):
+        """
+        Memory-efficient version using precomputed sufficient statistics.
+
+        Parameters:
+        -----------
+        z_sum_over_samples : ndarray, shape (p, d)
+            sum_i z_ijl - precomputed sufficient statistic
+        """
+        a_beta_hat = self.alpha_beta + scale_factor * z_sum_over_samples
+        b_beta_hat = self.E_eta[:, np.newaxis] + scale_factor * np.sum(E_theta, axis=0)[np.newaxis, :]
+
+        b_beta_hat = np.clip(b_beta_hat, 1e-6, 1e6)
+        a_beta_hat = np.clip(a_beta_hat, 1.01, 1e6)
+
+        return a_beta_hat, b_beta_hat
+
     def _compute_intermediate_eta(self, E_theta, scale_factor: float):
         """Compute intermediate eta parameters."""
         a_eta_hat = np.full(self.p, self.alpha_eta + self.d * self.alpha_beta)
@@ -449,6 +467,30 @@ class SVI:
     def _compute_intermediate_rho_beta(self, z: np.ndarray, E_theta, scale_factor: float):
         """Compute intermediate rho_beta (spike-and-slab indicators for beta)."""
         z_sum = scale_factor * np.sum(z, axis=0)
+        theta_sum = scale_factor * np.sum(E_theta, axis=0)
+
+        log_spike_value = np.log(self.spike_value_beta + 1e-10)
+
+        ll_diff = z_sum * (self.E_log_beta_slab - log_spike_value)
+        ll_diff -= theta_sum[np.newaxis, :] * (self.E_beta_slab - self.spike_value_beta)
+
+        log_prior_odds = np.log(self.pi_beta / (1 - self.pi_beta + 1e-10))
+        log_odds = ll_diff + log_prior_odds
+        log_odds = np.clip(log_odds, -20, 20)
+
+        return expit(log_odds)
+
+    def _compute_intermediate_rho_beta_from_suffstats(self, z_sum_over_samples: np.ndarray,
+                                                       E_theta, scale_factor: float):
+        """
+        Memory-efficient version using precomputed sufficient statistics.
+
+        Parameters:
+        -----------
+        z_sum_over_samples : ndarray, shape (p, d)
+            sum_i z_ijl - precomputed sufficient statistic
+        """
+        z_sum = scale_factor * z_sum_over_samples
         theta_sum = scale_factor * np.sum(E_theta, axis=0)
 
         log_spike_value = np.log(self.spike_value_beta + 1e-10)
@@ -597,126 +639,115 @@ class SVI:
     def _compute_elbo_batch(self, X_batch: np.ndarray, y_batch: np.ndarray,
                             X_aux_batch: np.ndarray, E_theta, E_log_theta,
                             a_theta, b_theta, E_xi, E_log_xi, a_xi, b_xi,
-                            zeta, scale_factor: float) -> float:
+                            zeta, scale_factor: float, gene_chunk: int = 2000) -> float:
         """
         Compute ELBO contribution from a mini-batch (scaled to full dataset).
+        Memory-efficient version that processes genes in chunks.
         """
-        z = self._allocate_counts(X_batch, E_log_theta, self.E_log_beta)
         batch_size = X_batch.shape[0]
         elbo = 0.0
 
-        # E[log p(z | θ, β)] - scaled
+        # E[log p(z | θ, β)] - scaled (memory-efficient chunked computation)
         elbo_z = 0.0
-        for i in range(batch_size):
-            for j in range(self.p):
-                for ell in range(self.d):
-                    if z[i, j, ell] > 1e-10:
-                        elbo_z += z[i, j, ell] * (E_log_theta[i, ell] + self.E_log_beta[j, ell])
-                        elbo_z -= E_theta[i, ell] * self.E_beta[j, ell]
-                        elbo_z -= gammaln(z[i, j, ell] + 1)
+        for g_start in range(0, self.p, gene_chunk):
+            g_end = min(g_start + gene_chunk, self.p)
+            E_log_beta_chunk = self.E_log_beta[g_start:g_end]  # (g_chunk, d)
+            E_beta_chunk = self.E_beta[g_start:g_end]  # (g_chunk, d)
+            X_chunk = X_batch[:, g_start:g_end]  # (batch, g_chunk)
+
+            # Compute phi for this gene chunk
+            log_phi = E_log_theta[:, np.newaxis, :] + E_log_beta_chunk[np.newaxis, :, :]
+            log_phi_max = log_phi.max(axis=2, keepdims=True)
+            phi = np.exp(log_phi - log_phi_max)
+            phi = phi / phi.sum(axis=2, keepdims=True)
+
+            # z = x * phi
+            z_chunk = X_chunk[:, :, np.newaxis] * phi  # (batch, g_chunk, d)
+
+            # ELBO contribution from this chunk (vectorized)
+            # sum_ijl z_ijl * (E_log_theta_il + E_log_beta_jl)
+            elbo_z += np.sum(z_chunk * (E_log_theta[:, np.newaxis, :] + E_log_beta_chunk[np.newaxis, :, :]))
+            # - sum_ijl E_theta_il * E_beta_jl (can be computed without z)
+            elbo_z -= np.sum(E_theta[:, np.newaxis, :] * E_beta_chunk[np.newaxis, :, :])
+            # - sum_ijl gammaln(z_ijl + 1)
+            elbo_z -= np.sum(gammaln(z_chunk + 1))
+
+            del log_phi, phi, z_chunk  # Free memory
+
         elbo += scale_factor * elbo_z
 
-        # E[log p(y | θ, v, γ)] - scaled
+        # E[log p(y | θ, v, γ)] - scaled (vectorized)
         elbo_y = 0.0
         for k in range(self.kappa):
             y_k = y_batch[:, k] if y_batch.ndim > 1 else y_batch
             lam = self._lambda_jj(zeta[:, k])
 
-            for i in range(batch_size):
-                E_A = E_theta[i] @ self.E_v[k] + X_aux_batch[i] @ self.E_gamma[k]
-                E_A_sq = E_A**2
-                E_A_sq += np.sum((self.mu_v[k]**2 + np.diag(self.Sigma_v[k])) *
-                                (a_theta[i] / b_theta[i]**2))
-                elbo_y += (y_k[i] - 0.5) * E_A - lam[i] * E_A_sq
+            E_A = E_theta @ self.E_v[k] + X_aux_batch @ self.E_gamma[k]
+            E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
+            Var_theta = a_theta / (b_theta**2)
+            E_A_sq = E_A**2 + np.sum(Var_theta * E_v_sq[np.newaxis, :], axis=1)
+
+            elbo_y += np.sum((y_k - 0.5) * E_A - lam * E_A_sq)
         elbo += scale_factor * elbo_y
 
-        # E[log p(θ | ξ)] + E[log p(ξ)] - scaled
-        elbo_theta_xi = 0.0
-        for i in range(batch_size):
-            elbo_theta_xi += (self.alpha_xi - 1) * E_log_xi[i]
-            elbo_theta_xi -= self.lambda_xi * E_xi[i]
-            elbo_theta_xi += self.alpha_xi * np.log(self.lambda_xi) - gammaln(self.alpha_xi)
+        # E[log p(θ | ξ)] + E[log p(ξ)] - scaled (vectorized)
+        elbo_theta_xi = np.sum((self.alpha_xi - 1) * E_log_xi)
+        elbo_theta_xi -= self.lambda_xi * np.sum(E_xi)
+        elbo_theta_xi += batch_size * (self.alpha_xi * np.log(self.lambda_xi) - gammaln(self.alpha_xi))
 
-            for ell in range(self.d):
-                elbo_theta_xi += (self.alpha_theta - 1) * E_log_theta[i, ell]
-                elbo_theta_xi += self.alpha_theta * E_log_xi[i]
-                elbo_theta_xi -= E_xi[i] * E_theta[i, ell]
-                elbo_theta_xi -= gammaln(self.alpha_theta)
+        elbo_theta_xi += np.sum((self.alpha_theta - 1) * E_log_theta)
+        elbo_theta_xi += self.alpha_theta * self.d * np.sum(E_log_xi)
+        elbo_theta_xi -= np.sum(E_xi[:, np.newaxis] * E_theta)
+        elbo_theta_xi -= batch_size * self.d * gammaln(self.alpha_theta)
         elbo += scale_factor * elbo_theta_xi
 
-        # Local entropy (scaled)
-        entropy_theta = 0.0
-        for i in range(batch_size):
-            for ell in range(self.d):
-                entropy_theta += a_theta[i, ell] - np.log(b_theta[i, ell])
-                entropy_theta += gammaln(a_theta[i, ell])
-                entropy_theta += (1 - a_theta[i, ell]) * digamma(a_theta[i, ell])
+        # Local entropy (scaled, vectorized)
+        entropy_theta = np.sum(a_theta - np.log(b_theta) + gammaln(a_theta) +
+                               (1 - a_theta) * digamma(a_theta))
         elbo += scale_factor * entropy_theta
 
-        entropy_xi = 0.0
-        for i in range(batch_size):
-            entropy_xi += a_xi[i] - np.log(b_xi[i])
-            entropy_xi += gammaln(a_xi[i])
-            entropy_xi += (1 - a_xi[i]) * digamma(a_xi[i])
+        entropy_xi = np.sum(a_xi - np.log(b_xi) + gammaln(a_xi) +
+                            (1 - a_xi) * digamma(a_xi))
         elbo += scale_factor * entropy_xi
 
-        # Global terms (not scaled - computed once)
+        # Global terms (not scaled - computed once, vectorized)
         # E[log p(β | η)] + E[log p(η)]
-        elbo_beta_eta = 0.0
-        for j in range(self.p):
-            elbo_beta_eta += (self.alpha_eta - 1) * self.E_log_eta[j]
-            elbo_beta_eta -= self.lambda_eta * self.E_eta[j]
-            elbo_beta_eta += self.alpha_eta * np.log(self.lambda_eta) - gammaln(self.alpha_eta)
+        elbo_beta_eta = np.sum((self.alpha_eta - 1) * self.E_log_eta)
+        elbo_beta_eta -= self.lambda_eta * np.sum(self.E_eta)
+        elbo_beta_eta += self.p * (self.alpha_eta * np.log(self.lambda_eta) - gammaln(self.alpha_eta))
 
-            for ell in range(self.d):
-                slab_contrib = (self.alpha_beta - 1) * self.E_log_beta_slab[j, ell]
-                slab_contrib += self.alpha_beta * self.E_log_eta[j]
-                slab_contrib -= self.E_eta[j] * self.E_beta_slab[j, ell]
-                slab_contrib -= gammaln(self.alpha_beta)
-                elbo_beta_eta += self.rho_beta[j, ell] * slab_contrib
+        slab_contrib = ((self.alpha_beta - 1) * self.E_log_beta_slab +
+                        self.alpha_beta * self.E_log_eta[:, np.newaxis] -
+                        self.E_eta[:, np.newaxis] * self.E_beta_slab - gammaln(self.alpha_beta))
+        elbo_beta_eta += np.sum(self.rho_beta * slab_contrib)
 
-                if self.rho_beta[j, ell] > 1e-10:
-                    elbo_beta_eta += self.rho_beta[j, ell] * np.log(self.pi_beta + 1e-10)
-                if (1 - self.rho_beta[j, ell]) > 1e-10:
-                    elbo_beta_eta += (1 - self.rho_beta[j, ell]) * np.log(1 - self.pi_beta + 1e-10)
+        # Spike-and-slab prior terms
+        rho_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
+        elbo_beta_eta += np.sum(self.rho_beta * np.log(self.pi_beta + 1e-10))
+        elbo_beta_eta += np.sum((1 - self.rho_beta) * np.log(1 - self.pi_beta + 1e-10))
         elbo += elbo_beta_eta
 
-        # E[log p(v)] + E[log p(γ)]
+        # E[log p(v)] + E[log p(γ)] (vectorized)
         elbo_v_gamma = 0.0
+        E_v_sq = self.mu_v**2 + np.diagonal(self.Sigma_v, axis1=1, axis2=2)
+        slab_contrib_v = -0.5 * np.log(2 * np.pi * self.sigma_v**2) - 0.5 * E_v_sq / self.sigma_v**2
+        spike_contrib_v = -0.5 * np.log(2 * np.pi * self.spike_variance_v) - 0.5 * E_v_sq / self.spike_variance_v
+        elbo_v_gamma += np.sum(self.rho_v * slab_contrib_v + (1 - self.rho_v) * spike_contrib_v)
+        elbo_v_gamma += np.sum(self.rho_v * np.log(self.pi_v + 1e-10))
+        elbo_v_gamma += np.sum((1 - self.rho_v) * np.log(1 - self.pi_v + 1e-10))
+
         for k in range(self.kappa):
-            for ell in range(self.d):
-                slab_contrib = -0.5 * np.log(2 * np.pi * self.sigma_v**2)
-                slab_contrib -= 0.5 * (self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]) / self.sigma_v**2
-
-                spike_contrib = -0.5 * np.log(2 * np.pi * self.spike_variance_v)
-                spike_contrib -= 0.5 * (self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]) / self.spike_variance_v
-
-                elbo_v_gamma += self.rho_v[k, ell] * slab_contrib
-                elbo_v_gamma += (1 - self.rho_v[k, ell]) * spike_contrib
-
-                if self.rho_v[k, ell] > 1e-10:
-                    elbo_v_gamma += self.rho_v[k, ell] * np.log(self.pi_v + 1e-10)
-                if (1 - self.rho_v[k, ell]) > 1e-10:
-                    elbo_v_gamma += (1 - self.rho_v[k, ell]) * np.log(1 - self.pi_v + 1e-10)
-
             elbo_v_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
             elbo_v_gamma -= 0.5 * (np.sum(self.mu_gamma[k]**2) + np.trace(self.Sigma_gamma[k])) / self.sigma_gamma**2
         elbo += elbo_v_gamma
 
-        # Global entropy terms
-        entropy_beta = 0.0
-        for j in range(self.p):
-            for ell in range(self.d):
-                entropy_beta += self.a_beta[j, ell] - np.log(self.b_beta[j, ell])
-                entropy_beta += gammaln(self.a_beta[j, ell])
-                entropy_beta += (1 - self.a_beta[j, ell]) * digamma(self.a_beta[j, ell])
+        # Global entropy terms (vectorized)
+        entropy_beta = np.sum(self.a_beta - np.log(self.b_beta) + gammaln(self.a_beta) +
+                              (1 - self.a_beta) * digamma(self.a_beta))
         elbo += entropy_beta
 
-        entropy_eta = 0.0
-        for j in range(self.p):
-            entropy_eta += self.a_eta[j] - np.log(self.b_eta[j])
-            entropy_eta += gammaln(self.a_eta[j])
-            entropy_eta += (1 - self.a_eta[j]) * digamma(self.a_eta[j])
+        entropy_eta = np.sum(self.a_eta - np.log(self.b_eta) + gammaln(self.a_eta) +
+                             (1 - self.a_eta) * digamma(self.a_eta))
         elbo += entropy_eta
 
         entropy_v = 0.0
@@ -733,21 +764,15 @@ class SVI:
                 entropy_gamma += 0.5 * (self.p_aux * (1 + np.log(2 * np.pi)) + logdet)
         elbo += entropy_gamma
 
-        # Spike-and-slab entropy
-        entropy_s_beta = 0.0
-        for j in range(self.p):
-            for ell in range(self.d):
-                rho = self.rho_beta[j, ell]
-                if rho > 1e-10 and rho < 1 - 1e-10:
-                    entropy_s_beta -= rho * np.log(rho) + (1 - rho) * np.log(1 - rho)
+        # Spike-and-slab entropy (vectorized)
+        rho_beta_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
+        entropy_s_beta = -np.sum(rho_beta_safe * np.log(rho_beta_safe) +
+                                  (1 - rho_beta_safe) * np.log(1 - rho_beta_safe))
         elbo += entropy_s_beta
 
-        entropy_s_v = 0.0
-        for k in range(self.kappa):
-            for ell in range(self.d):
-                rho = self.rho_v[k, ell]
-                if rho > 1e-10 and rho < 1 - 1e-10:
-                    entropy_s_v -= rho * np.log(rho) + (1 - rho) * np.log(1 - rho)
+        rho_v_safe = np.clip(self.rho_v, 1e-10, 1 - 1e-10)
+        entropy_s_v = -np.sum(rho_v_safe * np.log(rho_v_safe) +
+                               (1 - rho_v_safe) * np.log(1 - rho_v_safe))
         elbo += entropy_s_v
 
         return elbo if np.isfinite(elbo) else -np.inf
@@ -850,18 +875,20 @@ class SVI:
                     X_batch, actual_batch_size
                 )
 
-                # Optimize local parameters
+                # Optimize local parameters (memory-efficient: no full z array)
                 for local_iter in range(self.local_iterations):
                     E_theta, E_log_theta, E_xi, E_log_xi = self._compute_local_expectations(
                         a_theta, b_theta, a_xi, b_xi
                     )
 
-                    # Allocate counts
-                    z = self._allocate_counts(X_batch, E_log_theta, self.E_log_beta)
+                    # Compute z sufficient statistics without full array allocation
+                    z_sum_genes, _ = self._compute_z_suffstats_batch(
+                        X_batch, E_log_theta, self.E_log_beta
+                    )
 
-                    # Update local parameters
-                    a_theta, b_theta = self._update_local_theta(
-                        z, y_batch, X_aux_batch, a_theta, b_theta, E_theta, E_xi, zeta
+                    # Update local parameters using sufficient statistics
+                    a_theta, b_theta = self._update_local_theta_from_suffstats(
+                        z_sum_genes, y_batch, X_aux_batch, a_theta, b_theta, E_theta, E_xi, zeta
                     )
                     a_xi, b_xi = self._update_local_xi(E_theta, actual_batch_size)
                     zeta = self._update_local_zeta(E_theta, X_aux_batch, zeta)
@@ -870,12 +897,22 @@ class SVI:
                         a_theta, b_theta, a_xi, b_xi
                     )
 
-                # Compute intermediate global parameters
-                z = self._allocate_counts(X_batch, E_log_theta, self.E_log_beta)
+                    del z_sum_genes  # Free memory
 
-                a_beta_hat, b_beta_hat = self._compute_intermediate_beta(z, E_theta, actual_scale)
+                # Compute intermediate global parameters (memory-efficient)
+                z_sum_genes, z_sum_samples = self._compute_z_suffstats_batch(
+                    X_batch, E_log_theta, self.E_log_beta
+                )
+
+                a_beta_hat, b_beta_hat = self._compute_intermediate_beta_from_suffstats(
+                    z_sum_samples, E_theta, actual_scale
+                )
                 a_eta_hat, b_eta_hat = self._compute_intermediate_eta(E_theta, actual_scale)
-                rho_beta_hat = self._compute_intermediate_rho_beta(z, E_theta, actual_scale)
+                rho_beta_hat = self._compute_intermediate_rho_beta_from_suffstats(
+                    z_sum_samples, E_theta, actual_scale
+                )
+
+                del z_sum_genes, z_sum_samples  # Free memory
 
                 mu_v_hat, Sigma_v_hat = self._compute_intermediate_v(
                     y_batch, X_aux_batch, E_theta, a_theta, b_theta, zeta, actual_scale
