@@ -282,6 +282,47 @@ class SVI:
         z = X_batch[:, :, np.newaxis] * phi
         return z
 
+    def _compute_z_suffstats_batch(self, X_batch: np.ndarray, E_log_theta, E_log_beta,
+                                    gene_chunk: int = 2000):
+        """
+        Compute sufficient statistics from z WITHOUT materializing full array.
+        Processes genes in chunks to limit memory.
+
+        Returns:
+        --------
+        z_sum_over_genes : ndarray, shape (batch_size, d)
+            sum_j z_ijl for theta updates
+        z_sum_over_samples : ndarray, shape (p, d)
+            sum_i z_ijl for beta updates
+        """
+        batch_size = X_batch.shape[0]
+        p = E_log_beta.shape[0]
+
+        z_sum_over_genes = np.zeros((batch_size, self.d), dtype=np.float64)
+        z_sum_over_samples = np.zeros((p, self.d), dtype=np.float64)
+
+        for g_start in range(0, p, gene_chunk):
+            g_end = min(g_start + gene_chunk, p)
+            E_log_beta_chunk = E_log_beta[g_start:g_end]  # (g_chunk, d)
+            X_chunk = X_batch[:, g_start:g_end]  # (batch, g_chunk)
+
+            # Compute phi for this gene chunk
+            log_phi = E_log_theta[:, np.newaxis, :] + E_log_beta_chunk[np.newaxis, :, :]
+            log_phi_max = log_phi.max(axis=2, keepdims=True)
+            phi = np.exp(log_phi - log_phi_max)
+            phi = phi / phi.sum(axis=2, keepdims=True)
+
+            # z = x * phi
+            z_chunk = X_chunk[:, :, np.newaxis] * phi
+
+            # Accumulate sufficient statistics
+            z_sum_over_genes += z_chunk.sum(axis=1)
+            z_sum_over_samples[g_start:g_end] = z_chunk.sum(axis=0)
+
+            del log_phi, phi, z_chunk
+
+        return z_sum_over_genes, z_sum_over_samples
+
     def _update_local_theta(self, z: np.ndarray, y_batch: np.ndarray, X_aux_batch: np.ndarray,
                            a_theta, b_theta, E_theta, E_xi, zeta):
         """Update local theta parameters for mini-batch."""
@@ -309,6 +350,48 @@ class SVI:
                     -(y_k - 0.5) * self.E_v[k, ell]
                     + 2 * lam * self.E_v[k, ell] * E_C
                     + 2 * lam * E_theta[:, ell] * E_v_sq_ell
+                )
+
+                b_theta_new[:, ell] += self.regression_weight * regression_contrib
+
+        b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
+        a_theta_new = np.clip(a_theta_new, 1.01, 1e6)
+
+        return a_theta_new, b_theta_new
+
+    def _update_local_theta_from_suffstats(self, z_sum_over_genes: np.ndarray,
+                                            y_batch: np.ndarray, X_aux_batch: np.ndarray,
+                                            a_theta, b_theta, E_theta, E_xi, zeta):
+        """
+        Update local theta parameters using sufficient statistics (memory-efficient).
+
+        Parameters:
+        -----------
+        z_sum_over_genes : ndarray, shape (batch_size, d)
+            sum_j z_ijl - precomputed sufficient statistic
+        """
+        # Shape: alpha_theta + sum_j z_ijl
+        a_theta_new = self.alpha_theta + z_sum_over_genes
+
+        # Rate: E[xi_i] + sum_j E[beta_jl] + regression terms
+        b_theta_new = E_xi[:, np.newaxis] + np.sum(self.E_beta, axis=0)[np.newaxis, :]
+
+        # Add regression contribution (vectorized)
+        for k in range(self.kappa):
+            y_k = y_batch[:, k] if y_batch.ndim > 1 else y_batch
+            lam = self._lambda_jj(zeta[:, k])
+
+            E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
+            base_pred = X_aux_batch @ self.E_gamma[k]
+            theta_v_product = E_theta @ self.E_v[k]
+
+            for ell in range(self.d):
+                E_C = theta_v_product - E_theta[:, ell] * self.E_v[k, ell] + base_pred
+
+                regression_contrib = (
+                    -(y_k - 0.5) * self.E_v[k, ell]
+                    + 2 * lam * self.E_v[k, ell] * E_C
+                    + 2 * lam * E_theta[:, ell] * E_v_sq[ell]
                 )
 
                 b_theta_new[:, ell] += self.regression_weight * regression_contrib
@@ -879,8 +962,19 @@ class SVI:
 
         return self
 
-    def _compute_full_theta(self, X: np.ndarray, y: np.ndarray, X_aux: np.ndarray):
-        """Compute theta for all training samples after fitting."""
+    def _compute_full_theta(self, X: np.ndarray, y: np.ndarray, X_aux: np.ndarray,
+                             batch_size: int = 1000, n_iter: int = 10):
+        """
+        Compute theta for all training samples after fitting.
+        Uses batched processing to avoid OOM with large datasets.
+
+        Parameters:
+        -----------
+        batch_size : int
+            Number of samples to process at once (default: 1000)
+        n_iter : int
+            Number of iterations for theta inference (default: 10, reduced from 20)
+        """
         n_samples = X.shape[0]
 
         # Initialize
@@ -896,19 +990,55 @@ class SVI:
         self.b_xi = np.ones(n_samples) * self.lambda_xi
         self.zeta = np.ones((n_samples, self.kappa)) * 0.1
 
-        # Iterate to convergence
-        for _ in range(20):
-            E_theta, E_log_theta, E_xi, E_log_xi = self._compute_local_expectations(
-                self.a_theta, self.b_theta, self.a_xi, self.b_xi
-            )
+        # Iterate to convergence using batched updates
+        for iteration in range(n_iter):
+            # Process in batches to limit memory
+            for start in range(0, n_samples, batch_size):
+                end = min(start + batch_size, n_samples)
 
-            z = self._allocate_counts(X, E_log_theta, self.E_log_beta)
+                # Get batch data
+                X_batch = X[start:end]
+                y_batch = y[start:end] if y.ndim > 1 else y[start:end, np.newaxis]
+                X_aux_batch = X_aux[start:end]
+                a_theta_batch = self.a_theta[start:end]
+                b_theta_batch = self.b_theta[start:end]
+                a_xi_batch = self.a_xi[start:end]
+                b_xi_batch = self.b_xi[start:end]
+                zeta_batch = self.zeta[start:end]
 
-            self.a_theta, self.b_theta = self._update_local_theta(
-                z, y, X_aux, self.a_theta, self.b_theta, E_theta, E_xi, self.zeta
-            )
-            self.a_xi, self.b_xi = self._update_local_xi(E_theta, n_samples)
-            self.zeta = self._update_local_zeta(E_theta, X_aux, self.zeta)
+                # Compute local expectations for batch
+                E_theta_batch = a_theta_batch / b_theta_batch
+                E_log_theta_batch = digamma(a_theta_batch) - np.log(b_theta_batch)
+                E_xi_batch = a_xi_batch / b_xi_batch
+
+                # Compute z sufficient statistics (memory-efficient)
+                z_sum_genes, _ = self._compute_z_suffstats_batch(
+                    X_batch, E_log_theta_batch, self.E_log_beta
+                )
+
+                # Update theta for this batch
+                a_theta_new, b_theta_new = self._update_local_theta_from_suffstats(
+                    z_sum_genes, y_batch, X_aux_batch,
+                    a_theta_batch, b_theta_batch, E_theta_batch, E_xi_batch, zeta_batch
+                )
+
+                # Update xi for this batch
+                E_theta_new = a_theta_new / b_theta_new
+                a_xi_new, b_xi_new = self._update_local_xi(E_theta_new, end - start)
+
+                # Update zeta for this batch
+                zeta_new = self._update_local_zeta(E_theta_new, X_aux_batch, zeta_batch)
+
+                # Store back
+                self.a_theta[start:end] = a_theta_new
+                self.b_theta[start:end] = b_theta_new
+                self.a_xi[start:end] = a_xi_new
+                self.b_xi[start:end] = b_xi_new
+                self.zeta[start:end] = zeta_new
+
+                # Free memory
+                del z_sum_genes, E_theta_batch, E_log_theta_batch, E_xi_batch
+                del a_theta_new, b_theta_new, a_xi_new, b_xi_new, zeta_new
 
         # Store final expectations
         self.E_theta = self.a_theta / self.b_theta
@@ -945,10 +1075,12 @@ class SVI:
         max_iter: int = 50,
         tol: float = 1e-4,
         verbose: bool = False,
-        use_regression: bool = True
+        use_regression: bool = True,
+        batch_size: int = 1000
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Infer theta for new samples using learned global parameters.
+        Uses batched processing to avoid OOM with large datasets.
 
         Same interface as VI.infer_theta for compatibility.
         """
@@ -970,55 +1102,72 @@ class SVI:
         zeta_new = np.ones((n_new, self.kappa)) * 0.5
 
         if verbose:
-            print(f"Inferring theta for {n_new} new samples...")
+            print(f"Inferring theta for {n_new} new samples (batch_size={batch_size})...")
 
         for iteration in range(max_iter):
             a_theta_old = a_theta_new.copy()
 
-            E_theta_new = a_theta_new / b_theta_new
-            E_log_theta_new = digamma(a_theta_new) - np.log(b_theta_new)
+            # Process in batches to avoid OOM
+            for start in range(0, n_new, batch_size):
+                end = min(start + batch_size, n_new)
 
-            log_phi = E_log_theta_new[:, np.newaxis, :] + self.E_log_beta[np.newaxis, :, :]
-            log_phi_normalized = log_phi - logsumexp(log_phi, axis=2, keepdims=True)
-            phi = np.exp(log_phi_normalized)
-            z_new = X[:, :, np.newaxis] * phi
+                # Get batch slices
+                X_batch = X[start:end]
+                X_aux_batch = X_aux[start:end]
+                a_theta_batch = a_theta_new[start:end]
+                b_theta_batch = b_theta_new[start:end]
+                zeta_batch = zeta_new[start:end]
 
-            a_theta_new = self.alpha_theta + np.sum(z_new, axis=1)
+                E_theta_batch = a_theta_batch / b_theta_batch
+                E_log_theta_batch = digamma(a_theta_batch) - np.log(b_theta_batch)
 
-            a_xi_new = np.full(n_new, self.alpha_xi + self.d * self.alpha_theta)
-            b_xi_new = self.lambda_xi + np.sum(E_theta_new, axis=1)
-            b_xi_new = np.clip(b_xi_new, 1e-6, 1e6)
-            E_xi_new = a_xi_new / b_xi_new
+                # Compute z sufficient statistics using chunked processing
+                z_sum_genes, _ = self._compute_z_suffstats_batch(
+                    X_batch, E_log_theta_batch, self.E_log_beta
+                )
 
-            b_theta_new = E_xi_new[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
+                # Update a_theta for this batch
+                a_theta_new[start:end] = self.alpha_theta + z_sum_genes
 
-            if use_regression:
-                for k in range(self.kappa):
-                    E_A = E_theta_new @ self.E_v[k] + X_aux @ self.E_gamma[k]
-                    E_y = expit(E_A)
+                # Update xi
+                a_xi_new[start:end] = self.alpha_xi + self.d * self.alpha_theta
+                b_xi_new[start:end] = self.lambda_xi + np.sum(E_theta_batch, axis=1)
+                b_xi_new[start:end] = np.clip(b_xi_new[start:end], 1e-6, 1e6)
+                E_xi_batch = a_xi_new[start:end] / b_xi_new[start:end]
 
-                    E_A_sq = E_A**2
-                    E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
-                    Var_theta = a_theta_new / (b_theta_new**2)
-                    E_A_sq += (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
-                    zeta_new[:, k] = np.sqrt(np.maximum(E_A_sq, 1e-10))
+                # Update b_theta
+                b_theta_new[start:end] = E_xi_batch[:, np.newaxis] + beta_sum_per_factor[np.newaxis, :]
 
-                    lam = self._lambda_jj(zeta_new[:, k])
+                if use_regression:
+                    for k in range(self.kappa):
+                        E_A = E_theta_batch @ self.E_v[k] + X_aux_batch @ self.E_gamma[k]
+                        E_y = expit(E_A)
 
-                    for ell in range(self.d):
-                        mask = np.ones(self.d, dtype=bool)
-                        mask[ell] = False
-                        E_C = E_theta_new[:, mask] @ self.E_v[k, mask] + X_aux @ self.E_gamma[k]
+                        E_A_sq = E_A**2
+                        E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
+                        Var_theta = a_theta_batch / (b_theta_batch**2)
+                        E_A_sq += (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
+                        zeta_new[start:end, k] = np.sqrt(np.maximum(E_A_sq, 1e-10))
 
-                        E_v_sq_ell = self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]
+                        lam = self._lambda_jj(zeta_new[start:end, k])
 
-                        regression_contrib = (
-                            -(E_y - 0.5) * self.E_v[k, ell]
-                            + 2 * lam * self.E_v[k, ell] * E_C
-                            + 2 * lam * E_theta_new[:, ell] * E_v_sq_ell
-                        )
+                        # Vectorized regression contribution
+                        E_v_sq_all = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
+                        theta_v_product = E_theta_batch @ self.E_v[k]
+                        base_pred = X_aux_batch @ self.E_gamma[k]
 
-                        b_theta_new[:, ell] += self.regression_weight * regression_contrib
+                        for ell in range(self.d):
+                            E_C = theta_v_product - E_theta_batch[:, ell] * self.E_v[k, ell] + base_pred
+
+                            regression_contrib = (
+                                -(E_y - 0.5) * self.E_v[k, ell]
+                                + 2 * lam * self.E_v[k, ell] * E_C
+                                + 2 * lam * E_theta_batch[:, ell] * E_v_sq_all[ell]
+                            )
+
+                            b_theta_new[start:end, ell] += self.regression_weight * regression_contrib
+
+                del z_sum_genes, E_theta_batch, E_log_theta_batch
 
             b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
             a_theta_new = np.clip(a_theta_new, 1.01, 1e6)

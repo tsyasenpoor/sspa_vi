@@ -247,7 +247,8 @@ def save_results(
     splits: Dict[str, List[str]],
     prefix: str = 'vi',
     save_model: bool = True,
-    compress: bool = True
+    compress: bool = True,
+    save_full_model: bool = False
 ) -> Dict[str, Path]:
     """
     Save VI model results to files.
@@ -265,9 +266,12 @@ def save_results(
     prefix : str, default='vi'
         Prefix for output files.
     save_model : bool, default=True
-        Whether to save the full model pickle.
+        Whether to save the model (essential parameters only by default).
     compress : bool, default=True
         Whether to compress CSV files with gzip.
+    save_full_model : bool, default=False
+        If True, save entire model object. If False (default), save only
+        essential parameters to reduce memory during save.
 
     Returns
     -------
@@ -281,13 +285,53 @@ def save_results(
     ext = '.csv.gz' if compress else '.csv'
     compression = 'gzip' if compress else None
 
-    # Save model
+    # Save model - either full or essential parameters only
     if save_model:
-        model_path = output_dir / f'{prefix}_model.pkl'
-        with open(model_path, 'wb') as f:
-            pickle.dump(model, f)
-        saved_files['model'] = model_path
-        print(f"Saved model to {model_path}")
+        if save_full_model:
+            # Full model pickle (can be very large)
+            model_path = output_dir / f'{prefix}_model.pkl'
+            with open(model_path, 'wb') as f:
+                pickle.dump(model, f)
+            saved_files['model'] = model_path
+            print(f"Saved full model to {model_path}")
+        else:
+            # Save only essential parameters (memory-efficient)
+            essential_params = {
+                # Hyperparameters
+                'n_factors': model.d,
+                'alpha_theta': model.alpha_theta,
+                'alpha_beta': model.alpha_beta,
+                'sigma_v': model.sigma_v,
+                'sigma_gamma': model.sigma_gamma,
+                'pi_v': model.pi_v,
+                'pi_beta': model.pi_beta,
+                # Global parameters (needed for inference)
+                'E_beta': model.E_beta,
+                'E_log_beta': model.E_log_beta,
+                'rho_beta': model.rho_beta,
+                # Classification weights
+                'mu_v': model.mu_v,
+                'Sigma_v_diag': np.array([np.diag(model.Sigma_v[k]) for k in range(model.kappa)]),  # Only diagonal
+                'rho_v': model.rho_v,
+                'mu_gamma': model.mu_gamma,
+                'Sigma_gamma': model.Sigma_gamma,
+                # Dimensions
+                'n': model.n,
+                'p': model.p,
+                'kappa': model.kappa,
+                'p_aux': model.p_aux,
+            }
+
+            # Optional: include training history
+            if hasattr(model, 'elbo_history_'):
+                essential_params['elbo_history'] = model.elbo_history_
+            if hasattr(model, 'training_time_'):
+                essential_params['training_time'] = model.training_time_
+
+            model_path = output_dir / f'{prefix}_model_params.npz'
+            np.savez_compressed(model_path, **essential_params)
+            saved_files['model_params'] = model_path
+            print(f"Saved essential model parameters to {model_path}")
 
     # Save gene programs (beta matrix)
     beta_df = pd.DataFrame(
