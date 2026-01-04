@@ -297,6 +297,24 @@ def create_parser() -> argparse.ArgumentParser:
         help='Print detailed debug information'
     )
     train_parser.add_argument(
+        '--profile',
+        action='store_true',
+        help='Enable cProfile profiling to measure function execution times and find bottlenecks'
+    )
+    train_parser.add_argument(
+        '--profile-sort',
+        type=str,
+        default='cumulative',
+        choices=['cumulative', 'tottime', 'calls', 'ncalls', 'filename'],
+        help='Sort order for profile output (cumulative=time including subcalls, tottime=time excluding subcalls)'
+    )
+    train_parser.add_argument(
+        '--profile-lines',
+        type=int,
+        default=50,
+        help='Number of lines to show in profile summary'
+    )
+    train_parser.add_argument(
         '--cache-dir',
         type=str,
         default=None,
@@ -362,11 +380,21 @@ def create_parser() -> argparse.ArgumentParser:
 
 def cmd_train(args: argparse.Namespace) -> int:
     """Execute the train command."""
+    import cProfile
+    import pstats
+    import io
     from .vi import VI
     from .svi import SVI
     from .data_loader import DataLoader
     from .config import VIConfig, SVIConfig
     from .utils import save_results, compute_metrics, print_model_summary
+
+    # Initialize profiler if requested
+    profiler = None
+    if args.profile:
+        profiler = cProfile.Profile()
+        profiler.enable()
+        print("\n[PROFILER] Profiling enabled - measuring function execution times...")
 
     use_svi = args.method.lower() == 'svi'
     method_name = "STOCHASTIC VARIATIONAL INFERENCE" if use_svi else "VARIATIONAL INFERENCE"
@@ -561,6 +589,64 @@ def cmd_train(args: argparse.Namespace) -> int:
     print("TRAINING COMPLETE")
     print("=" * 60)
     print(f"\nResults saved to: {output_dir}")
+
+    # Finalize profiling if enabled
+    if profiler is not None:
+        profiler.disable()
+
+        # Save raw profile data for external analysis (e.g., snakeviz, pstats)
+        profile_path = output_dir / f'{args.prefix}_profile.prof'
+        profiler.dump_stats(str(profile_path))
+        print(f"\n[PROFILER] Raw profile data saved to: {profile_path}")
+        print(f"[PROFILER] Analyze with: python -m pstats {profile_path}")
+        print(f"[PROFILER] Or visualize with: snakeviz {profile_path}")
+
+        # Print profile summary to console
+        print("\n" + "=" * 60)
+        print(f"PROFILE SUMMARY (sorted by {args.profile_sort}, top {args.profile_lines} functions)")
+        print("=" * 60)
+
+        # Create stats object and print to string buffer
+        stream = io.StringIO()
+        stats = pstats.Stats(profiler, stream=stream)
+        stats.strip_dirs()
+        stats.sort_stats(args.profile_sort)
+        stats.print_stats(args.profile_lines)
+        print(stream.getvalue())
+
+        # Also save text summary to file
+        profile_txt_path = output_dir / f'{args.prefix}_profile_summary.txt'
+        stream_file = io.StringIO()
+        stats_file = pstats.Stats(profiler, stream=stream_file)
+        stats_file.strip_dirs()
+        stats_file.sort_stats(args.profile_sort)
+        stats_file.print_stats()  # Full output to file
+        with open(profile_txt_path, 'w') as f:
+            f.write(f"Profile Summary (sorted by {args.profile_sort})\n")
+            f.write("=" * 60 + "\n")
+            f.write(stream_file.getvalue())
+        print(f"[PROFILER] Full profile summary saved to: {profile_txt_path}")
+
+        # Print key bottleneck analysis
+        print("\n" + "-" * 60)
+        print("TOP BOTTLENECKS BY CUMULATIVE TIME (time including subcalls):")
+        print("-" * 60)
+        stream_cum = io.StringIO()
+        stats_cum = pstats.Stats(profiler, stream=stream_cum)
+        stats_cum.strip_dirs()
+        stats_cum.sort_stats('cumulative')
+        stats_cum.print_stats(15)
+        print(stream_cum.getvalue())
+
+        print("-" * 60)
+        print("TOP BOTTLENECKS BY TOTAL TIME (time excluding subcalls):")
+        print("-" * 60)
+        stream_tot = io.StringIO()
+        stats_tot = pstats.Stats(profiler, stream=stream_tot)
+        stats_tot.strip_dirs()
+        stats_tot.sort_stats('tottime')
+        stats_tot.print_stats(15)
+        print(stream_tot.getvalue())
 
     return 0
 
