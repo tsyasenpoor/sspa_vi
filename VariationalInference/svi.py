@@ -95,6 +95,9 @@ class SVI:
         Expected classification weights after fitting.
     elbo_history_ : list of tuples
         History of (iteration, ELBO) values during training.
+    epoch_end_elbo_history_ : list of tuples
+        History of (epoch, ELBO) values computed at the END of each epoch.
+        Used for accurate epoch-over-epoch convergence tracking.
     training_time_ : float
         Total training time in seconds.
     """
@@ -837,6 +840,7 @@ class SVI:
         scale_factor = n_samples / batch_size
 
         elbo_history = []
+        epoch_end_elbo_history = []  # Track ELBO at the END of each epoch for proper convergence
         patience_counter = 0
         iteration = 0
 
@@ -951,24 +955,33 @@ class SVI:
 
             epoch_time = time.time() - epoch_start
 
-            # End of epoch: report and check convergence
-            if verbose and len(elbo_history) > 0:
-                _, elbo_curr = elbo_history[-1]
+            # End of epoch: compute epoch-end ELBO for accurate epoch-over-epoch comparison
+            # Use the last batch's local parameters to compute epoch-end ELBO
+            epoch_end_elbo = self._compute_elbo_batch(
+                X_batch, y_batch, X_aux_batch,
+                E_theta, E_log_theta, a_theta, b_theta,
+                E_xi, E_log_xi, a_xi, b_xi, zeta, actual_scale
+            )
+            epoch_end_elbo_history.append((epoch, epoch_end_elbo))
+            elbo_history.append((iteration - 1, epoch_end_elbo))  # Also add to elbo_history for completeness
+
+            # Report epoch progress
+            if verbose:
                 total_time = time.time() - start_time
-                print(f"\nEpoch {epoch + 1}/{max_epochs}, ELBO: {elbo_curr:.2f}, "
+                print(f"\nEpoch {epoch + 1}/{max_epochs}, ELBO: {epoch_end_elbo:.2f}, "
                       f"ρ_t: {rho_t:.4f} (epoch: {epoch_time:.2f}s, total: {total_time:.2f}s)")
 
-                if len(elbo_history) > 1:
-                    _, elbo_prev = elbo_history[-2]
-                    elbo_change = elbo_curr - elbo_prev
+                if len(epoch_end_elbo_history) > 1:
+                    _, prev_epoch_elbo = epoch_end_elbo_history[-2]
+                    elbo_change = epoch_end_elbo - prev_epoch_elbo
                     change_symbol = "↑" if elbo_change > 0 else "↓"
-                    rel_change = abs(elbo_change / (abs(elbo_prev) + 1e-10))
-                    print(f"  ELBO change: {change_symbol} {elbo_change:.2f} (relative: {rel_change:.6f})")
+                    rel_change = abs(elbo_change / (abs(prev_epoch_elbo) + 1e-10))
+                    print(f"  Epoch ELBO change: {change_symbol} {elbo_change:.2f} (relative: {rel_change:.6f})")
 
-            # Check convergence
-            if epoch >= min_epochs and len(elbo_history) > 1:
-                _, elbo_curr = elbo_history[-1]
-                _, elbo_prev = elbo_history[-2]
+            # Check convergence using epoch-end ELBOs for accurate epoch-over-epoch comparison
+            if epoch >= min_epochs and len(epoch_end_elbo_history) > 1:
+                _, elbo_curr = epoch_end_elbo_history[-1]
+                _, elbo_prev = epoch_end_elbo_history[-2]
                 elbo_change = elbo_curr - elbo_prev
                 rel_change = abs(elbo_change / (abs(elbo_prev) + 1e-10))
 
@@ -990,6 +1003,7 @@ class SVI:
         self._compute_full_theta(X, y, X_aux)
 
         self.elbo_history_ = elbo_history
+        self.epoch_end_elbo_history_ = epoch_end_elbo_history  # Epoch-end ELBOs for accurate convergence tracking
         self.training_time_ = time.time() - start_time
 
         if verbose:
