@@ -315,14 +315,13 @@ class SVI:
             phi = np.exp(log_phi - log_phi_max)
             phi = phi / phi.sum(axis=2, keepdims=True)
 
-            # z = x * phi
-            z_chunk = X_chunk[:, :, np.newaxis] * phi
+            # Use einsum to compute sufficient statistics directly without
+            # materializing the full z_chunk array (batch_size x gene_chunk x d)
+            # z_ijl = X_ij * phi_ijl, then sum appropriately
+            z_sum_over_genes += np.einsum('ij,ijd->id', X_chunk, phi)
+            z_sum_over_samples[g_start:g_end] = np.einsum('ij,ijd->jd', X_chunk, phi)
 
-            # Accumulate sufficient statistics
-            z_sum_over_genes += z_chunk.sum(axis=1)
-            z_sum_over_samples[g_start:g_end] = z_chunk.sum(axis=0)
-
-            del log_phi, phi, z_chunk
+            del log_phi, phi
 
         return z_sum_over_genes, z_sum_over_samples
 
@@ -388,16 +387,17 @@ class SVI:
             base_pred = X_aux_batch @ self.E_gamma[k]
             theta_v_product = E_theta @ self.E_v[k]
 
-            for ell in range(self.d):
-                E_C = theta_v_product - E_theta[:, ell] * self.E_v[k, ell] + base_pred
+            # Vectorized over all factors ell (eliminates inner loop)
+            # E_C_ell = theta_v_product - E_theta[:, ell] * E_v[k, ell] + base_pred
+            E_C_all = theta_v_product[:, np.newaxis] - E_theta * self.E_v[k] + base_pred[:, np.newaxis]
 
-                regression_contrib = (
-                    -(y_k - 0.5) * self.E_v[k, ell]
-                    + 2 * lam * self.E_v[k, ell] * E_C
-                    + 2 * lam * E_theta[:, ell] * E_v_sq[ell]
-                )
+            regression_contrib = (
+                -(y_k - 0.5)[:, np.newaxis] * self.E_v[k]
+                + 2 * lam[:, np.newaxis] * self.E_v[k] * E_C_all
+                + 2 * lam[:, np.newaxis] * E_theta * E_v_sq
+            )
 
-                b_theta_new[:, ell] += self.regression_weight * regression_contrib
+            b_theta_new += self.regression_weight * regression_contrib
 
         b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
         a_theta_new = np.clip(a_theta_new, 1.01, 1e6)
@@ -575,31 +575,36 @@ class SVI:
 
             base_pred = X_aux_batch @ self.E_gamma[k]
 
-            for ell in range(self.d):
-                mask = np.ones(self.d, dtype=bool)
-                mask[ell] = False
-                other_contrib = E_theta[:, mask] @ self.E_v[k, mask]
+            # Vectorized over all factors ell (eliminates inner loop)
+            # Compute full contribution once
+            full_contrib = E_theta @ self.E_v[k]  # (batch,)
 
-                E_A_active = E_theta[:, ell] * self.mu_v[k, ell] + other_contrib + base_pred
-                E_A_inactive = other_contrib + base_pred
+            # other_contrib_ell = full_contrib - E_theta[:, ell] * E_v[k, ell]
+            other_contrib_all = full_contrib[:, np.newaxis] - E_theta * self.E_v[k]  # (batch, d)
 
-                E_v_sq_ell = self.mu_v[k, ell]**2 + self.Sigma_v[k, ell, ell]
-                E_theta_sq = E_theta[:, ell]**2 + a_theta_batch[:, ell] / (b_theta_batch[:, ell]**2)
+            E_A_active_all = E_theta * self.mu_v[k] + other_contrib_all + base_pred[:, np.newaxis]
+            E_A_inactive_all = other_contrib_all + base_pred[:, np.newaxis]
 
-                E_A_sq_active = E_A_active**2 + E_theta_sq * self.Sigma_v[k, ell, ell]
-                E_A_sq_inactive = E_A_inactive**2
+            E_v_sq_all = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])  # (d,)
+            E_theta_sq_all = E_theta**2 + a_theta_batch / (b_theta_batch**2)  # (batch, d)
+            Sigma_v_diag = np.diag(self.Sigma_v[k])  # (d,)
 
-                # Scale the likelihood contributions
-                ll_active = scale_factor * np.sum((y_k - 0.5) * E_A_active - lam * E_A_sq_active)
-                ll_inactive = scale_factor * np.sum((y_k - 0.5) * E_A_inactive - lam * E_A_sq_inactive)
+            E_A_sq_active_all = E_A_active_all**2 + E_theta_sq_all * Sigma_v_diag
+            E_A_sq_inactive_all = E_A_inactive_all**2
 
-                prior_slab = -0.5 * E_v_sq_ell / self.sigma_v**2
-                prior_spike = 0.0
+            # Sum over samples (axis=0) for each factor
+            y_shifted = (y_k - 0.5)[:, np.newaxis]
+            lam_exp = lam[:, np.newaxis]
 
-                log_odds = (ll_active - ll_inactive) + (prior_slab - prior_spike)
-                log_odds += np.log(self.pi_v / (1 - self.pi_v + 1e-10))
-                log_odds = np.clip(log_odds, -20, 20)
-                rho_v_hat[k, ell] = expit(log_odds)
+            ll_active_all = scale_factor * np.sum(y_shifted * E_A_active_all - lam_exp * E_A_sq_active_all, axis=0)
+            ll_inactive_all = scale_factor * np.sum(y_shifted * E_A_inactive_all - lam_exp * E_A_sq_inactive_all, axis=0)
+
+            prior_slab_all = -0.5 * E_v_sq_all / self.sigma_v**2
+
+            log_odds_all = (ll_active_all - ll_inactive_all) + prior_slab_all
+            log_odds_all += np.log(self.pi_v / (1 - self.pi_v + 1e-10))
+            log_odds_all = np.clip(log_odds_all, -20, 20)
+            rho_v_hat[k] = expit(log_odds_all)
 
         return rho_v_hat
 
@@ -1202,21 +1207,21 @@ class SVI:
 
                         lam = self._lambda_jj(zeta_new[start:end, k])
 
-                        # Vectorized regression contribution
+                        # Vectorized regression contribution over all factors ell
                         E_v_sq_all = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
                         theta_v_product = E_theta_batch @ self.E_v[k]
                         base_pred = X_aux_batch @ self.E_gamma[k]
 
-                        for ell in range(self.d):
-                            E_C = theta_v_product - E_theta_batch[:, ell] * self.E_v[k, ell] + base_pred
+                        # E_C_ell = theta_v_product - E_theta[:, ell] * E_v[k, ell] + base_pred
+                        E_C_all = theta_v_product[:, np.newaxis] - E_theta_batch * self.E_v[k] + base_pred[:, np.newaxis]
 
-                            regression_contrib = (
-                                -(E_y - 0.5) * self.E_v[k, ell]
-                                + 2 * lam * self.E_v[k, ell] * E_C
-                                + 2 * lam * E_theta_batch[:, ell] * E_v_sq_all[ell]
-                            )
+                        regression_contrib = (
+                            -(E_y - 0.5)[:, np.newaxis] * self.E_v[k]
+                            + 2 * lam[:, np.newaxis] * self.E_v[k] * E_C_all
+                            + 2 * lam[:, np.newaxis] * E_theta_batch * E_v_sq_all
+                        )
 
-                            b_theta_new[start:end, ell] += self.regression_weight * regression_contrib
+                        b_theta_new[start:end] += self.regression_weight * regression_contrib
 
                 del z_sum_genes, E_theta_batch, E_log_theta_batch
 
