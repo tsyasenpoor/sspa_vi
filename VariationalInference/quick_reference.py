@@ -66,6 +66,7 @@ import argparse
 import numpy as np
 import pandas as pd
 from typing import Optional, List
+from scipy.special import expit
 
 
 def parse_args() -> argparse.Namespace:
@@ -397,7 +398,15 @@ def main():
     print("Validation Set Evaluation")
     print("=" * 80)
 
-    y_val_proba = model.predict_proba(X_val, X_aux_val, max_iter=100, verbose=args.verbose)
+    # Infer theta once and compute probabilities from it (avoid duplicate theta calculation)
+    E_theta_val, _, _ = model.infer_theta(
+        X_val, X_aux_val, max_iter=100, tol=1e-4, verbose=args.verbose
+    )
+    # Compute probabilities using inferred theta
+    linear_pred_val = E_theta_val @ model.E_v.T + X_aux_val @ model.E_gamma.T
+    y_val_proba = expit(linear_pred_val)
+    if args.verbose:
+        print(f"Predicted probabilities: min={y_val_proba.min():.4f}, max={y_val_proba.max():.4f}")
     y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
 
     val_metrics = compute_metrics(y_val, y_val_pred, y_val_proba.ravel())
@@ -409,11 +418,6 @@ def main():
     print(f"  Precision: {val_metrics['precision']:.4f}")
     print(f"  Recall:    {val_metrics['recall']:.4f}")
 
-    # Infer theta for validation set (for downstream analysis)
-    E_theta_val, _, _ = model.infer_theta(
-        X_val, X_aux_val, max_iter=100, tol=1e-4, verbose=args.verbose
-    )
-
     # =========================================================================
     # STEP 6: Evaluate on Test Set
     # =========================================================================
@@ -421,7 +425,15 @@ def main():
     print("Test Set Evaluation")
     print("=" * 80)
 
-    y_test_proba = model.predict_proba(X_test, X_aux_test, max_iter=100, verbose=args.verbose)
+    # Infer theta once and compute probabilities from it (avoid duplicate theta calculation)
+    E_theta_test, _, _ = model.infer_theta(
+        X_test, X_aux_test, max_iter=100, tol=1e-4, verbose=args.verbose
+    )
+    # Compute probabilities using inferred theta
+    linear_pred_test = E_theta_test @ model.E_v.T + X_aux_test @ model.E_gamma.T
+    y_test_proba = expit(linear_pred_test)
+    if args.verbose:
+        print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
     y_test_pred = (y_test_proba.ravel() > 0.5).astype(int)
 
     test_metrics = compute_metrics(y_test, y_test_pred, y_test_proba.ravel())
@@ -462,8 +474,7 @@ def main():
     theta_val_df.to_csv(output_dir / f'{prefix}_theta_val.csv.gz', compression='gzip')
     print(f"Saved validation theta to {output_dir / f'{prefix}_theta_val.csv.gz'}")
 
-    # Test theta
-    E_theta_test, _, _ = model.infer_theta(X_test, X_aux_test, max_iter=100, tol=1e-4)
+    # Test theta (already computed above during evaluation)
     theta_test_df = pd.DataFrame(
         E_theta_test,
         index=splits['test'],
