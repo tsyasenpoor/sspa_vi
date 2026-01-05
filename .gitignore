@@ -265,3 +265,5 @@ sspa_bcell/train_data_full_genes.csv
 confusion_matrices.png
 probability_vs_true_labels.png
 roc_curves.png
+jobs_sh/pickle_vi.sh
+anal.ipynb
