@@ -168,8 +168,8 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         '--pi-v',
         type=float,
-        default=0.2,
-        help='Prior probability of v being active'
+        default=0.9,
+        help='Prior probability of v being active. Values 0.9-1.0 favor classification.'
     )
     train_parser.add_argument(
         '--pi-beta',
@@ -268,8 +268,8 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         '--regression-weight',
         type=float,
-        default=1.0,
-        help='Weight for classification objective in SVI (higher=more focus on classification)'
+        default=10.0,
+        help='Weight for classification objective in SVI (higher=more focus on classification). Values 5-20 work well.'
     )
     train_parser.add_argument(
         '--lr-reduction-patience',

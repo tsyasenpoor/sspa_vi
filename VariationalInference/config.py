@@ -63,7 +63,7 @@ class VIConfig:
         Prior std for classification weights.
     sigma_gamma : float, default=0.5
         Prior std for auxiliary feature effects.
-    pi_v : float, default=0.2
+    pi_v : float, default=0.9
         Prior probability of v being active (slab).
     pi_beta : float, default=0.05
         Prior probability of beta being active (slab).
@@ -135,7 +135,7 @@ class VIConfig:
     lambda_eta: float = 1.5
     sigma_v: float = 0.2
     sigma_gamma: float = 0.5
-    pi_v: float = 0.2
+    pi_v: float = 0.9
     pi_beta: float = 0.05
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
@@ -337,9 +337,9 @@ class SVIConfig:
         Number of epochs for learning rate warmup.
     local_iterations : int, default=5
         Number of iterations to optimize local parameters per mini-batch.
-    regression_weight : float, default=1.0
+    regression_weight : float, default=10.0
         Weight for classification objective. Higher values make classification
-        more influential on theta updates. Values around 1.0-10.0 are typical.
+        more influential on theta updates. Values around 5.0-20.0 work well.
     lr_reduction_patience : int, default=5
         Number of consecutive epochs of ELBO degradation before reducing learning rate.
         This helps SVI stabilize when it overshoots the optimum.
@@ -356,7 +356,7 @@ class SVIConfig:
     lambda_xi, lambda_eta : float, default=1.5
     sigma_v : float, default=0.2
     sigma_gamma : float, default=0.5
-    pi_v : float, default=0.2
+    pi_v : float, default=0.9
     pi_beta : float, default=0.05
 
     Training Parameters
@@ -386,7 +386,7 @@ class SVIConfig:
     learning_rate_min: float = 1e-4
     warmup_epochs: int = 5
     local_iterations: int = 5
-    regression_weight: float = 1.0
+    regression_weight: float = 10.0
 
     # Adaptive learning rate parameters
     lr_reduction_patience: int = 5
@@ -402,7 +402,7 @@ class SVIConfig:
     lambda_eta: float = 1.5
     sigma_v: float = 0.2
     sigma_gamma: float = 0.5
-    pi_v: float = 0.2
+    pi_v: float = 0.9
     pi_beta: float = 0.05
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
