@@ -331,8 +331,15 @@ class SVIConfig:
         Decay exponent (kappa) for learning rate schedule.
     learning_rate_delay : float, default=1.0
         Delay parameter (tau) for learning rate schedule.
+    learning_rate_min : float, default=1e-4
+        Minimum learning rate to prevent stagnation in late training.
+    warmup_epochs : int, default=5
+        Number of epochs for learning rate warmup.
     local_iterations : int, default=5
         Number of iterations to optimize local parameters per mini-batch.
+    regression_weight : float, default=1.0
+        Weight for classification objective. Higher values make classification
+        more influential on theta updates. Values around 1.0-10.0 are typical.
 
     Model Hyperparameters (Same as VI)
     ----------------------------------
@@ -367,7 +374,10 @@ class SVIConfig:
     learning_rate: float = 0.01
     learning_rate_decay: float = 0.75
     learning_rate_delay: float = 1.0
+    learning_rate_min: float = 1e-4
+    warmup_epochs: int = 5
     local_iterations: int = 5
+    regression_weight: float = 1.0
 
     # Model hyperparameters (same as VI)
     alpha_theta: float = 2.0
@@ -437,7 +447,10 @@ class SVIConfig:
             'learning_rate': self.learning_rate,
             'learning_rate_decay': self.learning_rate_decay,
             'learning_rate_delay': self.learning_rate_delay,
+            'learning_rate_min': self.learning_rate_min,
+            'warmup_epochs': self.warmup_epochs,
             'local_iterations': self.local_iterations,
+            'regression_weight': self.regression_weight,
             'alpha_theta': self.alpha_theta,
             'alpha_beta': self.alpha_beta,
             'alpha_xi': self.alpha_xi,
