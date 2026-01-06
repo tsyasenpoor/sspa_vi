@@ -53,9 +53,14 @@ class SVI:
     learning_rate : float, default=0.01
         Initial learning rate for global parameter updates.
     learning_rate_decay : float, default=0.75
-        Decay exponent for learning rate schedule (kappa in ρ_t = (τ + t)^(-κ)).
+        Decay exponent for learning rate schedule (kappa in ρ_t = lr * (τ + t)^(-κ)).
     learning_rate_delay : float, default=1.0
-        Delay parameter for learning rate schedule (tau in ρ_t = (τ + t)^(-κ)).
+        Delay parameter for learning rate schedule (tau in ρ_t = lr * (τ + t)^(-κ)).
+    learning_rate_min : float, default=1e-4
+        Minimum learning rate to prevent stagnation in late training.
+    warmup_epochs : int, default=5
+        Number of epochs for learning rate warmup. During warmup, learning rate
+        linearly increases from learning_rate_min to the scheduled rate.
     local_iterations : int, default=5
         Number of iterations to optimize local parameters per mini-batch.
     alpha_theta : float, default=2.0
@@ -84,6 +89,10 @@ class SVI:
         Variance for spike component of v.
     spike_value_beta : float, default=1e-6
         Value for spike component of beta.
+    regression_weight : float, default=1.0
+        Weight for classification/regression objective. Controls how much the
+        label y influences theta updates. Higher values make the model focus
+        more on classification. Values around 1.0-10.0 are typical.
 
     Attributes
     ----------
@@ -109,6 +118,8 @@ class SVI:
         learning_rate: float = 0.01,
         learning_rate_decay: float = 0.75,
         learning_rate_delay: float = 1.0,
+        learning_rate_min: float = 1e-4,
+        warmup_epochs: int = 5,
         local_iterations: int = 5,
         alpha_theta: float = 2.0,
         alpha_beta: float = 2.0,
@@ -122,13 +133,16 @@ class SVI:
         pi_v: float = 0.2,
         pi_beta: float = 0.05,
         spike_variance_v: float = 1e-6,
-        spike_value_beta: float = 1e-6
+        spike_value_beta: float = 1e-6,
+        regression_weight: float = 1.0
     ):
         self.d = n_factors
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.learning_rate_decay = learning_rate_decay
         self.learning_rate_delay = learning_rate_delay
+        self.learning_rate_min = learning_rate_min
+        self.warmup_epochs = warmup_epochs
         self.local_iterations = local_iterations
 
         self.alpha_theta = alpha_theta
@@ -148,7 +162,9 @@ class SVI:
             self.rng = np.random.default_rng(random_state)
             self.seed_used_ = random_state
 
-        self.regression_weight = 0.01
+        # Classification weight - controls influence of y on theta updates
+        # Higher values make classification more influential
+        self.regression_weight = regression_weight
 
         # Spike-and-slab parameters
         self.pi_v = pi_v
@@ -156,23 +172,37 @@ class SVI:
         self.spike_variance_v = spike_variance_v
         self.spike_value_beta = spike_value_beta
 
-    def _get_learning_rate(self, iteration: int) -> float:
+    def _get_learning_rate(self, iteration: int, n_batches_per_epoch: int = 1) -> float:
         """
-        Compute learning rate for current iteration.
+        Compute learning rate for current iteration with warmup and minimum bound.
 
-        Uses Robbins-Monro schedule: ρ_t = (τ + t)^(-κ)
+        Uses scaled Robbins-Monro schedule: ρ_t = lr * (τ + t)^(-κ)
+        with optional warmup and minimum learning rate.
 
         Parameters
         ----------
         iteration : int
             Current iteration number (0-indexed).
+        n_batches_per_epoch : int
+            Number of batches per epoch (for warmup calculation).
 
         Returns
         -------
         rho : float
             Learning rate for this iteration.
         """
-        return (self.learning_rate_delay + iteration) ** (-self.learning_rate_decay)
+        # Calculate base Robbins-Monro rate
+        base_rate = self.learning_rate * (self.learning_rate_delay + iteration) ** (-self.learning_rate_decay)
+
+        # Apply warmup if in warmup phase
+        warmup_iterations = self.warmup_epochs * n_batches_per_epoch
+        if warmup_iterations > 0 and iteration < warmup_iterations:
+            # Linear warmup from learning_rate_min to base_rate
+            warmup_factor = (iteration + 1) / warmup_iterations
+            base_rate = self.learning_rate_min + warmup_factor * (base_rate - self.learning_rate_min)
+
+        # Ensure minimum learning rate
+        return max(base_rate, self.learning_rate_min)
 
     def _initialize_global_parameters(self, X: np.ndarray, y: np.ndarray, X_aux: np.ndarray):
         """
@@ -853,7 +883,9 @@ class SVI:
             print(f"\nSVI Training Configuration:")
             print(f"  Samples: {n_samples}, Genes: {self.p}, Factors: {self.d}")
             print(f"  Batch size: {batch_size}, Batches per epoch: {n_batches}")
-            print(f"  Learning rate schedule: (τ + t)^(-κ) with τ={self.learning_rate_delay}, κ={self.learning_rate_decay}")
+            print(f"  Learning rate: {self.learning_rate} * (τ + t)^(-κ) with τ={self.learning_rate_delay}, κ={self.learning_rate_decay}")
+            print(f"  Learning rate min: {self.learning_rate_min}, Warmup epochs: {self.warmup_epochs}")
+            print(f"  Regression weight: {self.regression_weight}")
 
         for epoch in range(max_epochs):
             # Shuffle data at the start of each epoch
@@ -876,8 +908,8 @@ class SVI:
 
                 actual_scale = n_samples / actual_batch_size
 
-                # Get learning rate for this iteration
-                rho_t = self._get_learning_rate(iteration)
+                # Get learning rate for this iteration (with warmup support)
+                rho_t = self._get_learning_rate(iteration, n_batches)
 
                 # Initialize local parameters for this batch
                 a_theta, b_theta, a_xi, b_xi, zeta = self._initialize_local_parameters(
