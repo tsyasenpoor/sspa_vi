@@ -93,6 +93,15 @@ class SVI:
         Weight for classification/regression objective. Controls how much the
         label y influences theta updates. Higher values make the model focus
         more on classification. Values around 1.0-10.0 are typical.
+    lr_reduction_patience : int, default=5
+        Number of consecutive epochs of ELBO degradation before reducing learning rate.
+        This helps SVI stabilize when it overshoots the optimum.
+    lr_reduction_factor : float, default=0.5
+        Factor by which to reduce learning rate when ELBO degrades consistently.
+        Learning rate is multiplied by this factor (0.5 = halve the learning rate).
+    restore_best : bool, default=True
+        Whether to restore the best parameters when reducing learning rate.
+        This helps the model recover from overshooting the optimum.
 
     Attributes
     ----------
@@ -134,7 +143,10 @@ class SVI:
         pi_beta: float = 0.05,
         spike_variance_v: float = 1e-6,
         spike_value_beta: float = 1e-6,
-        regression_weight: float = 1.0
+        regression_weight: float = 1.0,
+        lr_reduction_patience: int = 5,
+        lr_reduction_factor: float = 0.5,
+        restore_best: bool = True
     ):
         self.d = n_factors
         self.batch_size = batch_size
@@ -172,6 +184,12 @@ class SVI:
         self.spike_variance_v = spike_variance_v
         self.spike_value_beta = spike_value_beta
 
+        # Adaptive learning rate parameters
+        self.lr_reduction_patience = lr_reduction_patience
+        self.lr_reduction_factor = lr_reduction_factor
+        self.restore_best = restore_best
+        self._current_lr_multiplier = 1.0  # Tracks cumulative learning rate reductions
+
     def _get_learning_rate(self, iteration: int, n_batches_per_epoch: int = 1) -> float:
         """
         Compute learning rate for current iteration with warmup and minimum bound.
@@ -191,8 +209,8 @@ class SVI:
         rho : float
             Learning rate for this iteration.
         """
-        # Calculate base Robbins-Monro rate
-        base_rate = self.learning_rate * (self.learning_rate_delay + iteration) ** (-self.learning_rate_decay)
+        # Calculate base Robbins-Monro rate with adaptive multiplier
+        base_rate = self.learning_rate * self._current_lr_multiplier * (self.learning_rate_delay + iteration) ** (-self.learning_rate_decay)
 
         # Apply warmup if in warmup phase
         warmup_iterations = self.warmup_epochs * n_batches_per_epoch
@@ -203,6 +221,44 @@ class SVI:
 
         # Ensure minimum learning rate
         return max(base_rate, self.learning_rate_min)
+
+    def _save_global_checkpoint(self) -> dict:
+        """Save current global parameters as a checkpoint."""
+        return {
+            'a_beta': self.a_beta.copy(),
+            'b_beta': self.b_beta.copy(),
+            'a_eta': self.a_eta.copy(),
+            'b_eta': self.b_eta.copy(),
+            'rho_beta': self.rho_beta.copy(),
+            'mu_v': self.mu_v.copy(),
+            'Sigma_v': self.Sigma_v.copy(),
+            'mu_gamma': self.mu_gamma.copy(),
+            'Sigma_gamma': self.Sigma_gamma.copy(),
+            'rho_v': self.rho_v.copy(),
+            'E_beta': self.E_beta.copy(),
+            'E_log_beta': self.E_log_beta.copy(),
+            'E_eta': self.E_eta.copy(),
+            'E_v': self.E_v.copy(),
+            'E_gamma': self.E_gamma.copy(),
+        }
+
+    def _restore_global_checkpoint(self, checkpoint: dict):
+        """Restore global parameters from a checkpoint."""
+        self.a_beta = checkpoint['a_beta'].copy()
+        self.b_beta = checkpoint['b_beta'].copy()
+        self.a_eta = checkpoint['a_eta'].copy()
+        self.b_eta = checkpoint['b_eta'].copy()
+        self.rho_beta = checkpoint['rho_beta'].copy()
+        self.mu_v = checkpoint['mu_v'].copy()
+        self.Sigma_v = checkpoint['Sigma_v'].copy()
+        self.mu_gamma = checkpoint['mu_gamma'].copy()
+        self.Sigma_gamma = checkpoint['Sigma_gamma'].copy()
+        self.rho_v = checkpoint['rho_v'].copy()
+        self.E_beta = checkpoint['E_beta'].copy()
+        self.E_log_beta = checkpoint['E_log_beta'].copy()
+        self.E_eta = checkpoint['E_eta'].copy()
+        self.E_v = checkpoint['E_v'].copy()
+        self.E_gamma = checkpoint['E_gamma'].copy()
 
     def _initialize_global_parameters(self, X: np.ndarray, y: np.ndarray, X_aux: np.ndarray):
         """
@@ -879,6 +935,14 @@ class SVI:
         patience_counter = 0
         iteration = 0
 
+        # Adaptive learning rate tracking
+        self._current_lr_multiplier = 1.0  # Reset at start of training
+        best_elbo = -np.inf
+        best_epoch = 0
+        best_checkpoint = None
+        degradation_counter = 0  # Count consecutive epochs of ELBO degradation
+        lr_reductions = 0  # Track how many times learning rate has been reduced
+
         if verbose:
             print(f"\nSVI Training Configuration:")
             print(f"  Samples: {n_samples}, Genes: {self.p}, Factors: {self.d}")
@@ -1002,6 +1066,38 @@ class SVI:
             epoch_end_elbo_history.append((epoch, epoch_end_elbo))
             elbo_history.append((iteration - 1, epoch_end_elbo))  # Also add to elbo_history for completeness
 
+            # Adaptive learning rate: track best ELBO and detect degradation
+            if epoch_end_elbo > best_elbo:
+                best_elbo = epoch_end_elbo
+                best_epoch = epoch
+                best_checkpoint = self._save_global_checkpoint()
+                degradation_counter = 0  # Reset degradation counter on improvement
+            else:
+                # ELBO did not improve
+                degradation_counter += 1
+
+            # Check if we should reduce learning rate due to consistent degradation
+            if (degradation_counter >= self.lr_reduction_patience and
+                epoch >= self.warmup_epochs and
+                self._current_lr_multiplier > 0.01):  # Don't reduce below 1% of original
+
+                # Reduce learning rate
+                self._current_lr_multiplier *= self.lr_reduction_factor
+                lr_reductions += 1
+
+                if verbose:
+                    print(f"  ⚠ ELBO degraded for {degradation_counter} epochs. "
+                          f"Reducing learning rate by {self.lr_reduction_factor:.1f}x "
+                          f"(multiplier now: {self._current_lr_multiplier:.4f})")
+
+                # Optionally restore best parameters
+                if self.restore_best and best_checkpoint is not None:
+                    self._restore_global_checkpoint(best_checkpoint)
+                    if verbose:
+                        print(f"  ↩ Restored parameters from best epoch {best_epoch + 1} (ELBO: {best_elbo:.2f})")
+
+                degradation_counter = 0  # Reset counter after reduction
+
             # Report epoch progress
             if verbose:
                 total_time = time.time() - start_time
@@ -1036,17 +1132,30 @@ class SVI:
                         print(f"{'='*60}")
                     break
 
+        # At end of training, optionally restore best parameters
+        final_elbo = epoch_end_elbo_history[-1][1] if epoch_end_elbo_history else -np.inf
+        if self.restore_best and best_checkpoint is not None and final_elbo < best_elbo:
+            self._restore_global_checkpoint(best_checkpoint)
+            if verbose:
+                print(f"\n  ↩ Restored best parameters from epoch {best_epoch + 1} (ELBO: {best_elbo:.2f} vs final: {final_elbo:.2f})")
+
         # Store full-data theta for training samples
         self._compute_full_theta(X, y, X_aux)
 
         self.elbo_history_ = elbo_history
         self.epoch_end_elbo_history_ = epoch_end_elbo_history  # Epoch-end ELBOs for accurate convergence tracking
+        self.best_elbo_ = best_elbo
+        self.best_epoch_ = best_epoch
+        self.lr_reductions_ = lr_reductions
         self.training_time_ = time.time() - start_time
 
         if verbose:
             print(f"\nTraining completed in {self.training_time_:.2f}s")
             if elbo_history:
                 print(f"Final ELBO: {elbo_history[-1][1]:.2f}")
+            print(f"Best ELBO: {best_elbo:.2f} (epoch {best_epoch + 1})")
+            if lr_reductions > 0:
+                print(f"Learning rate reductions: {lr_reductions}")
 
         return self
 
