@@ -300,6 +300,16 @@ class SVI:
         self.mu_gamma = 0.01 * self.rng.standard_normal((self.kappa, self.p_aux))
         self.Sigma_gamma = np.tile(np.eye(self.p_aux)[np.newaxis, :, :], (self.kappa, 1, 1))
 
+        # Initialize intercept (first column of gamma) to class prior log-odds
+        # This helps the model start with correct baseline prediction for imbalanced classes
+        if self.p_aux >= 1:
+            y_flat = y.ravel() if y.ndim > 1 else y
+            for k in range(self.kappa):
+                y_k = y_flat if self.kappa == 1 else y[:, k]
+                class1_prop = np.clip(np.mean(y_k), 0.01, 0.99)
+                log_odds = np.log(class1_prop / (1 - class1_prop))
+                self.mu_gamma[k, 0] = log_odds  # First column is intercept
+
         # Compute initial global expectations
         self._compute_global_expectations()
 

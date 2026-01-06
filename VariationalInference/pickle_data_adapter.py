@@ -286,9 +286,9 @@ def load_pickle_data(
     
     # Get auxiliary features
     if aux_columns is None or len(aux_columns) == 0:
-        # No auxiliary features - create zero matrix
-        X_aux = np.zeros((n_cells, 1), dtype=np.float64)
-        print(f"  No auxiliary features - using zeros")
+        # No auxiliary features - just intercept
+        X_aux = np.zeros((n_cells, 0), dtype=np.float64)
+        print(f"  No auxiliary features specified")
     else:
         missing_cols = [col for col in aux_columns if col not in features.columns]
         if missing_cols:
@@ -296,6 +296,12 @@ def load_pickle_data(
                            f"Available: {list(features.columns)}")
         X_aux = features[aux_columns].values.astype(np.float64)
         print(f"  Auxiliary features: {X_aux.shape[1]} columns")
+
+    # Always add intercept column as first column
+    # This is critical for logistic regression to capture class imbalance
+    intercept = np.ones((n_cells, 1), dtype=np.float64)
+    X_aux = np.hstack([intercept, X_aux])
+    print(f"  Total aux features (with intercept): {X_aux.shape[1]} columns")
     
     # Get gene names
     if isinstance(df.columns, pd.Index):
@@ -508,7 +514,29 @@ def main():
     print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
     print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
     print(f"  Time:       {model.training_time_:.2f}s")
-    
+
+    # Training evaluation
+    print("\n" + "=" * 80)
+    print("Training Set Evaluation")
+    print("=" * 80)
+
+    # For training set, we can use the E_theta computed during training
+    E_theta_train = model.E_theta
+    linear_pred_train = E_theta_train @ model.E_v.T + X_aux_train @ model.E_gamma.T
+    y_train_proba = expit(linear_pred_train)
+    if args.verbose:
+        print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
+    y_train_pred = (y_train_proba.ravel() > 0.5).astype(int)
+
+    train_metrics = compute_metrics(y_train, y_train_pred, y_train_proba.ravel())
+    print(f"\nTraining Results:")
+    print(f"  Accuracy:  {train_metrics['accuracy']:.4f}")
+    if 'auc' in train_metrics:
+        print(f"  AUC:       {train_metrics['auc']:.4f}")
+    print(f"  F1:        {train_metrics['f1']:.4f}")
+    print(f"  Precision: {train_metrics['precision']:.4f}")
+    print(f"  Recall:    {train_metrics['recall']:.4f}")
+
     # Validation evaluation
     print("\n" + "=" * 80)
     print("Validation Set Evaluation")
@@ -594,6 +622,14 @@ def main():
     print(f"Saved test theta to {output_dir / f'{prefix}_theta_test.csv.gz'}")
     
     # Save predictions
+    train_pred_df = pd.DataFrame({
+        'cell_id': splits['train'],
+        'true_label': y_train,
+        'pred_prob': y_train_proba.ravel(),
+        'pred_label': y_train_pred
+    })
+    train_pred_df.to_csv(output_dir / f'{prefix}_train_predictions.csv.gz', compression='gzip', index=False)
+
     val_pred_df = pd.DataFrame({
         'cell_id': splits['val'],
         'true_label': y_val,
@@ -601,7 +637,7 @@ def main():
         'pred_label': y_val_pred
     })
     val_pred_df.to_csv(output_dir / f'{prefix}_val_predictions.csv.gz', compression='gzip', index=False)
-    
+
     test_pred_df = pd.DataFrame({
         'cell_id': splits['test'],
         'true_label': y_test,
@@ -657,6 +693,7 @@ def main():
         print(f"  - {path}")
     print(f"  - {output_dir / f'{prefix}_theta_val.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_theta_test.csv.gz'}")
+    print(f"  - {output_dir / f'{prefix}_train_predictions.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_val_predictions.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_test_predictions.csv.gz'}")
 
