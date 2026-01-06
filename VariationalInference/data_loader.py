@@ -84,6 +84,10 @@ class DataLoader:
         self.use_cache = use_cache
         self.verbose = verbose
 
+        # Detect data type from filename
+        self.is_singscore = 'singscore' in str(self.data_path).lower()
+        self.feature_type = 'pathway' if self.is_singscore else 'gene'
+        
         # Create cache directory
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -134,7 +138,8 @@ class DataLoader:
 
         self._log(f"Loading h5ad file: {self.data_path}")
         self.adata = sc.read_h5ad(str(self.data_path).strip())
-        self._log(f"  Shape: {self.adata.n_obs} cells x {self.adata.n_vars} genes")
+        self._log(f"  Data type: {self.feature_type} (singscore={self.is_singscore})")
+        self._log(f"  Shape: {self.adata.n_obs} cells x {self.adata.n_vars} {self.feature_type}s")
         self._log(f"  Obs columns: {list(self.adata.obs.columns)}")
 
         return self.adata
@@ -151,7 +156,7 @@ class DataLoader:
         Returns
         -------
         pd.DataFrame
-            Expression DataFrame with cells as rows, genes as columns.
+            Expression DataFrame with cells as rows, genes/pathways as columns.
         """
         if self.adata is None:
             self.load_adata()
@@ -163,19 +168,33 @@ class DataLoader:
             self._log("Using adata.X")
             self.raw_df = self.adata.to_df()
 
+        # Rescale singscore data to be all positive
+        if self.is_singscore:
+            min_val = self.raw_df.min().min()
+            if min_val < 0:
+                self._log(f"Rescaling singscore data: min value = {min_val:.4f}")
+                self.raw_df = self.raw_df - min_val
+                self._log(f"  After rescaling: min = {self.raw_df.min().min():.4f}, max = {self.raw_df.max().max():.4f}")
+
         return self.raw_df
 
     def convert_genes_to_ensembl(self) -> pd.DataFrame:
         """
         Convert gene names to Ensembl IDs.
+        Skipped for singscore data (pathways).
 
         Returns
         -------
         pd.DataFrame
-            Expression DataFrame with Ensembl ID columns.
+            Expression DataFrame with Ensembl ID columns (or unchanged for pathways).
         """
         if self.raw_df is None:
             self.get_expression_df()
+
+        # Skip conversion for singscore/pathway data
+        if self.is_singscore:
+            self._log("Skipping Ensembl conversion for pathway data")
+            return self.raw_df
 
         gene_names = self.raw_df.columns.tolist()
         converter = self._get_gene_converter()
@@ -191,7 +210,7 @@ class DataLoader:
 
     def remove_duplicate_genes(self) -> pd.DataFrame:
         """
-        Remove duplicate gene columns (keep first occurrence).
+        Remove duplicate gene/pathway columns (keep first occurrence).
 
         Returns
         -------
@@ -206,12 +225,13 @@ class DataLoader:
         self.raw_df = self.raw_df.loc[:, mask]
         n_after = self.raw_df.shape[1]
 
-        self._log(f"Removed {n_before - n_after} duplicate genes: {n_before} -> {n_after}")
+        self._log(f"Removed {n_before - n_after} duplicate {self.feature_type}s: {n_before} -> {n_after}")
         return self.raw_df
 
     def filter_protein_coding(self) -> pd.DataFrame:
         """
         Filter to keep only protein-coding genes.
+        Skipped for singscore data (pathways).
 
         Requires gene_annotation_path to be set.
         Uses the gene annotation file structure with 'Genename', 'GeneID', and 'Genetype' columns.
@@ -219,8 +239,13 @@ class DataLoader:
         Returns
         -------
         pd.DataFrame
-            Expression DataFrame with only protein-coding genes.
+            Expression DataFrame with only protein-coding genes (or unchanged for pathways).
         """
+        # Skip protein-coding filter for pathway data
+        if self.is_singscore:
+            self._log("Skipping protein-coding filter for pathway data")
+            return self.raw_df
+
         if self.gene_annotation_path is None:
             self._log("No gene annotation file provided - skipping protein-coding filter")
             return self.raw_df
@@ -281,12 +306,12 @@ class DataLoader:
 
     def filter_zero_genes(self) -> pd.DataFrame:
         """
-        Remove genes with zero expression across all cells.
+        Remove genes/pathways with zero expression across all cells.
 
         Returns
         -------
         pd.DataFrame
-            Expression DataFrame without all-zero genes.
+            Expression DataFrame without all-zero genes/pathways.
         """
         if self.raw_df is None:
             raise ValueError("Must load expression data first")
@@ -295,22 +320,22 @@ class DataLoader:
         self.raw_df = self.raw_df.loc[:, (self.raw_df != 0).any(axis=0)]
         n_after = self.raw_df.shape[1]
 
-        self._log(f"Removed {n_before - n_after} all-zero genes: {n_before} -> {n_after}")
+        self._log(f"Removed {n_before - n_after} all-zero {self.feature_type}s: {n_before} -> {n_after}")
         return self.raw_df
 
     def filter_min_cells(self, min_fraction: float = 0.02) -> pd.DataFrame:
         """
-        Keep only genes expressed in at least min_fraction of cells.
+        Keep only genes/pathways expressed in at least min_fraction of cells.
 
         Parameters
         ----------
         min_fraction : float, default=0.02
-            Minimum fraction of cells that must express the gene.
+            Minimum fraction of cells that must express the gene/pathway.
 
         Returns
         -------
         pd.DataFrame
-            Expression DataFrame with filtered genes.
+            Expression DataFrame with filtered genes/pathways.
         """
         if self.raw_df is None:
             raise ValueError("Must load expression data first")
@@ -322,7 +347,7 @@ class DataLoader:
         self.raw_df = self.raw_df.loc[:, genes_to_keep]
         n_after = self.raw_df.shape[1]
 
-        self._log(f"Kept genes in >={min_cells} cells ({min_fraction*100:.1f}%): {n_before} -> {n_after}")
+        self._log(f"Kept {self.feature_type}s in >={min_cells} cells ({min_fraction*100:.1f}%): {n_before} -> {n_after}")
         return self.raw_df
 
     def preprocess(
@@ -335,26 +360,34 @@ class DataLoader:
         """
         Run full preprocessing pipeline.
 
+        For singscore data (pathways), convert_to_ensembl and filter_protein_coding
+        are automatically skipped regardless of parameter values.
+
         Parameters
         ----------
         layer : str, default='raw'
             Which layer to use for expression data.
         convert_to_ensembl : bool, default=True
-            Whether to convert gene symbols to Ensembl IDs.
+            Whether to convert gene symbols to Ensembl IDs (ignored for pathways).
         filter_protein_coding : bool, default=True
-            Whether to filter for protein-coding genes.
+            Whether to filter for protein-coding genes (ignored for pathways).
         min_cells_expressing : float, default=0.02
-            Minimum fraction of cells expressing each gene.
+            Minimum fraction of cells expressing each gene/pathway.
 
         Returns
         -------
         pd.DataFrame
             Preprocessed expression DataFrame.
         """
+        # Override settings for singscore data
+        if self.is_singscore:
+            convert_to_ensembl = False
+            filter_protein_coding = False
+            
         # Check cache
         if self.use_cache:
             cache_key = self._get_cache_key()
-            cache_params = f"{layer}_{convert_to_ensembl}_{filter_protein_coding}_{min_cells_expressing}"
+            cache_params = f"{layer}_{convert_to_ensembl}_{filter_protein_coding}_{min_cells_expressing}_{self.is_singscore}"
             cache_file = self.cache_dir / f"preprocessed_{cache_key}_{hashlib.md5(cache_params.encode()).hexdigest()[:8]}.pkl"
 
             if cache_file.exists():
@@ -387,7 +420,7 @@ class DataLoader:
         self.gene_list = self.raw_df.columns.tolist()
         self.cell_ids = self.raw_df.index.tolist()
 
-        self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
+        self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} {self.feature_type}s")
 
         # Save to cache
         if self.use_cache:
@@ -677,7 +710,9 @@ class DataLoader:
             'splits': splits,
             'n_genes': len(self.gene_list),
             'n_cells': len(self.cell_ids),
-            'n_aux': X_aux_train.shape[1]
+            'n_aux': X_aux_train.shape[1],
+            'feature_type': self.feature_type,
+            'is_singscore': self.is_singscore
         }
 
 

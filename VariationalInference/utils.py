@@ -248,7 +248,8 @@ def save_results(
     prefix: str = 'vi',
     save_model: bool = True,
     compress: bool = True,
-    save_full_model: bool = False
+    save_full_model: bool = False,
+    feature_type: str = 'gene'
 ) -> Dict[str, Path]:
     """
     Save VI model results to files.
@@ -260,7 +261,7 @@ def save_results(
     output_dir : str or Path
         Directory to save results.
     gene_list : list of str
-        List of gene names.
+        List of gene/pathway names.
     splits : dict
         Dictionary with train/val/test cell ID lists.
     prefix : str, default='vi'
@@ -272,6 +273,8 @@ def save_results(
     save_full_model : bool, default=False
         If True, save entire model object. If False (default), save only
         essential parameters to reduce memory during save.
+    feature_type : str, default='gene'
+        Type of features ('gene' or 'pathway').
 
     Returns
     -------
@@ -333,9 +336,10 @@ def save_results(
             saved_files['model_params'] = model_path
             print(f"Saved essential model parameters to {model_path}")
 
-    # Save gene programs (beta matrix)
+    # Save gene/pathway programs (beta matrix)
+    program_label = f"{feature_type}_program" if feature_type == 'pathway' else "gene_program"
     beta_df = pd.DataFrame(
-        model.E_beta.T,  # Transpose: programs x genes
+        model.E_beta.T,  # Transpose: programs x genes/pathways
         index=[f"GP{k+1}" for k in range(model.d)],
         columns=gene_list
     )
@@ -345,10 +349,10 @@ def save_results(
         for k in range(model.kappa):
             beta_df.insert(0, f'v_weight_class{k}', model.E_v[k])
 
-    beta_path = output_dir / f'{prefix}_gene_programs{ext}'
+    beta_path = output_dir / f'{prefix}_{feature_type}_programs{ext}'
     beta_df.to_csv(beta_path, compression=compression)
-    saved_files['gene_programs'] = beta_path
-    print(f"Saved gene programs to {beta_path}")
+    saved_files[f'{feature_type}_programs'] = beta_path
+    print(f"Saved {feature_type} programs to {beta_path}")
 
     # Save training theta
     if hasattr(model, 'E_theta'):
@@ -374,11 +378,12 @@ def save_results(
             'pi_beta': model.pi_beta,
         },
         'data_shapes': {
-            'n_genes': len(gene_list),
+            f'n_{feature_type}s': len(gene_list),
             'n_train': len(splits['train']),
             'n_val': len(splits['val']),
             'n_test': len(splits['test']),
         },
+        'feature_type': feature_type,
         'training': {
             'training_time': getattr(model, 'training_time_', None),
             'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') else None,
@@ -412,26 +417,29 @@ def get_top_genes_per_program(
     model: Any,
     gene_list: List[str],
     n_top: int = 10,
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    feature_type: str = 'gene'
 ) -> Dict[str, List[Tuple[str, float]]]:
     """
-    Get top genes for each gene program.
+    Get top genes/pathways for each gene program.
 
     Parameters
     ----------
     model : VI
         Trained model with E_beta attribute.
     gene_list : list of str
-        List of gene names corresponding to beta rows.
+        List of gene/pathway names corresponding to beta rows.
     n_top : int, default=10
-        Number of top genes to return per program.
+        Number of top genes/pathways to return per program.
     threshold : float, default=0.5
-        Spike-and-slab threshold for considering genes active.
+        Spike-and-slab threshold for considering genes/pathways active.
+    feature_type : str, default='gene'
+        Type of features ('gene' or 'pathway').
 
     Returns
     -------
     dict
-        Dictionary mapping program names to lists of (gene, loading) tuples.
+        Dictionary mapping program names to lists of (gene/pathway, loading) tuples.
     """
     results = {}
 
