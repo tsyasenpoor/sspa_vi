@@ -177,6 +177,24 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help='Learning rate decay exponent (kappa) for SVI'
     )
+    parser.add_argument(
+        '--learning-rate-min',
+        type=float,
+        default=1e-4,
+        help='Minimum learning rate for SVI to prevent stagnation'
+    )
+    parser.add_argument(
+        '--warmup-epochs',
+        type=int,
+        default=5,
+        help='Number of epochs for learning rate warmup in SVI'
+    )
+    parser.add_argument(
+        '--regression-weight',
+        type=float,
+        default=1.0,
+        help='Weight for classification objective in SVI (higher=more focus on classification)'
+    )
 
     # Output options
     parser.add_argument(
@@ -329,6 +347,9 @@ def main():
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             learning_rate_decay=args.learning_rate_decay,
+            learning_rate_min=args.learning_rate_min,
+            warmup_epochs=args.warmup_epochs,
+            regression_weight=args.regression_weight,
             alpha_theta=0.5,   # Loose prior on theta
             alpha_beta=2.0,    # Tight prior on beta
             alpha_xi=2.0,

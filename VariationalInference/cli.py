@@ -248,10 +248,28 @@ def create_parser() -> argparse.ArgumentParser:
         help='Learning rate delay (tau) for SVI'
     )
     train_parser.add_argument(
+        '--learning-rate-min',
+        type=float,
+        default=1e-4,
+        help='Minimum learning rate for SVI to prevent stagnation'
+    )
+    train_parser.add_argument(
+        '--warmup-epochs',
+        type=int,
+        default=5,
+        help='Number of epochs for learning rate warmup in SVI'
+    )
+    train_parser.add_argument(
         '--local-iterations',
         type=int,
         default=5,
         help='Number of local parameter iterations per batch for SVI'
+    )
+    train_parser.add_argument(
+        '--regression-weight',
+        type=float,
+        default=1.0,
+        help='Weight for classification objective in SVI (higher=more focus on classification)'
     )
 
     # Output options
@@ -424,7 +442,10 @@ def cmd_train(args: argparse.Namespace) -> int:
                 learning_rate=args.learning_rate,
                 learning_rate_decay=args.learning_rate_decay,
                 learning_rate_delay=args.learning_rate_delay,
+                learning_rate_min=args.learning_rate_min,
+                warmup_epochs=args.warmup_epochs,
                 local_iterations=args.local_iterations,
+                regression_weight=args.regression_weight,
                 alpha_theta=args.alpha_theta,
                 alpha_beta=args.alpha_beta,
                 sigma_v=args.sigma_v,
@@ -475,6 +496,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         print(f"batch_size: {config.batch_size}")
         print(f"max_epochs: {config.max_epochs}")
         print(f"learning_rate: {config.learning_rate}")
+        print(f"learning_rate_min: {config.learning_rate_min}")
+        print(f"warmup_epochs: {config.warmup_epochs}")
+        print(f"regression_weight: {config.regression_weight}")
     else:
         print(f"max_iter: {config.max_iter}")
     print(f"label_column: {config.label_column}")
