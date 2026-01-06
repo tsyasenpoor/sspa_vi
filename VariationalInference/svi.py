@@ -81,18 +81,21 @@ class SVI:
         Prior standard deviation for auxiliary feature effects.
     random_state : int or None, default=None
         Random seed for reproducibility.
-    pi_v : float, default=0.2
+    pi_v : float, default=0.9
         Prior probability of classification weights being active.
+        Higher values (0.9-1.0) favor keeping factors active for classification.
     pi_beta : float, default=0.05
         Prior probability of gene loadings being active.
     spike_variance_v : float, default=1e-6
         Variance for spike component of v.
     spike_value_beta : float, default=1e-6
         Value for spike component of beta.
-    regression_weight : float, default=1.0
+    regression_weight : float, default=10.0
         Weight for classification/regression objective. Controls how much the
         label y influences theta updates. Higher values make the model focus
-        more on classification. Values around 1.0-10.0 are typical.
+        more on classification. Values around 5.0-20.0 work well for
+        classification tasks. Lower values (1.0) may cause the model to
+        focus on reconstruction and ignore labels.
     lr_reduction_patience : int, default=5
         Number of consecutive epochs of ELBO degradation before reducing learning rate.
         This helps SVI stabilize when it overshoots the optimum.
@@ -139,11 +142,11 @@ class SVI:
         sigma_v: float = 0.2,
         sigma_gamma: float = 0.5,
         random_state: Optional[int] = None,
-        pi_v: float = 0.2,
+        pi_v: float = 0.9,
         pi_beta: float = 0.05,
         spike_variance_v: float = 1e-6,
         spike_value_beta: float = 1e-6,
-        regression_weight: float = 1.0,
+        regression_weight: float = 10.0,
         lr_reduction_patience: int = 5,
         lr_reduction_factor: float = 0.5,
         restore_best: bool = True
@@ -293,7 +296,8 @@ class SVI:
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
 
         # Initialize spike-and-slab indicators
-        self.rho_v = np.ones((self.kappa, self.d)) * 0.5
+        # Initialize rho_v based on prior - high pi_v means start with factors active
+        self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
         self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
 
         # Initialize gamma (auxiliary effects)

@@ -53,14 +53,18 @@ class VI:
         Random seed for reproducibility. If None (default), uses true random
         initialization from system entropy - recommended for scientific experiments.
         Set to an integer for reproducible results during debugging/testing.
-    pi_v : float, default=0.2
+    pi_v : float, default=0.9
         Prior probability of classification weights being active (slab).
+        Higher values (0.9-1.0) favor keeping factors active for classification.
     pi_beta : float, default=0.05
         Prior probability of gene loadings being active (slab).
     spike_variance_v : float, default=1e-6
         Variance for spike component of v (near-zero).
     spike_value_beta : float, default=1e-6
         Value for spike component of beta (near-zero).
+    regression_weight : float, default=10.0
+        Weight for classification objective. Higher values make classification
+        more influential on theta updates.
 
     Attributes
     ----------
@@ -90,10 +94,11 @@ class VI:
         sigma_v: float = 0.2,
         sigma_gamma: float = 0.5,
         random_state: Optional[int] = None,
-        pi_v: float = 0.2,
+        pi_v: float = 0.9,
         pi_beta: float = 0.05,
         spike_variance_v: float = 1e-6,
-        spike_value_beta: float = 1e-6
+        spike_value_beta: float = 1e-6,
+        regression_weight: float = 10.0
     ):
         self.d = n_factors
         self.alpha_theta = alpha_theta
@@ -115,7 +120,7 @@ class VI:
             self.rng = np.random.default_rng(random_state)
             self.seed_used_ = random_state
 
-        self.regression_weight = 0.01
+        self.regression_weight = regression_weight
         
         # Spike-and-slab parameters
         self.pi_v = pi_v
@@ -167,8 +172,8 @@ class VI:
         
         # Initialize spike-and-slab indicators for v
         # rho_v[k, ell] = q(s_v_kell = 1) - probability that v_kell is active (slab)
-        # Initialize at 0.5 to let data decide
-        self.rho_v = np.ones((self.kappa, self.d)) * 0.5
+        # Initialize based on prior - high pi_v means start with factors active
+        self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
 
         self.mu_gamma = 0.01 * self.rng.standard_normal((self.kappa, self.p_aux))
         self.Sigma_gamma = np.tile(np.eye(self.p_aux)[np.newaxis, :, :], (self.kappa, 1, 1))
