@@ -413,6 +413,30 @@ def main():
     print(f"  Time:       {model.training_time_:.2f}s")
 
     # =========================================================================
+    # STEP 4.5: Evaluate on Training Set
+    # =========================================================================
+    print("\n" + "=" * 80)
+    print("Training Set Evaluation")
+    print("=" * 80)
+
+    # For training set, we can use the E_theta computed during training
+    E_theta_train = model.E_theta
+    linear_pred_train = E_theta_train @ model.E_v.T + X_aux_train @ model.E_gamma.T
+    y_train_proba = expit(linear_pred_train)
+    if args.verbose:
+        print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
+    y_train_pred = (y_train_proba.ravel() > 0.5).astype(int)
+
+    train_metrics = compute_metrics(y_train, y_train_pred, y_train_proba.ravel())
+    print(f"\nTraining Results:")
+    print(f"  Accuracy:  {train_metrics['accuracy']:.4f}")
+    if 'auc' in train_metrics:
+        print(f"  AUC:       {train_metrics['auc']:.4f}")
+    print(f"  F1:        {train_metrics['f1']:.4f}")
+    print(f"  Precision: {train_metrics['precision']:.4f}")
+    print(f"  Recall:    {train_metrics['recall']:.4f}")
+
+    # =========================================================================
     # STEP 5: Evaluate on Validation Set
     # =========================================================================
     print("\n" + "=" * 80)
@@ -505,6 +529,14 @@ def main():
     print(f"Saved test theta to {output_dir / f'{prefix}_theta_test.csv.gz'}")
 
     # Predictions
+    train_pred_df = pd.DataFrame({
+        'cell_id': splits['train'],
+        'true_label': y_train,
+        'pred_prob': y_train_proba.ravel(),
+        'pred_label': y_train_pred
+    })
+    train_pred_df.to_csv(output_dir / f'{prefix}_train_predictions.csv.gz', compression='gzip', index=False)
+
     val_pred_df = pd.DataFrame({
         'cell_id': splits['val'],
         'true_label': y_val,
@@ -603,6 +635,7 @@ def main():
         print(f"  - {path}")
     print(f"  - {output_dir / f'{prefix}_theta_val.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_theta_test.csv.gz'}")
+    print(f"  - {output_dir / f'{prefix}_train_predictions.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_val_predictions.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_test_predictions.csv.gz'}")
 

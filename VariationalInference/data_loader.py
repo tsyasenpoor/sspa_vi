@@ -624,6 +624,11 @@ class DataLoader:
         else:
             X_aux = np.zeros((len(cell_ids), 0))
 
+        # Always add intercept column as first column
+        # This is critical for logistic regression to capture class imbalance
+        intercept = np.ones((len(cell_ids), 1))
+        X_aux = np.hstack([intercept, X_aux])
+
         return X, X_aux, y
 
     def load_and_preprocess(
