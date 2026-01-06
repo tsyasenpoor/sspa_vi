@@ -340,6 +340,15 @@ class SVIConfig:
     regression_weight : float, default=1.0
         Weight for classification objective. Higher values make classification
         more influential on theta updates. Values around 1.0-10.0 are typical.
+    lr_reduction_patience : int, default=5
+        Number of consecutive epochs of ELBO degradation before reducing learning rate.
+        This helps SVI stabilize when it overshoots the optimum.
+    lr_reduction_factor : float, default=0.5
+        Factor by which to reduce learning rate when ELBO degrades consistently.
+        Learning rate is multiplied by this factor (0.5 = halve the learning rate).
+    restore_best : bool, default=True
+        Whether to restore the best parameters when reducing learning rate or at end
+        of training. This helps the model recover from overshooting the optimum.
 
     Model Hyperparameters (Same as VI)
     ----------------------------------
@@ -378,6 +387,11 @@ class SVIConfig:
     warmup_epochs: int = 5
     local_iterations: int = 5
     regression_weight: float = 1.0
+
+    # Adaptive learning rate parameters
+    lr_reduction_patience: int = 5
+    lr_reduction_factor: float = 0.5
+    restore_best: bool = True
 
     # Model hyperparameters (same as VI)
     alpha_theta: float = 2.0
@@ -451,6 +465,9 @@ class SVIConfig:
             'warmup_epochs': self.warmup_epochs,
             'local_iterations': self.local_iterations,
             'regression_weight': self.regression_weight,
+            'lr_reduction_patience': self.lr_reduction_patience,
+            'lr_reduction_factor': self.lr_reduction_factor,
+            'restore_best': self.restore_best,
             'alpha_theta': self.alpha_theta,
             'alpha_beta': self.alpha_beta,
             'alpha_xi': self.alpha_xi,

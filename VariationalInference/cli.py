@@ -271,6 +271,23 @@ def create_parser() -> argparse.ArgumentParser:
         default=1.0,
         help='Weight for classification objective in SVI (higher=more focus on classification)'
     )
+    train_parser.add_argument(
+        '--lr-reduction-patience',
+        type=int,
+        default=5,
+        help='Epochs of ELBO degradation before reducing learning rate (SVI adaptive LR)'
+    )
+    train_parser.add_argument(
+        '--lr-reduction-factor',
+        type=float,
+        default=0.5,
+        help='Factor to reduce learning rate by when ELBO degrades (default: 0.5 = halve)'
+    )
+    train_parser.add_argument(
+        '--no-restore-best',
+        action='store_true',
+        help='Do not restore best parameters when learning rate is reduced or at end of training'
+    )
 
     # Output options
     train_parser.add_argument(
@@ -446,6 +463,9 @@ def cmd_train(args: argparse.Namespace) -> int:
                 warmup_epochs=args.warmup_epochs,
                 local_iterations=args.local_iterations,
                 regression_weight=args.regression_weight,
+                lr_reduction_patience=args.lr_reduction_patience,
+                lr_reduction_factor=args.lr_reduction_factor,
+                restore_best=not args.no_restore_best,
                 alpha_theta=args.alpha_theta,
                 alpha_beta=args.alpha_beta,
                 sigma_v=args.sigma_v,
