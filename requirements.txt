@@ -17,3 +17,6 @@ matplotlib>=3.4.0
 
 # Progress bars
 tqdm>=4.60.0
+
+# Note: scDesign3 integration requires R >= 4.3.0 and the scDesign3 R package
+# To install: cd VariationalInference/scdesign3 && bash setup_r_env.sh
