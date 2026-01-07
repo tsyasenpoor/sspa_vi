@@ -297,11 +297,9 @@ def load_pickle_data(
         X_aux = features[aux_columns].values.astype(np.float64)
         print(f"  Auxiliary features: {X_aux.shape[1]} columns")
 
-    # Always add intercept column as first column
-    # This is critical for logistic regression to capture class imbalance
-    intercept = np.ones((n_cells, 1), dtype=np.float64)
-    X_aux = np.hstack([intercept, X_aux])
-    print(f"  Total aux features (with intercept): {X_aux.shape[1]} columns")
+    # No intercept - gamma only models auxiliary variable effects
+    # The model prediction is: theta @ v + X_aux @ gamma
+    print(f"  Total aux features: {X_aux.shape[1]} columns")
     
     # Get gene names
     if isinstance(df.columns, pd.Index):
