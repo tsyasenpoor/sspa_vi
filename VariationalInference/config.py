@@ -139,6 +139,7 @@ class VIConfig:
     pi_beta: float = 0.05
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
+    regression_weight: float = 1.0
 
     # Training parameters
     max_iter: int = 200
@@ -208,6 +209,7 @@ class VIConfig:
             'pi_beta': self.pi_beta,
             'spike_variance_v': self.spike_variance_v,
             'spike_value_beta': self.spike_value_beta,
+            'regression_weight': self.regression_weight,
         }
 
     def training_params(self) -> Dict[str, Any]:
@@ -337,9 +339,9 @@ class SVIConfig:
         Number of epochs for learning rate warmup.
     local_iterations : int, default=5
         Number of iterations to optimize local parameters per mini-batch.
-    regression_weight : float, default=10.0
+    regression_weight : float, default=1.0
         Weight for classification objective. Higher values make classification
-        more influential on theta updates. Values around 5.0-20.0 work well.
+        more influential on theta updates. Values above 5.0 may cause instability.
     lr_reduction_patience : int, default=5
         Number of consecutive epochs of ELBO degradation before reducing learning rate.
         This helps SVI stabilize when it overshoots the optimum.
@@ -386,7 +388,7 @@ class SVIConfig:
     learning_rate_min: float = 1e-4
     warmup_epochs: int = 5
     local_iterations: int = 5
-    regression_weight: float = 10.0
+    regression_weight: float = 1.0
 
     # Adaptive learning rate parameters
     lr_reduction_patience: int = 5

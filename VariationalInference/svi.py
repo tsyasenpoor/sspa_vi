@@ -90,12 +90,11 @@ class SVI:
         Variance for spike component of v.
     spike_value_beta : float, default=1e-6
         Value for spike component of beta.
-    regression_weight : float, default=10.0
+    regression_weight : float, default=1.0
         Weight for classification/regression objective. Controls how much the
         label y influences theta updates. Higher values make the model focus
-        more on classification. Values around 5.0-20.0 work well for
-        classification tasks. Lower values (1.0) may cause the model to
-        focus on reconstruction and ignore labels.
+        more on classification. Values above 5.0 may cause instability in
+        batch VI. For SVI, higher values may be tolerable due to learning rate damping.
     lr_reduction_patience : int, default=5
         Number of consecutive epochs of ELBO degradation before reducing learning rate.
         This helps SVI stabilize when it overshoots the optimum.
@@ -146,7 +145,7 @@ class SVI:
         pi_beta: float = 0.05,
         spike_variance_v: float = 1e-6,
         spike_value_beta: float = 1e-6,
-        regression_weight: float = 10.0,
+        regression_weight: float = 1.0,
         lr_reduction_patience: int = 5,
         lr_reduction_factor: float = 0.5,
         restore_best: bool = True
