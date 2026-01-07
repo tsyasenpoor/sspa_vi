@@ -178,8 +178,11 @@ def compute_metrics(
 
     if y_proba is not None:
         try:
-            metrics['auc'] = roc_auc_score(y_true, y_proba)
-            metrics['average_precision'] = average_precision_score(y_true, y_proba)
+            # Ensure arrays are 1D for consistent handling
+            y_true_flat = np.asarray(y_true).ravel()
+            y_proba_flat = np.asarray(y_proba).ravel()
+            metrics['auc'] = roc_auc_score(y_true_flat, y_proba_flat)
+            metrics['average_precision'] = average_precision_score(y_true_flat, y_proba_flat)
         except ValueError:
             # Handle case where only one class is present
             metrics['auc'] = float('nan')

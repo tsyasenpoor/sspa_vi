@@ -223,18 +223,19 @@ def evaluate_prediction_performance(model, X_test, y_test, X_aux_test):
     
     # AUC
     if len(np.unique(y_test)) > 1:
-        auc = roc_auc_score(y_test, y_pred_proba)
+        auc = roc_auc_score(y_test.ravel(), y_pred_proba.ravel())
         print(f"\nTest AUC: {auc:.4f}")
-        
+
         # Threshold at 0.5
-        y_pred = (y_pred_proba > 0.5).astype(int)
-        accuracy = (y_pred == y_test).mean()
+        y_pred = (y_pred_proba.ravel() > 0.5).astype(int)
+        accuracy = (y_pred == y_test.ravel()).mean()
         
         # Confusion matrix
-        tp = np.sum((y_pred == 1) & (y_test == 1))
-        tn = np.sum((y_pred == 0) & (y_test == 0))
-        fp = np.sum((y_pred == 1) & (y_test == 0))
-        fn = np.sum((y_pred == 0) & (y_test == 1))
+        y_test_flat = y_test.ravel()
+        tp = np.sum((y_pred == 1) & (y_test_flat == 1))
+        tn = np.sum((y_pred == 0) & (y_test_flat == 0))
+        fp = np.sum((y_pred == 1) & (y_test_flat == 0))
+        fn = np.sum((y_pred == 0) & (y_test_flat == 1))
         
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
