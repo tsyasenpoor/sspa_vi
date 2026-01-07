@@ -33,15 +33,13 @@ from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner, SuccessiveHalvingPruner
 from sklearn.metrics import roc_auc_score
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 # Suppress some warnings during optimization
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
-
-# Add parent directory to path to allow VariationalInference imports
-script_dir = Path(__file__).resolve().parent
-parent_dir = script_dir.parent
-if str(parent_dir) not in sys.path:
-    sys.path.insert(0, str(parent_dir))
 
 # Import VI components
 from VariationalInference.data_loader import DataLoader
@@ -73,7 +71,7 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
         'learning_rate': {
             'type': 'float',
             'low': 1e-4,
-            'high': 0.1,
+            'high': 100,
             'log': True,
             'description': 'Learning rate for stochastic optimization'
         },
@@ -128,14 +126,14 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
         'sigma_v': {
             'type': 'float',
             'low': 0.01,
-            'high': 2.0,
+            'high': 4.0,
             'log': True,
             'description': 'Prior std for classification weights'
         },
         'sigma_gamma': {
             'type': 'float',
             'low': 0.01,
-            'high': 2.0,
+            'high': 4.0,
             'log': True,
             'description': 'Prior std for auxiliary effects'
         },
@@ -151,7 +149,7 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
         'pi_beta': {
             'type': 'float',
             'low': 0.01,
-            'high': 0.5,
+            'high': 1.0,
             'log': True,
             'description': 'Prior prob of beta being active'
         },
@@ -391,9 +389,11 @@ class VIObjective:
                 )
             else:
                 # SVI - import if needed
-                from .svi import SVI
+                from VariationalInference.svi import SVI
                 model = SVI(
                     n_factors=n_factors,
+                    batch_size=self.batch_size,
+                    learning_rate=learning_rate,
                     alpha_theta=params.get('alpha_theta', 2.0),
                     alpha_beta=params.get('alpha_beta', 2.0),
                     alpha_xi=params.get('alpha_xi', 2.0),
@@ -411,8 +411,6 @@ class VIObjective:
                     y=self._y_train,
                     X_aux=self._X_aux_train,
                     max_epochs=self.max_iter,
-                    batch_size=self.batch_size,
-                    learning_rate=learning_rate,
                     verbose=self.verbose
                 )
 

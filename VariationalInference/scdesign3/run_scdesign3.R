@@ -63,12 +63,26 @@ if (grepl("\\.h5ad$", input_file)) {
     # Extract count matrix (X)
     if ("X" %in% names(h5_data)) {
         if (is.list(h5_data$X)) {
-            # Sparse matrix format
+            # Sparse matrix format (CSR in AnnData)
+            # Dimensions from metadata
+            n_obs <- length(h5_data$X$indptr) - 1
+            if ("var" %in% names(h5_data) && "_index" %in% names(h5_data$var)) {
+                n_var <- length(h5_data$var$`_index`)
+            } else if ("var_names" %in% names(h5_data)) {
+                n_var <- length(h5_data$var_names)
+            } else {
+                n_var <- max(h5_data$X$indices) + 1
+            }
+            
+            # Build from triplets: expand CSR to COO format
+            row_indices <- rep(seq_len(n_obs), diff(h5_data$X$indptr))
+            col_indices <- h5_data$X$indices + 1  # R is 1-indexed
+            
             counts <- sparseMatrix(
-                i = h5_data$X$indices + 1,
-                p = h5_data$X$indptr,
-                x = h5_data$X$data,
-                dims = rev(h5_data$X$shape)
+                i = row_indices,
+                j = col_indices,
+                x = as.numeric(h5_data$X$data),
+                dims = c(n_obs, n_var)
             )
             counts <- t(counts)  # AnnData is obs x var, SCE is var x obs
         } else {
@@ -261,19 +275,24 @@ if (is.null(n_cores) || n_cores <= 0) {
 
 # Run simulation
 tryCatch({
+    # Null-coalesce return_model parameter
+    return_model_val <- if (is.null(config$return_model)) FALSE else config$return_model
+    
     result <- scdesign3(
         sce = sce,
         assay_use = "counts",
         celltype = celltype_col,
         pseudotime = pseudotime_col,
         spatial = spatial_data,
+        other_covariates = NULL,
+        corr_formula = "1",
         mu_formula = mu_formula,
         sigma_formula = "1",
         family_use = family_use,
         n_cores = n_cores,
         copula = copula_type,
         ncell = n_cells,
-        return_model = config$return_model %||% FALSE
+        return_model = return_model_val
     )
 
     cat("\nSimulation completed successfully!\n")

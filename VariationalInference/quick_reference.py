@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         '--data', '-d',
         type=str,
         required=True,
-        help='Path to h5ad file with gene expression data'
+        help='Path to h5ad or CSV file (auto-detects simulated CSV if "simulated" in filename)'
     )
     parser.add_argument(
         '--n-factors', '-k',
@@ -142,8 +142,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--patience',
         type=int,
-        default=5,
-        help='Early stopping patience'
+        default=10,
+        help='Early stopping patience (increased for small datasets)'
     )
 
     # SVI-specific options
@@ -194,6 +194,68 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help='Weight for classification objective in SVI (higher=more focus on classification)'
+    )
+
+    # Hyperparameter options (Priors & Regularization)
+    parser.add_argument(
+        '--alpha-theta',
+        type=float,
+        default=None,
+        help='Gamma prior shape for theta (gene programs). None=auto (1.0 for N<200, 0.5 else)'
+    )
+    parser.add_argument(
+        '--alpha-beta',
+        type=float,
+        default=2.0,
+        help='Gamma prior shape for beta (gene-program loadings)'
+    )
+    parser.add_argument(
+        '--alpha-xi',
+        type=float,
+        default=2.0,
+        help='Gamma prior shape for xi (auxiliary precision)'
+    )
+    parser.add_argument(
+        '--alpha-eta',
+        type=float,
+        default=2.0,
+        help='Gamma prior shape for eta (gene-specific precision)'
+    )
+    parser.add_argument(
+        '--lambda-xi',
+        type=float,
+        default=2.0,
+        help='Gamma prior rate for xi'
+    )
+    parser.add_argument(
+        '--lambda-eta',
+        type=float,
+        default=2.0,
+        help='Gamma prior rate for eta'
+    )
+    parser.add_argument(
+        '--sigma-v',
+        type=float,
+        default=None,
+        help='Gaussian prior std for v (classification weights). None=auto (1.0 for N<200, 2.0 else)'
+    )
+    parser.add_argument(
+        '--sigma-gamma',
+        type=float,
+        default=1.0,
+        help='Gaussian prior std for gamma (auxiliary effects)'
+    )
+    parser.add_argument(
+        '--pi-v',
+        type=float,
+        default=0.5,
+        help='Spike-and-slab prior probability for v (0=all spike, 1=all slab)'
+    )
+    parser.add_argument(
+        '--pi-beta',
+        type=float,
+        default=0.5,
+        help='Spike-and-slab prior probability for beta'
     )
 
     # Output options
@@ -334,6 +396,34 @@ def main():
     print(f"  Label dist:     {np.bincount(y_train)}")
 
     # =========================================================================
+    # STEP 3.5: Set Hyperparameters
+    # =========================================================================
+    n_train = X_train.shape[0]
+    
+    # Auto-configure hyperparameters if not provided
+    if args.alpha_theta is None:
+        alpha_theta = 1.0 if n_train < 200 else 0.5
+    else:
+        alpha_theta = args.alpha_theta
+    
+    if args.sigma_v is None:
+        sigma_v = 1.0 if n_train < 200 else 2.0
+    else:
+        sigma_v = args.sigma_v
+    
+    print(f"\nModel Hyperparameters:")
+    print(f"  alpha_theta:  {alpha_theta:.4f}")
+    print(f"  alpha_beta:   {args.alpha_beta:.4f}")
+    print(f"  alpha_xi:     {args.alpha_xi:.4f}")
+    print(f"  alpha_eta:    {args.alpha_eta:.4f}")
+    print(f"  lambda_xi:    {args.lambda_xi:.4f}")
+    print(f"  lambda_eta:   {args.lambda_eta:.4f}")
+    print(f"  sigma_v:      {sigma_v:.4f}")
+    print(f"  sigma_gamma:  {args.sigma_gamma:.4f}")
+    print(f"  pi_v:         {args.pi_v:.4f}")
+    print(f"  pi_beta:      {args.pi_beta:.4f}")
+
+    # =========================================================================
     # STEP 4: Train Model (VI or SVI)
     # =========================================================================
     print("\n" + "=" * 80)
@@ -350,12 +440,16 @@ def main():
             learning_rate_min=args.learning_rate_min,
             warmup_epochs=args.warmup_epochs,
             regression_weight=args.regression_weight,
-            alpha_theta=0.5,   # Loose prior on theta
-            alpha_beta=2.0,    # Tight prior on beta
-            alpha_xi=2.0,
-            lambda_xi=2.0,
-            sigma_v=2.0,       # Regularization for classification weights
-            sigma_gamma=1.0,   # Regularization for auxiliary effects
+            alpha_theta=alpha_theta,
+            alpha_beta=args.alpha_beta,
+            alpha_xi=args.alpha_xi,
+            lambda_xi=args.lambda_xi,
+            alpha_eta=args.alpha_eta,
+            lambda_eta=args.lambda_eta,
+            sigma_v=sigma_v,
+            sigma_gamma=args.sigma_gamma,
+            pi_v=args.pi_v,
+            pi_beta=args.pi_beta,
             random_state=args.seed
         )
 
@@ -377,16 +471,31 @@ def main():
         # Create batch VI model
         model = VI(
             n_factors=args.n_factors,
-            alpha_theta=0.5,   # Loose prior on theta
-            alpha_beta=2.0,    # Tight prior on beta
-            alpha_xi=2.0,
-            lambda_xi=2.0,
-            sigma_v=2.0,       # Regularization for classification weights
-            sigma_gamma=1.0,   # Regularization for auxiliary effects
-            random_state=args.seed  # None = random, or pass seed for reproducibility
+            alpha_theta=alpha_theta,
+            alpha_beta=args.alpha_beta,
+            alpha_xi=args.alpha_xi,
+            lambda_xi=args.lambda_xi,
+            alpha_eta=args.alpha_eta,
+            lambda_eta=args.lambda_eta,
+            sigma_v=sigma_v,
+            sigma_gamma=args.sigma_gamma,
+            pi_v=args.pi_v,
+            pi_beta=args.pi_beta,
+            random_state=args.seed
         )
 
         # Train with adaptive damping
+        # Use higher damping for small datasets to prevent oscillation
+        n_train = X_train.shape[0]
+        if n_train < 200:
+            # Small dataset: conservative damping
+            theta_damp, beta_damp, v_damp = 0.95, 0.95, 0.90
+            gamma_damp, xi_damp, eta_damp = 0.90, 0.95, 0.95
+        else:
+            # Large dataset: standard damping
+            theta_damp, beta_damp, v_damp = 0.80, 0.80, 0.70
+            gamma_damp, xi_damp, eta_damp = 0.70, 0.90, 0.90
+        
         model.fit(
             X=X_train,
             y=y_train,
@@ -398,12 +507,12 @@ def main():
             min_iter=args.min_iter,
             patience=args.patience,
             verbose=True,
-            theta_damping=0.8,
-            beta_damping=0.8,
-            v_damping=0.7,
-            gamma_damping=0.7,
-            xi_damping=0.9,
-            eta_damping=0.9,
+            theta_damping=theta_damp,
+            beta_damping=beta_damp,
+            v_damping=v_damp,
+            gamma_damping=gamma_damp,
+            xi_damping=xi_damp,
+            eta_damping=eta_damp,
             debug=args.debug
         )
 

@@ -86,6 +86,7 @@ class DataLoader:
 
         # Detect data type from filename
         self.is_singscore = 'singscore' in str(self.data_path).lower()
+        self.is_simulated = 'simulated' in str(self.data_path).lower()
         self.feature_type = 'pathway' if self.is_singscore else 'gene'
         
         # Create cache directory
@@ -143,6 +144,42 @@ class DataLoader:
         self._log(f"  Obs columns: {list(self.adata.obs.columns)}")
 
         return self.adata
+
+    def load_simulated_csv(self) -> pd.DataFrame:
+        """
+        Load simulated data from CSV (simulated_gex_t2dm_groundtruth.csv format).
+        
+        Expected format:
+        - Rows: samples/cells
+        - Columns: genes (Ensembl IDs) + 't2dm' label column
+        - No preprocessing needed (already clean)
+        
+        Returns
+        -------
+        pd.DataFrame
+            Raw expression DataFrame with label column.
+        """
+        self._log(f"Loading simulated CSV: {self.data_path}")
+        
+        # Load CSV
+        df = pd.read_csv(self.data_path, index_col=0)
+        
+        # Check for t2dm column
+        if 't2dm' not in df.columns:
+            raise ValueError(f"Simulated CSV must contain 't2dm' label column. Found: {list(df.columns)}")
+        
+        # Separate labels from expression data
+        self.label_data = df['t2dm'].copy()
+        self.raw_df = df.drop(columns=['t2dm'])
+        
+        # Store metadata
+        self.gene_list = self.raw_df.columns.tolist()
+        self.cell_ids = self.raw_df.index.tolist()
+        
+        self._log(f"  Shape: {len(self.cell_ids)} cells x {len(self.gene_list)} genes")
+        self._log(f"  Label distribution: {self.label_data.value_counts().to_dict()}")
+        
+        return self.raw_df
 
     def get_expression_df(self, layer: str = 'raw') -> pd.DataFrame:
         """
@@ -362,15 +399,17 @@ class DataLoader:
 
         For singscore data (pathways), convert_to_ensembl and filter_protein_coding
         are automatically skipped regardless of parameter values.
+        
+        For simulated data (CSV), all preprocessing is skipped - data is used as-is.
 
         Parameters
         ----------
         layer : str, default='raw'
             Which layer to use for expression data.
         convert_to_ensembl : bool, default=True
-            Whether to convert gene symbols to Ensembl IDs (ignored for pathways).
+            Whether to convert gene symbols to Ensembl IDs (ignored for pathways/simulated).
         filter_protein_coding : bool, default=True
-            Whether to filter for protein-coding genes (ignored for pathways).
+            Whether to filter for protein-coding genes (ignored for pathways/simulated).
         min_cells_expressing : float, default=0.02
             Minimum fraction of cells expressing each gene/pathway.
 
@@ -379,6 +418,13 @@ class DataLoader:
         pd.DataFrame
             Preprocessed expression DataFrame.
         """
+        # SIMULATED DATA: Load directly from CSV, no preprocessing
+        if self.is_simulated:
+            self._log("Detected simulated data - loading CSV directly (no preprocessing)")
+            self.load_simulated_csv()
+            self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
+            return self.raw_df
+        
         # Override settings for singscore data
         if self.is_singscore:
             convert_to_ensembl = False
@@ -436,7 +482,7 @@ class DataLoader:
 
     def get_labels(self, label_column: str) -> np.ndarray:
         """
-        Get labels from adata.obs.
+        Get labels from adata.obs or simulated data.
 
         Parameters
         ----------
@@ -448,6 +494,12 @@ class DataLoader:
         np.ndarray
             Label array aligned with cell_ids.
         """
+        # For simulated data, labels are already loaded
+        if self.is_simulated:
+            if not hasattr(self, 'label_data') or self.label_data is None:
+                raise ValueError("Simulated data not loaded. Call preprocess() first.")
+            return self.label_data.values.astype(int)
+        
         if self.adata is None:
             self.load_adata()
 
@@ -460,6 +512,8 @@ class DataLoader:
     def get_auxiliary_features(self, aux_columns: List[str]) -> np.ndarray:
         """
         Get auxiliary features from adata.obs.
+        
+        For simulated data, returns empty array (no aux features).
 
         Parameters
         ----------
@@ -471,6 +525,14 @@ class DataLoader:
         np.ndarray
             Auxiliary feature matrix (n_cells, n_aux).
         """
+        # Simulated data has no auxiliary features
+        if self.is_simulated:
+            if not aux_columns:
+                return np.zeros((len(self.cell_ids), 0))
+            else:
+                self._log(f"WARNING: Simulated data has no auxiliary features. Ignoring: {aux_columns}")
+                return np.zeros((len(self.cell_ids), 0))
+        
         if self.adata is None:
             self.load_adata()
 
@@ -539,9 +601,15 @@ class DataLoader:
         # Get stratification labels if specified
         stratify = None
         if stratify_by is not None:
-            if self.adata is None:
-                self.load_adata()
-            stratify = self.adata.obs.loc[self.cell_ids, stratify_by].values
+            # For simulated data, use pre-loaded labels
+            if self.is_simulated:
+                if not hasattr(self, 'label_data') or self.label_data is None:
+                    raise ValueError("Simulated data not loaded. Call preprocess() first.")
+                stratify = self.label_data.loc[self.cell_ids].values
+            else:
+                if self.adata is None:
+                    self.load_adata()
+                stratify = self.adata.obs.loc[self.cell_ids, stratify_by].values
 
         # First split: train vs (val+test)
         train_ids, temp_ids = train_test_split(
@@ -610,13 +678,16 @@ class DataLoader:
         # Get expression matrix
         X = self.raw_df.loc[cell_ids].values
 
-        # Get labels
-        if self.adata is None:
-            self.load_adata()
-        y = self.adata.obs.loc[cell_ids, label_column].values.astype(int)
+        # Get labels (handles simulated vs h5ad)
+        if self.is_simulated:
+            y = self.label_data.loc[cell_ids].values.astype(int)
+        else:
+            if self.adata is None:
+                self.load_adata()
+            y = self.adata.obs.loc[cell_ids, label_column].values.astype(int)
 
-        # Get auxiliary features
-        if aux_columns:
+        # Get auxiliary features (empty for simulated)
+        if aux_columns and not self.is_simulated:
             X_aux = self.get_auxiliary_features(aux_columns)
             # Subset to requested cells
             cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]

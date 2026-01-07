@@ -280,7 +280,7 @@ class ScDesign3Simulator:
         n_genes: int = 0,
         gene_selection: str = "variable",
         min_cells_expressing: float = 0.0,
-        family: str = "nb",
+        family: str = "poisson",
         copula: str = "gaussian",
         mu_formula: Optional[str] = None,
         n_cores: int = 1,

@@ -22,6 +22,10 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Project-specific
+miscc/
+
 cytokine_de_results_no_outliers.csv
 cytoseed_ensembl_cache.pkl
 elbo_convergence.png
@@ -269,3 +273,4 @@ jobs_sh/pickle_vi.sh
 anal.ipynb
 jobs_sh/optimized_svi.sh
 jobs_sh/bayes_opt.sh
+ctrl_sspa_test/Bcell_GEX_20251201_control.h5ad
