@@ -1247,6 +1247,11 @@ class VI:
             compute_elbo = (iteration % elbo_freq == 0 or iteration == 0 or iteration == max_iter - 1)
 
             if compute_elbo:
+                # CRITICAL: Recompute expectations using updated variational parameters
+                # This ensures E_theta, E_log_theta etc. are consistent with current a_theta, b_theta
+                # Without this, ELBO uses stale expectations causing apparent divergence
+                self._compute_expectations()
+
                 # Recompute sufficient statistics for ELBO (or reuse if still in scope)
                 if use_ultra_efficient:
                     z_sum_genes, z_sum_samples = self._compute_z_suffstats_memory_efficient(X)
