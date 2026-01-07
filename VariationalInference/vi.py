@@ -62,9 +62,9 @@ class VI:
         Variance for spike component of v (near-zero).
     spike_value_beta : float, default=1e-6
         Value for spike component of beta (near-zero).
-    regression_weight : float, default=10.0
+    regression_weight : float, default=1.0
         Weight for classification objective. Higher values make classification
-        more influential on theta updates.
+        more influential on theta updates. Values above 5.0 may cause instability.
 
     Attributes
     ----------
@@ -98,7 +98,7 @@ class VI:
         pi_beta: float = 0.05,
         spike_variance_v: float = 1e-6,
         spike_value_beta: float = 1e-6,
-        regression_weight: float = 10.0
+        regression_weight: float = 1.0
     ):
         self.d = n_factors
         self.alpha_theta = alpha_theta
@@ -399,6 +399,10 @@ class VI:
                     + 2 * lam * self.E_v[k, ell] * E_C
                     + 2 * lam * E_theta_prev[:, ell] * E_v_sq[ell]
                 )
+
+                # Clip regression contribution to prevent numerical instability
+                # Large regression contributions cause ELBO oscillations
+                regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
 
                 self.b_theta[:, ell] += self.regression_weight * regression_contrib
 

@@ -268,8 +268,8 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         '--regression-weight',
         type=float,
-        default=10.0,
-        help='Weight for classification objective in SVI (higher=more focus on classification). Values 5-20 work well.'
+        default=1.0,
+        help='Weight for classification objective (higher=more focus on classification). Values above 5.0 may cause instability.'
     )
     train_parser.add_argument(
         '--lr-reduction-patience',
