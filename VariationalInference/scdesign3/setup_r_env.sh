@@ -42,8 +42,15 @@ install_if_missing <- function(pkg) {
 # Install BiocManager for Bioconductor packages
 install_if_missing("BiocManager")
 
-# Install devtools for GitHub packages
-install_if_missing("devtools")
+# Install devtools for GitHub packages (required for install_github)
+# Force install to ensure it's available
+if (!requireNamespace("devtools", quietly = TRUE)) {
+    cat("Installing devtools (this may take a few minutes)...\n")
+    install.packages("devtools", dependencies = TRUE)
+}
+# Explicitly load devtools
+library(devtools)
+cat("devtools loaded successfully\n")
 
 # Core dependencies from CRAN
 cran_packages <- c(
@@ -71,7 +78,8 @@ for (pkg in cran_packages) {
 bioc_packages <- c(
     "SingleCellExperiment",
     "SummarizedExperiment",
-    "BiocParallel"
+    "BiocParallel",
+    "rhdf5"  # For reading h5ad files
 )
 
 for (pkg in bioc_packages) {
