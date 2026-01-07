@@ -57,23 +57,70 @@ if (grepl("\\.h5ad$", input_file)) {
     }
     library(rhdf5)
 
+    # List structure to understand the file
+    h5_struct <- h5ls(input_file)
+    cat("H5 structure:\n")
+    print(head(h5_struct, 20))
+
     # Read the data
     h5_data <- h5read(input_file, "/")
 
     # Extract count matrix (X)
+    # AnnData stores X as (n_obs x n_var) = (cells x genes)
     if ("X" %in% names(h5_data)) {
         if (is.list(h5_data$X)) {
-            # Sparse matrix format
+            # Sparse matrix in CSR format (AnnData default)
+            # indices = column indices for each non-zero
+            # indptr = row pointers (length n_rows + 1)
+            # data = non-zero values
+
+            cat("Detected sparse matrix format\n")
+
+            # Get dimensions - AnnData shape is (n_obs, n_var) = (cells, genes)
+            # Check different possible locations for shape
+            if (!is.null(h5_data$X$shape)) {
+                n_obs <- h5_data$X$shape[1]  # cells
+                n_var <- h5_data$X$shape[2]  # genes
+            } else {
+                # Try to infer from indptr length (should be n_obs + 1)
+                n_obs <- length(h5_data$X$indptr) - 1
+                n_var <- max(h5_data$X$indices) + 1
+            }
+
+            cat(sprintf("Dimensions: %d cells x %d genes\n", n_obs, n_var))
+            cat(sprintf("Number of non-zeros: %d\n", length(h5_data$X$data)))
+
+            # Convert CSR to triplet format (i, j, x)
+            # indptr gives row boundaries, indices gives column positions
+            indptr <- h5_data$X$indptr
+            indices <- h5_data$X$indices
+            data_vals <- h5_data$X$data
+
+            # Build row indices from indptr
+            row_indices <- integer(length(data_vals))
+            for (row in 1:n_obs) {
+                start_idx <- indptr[row] + 1  # +1 for R indexing
+                end_idx <- indptr[row + 1]
+                if (end_idx >= start_idx) {
+                    row_indices[start_idx:end_idx] <- row
+                }
+            }
+
+            # Create sparse matrix (genes x cells for SCE)
+            # We transpose by swapping i and j
             counts <- sparseMatrix(
-                i = h5_data$X$indices + 1,
-                p = h5_data$X$indptr,
-                x = h5_data$X$data,
-                dims = rev(h5_data$X$shape)
+                i = indices + 1,  # column indices become row indices (genes)
+                j = row_indices,  # row indices become column indices (cells)
+                x = data_vals,
+                dims = c(n_var, n_obs)  # genes x cells
             )
-            counts <- t(counts)  # AnnData is obs x var, SCE is var x obs
+
+            cat(sprintf("Created sparse matrix: %d x %d\n", nrow(counts), ncol(counts)))
+
         } else {
-            # Dense matrix
-            counts <- t(h5_data$X)  # Transpose for SCE format
+            # Dense matrix - AnnData stores as (cells x genes)
+            cat("Detected dense matrix format\n")
+            counts <- t(h5_data$X)  # Transpose to genes x cells for SCE
         }
     } else if ("layers" %in% names(h5_data) && "counts" %in% names(h5_data$layers)) {
         counts <- t(h5_data$layers$counts)
