@@ -267,3 +267,4 @@ probability_vs_true_labels.png
 roc_curves.png
 jobs_sh/pickle_vi.sh
 anal.ipynb
+jobs_sh/optimized_svi.sh
