@@ -596,14 +596,19 @@ class VI:
             # Shape: (n,)
             E_A = self.E_theta @ self.E_v[k] + X_aux @ self.E_gamma[k]
             E_A_sq = E_A**2
-            
-            # Add variance terms: Σ_ℓ (E[v²_kℓ] * Var[θ_iℓ])
-            # Var[θ_iℓ] = a_iℓ / b_iℓ²
-            # E[v²_kℓ] = μ²_kℓ + Σ_kℓℓ
-            E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])  # Shape: (d,)
-            Var_theta = self.a_theta / (self.b_theta**2)  # Shape: (n, d)
+
+            # Add variance contributions for E[A²]:
+            # E[A²] = (E[A])² + sum_ℓ Var[θ_ℓ]*E[v²_ℓ] + sum_ℓ E[θ²_ℓ]*Var[v_ℓ]
+            E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])  # E[v²]
+            Var_v = np.diag(self.Sigma_v[k])  # Var[v]
+            Var_theta = self.a_theta / (self.b_theta**2)  # Var[θ]
+            E_theta_sq = self.E_theta**2 + Var_theta  # E[θ²]
+
+            # Term 1: sum_ℓ Var[θ_ℓ] * E[v²_ℓ]
             E_A_sq += (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
-            
+            # Term 2: sum_ℓ E[θ²_ℓ] * Var[v_ℓ] (was missing!)
+            E_A_sq += (E_theta_sq * Var_v[np.newaxis, :]).sum(axis=1)
+
             self.zeta[:, k] = np.sqrt(np.maximum(E_A_sq, 1e-10))
     
     def _compute_elbo(self, X: np.ndarray, y: np.ndarray, X_aux: np.ndarray, debug: bool = False, iteration: int = 0) -> float:
@@ -638,16 +643,30 @@ class VI:
         for k in range(self.kappa):
             y_k = y[:, k] if y.ndim > 1 else y
             lam = self._lambda_jj(self.zeta[:, k])
-            
+            zeta_k = self.zeta[:, k]
+
             for i in range(self.n):
                 E_A = self.E_theta[i] @ self.E_v[k] + X_aux[i] @ self.E_gamma[k]
                 E_A_sq = E_A**2
-                # Add variance contribution
-                E_A_sq += np.sum((self.mu_v[k]**2 + np.diag(self.Sigma_v[k])) * 
-                                (self.a_theta[i] / self.b_theta[i]**2))
-                
-                # Jaakola-Jordan lower bound
+
+                # Add variance contributions for E[A²]:
+                # E[A²] = (E[A])² + sum_ℓ Var[θ_ℓ]*E[v²_ℓ] + sum_ℓ E[θ²_ℓ]*Var[v_ℓ]
+                E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])  # E[v²]
+                Var_v = np.diag(self.Sigma_v[k])  # Var[v]
+                Var_theta_i = self.a_theta[i] / self.b_theta[i]**2  # Var[θ_i]
+                E_theta_sq_i = self.E_theta[i]**2 + Var_theta_i  # E[θ²_i]
+
+                # Term 1: sum_ℓ Var[θ_ℓ] * E[v²_ℓ]
+                E_A_sq += np.sum(Var_theta_i * E_v_sq)
+                # Term 2: sum_ℓ E[θ²_ℓ] * Var[v_ℓ] (was missing!)
+                E_A_sq += np.sum(E_theta_sq_i * Var_v)
+
+                # Jaakola-Jordan lower bound (main terms)
                 elbo_y += (y_k[i] - 0.5) * E_A - lam[i] * E_A_sq
+
+                # JJ constant terms: λ(ζ)*ζ² - ζ/2 - log(1 + exp(ζ))
+                zeta_i = np.clip(zeta_k[i], -500, 500)
+                elbo_y += lam[i] * zeta_k[i]**2 - 0.5 * zeta_k[i] - np.log1p(np.exp(zeta_i))
         elbo += elbo_y
         elbo_components['E[log p(y|theta,v,gamma)]'] = elbo_y
         
@@ -869,12 +888,26 @@ class VI:
             E_A = self.E_theta @ self.E_v[k] + X_aux @ self.E_gamma[k]  # (n,)
             E_A_sq = E_A**2
 
-            # Add variance contribution: sum_l E[v²_kl] * Var[θ_il]
-            E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])  # (d,)
-            Var_theta = self.a_theta / (self.b_theta**2)  # (n, d)
-            E_A_sq += (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
+            # Add variance contributions for E[A²]:
+            # E[A²] = (E[A])² + sum_ℓ Var[θ_ℓ]*E[v²_ℓ] + sum_ℓ E[θ²_ℓ]*Var[v_ℓ]
+            E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])  # E[v²] = E[v]² + Var[v]
+            Var_v = np.diag(self.Sigma_v[k])  # Var[v]
+            Var_theta = self.a_theta / (self.b_theta**2)  # Var[θ] for Gamma
+            E_theta_sq = self.E_theta**2 + Var_theta  # E[θ²] = E[θ]² + Var[θ]
 
+            # Term 1: sum_ℓ Var[θ_ℓ] * E[v²_ℓ]
+            E_A_sq += (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
+            # Term 2: sum_ℓ E[θ²_ℓ] * Var[v_ℓ] (was missing!)
+            E_A_sq += (E_theta_sq * Var_v[np.newaxis, :]).sum(axis=1)
+
+            # Main JJ bound terms
             elbo_y += np.sum((y_k - 0.5) * E_A - lam * E_A_sq)
+
+            # Add missing JJ constant terms: λ(ζ)*ζ² - ζ/2 - log(1 + exp(ζ))
+            # These terms are essential for correct ELBO computation
+            zeta_k = self.zeta[:, k]
+            jj_const = lam * zeta_k**2 - 0.5 * zeta_k - np.log1p(np.exp(np.clip(zeta_k, -500, 500)))
+            elbo_y += np.sum(jj_const)
         elbo += elbo_y
 
         # =====================================================================
@@ -1471,10 +1504,17 @@ class VI:
                         E_A = E_theta_batch @ self.E_v[k] + X_aux_batch @ self.E_gamma[k]
                         E_y = expit(E_A)
 
+                        # Compute E[A²] correctly
                         E_A_sq = E_A**2
-                        E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
-                        Var_theta = a_theta_batch / (b_theta_batch**2)
+                        E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])  # E[v²]
+                        Var_v = np.diag(self.Sigma_v[k])  # Var[v]
+                        Var_theta = a_theta_batch / (b_theta_batch**2)  # Var[θ]
+                        E_theta_sq = E_theta_batch**2 + Var_theta  # E[θ²]
+
+                        # Term 1: sum_ℓ Var[θ_ℓ] * E[v²_ℓ]
                         E_A_sq += (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
+                        # Term 2: sum_ℓ E[θ²_ℓ] * Var[v_ℓ]
+                        E_A_sq += (E_theta_sq * Var_v[np.newaxis, :]).sum(axis=1)
                         zeta_new[start:end, k] = np.sqrt(np.maximum(E_A_sq, 1e-10))
 
                         lam = self._lambda_jj(zeta_new[start:end, k])
