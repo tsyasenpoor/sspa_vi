@@ -268,3 +268,4 @@ roc_curves.png
 jobs_sh/pickle_vi.sh
 anal.ipynb
 jobs_sh/optimized_svi.sh
+jobs_sh/bayes_opt.sh

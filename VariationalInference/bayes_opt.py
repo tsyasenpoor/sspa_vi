@@ -37,11 +37,17 @@ from sklearn.metrics import roc_auc_score
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
+# Add parent directory to path to allow VariationalInference imports
+script_dir = Path(__file__).resolve().parent
+parent_dir = script_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+
 # Import VI components
-from .data_loader import DataLoader
-from .vi import VI
-from .config import VIConfig
-from .utils import compute_metrics
+from VariationalInference.data_loader import DataLoader
+from VariationalInference.vi import VI
+from VariationalInference.config import VIConfig
+from VariationalInference.utils import compute_metrics
 
 # Configure logging
 logging.basicConfig(
@@ -370,6 +376,7 @@ class VIObjective:
                 sigma_gamma=params.get('sigma_gamma', 0.5),
                 pi_v=params.get('pi_v', 0.9),
                 pi_beta=params.get('pi_beta', 0.05),
+                regression_weight=params.get('regression_weight', 1.0),
             )
 
             # Train model
@@ -379,7 +386,6 @@ class VIObjective:
                     y=self._y_train,
                     X_aux=self._X_aux_train,
                     max_iter=self.max_iter,
-                    regression_weight=params.get('regression_weight', 1.0),
                     patience=self.early_stopping_patience,
                     verbose=self.verbose
                 )
@@ -398,6 +404,7 @@ class VIObjective:
                     sigma_gamma=params.get('sigma_gamma', 0.5),
                     pi_v=params.get('pi_v', 0.9),
                     pi_beta=params.get('pi_beta', 0.05),
+                    regression_weight=params.get('regression_weight', 1.0),
                 )
                 model.fit(
                     X=self._X_train,
@@ -406,7 +413,6 @@ class VIObjective:
                     max_epochs=self.max_iter,
                     batch_size=self.batch_size,
                     learning_rate=learning_rate,
-                    regression_weight=params.get('regression_weight', 1.0),
                     verbose=self.verbose
                 )
 
