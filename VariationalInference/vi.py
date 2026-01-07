@@ -276,7 +276,21 @@ class VI:
         result[nonzero] = (1.0 / (4.0 * zeta[nonzero])) * np.tanh(zeta[nonzero] / 2.0)
         result[~nonzero] = 0.125
         return result
-    
+
+    def _allocate_counts(self, X: np.ndarray) -> tuple:
+        """
+        Allocate counts using multinomial with expected log parameters.
+        Returns both z array and log_phi (normalized) for entropy calculation.
+        """
+        log_phi = self.E_log_theta[:, np.newaxis, :] + self.E_log_beta[np.newaxis, :, :]
+        log_phi_max = log_phi.max(axis=2, keepdims=True)
+        phi = np.exp(log_phi - log_phi_max)
+        phi_sum = phi.sum(axis=2, keepdims=True)
+        phi = phi / phi_sum
+        log_phi_normalized = log_phi - log_phi_max - np.log(phi_sum)
+        z = X[:, :, np.newaxis] * phi
+        return z, log_phi_normalized
+
     def _compute_z_suffstats(self, X: np.ndarray, chunk_size: int = 1000):
         """
         Compute sufficient statistics from z WITHOUT materializing full (n, p, d) array.
@@ -617,22 +631,25 @@ class VI:
         
         Using Poisson augmentation structure for tractable computation.
         """
-        z = self._allocate_counts(X)
+        z, log_phi = self._allocate_counts(X)
         elbo = 0.0
         elbo_components = {}
-        
+
         # =====================================================================
-        # E[log p(z | θ, β)] - Poisson latent variables
+        # E[log p(z | θ, β)] - Poisson latent variables with correct entropy
         # =====================================================================
+        # ELBO_z = sum_ijl z_ijl * (E[log θ] + E[log β] - log φ) - sum_ijl E[θ]E[β]
+        # The -log φ term is the entropy of the variational distribution over z
         elbo_z = 0.0
         for i in range(self.n):
             for j in range(self.p):
                 for ell in range(self.d):
                     if z[i, j, ell] > 1e-10:
-                        # E[log Poisson(z_ijℓ | θ_iℓ β_jℓ)]
+                        # E[log p(z|θ,β)] contribution
                         elbo_z += z[i, j, ell] * (self.E_log_theta[i, ell] + self.E_log_beta[j, ell])
                         elbo_z -= self.E_theta[i, ell] * self.E_beta[j, ell]
-                        elbo_z -= gammaln(z[i, j, ell] + 1)
+                        # Multinomial entropy term: -z * log(φ) (replaces incorrect gammaln)
+                        elbo_z -= z[i, j, ell] * log_phi[i, j, ell]
         elbo += elbo_z
         elbo_components['E[log p(z|theta,beta)]'] = elbo_z
         

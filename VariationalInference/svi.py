@@ -104,6 +104,11 @@ class SVI:
     restore_best : bool, default=True
         Whether to restore the best parameters when reducing learning rate.
         This helps the model recover from overshooting the optimum.
+    regression_lr_multiplier : float, default=10.0
+        Multiplier for learning rate when updating regression parameters (v, gamma).
+        Higher values help break the bootstrap problem where v needs class-discriminative
+        theta to learn, but theta needs v to receive class signal. The regression
+        learning rate is min(rho_t * multiplier, 1.0) to prevent overshooting.
 
     Attributes
     ----------
@@ -148,7 +153,8 @@ class SVI:
         regression_weight: float = 1.0,
         lr_reduction_patience: int = 5,
         lr_reduction_factor: float = 0.5,
-        restore_best: bool = True
+        restore_best: bool = True,
+        regression_lr_multiplier: float = 10.0
     ):
         self.d = n_factors
         self.batch_size = batch_size
@@ -191,6 +197,11 @@ class SVI:
         self.lr_reduction_factor = lr_reduction_factor
         self.restore_best = restore_best
         self._current_lr_multiplier = 1.0  # Tracks cumulative learning rate reductions
+
+        # Separate higher learning rate for regression parameters (v, gamma)
+        # This helps break the bootstrap problem where v needs class-discriminative
+        # theta to learn, but theta needs v to receive class signal
+        self.regression_lr_multiplier = regression_lr_multiplier
 
     def _get_learning_rate(self, iteration: int, n_batches_per_epoch: int = 1) -> float:
         """
@@ -710,6 +721,10 @@ class SVI:
         """
         Update global parameters using SVI update rule:
         λ^(t) = (1 - ρ_t) λ^(t-1) + ρ_t λ̂
+
+        Uses a separate, higher learning rate for regression parameters (v, gamma)
+        to help break the bootstrap problem where v needs class-discriminative
+        theta to learn, but theta needs v to receive class signal.
         """
         # Update beta
         self.a_beta = (1 - rho_t) * self.a_beta + rho_t * a_beta_hat
@@ -722,16 +737,20 @@ class SVI:
         # Update rho_beta
         self.rho_beta = (1 - rho_t) * self.rho_beta + rho_t * rho_beta_hat
 
-        # Update v
-        self.mu_v = (1 - rho_t) * self.mu_v + rho_t * mu_v_hat
-        self.Sigma_v = (1 - rho_t) * self.Sigma_v + rho_t * Sigma_v_hat
+        # Use higher learning rate for regression parameters to break bootstrap
+        # problem. Cap at 1.0 to avoid overshooting.
+        rho_t_reg = min(rho_t * self.regression_lr_multiplier, 1.0)
 
-        # Update gamma
-        self.mu_gamma = (1 - rho_t) * self.mu_gamma + rho_t * mu_gamma_hat
-        self.Sigma_gamma = (1 - rho_t) * self.Sigma_gamma + rho_t * Sigma_gamma_hat
+        # Update v with higher learning rate
+        self.mu_v = (1 - rho_t_reg) * self.mu_v + rho_t_reg * mu_v_hat
+        self.Sigma_v = (1 - rho_t_reg) * self.Sigma_v + rho_t_reg * Sigma_v_hat
 
-        # Update rho_v
-        self.rho_v = (1 - rho_t) * self.rho_v + rho_t * rho_v_hat
+        # Update gamma with higher learning rate
+        self.mu_gamma = (1 - rho_t_reg) * self.mu_gamma + rho_t_reg * mu_gamma_hat
+        self.Sigma_gamma = (1 - rho_t_reg) * self.Sigma_gamma + rho_t_reg * Sigma_gamma_hat
+
+        # Update rho_v with higher learning rate
+        self.rho_v = (1 - rho_t_reg) * self.rho_v + rho_t_reg * rho_v_hat
 
         # Recompute global expectations
         self._compute_global_expectations()
@@ -759,7 +778,10 @@ class SVI:
             log_phi = E_log_theta[:, np.newaxis, :] + E_log_beta_chunk[np.newaxis, :, :]
             log_phi_max = log_phi.max(axis=2, keepdims=True)
             phi = np.exp(log_phi - log_phi_max)
-            phi = phi / phi.sum(axis=2, keepdims=True)
+            phi_sum = phi.sum(axis=2, keepdims=True)
+            phi = phi / phi_sum
+            # Normalized log probabilities for entropy calculation
+            log_phi_normalized = log_phi - log_phi_max - np.log(phi_sum)
 
             # z = x * phi
             z_chunk = X_chunk[:, :, np.newaxis] * phi  # (batch, g_chunk, d)
@@ -769,10 +791,11 @@ class SVI:
             elbo_z += np.sum(z_chunk * (E_log_theta[:, np.newaxis, :] + E_log_beta_chunk[np.newaxis, :, :]))
             # - sum_ijl E_theta_il * E_beta_jl (can be computed without z)
             elbo_z -= np.sum(E_theta[:, np.newaxis, :] * E_beta_chunk[np.newaxis, :, :])
-            # - sum_ijl gammaln(z_ijl + 1)
-            elbo_z -= np.sum(gammaln(z_chunk + 1))
+            # Multinomial entropy term: -sum_ijl z_ijl * log(phi_ijl)
+            # This is the entropy of q(z) variational distribution, NOT gammaln(z+1)
+            elbo_z -= np.sum(z_chunk * log_phi_normalized)
 
-            del log_phi, phi, z_chunk  # Free memory
+            del log_phi, phi, phi_sum, log_phi_normalized, z_chunk  # Free memory
 
         elbo += scale_factor * elbo_z
 
