@@ -42,15 +42,13 @@ install_if_missing <- function(pkg) {
 # Install BiocManager for Bioconductor packages
 install_if_missing("BiocManager")
 
-# Install devtools for GitHub packages (required for install_github)
-# Force install to ensure it's available
-if (!requireNamespace("devtools", quietly = TRUE)) {
-    cat("Installing devtools (this may take a few minutes)...\n")
-    install.packages("devtools", dependencies = TRUE)
+# Install remotes for GitHub packages (lightweight alternative to devtools)
+if (!requireNamespace("remotes", quietly = TRUE)) {
+    cat("Installing remotes...\n")
+    install.packages("remotes")
 }
-# Explicitly load devtools
-library(devtools)
-cat("devtools loaded successfully\n")
+library(remotes)
+cat("remotes loaded successfully\n")
 
 # Core dependencies from CRAN
 cran_packages <- c(
@@ -97,7 +95,7 @@ cat("Installing scDesign3 from GitHub...\n")
 cat("============================================\n")
 
 if (!requireNamespace("scDesign3", quietly = TRUE)) {
-    devtools::install_github("SONGDONGYUAN1994/scDesign3", upgrade = "never")
+    remotes::install_github("SONGDONGYUAN1994/scDesign3", upgrade = "never")
 } else {
     cat("scDesign3 already installed\n")
 }
