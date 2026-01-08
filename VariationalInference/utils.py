@@ -348,9 +348,16 @@ def save_results(
     )
 
     # Add classification weights if available
+    # Note: v weights are logit coefficients. Positive v → increases P(y=1)
+    # For binary classification (kappa=1), positive means disease-promoting
     if hasattr(model, 'E_v'):
-        for k in range(model.kappa):
-            beta_df.insert(0, f'v_weight_class{k}', model.E_v[k])
+        if model.kappa == 1:
+            # Single binary outcome: use clearer naming
+            beta_df.insert(0, 'v_weight', model.E_v[0])
+        else:
+            # Multiple outcomes: use class index
+            for k in range(model.kappa):
+                beta_df.insert(0, f'v_weight_outcome{k}', model.E_v[k])
 
     beta_path = output_dir / f'{prefix}_{feature_type}_programs{ext}'
     beta_df.to_csv(beta_path, compression=compression)
