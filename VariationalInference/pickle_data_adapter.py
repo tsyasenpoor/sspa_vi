@@ -552,14 +552,61 @@ def main():
     y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
 
     val_metrics = compute_metrics(y_val, y_val_pred, y_val_proba.ravel())
-    print(f"\nValidation Results:")
+    print(f"\nValidation Results (before calibration):")
     print(f"  Accuracy:  {val_metrics['accuracy']:.4f}")
     if 'auc' in val_metrics:
         print(f"  AUC:       {val_metrics['auc']:.4f}")
     print(f"  F1:        {val_metrics['f1']:.4f}")
     print(f"  Precision: {val_metrics['precision']:.4f}")
     print(f"  Recall:    {val_metrics['recall']:.4f}")
-    
+
+    # Fit calibration on validation set
+    print("\n" + "=" * 80)
+    print("Fitting Calibration")
+    print("=" * 80)
+
+    model.fit_calibration(
+        X_val, y_val, X_aux_val,
+        method='platt',
+        optimize_threshold=True,
+        threshold_metric='f1',
+        verbose=True
+    )
+
+    # Re-evaluate validation with calibration
+    y_val_proba_cal = model._apply_calibration(y_val_proba)
+    y_val_pred_cal = (y_val_proba_cal.ravel() >= model.optimal_threshold_).astype(int)
+
+    val_metrics_cal = compute_metrics(y_val, y_val_pred_cal, y_val_proba_cal.ravel())
+    print(f"\nValidation Results (after calibration):")
+    print(f"  Accuracy:  {val_metrics_cal['accuracy']:.4f}")
+    if 'auc' in val_metrics_cal:
+        print(f"  AUC:       {val_metrics_cal['auc']:.4f}")
+    print(f"  F1:        {val_metrics_cal['f1']:.4f}")
+    print(f"  Precision: {val_metrics_cal['precision']:.4f}")
+    print(f"  Recall:    {val_metrics_cal['recall']:.4f}")
+
+    # Update validation predictions for saving
+    y_val_proba = y_val_proba_cal
+    y_val_pred = y_val_pred_cal
+
+    # Re-evaluate training with calibration
+    y_train_proba_cal = model._apply_calibration(expit(linear_pred_train))
+    y_train_pred_cal = (y_train_proba_cal.ravel() >= model.optimal_threshold_).astype(int)
+
+    train_metrics_cal = compute_metrics(y_train, y_train_pred_cal, y_train_proba_cal.ravel())
+    print(f"\nTraining Results (after calibration):")
+    print(f"  Accuracy:  {train_metrics_cal['accuracy']:.4f}")
+    if 'auc' in train_metrics_cal:
+        print(f"  AUC:       {train_metrics_cal['auc']:.4f}")
+    print(f"  F1:        {train_metrics_cal['f1']:.4f}")
+    print(f"  Precision: {train_metrics_cal['precision']:.4f}")
+    print(f"  Recall:    {train_metrics_cal['recall']:.4f}")
+
+    # Update training predictions for saving
+    y_train_proba = y_train_proba_cal
+    y_train_pred = y_train_pred_cal
+
     # Test evaluation
     print("\n" + "=" * 80)
     print("Test Set Evaluation")
@@ -569,15 +616,22 @@ def main():
     E_theta_test, _, _ = model.infer_theta(
         X_test, X_aux_test, max_iter=100, tol=1e-4, verbose=args.verbose
     )
-    # Compute probabilities using inferred theta
+    # Compute raw probabilities using inferred theta
     linear_pred_test = E_theta_test @ model.E_v.T + X_aux_test @ model.E_gamma.T
-    y_test_proba = expit(linear_pred_test)
+    y_test_proba_raw = expit(linear_pred_test)
     if args.verbose:
-        print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
-    y_test_pred = (y_test_proba.ravel() > 0.5).astype(int)
+        print(f"Raw predicted probabilities: min={y_test_proba_raw.min():.4f}, max={y_test_proba_raw.max():.4f}")
+
+    # Apply calibration
+    y_test_proba = model._apply_calibration(y_test_proba_raw)
+    y_test_pred = (y_test_proba.ravel() >= model.optimal_threshold_).astype(int)
+
+    if args.verbose:
+        print(f"Calibrated probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
+        print(f"Using threshold: {model.optimal_threshold_:.4f}")
 
     test_metrics = compute_metrics(y_test, y_test_pred, y_test_proba.ravel())
-    print(f"\nTest Results:")
+    print(f"\nTest Results (with calibration):")
     print(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
     if 'auc' in test_metrics:
         print(f"  AUC:       {test_metrics['auc']:.4f}")
