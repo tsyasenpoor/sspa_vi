@@ -127,7 +127,13 @@ class VI:
         self.pi_beta = pi_beta
         self.spike_variance_v = spike_variance_v
         self.spike_value_beta = spike_value_beta
-        
+
+        # Calibration parameters (fitted via fit_calibration)
+        self.calibration_a_ = None  # Platt scaling: sigmoid(a * logit + b)
+        self.calibration_b_ = None
+        self.optimal_threshold_ = 0.5  # Default threshold
+        self.is_calibrated_ = False
+
     def _initialize_parameters(self, X: np.ndarray, y: np.ndarray, X_aux: np.ndarray):
         """Initialize variational parameters with data-driven initialization."""
         self.n, self.p = X.shape
@@ -1679,4 +1685,326 @@ class VI:
             print(f"Predicted probabilities: min={probs.min():.4f}, max={probs.max():.4f}, mean={probs.mean():.4f}")
 
         return probs
+
+    def fit_calibration(
+        self,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        X_aux_val: np.ndarray,
+        method: str = 'platt',
+        optimize_threshold: bool = True,
+        threshold_metric: str = 'f1',
+        verbose: bool = False
+    ) -> 'VI':
+        """
+        Fit calibration parameters using validation data.
+
+        This method learns calibration parameters to transform raw predicted
+        probabilities into well-calibrated probabilities. It also optionally
+        finds the optimal classification threshold.
+
+        Parameters
+        ----------
+        X_val : ndarray of shape (n_val_samples, n_genes)
+            Validation gene expression counts.
+        y_val : ndarray of shape (n_val_samples,) or (n_val_samples, 1)
+            Validation labels (0 or 1).
+        X_aux_val : ndarray of shape (n_val_samples, n_aux_features)
+            Validation auxiliary features.
+        method : str, default='platt'
+            Calibration method:
+            - 'platt': Platt scaling (learns a, b for sigmoid(a * logit + b))
+            - 'temperature': Temperature scaling (learns T for logit / T)
+            - 'isotonic': Isotonic regression (non-parametric)
+        optimize_threshold : bool, default=True
+            Whether to find optimal classification threshold.
+        threshold_metric : str, default='f1'
+            Metric to optimize for threshold selection:
+            - 'f1': Maximize F1 score
+            - 'youden': Maximize Youden's J (sensitivity + specificity - 1)
+            - 'accuracy': Maximize accuracy
+        verbose : bool, default=False
+            Whether to print calibration information.
+
+        Returns
+        -------
+        self : VI
+            The fitted model with calibration parameters.
+        """
+        from scipy.optimize import minimize_scalar, minimize
+        from sklearn.isotonic import IsotonicRegression
+        from sklearn.metrics import f1_score, roc_curve
+
+        y_val = np.asarray(y_val).ravel()
+
+        # Get raw probabilities (uncalibrated)
+        raw_probs = self.predict_proba(
+            X_val, X_aux_val, verbose=False, use_regression=True
+        ).ravel()
+
+        # Convert to logits for calibration fitting
+        # Clip to avoid log(0) or log(inf)
+        eps = 1e-7
+        raw_probs_clipped = np.clip(raw_probs, eps, 1 - eps)
+        logits = np.log(raw_probs_clipped / (1 - raw_probs_clipped))
+
+        if verbose:
+            print(f"Fitting calibration using method='{method}'")
+            print(f"  Raw probs range: [{raw_probs.min():.4f}, {raw_probs.max():.4f}]")
+            print(f"  Logits range: [{logits.min():.4f}, {logits.max():.4f}]")
+
+        if method == 'platt':
+            # Platt scaling: P(y=1|x) = sigmoid(a * logit + b)
+            # Fit using maximum likelihood (logistic regression on logits)
+            def neg_log_likelihood(params):
+                a, b = params
+                calibrated_logits = a * logits + b
+                calibrated_probs = expit(calibrated_logits)
+                calibrated_probs = np.clip(calibrated_probs, eps, 1 - eps)
+                # Binary cross-entropy
+                ll = y_val * np.log(calibrated_probs) + (1 - y_val) * np.log(1 - calibrated_probs)
+                return -np.mean(ll)
+
+            # Initialize with identity transform
+            result = minimize(neg_log_likelihood, x0=[1.0, 0.0], method='L-BFGS-B')
+            self.calibration_a_, self.calibration_b_ = result.x
+
+            if verbose:
+                print(f"  Platt scaling: a={self.calibration_a_:.4f}, b={self.calibration_b_:.4f}")
+
+        elif method == 'temperature':
+            # Temperature scaling: P(y=1|x) = sigmoid(logit / T)
+            # This is equivalent to Platt with a=1/T, b=0
+            def neg_log_likelihood(T):
+                if T <= 0:
+                    return 1e10
+                calibrated_logits = logits / T
+                calibrated_probs = expit(calibrated_logits)
+                calibrated_probs = np.clip(calibrated_probs, eps, 1 - eps)
+                ll = y_val * np.log(calibrated_probs) + (1 - y_val) * np.log(1 - calibrated_probs)
+                return -np.mean(ll)
+
+            result = minimize_scalar(neg_log_likelihood, bounds=(0.01, 10.0), method='bounded')
+            T_opt = result.x
+            self.calibration_a_ = 1.0 / T_opt
+            self.calibration_b_ = 0.0
+
+            if verbose:
+                print(f"  Temperature scaling: T={T_opt:.4f} (a={self.calibration_a_:.4f})")
+
+        elif method == 'isotonic':
+            # Isotonic regression - non-parametric
+            iso_reg = IsotonicRegression(out_of_bounds='clip')
+            iso_reg.fit(raw_probs, y_val)
+            self._isotonic_regressor = iso_reg
+            self.calibration_a_ = None
+            self.calibration_b_ = None
+
+            if verbose:
+                print("  Fitted isotonic regression calibrator")
+
+        else:
+            raise ValueError(f"Unknown calibration method: {method}")
+
+        self._calibration_method = method
+        self.is_calibrated_ = True
+
+        # Optionally find optimal threshold
+        if optimize_threshold:
+            # Get calibrated probabilities for threshold optimization
+            calibrated_probs = self._apply_calibration(raw_probs)
+
+            if threshold_metric == 'youden':
+                # Find threshold that maximizes Youden's J statistic
+                fpr, tpr, thresholds = roc_curve(y_val, calibrated_probs)
+                J = tpr - fpr
+                best_idx = np.argmax(J)
+                self.optimal_threshold_ = thresholds[best_idx]
+
+            elif threshold_metric == 'f1':
+                # Grid search for best F1
+                best_f1 = 0
+                best_thresh = 0.5
+                for thresh in np.linspace(0.01, 0.99, 99):
+                    preds = (calibrated_probs >= thresh).astype(int)
+                    f1 = f1_score(y_val, preds, zero_division=0)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_thresh = thresh
+                self.optimal_threshold_ = best_thresh
+
+            elif threshold_metric == 'accuracy':
+                # Grid search for best accuracy
+                best_acc = 0
+                best_thresh = 0.5
+                for thresh in np.linspace(0.01, 0.99, 99):
+                    preds = (calibrated_probs >= thresh).astype(int)
+                    acc = np.mean(preds == y_val)
+                    if acc > best_acc:
+                        best_acc = acc
+                        best_thresh = thresh
+                self.optimal_threshold_ = best_thresh
+
+            else:
+                raise ValueError(f"Unknown threshold metric: {threshold_metric}")
+
+            if verbose:
+                print(f"  Optimal threshold ({threshold_metric}): {self.optimal_threshold_:.4f}")
+
+        # Compute and report calibration metrics
+        if verbose:
+            calibrated_probs = self._apply_calibration(raw_probs)
+            print(f"  Calibrated probs range: [{calibrated_probs.min():.4f}, {calibrated_probs.max():.4f}]")
+
+            # Expected Calibration Error (ECE)
+            ece = self._compute_ece(calibrated_probs, y_val)
+            print(f"  Expected Calibration Error (ECE): {ece:.4f}")
+
+        return self
+
+    def _apply_calibration(self, probs: np.ndarray) -> np.ndarray:
+        """Apply fitted calibration to raw probabilities."""
+        if not self.is_calibrated_:
+            return probs
+
+        if self._calibration_method == 'isotonic':
+            return self._isotonic_regressor.transform(probs.ravel()).reshape(probs.shape)
+        else:
+            # Platt or temperature scaling
+            eps = 1e-7
+            probs_clipped = np.clip(probs, eps, 1 - eps)
+            logits = np.log(probs_clipped / (1 - probs_clipped))
+            calibrated_logits = self.calibration_a_ * logits + self.calibration_b_
+            return expit(calibrated_logits)
+
+    def _compute_ece(self, probs: np.ndarray, y_true: np.ndarray, n_bins: int = 10) -> float:
+        """Compute Expected Calibration Error."""
+        probs = probs.ravel()
+        y_true = y_true.ravel()
+
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        ece = 0.0
+
+        for i in range(n_bins):
+            mask = (probs >= bin_edges[i]) & (probs < bin_edges[i + 1])
+            if mask.sum() > 0:
+                bin_acc = y_true[mask].mean()
+                bin_conf = probs[mask].mean()
+                ece += mask.sum() * np.abs(bin_acc - bin_conf)
+
+        return ece / len(probs)
+
+    def predict_proba_calibrated(
+        self,
+        X: np.ndarray,
+        X_aux: np.ndarray,
+        max_iter: int = 50,
+        tol: float = 1e-4,
+        verbose: bool = False,
+        use_sparse: bool = False,
+        sparse_threshold: float = 0.5,
+        use_regression: bool = True
+    ) -> np.ndarray:
+        """
+        Predict calibrated probabilities for new samples.
+
+        This method returns calibrated probabilities if fit_calibration has
+        been called, otherwise returns raw probabilities.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_genes)
+            Gene expression counts for new samples.
+        X_aux : ndarray of shape (n_samples, n_aux_features)
+            Auxiliary features for new samples.
+        max_iter : int, default=50
+            Maximum iterations for theta inference.
+        tol : float, default=1e-4
+            Convergence tolerance for theta inference.
+        verbose : bool, default=False
+            Whether to print inference information.
+        use_sparse : bool, default=False
+            Whether to use sparse v (based on spike-and-slab).
+        sparse_threshold : float, default=0.5
+            Threshold for determining active factors in v.
+        use_regression : bool, default=True
+            Whether to use regression in theta inference.
+
+        Returns
+        -------
+        probs : ndarray of shape (n_samples, n_outcomes)
+            Calibrated predicted probabilities.
+        """
+        raw_probs = self.predict_proba(
+            X, X_aux, max_iter=max_iter, tol=tol, verbose=verbose,
+            use_sparse=use_sparse, sparse_threshold=sparse_threshold,
+            use_regression=use_regression
+        )
+
+        if self.is_calibrated_:
+            calibrated_probs = self._apply_calibration(raw_probs)
+            if verbose:
+                print(f"Calibrated probabilities: min={calibrated_probs.min():.4f}, "
+                      f"max={calibrated_probs.max():.4f}")
+            return calibrated_probs
+        else:
+            return raw_probs
+
+    def predict(
+        self,
+        X: np.ndarray,
+        X_aux: np.ndarray,
+        threshold: Optional[float] = None,
+        max_iter: int = 50,
+        tol: float = 1e-4,
+        verbose: bool = False,
+        use_sparse: bool = False,
+        sparse_threshold: float = 0.5,
+        use_regression: bool = True
+    ) -> np.ndarray:
+        """
+        Predict class labels for new samples.
+
+        Uses calibrated probabilities if available, and optimal threshold
+        if fit_calibration was called with optimize_threshold=True.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_genes)
+            Gene expression counts for new samples.
+        X_aux : ndarray of shape (n_samples, n_aux_features)
+            Auxiliary features for new samples.
+        threshold : float or None, default=None
+            Classification threshold. If None, uses optimal_threshold_
+            (which defaults to 0.5 if not calibrated).
+        max_iter : int, default=50
+            Maximum iterations for theta inference.
+        tol : float, default=1e-4
+            Convergence tolerance for theta inference.
+        verbose : bool, default=False
+            Whether to print inference information.
+        use_sparse : bool, default=False
+            Whether to use sparse v.
+        sparse_threshold : float, default=0.5
+            Threshold for determining active factors.
+        use_regression : bool, default=True
+            Whether to use regression in theta inference.
+
+        Returns
+        -------
+        labels : ndarray of shape (n_samples,) or (n_samples, n_outcomes)
+            Predicted class labels (0 or 1).
+        """
+        probs = self.predict_proba_calibrated(
+            X, X_aux, max_iter=max_iter, tol=tol, verbose=verbose,
+            use_sparse=use_sparse, sparse_threshold=sparse_threshold,
+            use_regression=use_regression
+        )
+
+        thresh = threshold if threshold is not None else self.optimal_threshold_
+
+        if verbose:
+            print(f"Using threshold: {thresh:.4f}")
+
+        return (probs >= thresh).astype(int)
 
