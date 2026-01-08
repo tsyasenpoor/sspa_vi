@@ -874,23 +874,40 @@ class VI:
         elbo = 0.0
 
         # =====================================================================
-        # E[log p(z | θ, β)] - Using sufficient statistics
+        # E[log p(z | θ, β)] + H[q(z)] - Correct formulation with multinomial entropy
         # =====================================================================
-        # Original: sum_ijl z_ijl * (E[log θ_il] + E[log β_jl]) - E[θ_il]*E[β_jl] - log(z_ijl!)
+        # The Poisson-Multinomial model has:
+        #   z_ijℓ | X_ij ~ Multinomial(X_ij; φ_ij) where φ_ijℓ ∝ exp(E[log θ_iℓ] + E[log β_jℓ])
+        #
+        # The ELBO contribution from z is:
+        #   E_q[log p(z|θ,β)] + H[q(z)] = sum_ij X_ij * LSE(E[log θ_i] + E[log β_j])
+        #                                 - sum_ℓ (sum_i E[θ_iℓ]) * (sum_j E[β_jℓ])
+        #
+        # where LSE = log-sum-exp. This is the CORRECT form that includes the entropy.
+        # The previous form (sum_ijℓ E[z_ijℓ]*(E[log θ]+E[log β])) was MISSING H[q(z)],
+        # causing apparent ELBO decrease as factors specialize during training.
 
-        # Term 1: sum_ijl z_ijl * E[log θ_il] = sum_il E[log θ_il] * sum_j z_ijl
-        elbo_z = np.sum(z_sum_over_genes * self.E_log_theta)
+        # Term 1: sum_ij X_ij * log(sum_ℓ exp(E[log θ_iℓ] + E[log β_jℓ]))
+        # Computed in chunks to manage memory
+        elbo_z_lse = 0.0
+        chunk_size = min(500, self.n)
+        for start in range(0, self.n, chunk_size):
+            end = min(start + chunk_size, self.n)
+            E_log_theta_chunk = self.E_log_theta[start:end]  # (chunk_n, d)
+            X_chunk = X[start:end]  # (chunk_n, p)
 
-        # Term 2: sum_ijl z_ijl * E[log β_jl] = sum_jl E[log β_jl] * sum_i z_ijl
-        elbo_z += np.sum(z_sum_over_samples * self.E_log_beta)
+            # log_phi shape: (chunk_n, p, d)
+            log_phi = E_log_theta_chunk[:, np.newaxis, :] + self.E_log_beta[np.newaxis, :, :]
+            # LSE over factors (axis=2): shape (chunk_n, p)
+            lse = logsumexp(log_phi, axis=2)
+            # Weighted sum: X_ij * LSE_ij
+            elbo_z_lse += np.sum(X_chunk * lse)
 
-        # Term 3: -sum_ijl E[θ_il]*E[β_jl] = -sum_l (sum_i E[θ_il]) * (sum_j E[β_jl])
+        elbo_z = elbo_z_lse
+
+        # Term 2: -sum_ℓ (sum_i E[θ_iℓ]) * (sum_j E[β_jℓ])
         elbo_z -= np.sum(self.E_theta.sum(axis=0) * self.E_beta.sum(axis=0))
 
-        # Term 4: -sum_ijl log(z_ijl!) ≈ -sum_ijl z_ijl*log(z_ijl) + z_ijl (Stirling for large z)
-        # For small z, we can use approximation or skip (minor contribution)
-        # We approximate with: -sum z*log(z+1) which is well-behaved
-        # This is computed from sufficient stats approximately
         elbo += elbo_z
 
         # =====================================================================
