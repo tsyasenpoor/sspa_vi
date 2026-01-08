@@ -293,3 +293,4 @@ VariationalInference/synth_rec.py
 VariationalInference/synth_test_prog.py
 VariationalInference/test_vi_prog.py
 VariationalInference/vi_optimized.py
+jobs_sh/launch_optimized_svi_parallel.sh

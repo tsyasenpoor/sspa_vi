@@ -248,6 +248,7 @@ class VIObjective:
         fixed_params: Optional[Dict[str, Any]] = None,
         verbose: bool = False,
         early_stopping_patience: int = 3,
+        multi_objective: bool = False,
     ):
         """
         Initialize the objective function.
@@ -268,6 +269,7 @@ class VIObjective:
             fixed_params: Dict of fixed hyperparameter values
             verbose: Whether to print training progress
             early_stopping_patience: Patience for early stopping
+            multi_objective: Optimize both AUC and accuracy (Pareto front)
         """
         self.data_path = data_path
         self.label_column = label_column
@@ -284,6 +286,7 @@ class VIObjective:
         self.fixed_params = fixed_params or {}
         self.verbose = verbose
         self.early_stopping_patience = early_stopping_patience
+        self.multi_objective = multi_objective
 
         # Data will be loaded once and cached
         self._data_loaded = False
@@ -329,7 +332,7 @@ class VIObjective:
                    f"{self._X_val.shape[0]} val, {self._X_test.shape[0]} test samples")
         logger.info(f"Number of genes: {self._X_train.shape[1]}")
 
-    def __call__(self, trial: optuna.Trial) -> float:
+    def __call__(self, trial: optuna.Trial):
         """
         Evaluate a single trial.
 
@@ -337,7 +340,8 @@ class VIObjective:
             trial: Optuna trial object
 
         Returns:
-            Validation AUC score (to be maximized)
+            If multi_objective: tuple (val_auc, val_accuracy)
+            Otherwise: val_auc (float)
         """
         # Ensure data is loaded
         self._load_data()
@@ -421,66 +425,124 @@ class VIObjective:
                 verbose=False
             )
 
-            # Compute validation AUC
+            # Compute validation metrics
             val_auc = roc_auc_score(self._y_val.ravel(), y_val_proba.ravel())
+            y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
+            metrics = compute_metrics(self._y_val.ravel(), y_val_pred, y_val_proba.ravel())
+            val_accuracy = metrics.get('accuracy', 0)
 
             # Log trial result
             if self.verbose:
-                logger.info(f"Trial {trial.number}: Validation AUC = {val_auc:.4f}")
+                logger.info(f"Trial {trial.number}: AUC={val_auc:.4f}, Accuracy={val_accuracy:.4f}")
 
             # Store additional metrics as user attributes
-            y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
-            metrics = compute_metrics(self._y_val.ravel(), y_val_pred, y_val_proba.ravel())
-
             trial.set_user_attr('val_auc', val_auc)
-            trial.set_user_attr('val_accuracy', metrics.get('accuracy', 0))
+            trial.set_user_attr('val_accuracy', val_accuracy)
             trial.set_user_attr('val_f1', metrics.get('f1', 0))
             trial.set_user_attr('val_precision', metrics.get('precision', 0))
             trial.set_user_attr('val_recall', metrics.get('recall', 0))
 
-            return val_auc
+            if self.multi_objective:
+                return val_auc, val_accuracy
+            else:
+                return val_auc
 
         except Exception as e:
             logger.warning(f"Trial {trial.number} failed: {str(e)}")
             # Return a very low score for failed trials
-            return 0.0
+            if self.multi_objective:
+                return 0.0, 0.0
+            else:
+                return 0.0
 
 
 # =============================================================================
 # RESULT ANALYSIS AND EXPORT
 # =============================================================================
 
-def analyze_study_results(study: optuna.Study) -> Dict[str, Any]:
+def analyze_study_results(study: optuna.Study, multi_objective: bool = False) -> Dict[str, Any]:
     """
     Analyze the results of an Optuna study.
 
     Args:
         study: Completed Optuna study
+        multi_objective: Whether this was a multi-objective study
 
     Returns:
         Dictionary with analysis results
     """
     results = {
-        'best_trial_number': study.best_trial.number,
-        'best_value': study.best_value,
-        'best_params': study.best_params,
+        'multi_objective': multi_objective,
         'n_trials': len(study.trials),
         'n_completed': len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
         'n_failed': len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]),
     }
 
-    # Get best trial's user attributes (additional metrics)
-    best_trial = study.best_trial
-    results['best_metrics'] = {
-        'val_auc': best_trial.user_attrs.get('val_auc'),
-        'val_accuracy': best_trial.user_attrs.get('val_accuracy'),
-        'val_f1': best_trial.user_attrs.get('val_f1'),
-        'val_precision': best_trial.user_attrs.get('val_precision'),
-        'val_recall': best_trial.user_attrs.get('val_recall'),
-    }
+    if multi_objective:
+        # Multi-objective: get Pareto front
+        best_trials = study.best_trials
+        results['n_pareto_solutions'] = len(best_trials)
+        results['pareto_front'] = []
+        
+        for trial in best_trials:
+            results['pareto_front'].append({
+                'trial_number': trial.number,
+                'values': trial.values,  # (AUC, Accuracy)
+                'params': trial.params,
+                'val_auc': trial.user_attrs.get('val_auc'),
+                'val_accuracy': trial.user_attrs.get('val_accuracy'),
+                'val_f1': trial.user_attrs.get('val_f1'),
+                'val_precision': trial.user_attrs.get('val_precision'),
+                'val_recall': trial.user_attrs.get('val_recall'),
+            })
+        
+        # Select "best" based on highest mean of normalized objectives
+        if best_trials:
+            auc_values = [t.values[0] for t in best_trials]
+            acc_values = [t.values[1] for t in best_trials]
+            auc_max, auc_min = max(auc_values), min(auc_values)
+            acc_max, acc_min = max(acc_values), min(acc_values)
+            
+            best_idx = 0
+            best_score = -np.inf
+            for i, trial in enumerate(best_trials):
+                # Normalize and average
+                norm_auc = (trial.values[0] - auc_min) / (auc_max - auc_min + 1e-10)
+                norm_acc = (trial.values[1] - acc_min) / (acc_max - acc_min + 1e-10)
+                score = (norm_auc + norm_acc) / 2
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+            
+            best_compromise = best_trials[best_idx]
+            results['best_compromise_trial_number'] = best_compromise.number
+            results['best_compromise_values'] = best_compromise.values
+            results['best_compromise_params'] = best_compromise.params
+        else:
+            results['best_compromise_trial_number'] = None
+            results['best_compromise_values'] = None
+            results['best_compromise_params'] = {}
+    else:
+        # Single objective
+        results['best_trial_number'] = study.best_trial.number
+        results['best_value'] = study.best_value
+        results['best_params'] = study.best_params
 
-    # Parameter importance (if enough trials)
-    if len(study.trials) >= 10:
+    # Get best trial's user attributes (additional metrics)
+    best_trial = study.best_trial if not multi_objective else (best_trials[best_idx] if best_trials else None)
+    if best_trial:
+        results['best_metrics'] = {
+            'val_auc': best_trial.user_attrs.get('val_auc'),
+            'val_accuracy': best_trial.user_attrs.get('val_accuracy'),
+            'val_f1': best_trial.user_attrs.get('val_f1'),
+            'val_precision': best_trial.user_attrs.get('val_precision'),
+            'val_recall': best_trial.user_attrs.get('val_recall'),
+        }
+    else:
+        results['best_metrics'] = {}
+
+    # Parameter importance (if enough trials and single objective)
+    if len(study.trials) >= 10 and not multi_objective:
         try:
             importance = optuna.importance.get_param_importances(study)
             results['param_importance'] = importance
@@ -493,12 +555,16 @@ def analyze_study_results(study: optuna.Study) -> Dict[str, Any]:
     trials_data = []
     for trial in study.trials:
         if trial.state == optuna.trial.TrialState.COMPLETE:
-            trials_data.append({
+            trial_data = {
                 'number': trial.number,
-                'value': trial.value,
                 'params': trial.params,
                 'duration': trial.duration.total_seconds() if trial.duration else None
-            })
+            }
+            if multi_objective:
+                trial_data['values'] = trial.values
+            else:
+                trial_data['value'] = trial.value
+            trials_data.append(trial_data)
     results['all_trials'] = trials_data
 
     return results
@@ -521,16 +587,34 @@ def export_results(
     output_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    multi_objective = analysis.get('multi_objective', False)
 
     # Save best parameters as JSON
     best_params_file = output_path / f'best_params_{timestamp}.json'
-    with open(best_params_file, 'w') as f:
-        json.dump({
-            'best_params': study.best_params,
-            'best_value': study.best_value,
-            'best_metrics': analysis.get('best_metrics', {}),
-            'timestamp': timestamp
-        }, f, indent=2)
+    
+    if multi_objective:
+        # Save Pareto front
+        with open(best_params_file, 'w') as f:
+            json.dump({
+                'multi_objective': True,
+                'n_pareto_solutions': analysis.get('n_pareto_solutions', 0),
+                'best_compromise_trial_number': analysis.get('best_compromise_trial_number'),
+                'best_compromise_values': analysis.get('best_compromise_values'),
+                'best_compromise_params': analysis.get('best_compromise_params', {}),
+                'pareto_front': analysis.get('pareto_front', []),
+                'best_metrics': analysis.get('best_metrics', {}),
+                'timestamp': timestamp
+            }, f, indent=2)
+    else:
+        # Single objective
+        with open(best_params_file, 'w') as f:
+            json.dump({
+                'multi_objective': False,
+                'best_params': study.best_params,
+                'best_value': study.best_value,
+                'best_metrics': analysis.get('best_metrics', {}),
+                'timestamp': timestamp
+            }, f, indent=2)
     logger.info(f"Best parameters saved to {best_params_file}")
 
     # Save full analysis as JSON
@@ -567,18 +651,42 @@ def export_results(
         f.write(f"Completed trials: {analysis['n_completed']}\n")
         f.write(f"Failed trials: {analysis['n_failed']}\n\n")
 
-        f.write("-" * 40 + "\n")
-        f.write("BEST TRIAL\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"Trial number: {analysis['best_trial_number']}\n")
-        f.write(f"Validation AUC: {analysis['best_value']:.4f}\n\n")
+        if multi_objective:
+            f.write("-" * 40 + "\n")
+            f.write("MULTI-OBJECTIVE OPTIMIZATION\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Pareto front size: {analysis.get('n_pareto_solutions', 0)}\n\n")
+            
+            f.write("Best compromise solution:\n")
+            f.write(f"Trial number: {analysis.get('best_compromise_trial_number')}\n")
+            if analysis.get('best_compromise_values'):
+                f.write(f"Validation AUC: {analysis['best_compromise_values'][0]:.4f}\n")
+                f.write(f"Validation Accuracy: {analysis['best_compromise_values'][1]:.4f}\n\n")
+            
+            f.write("Best compromise hyperparameters:\n")
+            for name, value in analysis.get('best_compromise_params', {}).items():
+                if isinstance(value, float):
+                    f.write(f"  {name}: {value:.6f}\n")
+                else:
+                    f.write(f"  {name}: {value}\n")
+            
+            f.write("\nAll Pareto-optimal solutions:\n")
+            for i, sol in enumerate(analysis.get('pareto_front', [])[:10]):  # Show top 10
+                f.write(f"\n  Solution {i+1} (Trial #{sol['trial_number']}):\n")
+                f.write(f"    AUC: {sol['values'][0]:.4f}, Accuracy: {sol['values'][1]:.4f}\n")
+        else:
+            f.write("-" * 40 + "\n")
+            f.write("BEST TRIAL\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Trial number: {analysis['best_trial_number']}\n")
+            f.write(f"Validation AUC: {analysis['best_value']:.4f}\n\n")
 
-        f.write("Best hyperparameters:\n")
-        for name, value in analysis['best_params'].items():
-            if isinstance(value, float):
-                f.write(f"  {name}: {value:.6f}\n")
-            else:
-                f.write(f"  {name}: {value}\n")
+            f.write("Best hyperparameters:\n")
+            for name, value in analysis['best_params'].items():
+                if isinstance(value, float):
+                    f.write(f"  {name}: {value:.6f}\n")
+                else:
+                    f.write(f"  {name}: {value}\n")
 
         f.write("\nBest trial metrics:\n")
         for name, value in analysis.get('best_metrics', {}).items():
@@ -606,19 +714,36 @@ def export_results(
         matplotlib.use('Agg')  # Non-interactive backend
         import matplotlib.pyplot as plt
 
-        # Optimization history plot
-        fig = optuna.visualization.matplotlib.plot_optimization_history(study)
-        fig.savefig(output_path / f'optimization_history_{timestamp}.png', dpi=150, bbox_inches='tight')
-        plt.close(fig)
-
-        # Parameter importance plot (if available)
-        if len(study.trials) >= 10:
-            try:
-                fig = optuna.visualization.matplotlib.plot_param_importances(study)
-                fig.savefig(output_path / f'param_importance_{timestamp}.png', dpi=150, bbox_inches='tight')
+        if multi_objective:
+            # Pareto front plot
+            pareto_front = analysis.get('pareto_front', [])
+            if pareto_front:
+                aucs = [sol['values'][0] for sol in pareto_front]
+                accs = [sol['values'][1] for sol in pareto_front]
+                
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.scatter(aucs, accs, s=100, alpha=0.6, edgecolors='black')
+                ax.set_xlabel('Validation AUC', fontsize=12)
+                ax.set_ylabel('Validation Accuracy', fontsize=12)
+                ax.set_title('Pareto Front (AUC vs Accuracy)', fontsize=14)
+                ax.grid(True, alpha=0.3)
+                fig.tight_layout()
+                fig.savefig(output_path / f'pareto_front_{timestamp}.png', dpi=150, bbox_inches='tight')
                 plt.close(fig)
-            except Exception:
-                pass
+        else:
+            # Optimization history plot
+            fig = optuna.visualization.matplotlib.plot_optimization_history(study)
+            fig.savefig(output_path / f'optimization_history_{timestamp}.png', dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            # Parameter importance plot (if available)
+            if len(study.trials) >= 10:
+                try:
+                    fig = optuna.visualization.matplotlib.plot_param_importances(study)
+                    fig.savefig(output_path / f'param_importance_{timestamp}.png', dpi=150, bbox_inches='tight')
+                    plt.close(fig)
+                except Exception:
+                    pass
 
         logger.info("Visualization plots saved")
 
@@ -764,6 +889,11 @@ Examples:
         default='none',
         help='Optuna pruner for early stopping (default: none)'
     )
+    parser.add_argument(
+        '--multi-objective',
+        action='store_true',
+        help='Optimize both AUC and accuracy (Pareto front)'
+    )
 
     # Parameter selection
     parser.add_argument(
@@ -881,6 +1011,11 @@ def main():
     logger.info(f"Data: {args.data}")
     logger.info(f"Label column: {args.label_column}")
     logger.info(f"Method: {args.method}")
+    logger.info(f"Multi-objective: {args.multi_objective}")
+    if args.multi_objective:
+        logger.info("Optimizing: AUC + Accuracy (Pareto front)")
+    else:
+        logger.info("Optimizing: AUC")
     logger.info(f"Number of trials: {args.n_trials}")
     logger.info(f"Max iterations per trial: {args.max_iter}")
     if args.params_to_tune:
@@ -919,18 +1054,29 @@ def main():
         random_state=args.seed,
         params_to_tune=args.params_to_tune,
         fixed_params=fixed_params,
-        verbose=args.verbose
+        verbose=args.verbose,
+        multi_objective=args.multi_objective
     )
 
     # Create or load study
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=args.storage,
-        direction='maximize',  # Maximize validation AUC
-        sampler=sampler,
-        pruner=pruner,
-        load_if_exists=True
-    )
+    if args.multi_objective:
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=args.storage,
+            directions=['maximize', 'maximize'],  # Maximize AUC and Accuracy
+            sampler=sampler,
+            pruner=pruner,
+            load_if_exists=True
+        )
+    else:
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=args.storage,
+            direction='maximize',  # Maximize validation AUC
+            sampler=sampler,
+            pruner=pruner,
+            load_if_exists=True
+        )
 
     # Run optimization
     logger.info("\nStarting optimization...")
@@ -952,20 +1098,39 @@ def main():
 
     # Analyze results
     logger.info("\nAnalyzing results...")
-    analysis = analyze_study_results(study)
+    analysis = analyze_study_results(study, multi_objective=args.multi_objective)
 
     # Print summary
     print("\n" + "=" * 60)
     print("OPTIMIZATION RESULTS SUMMARY")
     print("=" * 60)
-    print(f"\nBest Validation AUC: {study.best_value:.4f}")
-    print(f"Best Trial: #{study.best_trial.number}")
-    print("\nBest Hyperparameters:")
-    for name, value in study.best_params.items():
-        if isinstance(value, float):
-            print(f"  {name}: {value:.6f}")
-        else:
-            print(f"  {name}: {value}")
+    
+    if args.multi_objective:
+        print(f"\nPareto front size: {analysis.get('n_pareto_solutions', 0)}")
+        print(f"\nBest compromise solution (Trial #{analysis.get('best_compromise_trial_number')}):")
+        if analysis.get('best_compromise_values'):
+            print(f"  Validation AUC: {analysis['best_compromise_values'][0]:.4f}")
+            print(f"  Validation Accuracy: {analysis['best_compromise_values'][1]:.4f}")
+        print("\nBest compromise hyperparameters:")
+        for name, value in analysis.get('best_compromise_params', {}).items():
+            if isinstance(value, float):
+                print(f"  {name}: {value:.6f}")
+            else:
+                print(f"  {name}: {value}")
+        
+        print("\nTop 5 Pareto-optimal solutions:")
+        for i, sol in enumerate(analysis.get('pareto_front', [])[:5]):
+            print(f"\n  {i+1}. Trial #{sol['trial_number']}")
+            print(f"     AUC: {sol['values'][0]:.4f}, Accuracy: {sol['values'][1]:.4f}")
+    else:
+        print(f"\nBest Validation AUC: {study.best_value:.4f}")
+        print(f"Best Trial: #{study.best_trial.number}")
+        print("\nBest Hyperparameters:")
+        for name, value in study.best_params.items():
+            if isinstance(value, float):
+                print(f"  {name}: {value:.6f}")
+            else:
+                print(f"  {name}: {value}")
 
     if analysis.get('param_importance'):
         print("\nParameter Importance:")
@@ -983,13 +1148,19 @@ def main():
     print("=" * 60)
 
     # Generate config code snippet
-    print("\nTo use these parameters in your training:")
+    if args.multi_objective:
+        best_params = analysis.get('best_compromise_params', {})
+        print("\nTo use the best compromise parameters in your training:")
+    else:
+        best_params = study.best_params
+        print("\nTo use these parameters in your training:")
+    
     print("-" * 40)
     print("from VariationalInference.config import VIConfig")
     print("from VariationalInference.vi import VI")
     print()
     print("config = VIConfig(")
-    for name, value in study.best_params.items():
+    for name, value in best_params.items():
         if isinstance(value, float):
             print(f"    {name}={value:.6f},")
         else:
