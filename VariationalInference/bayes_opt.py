@@ -5,12 +5,26 @@ Bayesian Optimization for VI/SVI Hyperparameter Tuning
 This standalone script uses Optuna to find optimal hyperparameters for the
 Variational Inference model by maximizing validation AUC.
 
+Supports multiple data formats:
+- h5ad files (AnnData format)
+- EMTAB CSV directories (preprocessed EMTAB11349 format)
+- Simulated CSV files
+
 Usage:
+    # h5ad data
     python -m VariationalInference.bayes_opt \
         --data /path/to/data.h5ad \
         --label-column t2dm \
         --n-trials 100 \
         --output-dir ./bayes_opt_results
+
+    # EMTAB directory (auto-detected)
+    python -m VariationalInference.bayes_opt \
+        --data /path/to/EMTAB11349/preprocessed \
+        --label-column IBD \
+        --aux-columns sex_female \
+        --gene-annotation /path/to/gene_annotation.csv \
+        --n-trials 100
 
 Author: Generated for VI hyperparameter optimization
 """
@@ -257,8 +271,8 @@ class VIObjective:
         Initialize the objective function.
 
         Args:
-            data_path: Path to the h5ad data file
-            label_column: Column name for binary labels
+            data_path: Path to h5ad file or EMTAB directory (auto-detected)
+            label_column: Column name for binary labels (in adata.obs or responses.csv.gz)
             aux_columns: List of auxiliary feature column names
             gene_annotation_path: Path to gene annotation CSV (optional)
             method: 'vi' or 'svi'
@@ -930,11 +944,19 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage
+  # Basic usage with h5ad file
   python -m VariationalInference.bayes_opt \\
       --data data.h5ad \\
       --label-column t2dm \\
       --n-trials 50
+
+  # EMTAB directory (auto-detected from file structure)
+  python -m VariationalInference.bayes_opt \\
+      --data /path/to/EMTAB11349/preprocessed \\
+      --label-column IBD \\
+      --aux-columns sex_female \\
+      --gene-annotation /path/to/gene_annotation.csv \\
+      --n-trials 100
 
   # RECOMMENDED: With 40% stratified subsampling for faster trials
   # (trains on ~4k samples, validates on full holdout)
@@ -973,18 +995,18 @@ Examples:
     parser.add_argument(
         '--data', '-d',
         required=True,
-        help='Path to h5ad data file'
+        help='Path to h5ad file or EMTAB directory (auto-detected)'
     )
     parser.add_argument(
         '--label-column', '-l',
         required=True,
-        help='Column name for binary labels'
+        help='Column name for binary labels (e.g., t2dm for h5ad, IBD for EMTAB)'
     )
     parser.add_argument(
         '--aux-columns', '-a',
         nargs='+',
         default=None,
-        help='Auxiliary feature column names'
+        help='Auxiliary feature column names (e.g., Sex for h5ad, sex_female for EMTAB)'
     )
     parser.add_argument(
         '--gene-annotation',
