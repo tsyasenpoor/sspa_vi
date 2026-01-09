@@ -109,6 +109,10 @@ class SVI:
         Higher values help break the bootstrap problem where v needs class-discriminative
         theta to learn, but theta needs v to receive class signal. The regression
         learning rate is min(rho_t * multiplier, 1.0) to prevent overshooting.
+    count_scale : float, default=1.0
+        Scaling factor for count data. Data is divided by this value before fitting.
+        Use values > 1 (e.g., 100 or 1000) when dealing with large raw counts to
+        improve numerical stability. The model parameters will be scaled accordingly.
 
     Attributes
     ----------
@@ -154,9 +158,11 @@ class SVI:
         lr_reduction_patience: int = 5,
         lr_reduction_factor: float = 0.5,
         restore_best: bool = True,
-        regression_lr_multiplier: float = 10.0
+        regression_lr_multiplier: float = 10.0,
+        count_scale: float = 1.0
     ):
         self.d = n_factors
+        self.count_scale = count_scale
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.learning_rate_decay = learning_rate_decay
@@ -764,13 +770,22 @@ class SVI:
     def _compute_elbo_batch(self, X_batch: np.ndarray, y_batch: np.ndarray,
                             X_aux_batch: np.ndarray, E_theta, E_log_theta,
                             a_theta, b_theta, E_xi, E_log_xi, a_xi, b_xi,
-                            zeta, scale_factor: float, gene_chunk: int = 2000) -> float:
+                            zeta, scale_factor: float, gene_chunk: int = 2000,
+                            debug_components: bool = False) -> float:
         """
         Compute ELBO contribution from a mini-batch (scaled to full dataset).
         Memory-efficient version that processes genes in chunks.
+
+        Parameters
+        ----------
+        debug_components : bool
+            If True, print component-wise ELBO values for debugging.
         """
         batch_size = X_batch.shape[0]
         elbo = 0.0
+
+        # For debugging
+        elbo_components = {} if debug_components else None
 
         # E[log p(z | θ, β)] - scaled (memory-efficient chunked computation)
         # Using NUMERICALLY STABLE log-sum-exp formulation:
@@ -808,6 +823,11 @@ class SVI:
         elbo_z = elbo_z_lse - elbo_z_rate
         elbo += scale_factor * elbo_z
 
+        if debug_components:
+            elbo_components['z_lse'] = scale_factor * elbo_z_lse
+            elbo_components['z_rate'] = scale_factor * elbo_z_rate
+            elbo_components['z_total'] = scale_factor * elbo_z
+
         # E[log p(y | θ, v, γ)] - scaled (vectorized)
         elbo_y = 0.0
         for k in range(self.kappa):
@@ -835,6 +855,9 @@ class SVI:
             elbo_y += np.sum(jj_const)
         elbo += scale_factor * elbo_y
 
+        if debug_components:
+            elbo_components['y_total'] = scale_factor * elbo_y
+
         # E[log p(θ | ξ)] + E[log p(ξ)] - scaled (vectorized)
         elbo_theta_xi = np.sum((self.alpha_xi - 1) * E_log_xi)
         elbo_theta_xi -= self.lambda_xi * np.sum(E_xi)
@@ -846,6 +869,9 @@ class SVI:
         elbo_theta_xi -= batch_size * self.d * gammaln(self.alpha_theta)
         elbo += scale_factor * elbo_theta_xi
 
+        if debug_components:
+            elbo_components['theta_xi_prior'] = scale_factor * elbo_theta_xi
+
         # Local entropy (scaled, vectorized)
         entropy_theta = np.sum(a_theta - np.log(b_theta) + gammaln(a_theta) +
                                (1 - a_theta) * digamma(a_theta))
@@ -854,6 +880,9 @@ class SVI:
         entropy_xi = np.sum(a_xi - np.log(b_xi) + gammaln(a_xi) +
                             (1 - a_xi) * digamma(a_xi))
         elbo += scale_factor * entropy_xi
+
+        if debug_components:
+            elbo_components['local_entropy'] = scale_factor * (entropy_theta + entropy_xi)
 
         # Global terms (not scaled - computed once, vectorized)
         # E[log p(β | η)] + E[log p(η)]
@@ -920,6 +949,20 @@ class SVI:
                                (1 - rho_v_safe) * np.log(1 - rho_v_safe))
         elbo += entropy_s_v
 
+        if debug_components:
+            elbo_components['global_priors'] = elbo_beta_eta + elbo_v_gamma
+            elbo_components['global_entropy'] = entropy_beta + entropy_eta + entropy_v + entropy_gamma + entropy_s_beta + entropy_s_v
+            print(f"\n  ELBO Components (scaled to full dataset):")
+            print(f"    z_lse (X*logsumexp):    {elbo_components['z_lse']:>20.2e}")
+            print(f"    z_rate (-θ*β):          {elbo_components['z_rate']:>20.2e}")
+            print(f"    z_total:                {elbo_components['z_total']:>20.2e}")
+            print(f"    y_total (classification): {elbo_components['y_total']:>20.2e}")
+            print(f"    theta_xi_prior:         {elbo_components['theta_xi_prior']:>20.2e}")
+            print(f"    local_entropy:          {elbo_components['local_entropy']:>20.2e}")
+            print(f"    global_priors:          {elbo_components['global_priors']:>20.2e}")
+            print(f"    global_entropy:         {elbo_components['global_entropy']:>20.2e}")
+            print(f"    TOTAL ELBO:             {elbo:>20.2e}")
+
         return elbo if np.isfinite(elbo) else -np.inf
 
     def fit(
@@ -972,6 +1015,12 @@ class SVI:
 
         if y.ndim == 1:
             y = y[:, np.newaxis]
+
+        # Scale data if count_scale > 1 for numerical stability
+        if self.count_scale > 1:
+            X = X / self.count_scale
+            if verbose:
+                print(f"  Data scaled by factor of {self.count_scale}")
 
         # Initialize global parameters
         self._initialize_global_parameters(X, y, X_aux)
@@ -1093,14 +1142,17 @@ class SVI:
 
                 # Compute ELBO periodically
                 if iteration % elbo_freq == 0:
+                    # Show detailed ELBO components for first few iterations when debugging
+                    show_components = debug and iteration <= 20
                     elbo = self._compute_elbo_batch(
                         X_batch, y_batch, X_aux_batch,
                         E_theta, E_log_theta, a_theta, b_theta,
-                        E_xi, E_log_xi, a_xi, b_xi, zeta, actual_scale
+                        E_xi, E_log_xi, a_xi, b_xi, zeta, actual_scale,
+                        debug_components=show_components
                     )
                     elbo_history.append((iteration, elbo))
 
-                    if debug:
+                    if debug and not show_components:
                         print(f"  Iter {iteration}: ELBO={elbo:.2f}, ρ_t={rho_t:.4f}")
 
                 iteration += 1
