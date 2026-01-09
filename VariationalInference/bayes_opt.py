@@ -32,6 +32,7 @@ import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner, SuccessiveHalvingPruner
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -249,6 +250,8 @@ class VIObjective:
         verbose: bool = False,
         early_stopping_patience: int = 3,
         multi_objective: bool = False,
+        subsample_ratio: Optional[float] = None,
+        subsample_size: Optional[int] = None,
     ):
         """
         Initialize the objective function.
@@ -270,6 +273,11 @@ class VIObjective:
             verbose: Whether to print training progress
             early_stopping_patience: Patience for early stopping
             multi_objective: Optimize both AUC and accuracy (Pareto front)
+            subsample_ratio: Fraction of training data to use per trial (0.0-1.0).
+                            If None and subsample_size is None, uses full training data.
+                            Stratified sampling preserves class proportions.
+            subsample_size: Exact number of training samples per trial.
+                           Takes precedence over subsample_ratio if both specified.
         """
         self.data_path = data_path
         self.label_column = label_column
@@ -287,6 +295,8 @@ class VIObjective:
         self.verbose = verbose
         self.early_stopping_patience = early_stopping_patience
         self.multi_objective = multi_objective
+        self.subsample_ratio = subsample_ratio
+        self.subsample_size = subsample_size
 
         # Data will be loaded once and cached
         self._data_loaded = False
@@ -300,6 +310,9 @@ class VIObjective:
         self._y_val = None
         self._y_test = None
         self._gene_list = None
+
+        # RNG for stratified subsampling (separate from data split seed)
+        self._subsample_rng = np.random.RandomState(random_state)
 
     def _load_data(self):
         """Load and preprocess data (called once)."""
@@ -332,6 +345,106 @@ class VIObjective:
                    f"{self._X_val.shape[0]} val, {self._X_test.shape[0]} test samples")
         logger.info(f"Number of genes: {self._X_train.shape[1]}")
 
+        # Log subsampling configuration
+        if self.subsample_size is not None:
+            target_size = min(self.subsample_size, self._X_train.shape[0])
+            logger.info(f"Subsampling enabled: {target_size} samples per trial (stratified)")
+        elif self.subsample_ratio is not None:
+            target_size = int(self._X_train.shape[0] * self.subsample_ratio)
+            logger.info(f"Subsampling enabled: {self.subsample_ratio:.1%} = {target_size} samples per trial (stratified)")
+        else:
+            logger.info("Subsampling disabled: using full training data per trial")
+
+    def _get_subsampled_train_data(
+        self,
+        trial_number: int
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+        """
+        Get stratified subsample of training data for a trial.
+
+        Uses different random seed per trial to add diversity while maintaining
+        reproducibility. Stratification ensures class proportions are preserved
+        (critical for imbalanced binary labels like T2DM).
+
+        Args:
+            trial_number: Optuna trial number (used for per-trial seeding)
+
+        Returns:
+            Tuple of (X_train_sub, X_aux_train_sub, y_train_sub)
+        """
+        n_train = self._X_train.shape[0]
+
+        # Determine target subsample size
+        if self.subsample_size is not None:
+            target_size = min(self.subsample_size, n_train)
+        elif self.subsample_ratio is not None:
+            target_size = int(n_train * self.subsample_ratio)
+        else:
+            # No subsampling - return full training data
+            return self._X_train, self._X_aux_train, self._y_train
+
+        # Don't subsample if target is >= actual size
+        if target_size >= n_train:
+            return self._X_train, self._X_aux_train, self._y_train
+
+        # Create per-trial seed for reproducibility with diversity
+        # Combine base seed with trial number
+        if self.random_state is not None:
+            trial_seed = self.random_state + trial_number
+        else:
+            trial_seed = trial_number
+
+        # Compute subsample ratio for train_test_split
+        subsample_frac = target_size / n_train
+
+        # Stratified subsampling using train_test_split
+        # We keep the "train" part which has subsample_frac of the data
+        y_flat = self._y_train.ravel()
+
+        try:
+            # Use stratified split - keep only the selected subset
+            indices = np.arange(n_train)
+            selected_indices, _ = train_test_split(
+                indices,
+                train_size=subsample_frac,
+                stratify=y_flat,
+                random_state=trial_seed
+            )
+
+            X_sub = self._X_train[selected_indices]
+            y_sub = self._y_train[selected_indices]
+
+            if self._X_aux_train is not None:
+                X_aux_sub = self._X_aux_train[selected_indices]
+            else:
+                X_aux_sub = None
+
+            if self.verbose:
+                # Log class distribution in subsample
+                pos_ratio = y_sub.sum() / len(y_sub)
+                orig_pos_ratio = y_flat.sum() / len(y_flat)
+                logger.debug(
+                    f"Trial {trial_number}: Subsampled {len(selected_indices)}/{n_train} samples "
+                    f"(pos ratio: {orig_pos_ratio:.3f} -> {pos_ratio:.3f})"
+                )
+
+            return X_sub, X_aux_sub, y_sub
+
+        except ValueError as e:
+            # Fallback if stratification fails (e.g., not enough samples per class)
+            logger.warning(
+                f"Trial {trial_number}: Stratified subsampling failed ({e}), "
+                f"using random subsampling"
+            )
+            rng = np.random.RandomState(trial_seed)
+            selected_indices = rng.choice(n_train, size=target_size, replace=False)
+
+            X_sub = self._X_train[selected_indices]
+            y_sub = self._y_train[selected_indices]
+            X_aux_sub = self._X_aux_train[selected_indices] if self._X_aux_train is not None else None
+
+            return X_sub, X_aux_sub, y_sub
+
     def __call__(self, trial: optuna.Trial):
         """
         Evaluate a single trial.
@@ -360,9 +473,14 @@ class VIObjective:
         n_factors = params.pop('n_factors', 50)
         learning_rate = params.pop('learning_rate', 0.01)
 
+        # Get subsampled training data (stratified to preserve class proportions)
+        # Validation always uses full holdout set
+        X_train_sub, X_aux_train_sub, y_train_sub = self._get_subsampled_train_data(trial.number)
+
         if self.verbose:
             logger.info(f"Trial {trial.number}: n_factors={n_factors}, "
-                       f"learning_rate={learning_rate:.4f}")
+                       f"learning_rate={learning_rate:.4f}, "
+                       f"train_samples={X_train_sub.shape[0]}")
 
         try:
             # Create model
@@ -381,12 +499,12 @@ class VIObjective:
                 regression_weight=params.get('regression_weight', 1.0),
             )
 
-            # Train model
+            # Train model on subsampled data
             if self.method == 'vi':
                 model.fit(
-                    X=self._X_train,
-                    y=self._y_train,
-                    X_aux=self._X_aux_train,
+                    X=X_train_sub,
+                    y=y_train_sub,
+                    X_aux=X_aux_train_sub,
                     max_iter=self.max_iter,
                     patience=self.early_stopping_patience,
                     verbose=self.verbose
@@ -411,9 +529,9 @@ class VIObjective:
                     regression_weight=params.get('regression_weight', 1.0),
                 )
                 model.fit(
-                    X=self._X_train,
-                    y=self._y_train,
-                    X_aux=self._X_aux_train,
+                    X=X_train_sub,
+                    y=y_train_sub,
+                    X_aux=X_aux_train_sub,
                     max_epochs=self.max_iter,
                     verbose=self.verbose
                 )
@@ -818,11 +936,27 @@ Examples:
       --label-column t2dm \\
       --n-trials 50
 
+  # RECOMMENDED: With 40% stratified subsampling for faster trials
+  # (trains on ~4k samples, validates on full holdout)
+  python -m VariationalInference.bayes_opt \\
+      --data data.h5ad \\
+      --label-column t2dm \\
+      --subsample-ratio 0.4 \\
+      --n-trials 100
+
+  # Alternative: Fixed subsample size (4000 samples per trial)
+  python -m VariationalInference.bayes_opt \\
+      --data data.h5ad \\
+      --label-column t2dm \\
+      --subsample-size 4000 \\
+      --n-trials 100
+
   # With specific parameters to tune
   python -m VariationalInference.bayes_opt \\
       --data data.h5ad \\
       --label-column t2dm \\
       --params-to-tune n_factors sigma_v pi_v regression_weight \\
+      --subsample-ratio 0.4 \\
       --n-trials 100
 
   # SVI with more iterations
@@ -941,6 +1075,24 @@ Examples:
         help='Validation data ratio (default: 0.15)'
     )
 
+    # Subsampling arguments for faster trials
+    parser.add_argument(
+        '--subsample-ratio',
+        type=float,
+        default=None,
+        help='Fraction of training data to use per trial (0.0-1.0). '
+             'Stratified sampling preserves class proportions. '
+             'Validation always uses full holdout. Recommended: 0.4 for large datasets.'
+    )
+    parser.add_argument(
+        '--subsample-size',
+        type=int,
+        default=None,
+        help='Exact number of training samples per trial. '
+             'Takes precedence over --subsample-ratio if both specified. '
+             'Recommended: 4000 for ~10k datasets.'
+    )
+
     # Output arguments
     parser.add_argument(
         '--output-dir', '-o',
@@ -1022,6 +1174,15 @@ def main():
         logger.info(f"Parameters to tune: {args.params_to_tune}")
     else:
         logger.info("Parameters to tune: ALL")
+
+    # Log subsampling configuration
+    if args.subsample_size is not None:
+        logger.info(f"Training subsampling: {args.subsample_size} samples per trial (stratified)")
+    elif args.subsample_ratio is not None:
+        logger.info(f"Training subsampling: {args.subsample_ratio:.0%} per trial (stratified)")
+    else:
+        logger.info("Training subsampling: DISABLED (using full training data)")
+    logger.info("Validation: full holdout set (no subsampling)")
     logger.info("=" * 60)
 
     # Create sampler
@@ -1055,7 +1216,9 @@ def main():
         params_to_tune=args.params_to_tune,
         fixed_params=fixed_params,
         verbose=args.verbose,
-        multi_objective=args.multi_objective
+        multi_objective=args.multi_objective,
+        subsample_ratio=args.subsample_ratio,
+        subsample_size=args.subsample_size,
     )
 
     # Create or load study
