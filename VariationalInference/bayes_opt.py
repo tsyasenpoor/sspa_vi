@@ -166,9 +166,9 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
         # Model complexity
         'n_factors': {
             'type': 'int',
-            'low': 10,
-            'high': 100,
-            'step': 5,
+            'low': 50,
+            'high': 500,
+            'step': 10,
             'description': 'Number of latent factors (d)'
         },
     }
