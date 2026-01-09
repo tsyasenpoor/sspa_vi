@@ -809,14 +809,27 @@ class SVI:
         elbo_y = 0.0
         for k in range(self.kappa):
             y_k = y_batch[:, k] if y_batch.ndim > 1 else y_batch
-            lam = self._lambda_jj(zeta[:, k])
+            zeta_k = zeta[:, k]
+            lam = self._lambda_jj(zeta_k)
 
             E_A = E_theta @ self.E_v[k] + X_aux_batch @ self.E_gamma[k]
             E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
+            Var_v = np.diag(self.Sigma_v[k])  # Variance of v
             Var_theta = a_theta / (b_theta**2)
-            E_A_sq = E_A**2 + np.sum(Var_theta * E_v_sq[np.newaxis, :], axis=1)
+            E_theta_sq = E_theta**2 + Var_theta  # E[θ²] = E[θ]² + Var[θ]
 
+            # E[A²] = E[A]² + Var[A] with proper variance propagation
+            E_A_sq = E_A**2
+            E_A_sq += np.sum(Var_theta * E_v_sq[np.newaxis, :], axis=1)
+            E_A_sq += np.sum(E_theta_sq * Var_v[np.newaxis, :], axis=1)
+
+            # Main JJ bound terms
             elbo_y += np.sum((y_k - 0.5) * E_A - lam * E_A_sq)
+
+            # JJ constant terms: λ(ζ)*ζ² - ζ/2 - log(1 + exp(ζ))
+            # These are essential for correct ELBO computation
+            jj_const = lam * zeta_k**2 - 0.5 * zeta_k - np.log1p(np.exp(np.clip(zeta_k, -500, 500)))
+            elbo_y += np.sum(jj_const)
         elbo += scale_factor * elbo_y
 
         # E[log p(θ | ξ)] + E[log p(ξ)] - scaled (vectorized)
