@@ -252,6 +252,7 @@ class VIObjective:
         multi_objective: bool = False,
         subsample_ratio: Optional[float] = None,
         subsample_size: Optional[int] = None,
+        preloaded_data: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the objective function.
@@ -278,6 +279,8 @@ class VIObjective:
                             Stratified sampling preserves class proportions.
             subsample_size: Exact number of training samples per trial.
                            Takes precedence over subsample_ratio if both specified.
+            preloaded_data: Pre-loaded data dict to avoid reloading in parallel workers.
+                           If provided, skips data loading. Keys: 'train', 'val', 'test', 'gene_list'.
         """
         self.data_path = data_path
         self.label_column = label_column
@@ -299,7 +302,6 @@ class VIObjective:
         self.subsample_size = subsample_size
 
         # Data will be loaded once and cached
-        self._data_loaded = False
         self._X_train = None
         self._X_val = None
         self._X_test = None
@@ -310,6 +312,16 @@ class VIObjective:
         self._y_val = None
         self._y_test = None
         self._gene_list = None
+
+        # Use preloaded data if provided (avoids duplicate loading in parallel workers)
+        if preloaded_data is not None:
+            self._X_train, self._X_aux_train, self._y_train = preloaded_data['train']
+            self._X_val, self._X_aux_val, self._y_val = preloaded_data['val']
+            self._X_test, self._X_aux_test, self._y_test = preloaded_data['test']
+            self._gene_list = preloaded_data['gene_list']
+            self._data_loaded = True
+        else:
+            self._data_loaded = False
 
         # RNG for stratified subsampling (separate from data split seed)
         self._subsample_rng = np.random.RandomState(random_state)
@@ -1174,15 +1186,6 @@ def main():
         logger.info(f"Parameters to tune: {args.params_to_tune}")
     else:
         logger.info("Parameters to tune: ALL")
-
-    # Log subsampling configuration
-    if args.subsample_size is not None:
-        logger.info(f"Training subsampling: {args.subsample_size} samples per trial (stratified)")
-    elif args.subsample_ratio is not None:
-        logger.info(f"Training subsampling: {args.subsample_ratio:.0%} per trial (stratified)")
-    else:
-        logger.info("Training subsampling: DISABLED (using full training data)")
-    logger.info("Validation: full holdout set (no subsampling)")
     logger.info("=" * 60)
 
     # Create sampler
@@ -1201,7 +1204,39 @@ def main():
     else:
         pruner = optuna.pruners.NopPruner()
 
-    # Create objective function
+    # Load data ONCE before optimization (prevents duplicate loading in parallel workers)
+    logger.info("Loading data (once, before optimization)...")
+    loader = DataLoader(
+        data_path=args.data,
+        gene_annotation_path=args.gene_annotation
+    )
+    data = loader.load_and_preprocess(
+        label_column=args.label_column,
+        aux_columns=args.aux_columns if args.aux_columns else None,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        random_state=args.seed
+    )
+    preloaded_data = {
+        'train': data['train'],
+        'val': data['val'],
+        'test': data['test'],
+        'gene_list': data['gene_list']
+    }
+    logger.info(f"Data loaded: {data['train'][0].shape[0]} train, "
+               f"{data['val'][0].shape[0]} val, {data['test'][0].shape[0]} test samples")
+    logger.info(f"Number of features: {data['train'][0].shape[1]}")
+
+    # Log subsampling info based on actual data size
+    n_train = data['train'][0].shape[0]
+    if args.subsample_size is not None:
+        target_size = min(args.subsample_size, n_train)
+        logger.info(f"Subsampling: {target_size}/{n_train} training samples per trial (stratified)")
+    elif args.subsample_ratio is not None:
+        target_size = int(n_train * args.subsample_ratio)
+        logger.info(f"Subsampling: {target_size}/{n_train} training samples per trial ({args.subsample_ratio:.0%}, stratified)")
+
+    # Create objective function with preloaded data
     objective = VIObjective(
         data_path=args.data,
         label_column=args.label_column,
@@ -1219,6 +1254,7 @@ def main():
         multi_objective=args.multi_objective,
         subsample_ratio=args.subsample_ratio,
         subsample_size=args.subsample_size,
+        preloaded_data=preloaded_data,
     )
 
     # Create or load study
