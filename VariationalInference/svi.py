@@ -773,36 +773,39 @@ class SVI:
         elbo = 0.0
 
         # E[log p(z | θ, β)] - scaled (memory-efficient chunked computation)
-        elbo_z = 0.0
+        # Using NUMERICALLY STABLE log-sum-exp formulation:
+        #   ELBO_z = sum_ij X_ij * log(sum_l exp(E[log θ_il] + E[log β_jl]))
+        #          - sum_l (sum_i E[θ_il]) * (sum_j E[β_jl])
+        #
+        # This is mathematically equivalent to the z-weighted form:
+        #   sum_ijl z_ijl * (E[log θ] + E[log β] - log φ) - sum_ijl E[θ] * E[β]
+        # but avoids catastrophic cancellation when X values are large.
+        # The z-weighted form computes two huge terms (~10^11) that nearly cancel,
+        # leading to severe numerical instability with raw count data.
+
+        elbo_z_lse = 0.0
         for g_start in range(0, self.p, gene_chunk):
             g_end = min(g_start + gene_chunk, self.p)
             E_log_beta_chunk = self.E_log_beta[g_start:g_end]  # (g_chunk, d)
-            E_beta_chunk = self.E_beta[g_start:g_end]  # (g_chunk, d)
             X_chunk = X_batch[:, g_start:g_end]  # (batch, g_chunk)
 
-            # Compute phi for this gene chunk
+            # log_phi shape: (batch, g_chunk, d)
             log_phi = E_log_theta[:, np.newaxis, :] + E_log_beta_chunk[np.newaxis, :, :]
-            log_phi_max = log_phi.max(axis=2, keepdims=True)
-            phi = np.exp(log_phi - log_phi_max)
-            phi_sum = phi.sum(axis=2, keepdims=True)
-            phi = phi / phi_sum
-            # Normalized log probabilities for entropy calculation
-            log_phi_normalized = log_phi - log_phi_max - np.log(phi_sum)
+            # Log-sum-exp over factors (axis=2): shape (batch, g_chunk)
+            lse = logsumexp(log_phi, axis=2)
+            # Weighted sum: X_ij * LSE_ij - this is numerically stable
+            elbo_z_lse += np.sum(X_chunk * lse)
 
-            # z = x * phi
-            z_chunk = X_chunk[:, :, np.newaxis] * phi  # (batch, g_chunk, d)
+            del log_phi, lse  # Free memory
 
-            # ELBO contribution from this chunk (vectorized)
-            # sum_ijl z_ijl * (E_log_theta_il + E_log_beta_jl)
-            elbo_z += np.sum(z_chunk * (E_log_theta[:, np.newaxis, :] + E_log_beta_chunk[np.newaxis, :, :]))
-            # - sum_ijl E_theta_il * E_beta_jl (can be computed without z)
-            elbo_z -= np.sum(E_theta[:, np.newaxis, :] * E_beta_chunk[np.newaxis, :, :])
-            # Multinomial entropy term: -sum_ijl z_ijl * log(phi_ijl)
-            # This is the entropy of q(z) variational distribution, NOT gammaln(z+1)
-            elbo_z -= np.sum(z_chunk * log_phi_normalized)
+        # Rate term: -sum_l (sum_i E[θ_il]) * (sum_j E[β_jl])
+        # For mini-batch: estimate full-data sum by scaling batch sum
+        # Note: We compute this more efficiently than element-wise over all i,j,l
+        theta_sum_per_factor = E_theta.sum(axis=0)  # (d,) sum over batch samples
+        beta_sum_per_factor = self.E_beta.sum(axis=0)  # (d,) sum over all genes
+        elbo_z_rate = np.sum(theta_sum_per_factor * beta_sum_per_factor)
 
-            del log_phi, phi, phi_sum, log_phi_normalized, z_chunk  # Free memory
-
+        elbo_z = elbo_z_lse - elbo_z_rate
         elbo += scale_factor * elbo_z
 
         # E[log p(y | θ, v, γ)] - scaled (vectorized)
