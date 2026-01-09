@@ -547,6 +547,7 @@ class VIObjective:
                     y=y_train_sub,
                     X_aux=X_aux_train_sub,
                     max_epochs=self.max_iter,
+                    patience=self.early_stopping_patience,
                     verbose=self.verbose
                 )
 
