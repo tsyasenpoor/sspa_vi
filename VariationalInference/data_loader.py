@@ -3,10 +3,15 @@ Data Loader for Variational Inference
 ======================================
 
 This module provides generic data loading and preprocessing utilities
-for single-cell RNA-seq h5ad files.
+for single-cell RNA-seq data in multiple formats.
+
+Supported Formats:
+- h5ad files (AnnData format)
+- EMTAB CSV directories (preprocessed EMTAB11349 format)
+- Simulated CSV files
 
 Features:
-- Load any h5ad file (AnnData format)
+- Automatic format detection based on path
 - Gene symbol to Ensembl ID conversion
 - Protein-coding gene filtering
 - Quality control and preprocessing
@@ -16,16 +21,22 @@ Features:
 Usage:
     from VariationalInference.data_loader import DataLoader
 
-    # Load and preprocess data
+    # Load h5ad file
     loader = DataLoader(
         data_path='/path/to/data.h5ad',
         gene_annotation_path='/path/to/gene_annotation.csv'  # optional
     )
 
+    # Load EMTAB data (auto-detected from directory structure)
+    loader = DataLoader(
+        data_path='/path/to/EMTAB11349/preprocessed',
+        gene_annotation_path='/path/to/gene_annotation.csv'
+    )
+
     # Get preprocessed data with random splits
     data = loader.load_and_preprocess(
-        label_column='t2dm',
-        aux_columns=['Sex'],
+        label_column='t2dm',  # or 'IBD' for EMTAB
+        aux_columns=['Sex'],  # or ['sex_female'] for EMTAB
         min_cells_expressing=0.02
     )
 
@@ -49,12 +60,16 @@ import os
 
 class DataLoader:
     """
-    Generic data loader for single-cell h5ad files.
+    Generic data loader for single-cell h5ad files and EMTAB CSV directories.
 
     Parameters
     ----------
     data_path : str or Path
-        Path to the h5ad file to load.
+        Path to the h5ad file to load, or directory containing EMTAB CSV files.
+        For EMTAB format, directory should contain:
+        - gene_expression_raw_processed.csv.gz
+        - responses.csv.gz
+        - aux_data.csv.gz
     gene_annotation_path : str or Path, optional
         Path to gene annotation CSV for protein-coding filtering.
         Expected columns: 'GeneID' (Ensembl), 'Genetype'.
@@ -67,6 +82,13 @@ class DataLoader:
     verbose : bool, default=True
         Whether to print progress messages.
     """
+
+    # EMTAB expected files
+    EMTAB_REQUIRED_FILES = [
+        'gene_expression_raw_processed.csv.gz',
+        'responses.csv.gz',
+        'aux_data.csv.gz'
+    ]
 
     def __init__(
         self,
@@ -84,11 +106,12 @@ class DataLoader:
         self.use_cache = use_cache
         self.verbose = verbose
 
-        # Detect data type from filename
-        self.is_singscore = 'singscore' in str(self.data_path).lower()
-        self.is_simulated = 'simulated' in str(self.data_path).lower()
+        # Detect data type from path
+        self.is_emtab = self._detect_emtab_format()
+        self.is_singscore = 'singscore' in str(self.data_path).lower() and not self.is_emtab
+        self.is_simulated = 'simulated' in str(self.data_path).lower() and not self.is_emtab
         self.feature_type = 'pathway' if self.is_singscore else 'gene'
-        
+
         # Create cache directory
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -99,10 +122,33 @@ class DataLoader:
         self.cell_ids = None
         self._gene_converter = None
 
+        # EMTAB-specific data containers
+        self.responses_df = None
+        self.aux_data_df = None
+
     def _log(self, message: str):
         """Print message if verbose mode is on."""
         if self.verbose:
             print(message)
+
+    def _detect_emtab_format(self) -> bool:
+        """
+        Detect if data_path is an EMTAB directory with required CSV files.
+
+        Returns
+        -------
+        bool
+            True if EMTAB format detected, False otherwise.
+        """
+        if not self.data_path.is_dir():
+            return False
+
+        # Check if all required files exist
+        for required_file in self.EMTAB_REQUIRED_FILES:
+            if not (self.data_path / required_file).exists():
+                return False
+
+        return True
 
     def _get_cache_key(self) -> str:
         """Generate cache key based on data file."""
@@ -144,6 +190,48 @@ class DataLoader:
         self._log(f"  Obs columns: {list(self.adata.obs.columns)}")
 
         return self.adata
+
+    def load_emtab_files(self) -> pd.DataFrame:
+        """
+        Load EMTAB preprocessed CSV files from directory.
+
+        Loads:
+        - gene_expression_raw_processed.csv.gz -> self.raw_df
+        - responses.csv.gz -> self.responses_df
+        - aux_data.csv.gz -> self.aux_data_df
+
+        Returns
+        -------
+        pd.DataFrame
+            Raw expression DataFrame.
+        """
+        self._log(f"Loading EMTAB data from directory: {self.data_path}")
+
+        gene_expr_path = self.data_path / 'gene_expression_raw_processed.csv.gz'
+        responses_path = self.data_path / 'responses.csv.gz'
+        aux_path = self.data_path / 'aux_data.csv.gz'
+
+        # Load all CSV files
+        gene_expression = pd.read_csv(gene_expr_path, compression='gzip')
+        self.responses_df = pd.read_csv(responses_path, compression='gzip')
+        self.aux_data_df = pd.read_csv(aux_path, compression='gzip')
+
+        self._log(f"  Gene expression: {gene_expression.shape}")
+        self._log(f"  Responses: {self.responses_df.shape}")
+        self._log(f"  Auxiliary: {self.aux_data_df.shape}")
+
+        # Extract expression matrix (drop Sample_ID column)
+        if 'Sample_ID' in gene_expression.columns:
+            self.cell_ids = gene_expression['Sample_ID'].tolist()
+            self.raw_df = gene_expression.drop(columns=['Sample_ID']).copy()
+            self.raw_df.index = self.cell_ids
+        else:
+            self.cell_ids = gene_expression.index.tolist()
+            self.raw_df = gene_expression.copy()
+
+        self.gene_list = self.raw_df.columns.tolist()
+
+        return self.raw_df
 
     def load_simulated_csv(self) -> pd.DataFrame:
         """
@@ -424,12 +512,32 @@ class DataLoader:
             self.load_simulated_csv()
             self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
             return self.raw_df
-        
+
+        # EMTAB DATA: Load from CSV directory with full preprocessing
+        if self.is_emtab:
+            self._log("Detected EMTAB format - loading from CSV directory")
+            self.load_emtab_files()
+
+            if convert_to_ensembl:
+                self.convert_genes_to_ensembl()
+
+            self.remove_duplicate_genes()
+
+            if filter_protein_coding:
+                self.filter_protein_coding()
+
+            self.filter_zero_genes()
+            self.filter_min_cells(min_cells_expressing)
+
+            self.gene_list = self.raw_df.columns.tolist()
+            self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
+            return self.raw_df
+
         # Override settings for singscore data
         if self.is_singscore:
             convert_to_ensembl = False
             filter_protein_coding = False
-            
+
         # Check cache
         if self.use_cache:
             cache_key = self._get_cache_key()
@@ -482,12 +590,12 @@ class DataLoader:
 
     def get_labels(self, label_column: str) -> np.ndarray:
         """
-        Get labels from adata.obs or simulated data.
+        Get labels from adata.obs, simulated data, or EMTAB responses.
 
         Parameters
         ----------
         label_column : str
-            Column name in adata.obs for labels.
+            Column name in adata.obs or responses.csv.gz for labels.
 
         Returns
         -------
@@ -499,7 +607,15 @@ class DataLoader:
             if not hasattr(self, 'label_data') or self.label_data is None:
                 raise ValueError("Simulated data not loaded. Call preprocess() first.")
             return self.label_data.values.astype(int)
-        
+
+        # For EMTAB data, get labels from responses_df
+        if self.is_emtab:
+            if self.responses_df is None:
+                raise ValueError("EMTAB data not loaded. Call preprocess() first.")
+            if label_column not in self.responses_df.columns:
+                raise ValueError(f"Label column '{label_column}' not found. Available: {list(self.responses_df.columns)}")
+            return self.responses_df[label_column].values.astype(int)
+
         if self.adata is None:
             self.load_adata()
 
@@ -511,14 +627,14 @@ class DataLoader:
 
     def get_auxiliary_features(self, aux_columns: List[str]) -> np.ndarray:
         """
-        Get auxiliary features from adata.obs.
-        
+        Get auxiliary features from adata.obs or EMTAB aux_data.
+
         For simulated data, returns empty array (no aux features).
 
         Parameters
         ----------
         aux_columns : list of str
-            Column names in adata.obs for auxiliary features.
+            Column names in adata.obs or aux_data.csv.gz for auxiliary features.
 
         Returns
         -------
@@ -532,7 +648,21 @@ class DataLoader:
             else:
                 self._log(f"WARNING: Simulated data has no auxiliary features. Ignoring: {aux_columns}")
                 return np.zeros((len(self.cell_ids), 0))
-        
+
+        # EMTAB data: get features from aux_data_df
+        if self.is_emtab:
+            if self.aux_data_df is None:
+                raise ValueError("EMTAB data not loaded. Call preprocess() first.")
+
+            if not aux_columns:
+                return np.zeros((len(self.cell_ids), 0))
+
+            missing = [col for col in aux_columns if col not in self.aux_data_df.columns]
+            if missing:
+                raise ValueError(f"Auxiliary columns not found: {missing}. Available: {list(self.aux_data_df.columns)}")
+
+            return self.aux_data_df[aux_columns].values.astype(float)
+
         if self.adata is None:
             self.load_adata()
 
@@ -606,6 +736,11 @@ class DataLoader:
                 if not hasattr(self, 'label_data') or self.label_data is None:
                     raise ValueError("Simulated data not loaded. Call preprocess() first.")
                 stratify = self.label_data.loc[self.cell_ids].values
+            # For EMTAB data, use responses_df
+            elif self.is_emtab:
+                if self.responses_df is None:
+                    raise ValueError("EMTAB data not loaded. Call preprocess() first.")
+                stratify = self.responses_df[stratify_by].values
             else:
                 if self.adata is None:
                     self.load_adata()
@@ -678,15 +813,19 @@ class DataLoader:
         # Get expression matrix
         X = self.raw_df.loc[cell_ids].values
 
-        # Get labels (handles simulated vs h5ad)
+        # Get labels (handles simulated vs EMTAB vs h5ad)
         if self.is_simulated:
             y = self.label_data.loc[cell_ids].values.astype(int)
+        elif self.is_emtab:
+            # For EMTAB, get labels from responses_df using cell indices
+            cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
+            y = self.responses_df[label_column].values[cell_idx].astype(int)
         else:
             if self.adata is None:
                 self.load_adata()
             y = self.adata.obs.loc[cell_ids, label_column].values.astype(int)
 
-        # Get auxiliary features (empty for simulated)
+        # Get auxiliary features
         if aux_columns and not self.is_simulated:
             X_aux = self.get_auxiliary_features(aux_columns)
             # Subset to requested cells
@@ -785,7 +924,8 @@ class DataLoader:
             'n_cells': len(self.cell_ids),
             'n_aux': X_aux_train.shape[1],
             'feature_type': self.feature_type,
-            'is_singscore': self.is_singscore
+            'is_singscore': self.is_singscore,
+            'is_emtab': self.is_emtab
         }
 
 
@@ -799,14 +939,20 @@ def load_data(
     """
     Convenience function to load and preprocess data in one call.
 
+    Supports multiple data formats:
+    - h5ad files (AnnData format)
+    - EMTAB directory with CSV files (gene_expression_raw_processed.csv.gz,
+      responses.csv.gz, aux_data.csv.gz)
+    - Simulated CSV files
+
     Parameters
     ----------
     data_path : str
-        Path to h5ad file.
+        Path to h5ad file or EMTAB directory containing CSV files.
     label_column : str, default='t2dm'
-        Column name for labels.
+        Column name for labels (in adata.obs or responses.csv.gz).
     aux_columns : list of str, optional
-        Column names for auxiliary features.
+        Column names for auxiliary features (in adata.obs or aux_data.csv.gz).
     gene_annotation_path : str, optional
         Path to gene annotation CSV.
     **kwargs
@@ -819,13 +965,20 @@ def load_data(
 
     Examples
     --------
+    >>> # Load from h5ad
     >>> data = load_data(
     ...     '/path/to/Bcell_GEX.h5ad',
     ...     label_column='t2dm',
     ...     aux_columns=['Sex']
     ... )
     >>> X_train, X_aux_train, y_train = data['train']
-    >>> print(f"Training samples: {X_train.shape[0]}")
+    >>>
+    >>> # Load from EMTAB directory
+    >>> data = load_data(
+    ...     '/path/to/EMTAB11349/preprocessed',
+    ...     label_column='IBD',
+    ...     aux_columns=['sex_female']
+    ... )
     """
     loader = DataLoader(
         data_path=data_path,
