@@ -288,6 +288,12 @@ def create_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Do not restore best parameters when learning rate is reduced or at end of training'
     )
+    train_parser.add_argument(
+        '--count-scale',
+        type=float,
+        default=1.0,
+        help='Scaling factor for count data (divide counts by this value). Use values > 1 (e.g., 100, 1000) with large raw counts for numerical stability.'
+    )
 
     # Output options
     train_parser.add_argument(
@@ -466,6 +472,7 @@ def cmd_train(args: argparse.Namespace) -> int:
                 lr_reduction_patience=args.lr_reduction_patience,
                 lr_reduction_factor=args.lr_reduction_factor,
                 restore_best=not args.no_restore_best,
+                count_scale=args.count_scale,
                 alpha_theta=args.alpha_theta,
                 alpha_beta=args.alpha_beta,
                 sigma_v=args.sigma_v,

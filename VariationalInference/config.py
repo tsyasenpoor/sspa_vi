@@ -395,6 +395,9 @@ class SVIConfig:
     lr_reduction_factor: float = 0.5
     restore_best: bool = True
 
+    # Numerical stability
+    count_scale: float = 1.0  # Divide counts by this value for numerical stability
+
     # Model hyperparameters (same as VI)
     alpha_theta: float = 2.0
     alpha_beta: float = 2.0
@@ -470,6 +473,7 @@ class SVIConfig:
             'lr_reduction_patience': self.lr_reduction_patience,
             'lr_reduction_factor': self.lr_reduction_factor,
             'restore_best': self.restore_best,
+            'count_scale': self.count_scale,
             'alpha_theta': self.alpha_theta,
             'alpha_beta': self.alpha_beta,
             'alpha_xi': self.alpha_xi,

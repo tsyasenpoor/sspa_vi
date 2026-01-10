@@ -195,6 +195,12 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help='Weight for classification objective in SVI (higher=more focus on classification)'
     )
+    parser.add_argument(
+        '--count-scale',
+        type=float,
+        default=1.0,
+        help='Scaling factor for count data (divide counts by this value). Use values > 1 (e.g., 100, 1000) with large raw counts for numerical stability.'
+    )
 
     # Hyperparameter options (Priors & Regularization)
     parser.add_argument(
@@ -440,6 +446,7 @@ def main():
             learning_rate_min=args.learning_rate_min,
             warmup_epochs=args.warmup_epochs,
             regression_weight=args.regression_weight,
+            count_scale=args.count_scale,
             alpha_theta=alpha_theta,
             alpha_beta=args.alpha_beta,
             alpha_xi=args.alpha_xi,
