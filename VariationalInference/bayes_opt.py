@@ -80,110 +80,117 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
 
     Returns a dict where each key is a hyperparameter name and value is a dict
     containing: 'type', 'low', 'high', 'log' (for float), 'choices' (for categorical).
+    
+    Key refinements:
+    - Alpha parameters: ≥1.0 to ensure proper Gamma priors
+    - Learning rate: Reduced upper bound for stability
+    - pi_v: Narrowed to 0.5-0.95 for better disease signal retention
+    - pi_beta: Increased sparsity (lower values) for gene programs
+    - sigma_v: Tightened regularization range for disease effects
     """
     return {
-        # Learning rate (for SVI) - log scale
+        # Learning rate (for SVI) - refined range
         'learning_rate': {
             'type': 'float',
             'low': 1e-4,
-            'high': 100,
+            'high': 0.1,
             'log': True,
-            'description': 'Learning rate for stochastic optimization'
+            'description': 'Natural gradient step size'
         },
 
-        # Prior shape parameters (alpha)
+        # Latent factor shape parameters (CORRECTED: ≥1 for proper priors)
         'alpha_theta': {
             'type': 'float',
-            'low': 0.5,
-            'high': 5.0,
+            'low': 1.0,
+            'high': 10.0,
             'log': False,
-            'description': 'Prior shape for sample factor activities'
+            'description': 'Sample factor sparsity (≥1 for proper prior)'
         },
         'alpha_beta': {
             'type': 'float',
-            'low': 0.5,
-            'high': 5.0,
+            'low': 1.0,
+            'high': 10.0,
             'log': False,
-            'description': 'Prior shape for gene loadings'
+            'description': 'Gene loading sparsity (≥1 for proper prior)'
         },
+
+        # Hierarchical shrinkage (CORRECTED)
         'alpha_xi': {
             'type': 'float',
-            'low': 0.5,
+            'low': 1.0,
             'high': 5.0,
             'log': False,
-            'description': 'Prior shape for sample depth'
+            'description': 'Sample depth heterogeneity'
         },
         'alpha_eta': {
             'type': 'float',
-            'low': 0.5,
+            'low': 1.0,
             'high': 5.0,
             'log': False,
-            'description': 'Prior shape for gene scaling'
+            'description': 'Gene scale heterogeneity'
         },
-
-        # Prior rate parameters (lambda)
         'lambda_xi': {
-            'type': 'float',
-            'low': 0.5,
-            'high': 5.0,
-            'log': False,
-            'description': 'Prior rate for sample depth'
-        },
-        'lambda_eta': {
-            'type': 'float',
-            'low': 0.5,
-            'high': 5.0,
-            'log': False,
-            'description': 'Prior rate for gene scaling'
-        },
-
-        # Classification weight regularization
-        'sigma_v': {
-            'type': 'float',
-            'low': 0.01,
-            'high': 4.0,
-            'log': True,
-            'description': 'Prior std for classification weights'
-        },
-        'sigma_gamma': {
-            'type': 'float',
-            'low': 0.01,
-            'high': 4.0,
-            'log': True,
-            'description': 'Prior std for auxiliary effects'
-        },
-
-        # Spike-and-slab sparsity priors
-        'pi_v': {
-            'type': 'float',
-            'low': 0.1,
-            'high': 0.99,
-            'log': False,
-            'description': 'Prior prob of v being active (slab)'
-        },
-        'pi_beta': {
-            'type': 'float',
-            'low': 0.01,
-            'high': 1.0,
-            'log': True,
-            'description': 'Prior prob of beta being active'
-        },
-
-        # Classification-reconstruction tradeoff
-        'regression_weight': {
             'type': 'float',
             'low': 0.1,
             'high': 10.0,
             'log': True,
-            'description': 'Weight for classification objective'
+            'description': 'Prior mean for sample depth'
+        },
+        'lambda_eta': {
+            'type': 'float',
+            'low': 0.1,
+            'high': 10.0,
+            'log': True,
+            'description': 'Prior mean for gene scaling'
+        },
+
+        # Spike-and-slab sparsity priors (CORRECTED)
+        'pi_v': {
+            'type': 'float',
+            'low': 0.5,
+            'high': 0.95,
+            'log': False,
+            'description': 'Disease coefficient inclusion prob'
+        },
+        'pi_beta': {
+            'type': 'float',
+            'low': 0.01,
+            'high': 0.20,
+            'log': True,
+            'description': 'Gene-program sparsity'
+        },
+
+        # Regression regularization (REFINED)
+        'sigma_v': {
+            'type': 'float',
+            'low': 0.1,
+            'high': 2.0,
+            'log': True,
+            'description': 'Disease effect regularization'
+        },
+        'sigma_gamma': {
+            'type': 'float',
+            'low': 0.5,
+            'high': 5.0,
+            'log': True,
+            'description': 'Auxiliary covariate regularization'
+        },
+
+        # Classification-reconstruction tradeoff (UNCHANGED)
+        'regression_weight': {
+            'type': 'float',
+            'low': 10.1,
+            'high': 500.0,
+            'log': True,
+            'description': 'Disease vs reconstruction tradeoff'
         },
 
         # Model complexity
         'n_factors': {
             'type': 'int',
-            'low': 50,
-            'high': 500,
-            'step': 10,
+            'low': 500,
+            'high': 2000,
+            'step': 150,
             'description': 'Number of latent factors (d)'
         },
     }
