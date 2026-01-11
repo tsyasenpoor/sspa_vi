@@ -41,9 +41,9 @@ class SVICorrected:
         learning_rate: float = 0.01,
         learning_rate_decay: float = 0.75,  # κ in ρ_t = (τ + t)^{-κ}
         learning_rate_delay: float = 1.0,   # τ
-        learning_rate_min: float = 1e-4,
+        learning_rate_min: float = 1e-6,    # Lower floor for better convergence
         local_iterations: int = 10,
-        
+
         # Priors
         alpha_theta: float = 1.1,
         alpha_beta: float = 1.1,
@@ -53,15 +53,23 @@ class SVICorrected:
         lambda_eta: float = 1.0,
         sigma_v: float = 1.0,
         sigma_gamma: float = 1.0,
-        
+
         # Spike-and-slab
         use_spike_slab: bool = False,
         pi_beta: float = 0.1,
         pi_v: float = 0.5,
-        
+
         # Supervision
         regression_weight: float = 1.0,
-        
+
+        # Convergence and averaging
+        averaging_start_fraction: float = 0.5,  # Start averaging after this fraction of epochs
+        full_elbo_freq: int = 1,                # Compute full ELBO every N epochs (0 = never)
+        early_stop_patience: int = 10,          # Epochs without improvement before stopping
+        early_stop_min_delta: float = 0.001,    # Minimum relative ELBO improvement
+        convergence_cv_threshold: float = 0.05, # CV threshold for convergence detection
+        restore_best: bool = True,              # Restore best parameters at end
+
         random_state: Optional[int] = None
     ):
         self.d = n_factors  # Number of factors
@@ -88,10 +96,18 @@ class SVICorrected:
         self.pi_v = pi_v
         
         self.regression_weight = regression_weight
-        
+
+        # Convergence and averaging
+        self.averaging_start_fraction = averaging_start_fraction
+        self.full_elbo_freq = full_elbo_freq
+        self.early_stop_patience = early_stop_patience
+        self.early_stop_min_delta = early_stop_min_delta
+        self.convergence_cv_threshold = convergence_cv_threshold
+        self.restore_best = restore_best
+
         # RNG
         self.rng = np.random.default_rng(random_state)
-        
+
         # Will be set during fit
         self.n = None  # num samples
         self.p = None  # num genes
@@ -297,7 +313,208 @@ class SVICorrected:
             self.E_beta_effective = self.E_beta
             self.E_log_beta_effective = self.E_log_beta
             self.E_v_effective = self.E_v
-    
+
+    # =========================================================================
+    # DATA VALIDATION
+    # =========================================================================
+
+    def _validate_data(self, X: np.ndarray, verbose: bool = True) -> dict:
+        """
+        Validate input data and warn about potential issues.
+
+        Returns dict with data statistics and recommended actions.
+        """
+        stats = {
+            'min': X.min(),
+            'max': X.max(),
+            'mean': X.mean(),
+            'median': np.median(X),
+            'std': X.std(),
+            'sparsity': (X == 0).mean(),
+            'needs_normalization': False,
+            'warnings': []
+        }
+
+        # Check for very large counts (suggests raw RNA-seq)
+        if stats['max'] > 10000:
+            stats['needs_normalization'] = True
+            stats['warnings'].append(
+                f"WARNING: Max count = {stats['max']:.0f}. Very large counts can cause "
+                "numerical issues with Poisson likelihood. Consider:\n"
+                "  1. Library size normalization: X / X.sum(axis=1, keepdims=True) * median_library_size\n"
+                "  2. Log transformation: np.log1p(X)\n"
+                "  3. Variance stabilization (e.g., scran, DESeq2 normalization)"
+            )
+
+        # Check for high variance/mean ratio (overdispersion)
+        if stats['mean'] > 0:
+            var_mean_ratio = (stats['std'] ** 2) / stats['mean']
+            if var_mean_ratio > 10:
+                stats['warnings'].append(
+                    f"WARNING: Variance/Mean ratio = {var_mean_ratio:.1f} >> 1. "
+                    "Data is highly overdispersed. Poisson model assumes Var = Mean. "
+                    "Consider Negative Binomial or normalized data."
+                )
+
+        # Check for extreme sparsity
+        if stats['sparsity'] > 0.9:
+            stats['warnings'].append(
+                f"WARNING: {stats['sparsity']*100:.1f}% of entries are zero. "
+                "High sparsity may affect model fit."
+            )
+
+        if verbose and stats['warnings']:
+            print("\n" + "="*70)
+            print("DATA VALIDATION WARNINGS")
+            print("="*70)
+            for w in stats['warnings']:
+                print(w)
+            print("="*70 + "\n")
+
+        return stats
+
+    # =========================================================================
+    # ITERATE AVERAGING (Polyak-Ruppert)
+    # =========================================================================
+
+    def _init_averaging(self):
+        """Initialize storage for averaged parameters."""
+        self._avg_count = 0
+
+        # Natural parameters for Gamma distributions
+        self._avg_eta1_beta = np.zeros_like(self.eta1_beta)
+        self._avg_eta2_beta = np.zeros_like(self.eta2_beta)
+        self._avg_eta1_eta = np.zeros_like(self.eta1_eta)
+        self._avg_eta2_eta = np.zeros_like(self.eta2_eta)
+
+        # Canonical parameters for Gaussian distributions
+        self._avg_mu_v = np.zeros_like(self.mu_v)
+        self._avg_Sigma_v = np.zeros_like(self.Sigma_v)
+        self._avg_mu_gamma = np.zeros_like(self.mu_gamma)
+        self._avg_Sigma_gamma = np.zeros_like(self.Sigma_gamma)
+
+    def _update_averaging(self):
+        """Update running averages of parameters (Polyak-Ruppert averaging)."""
+        self._avg_count += 1
+        weight = 1.0 / self._avg_count
+
+        # Update Gamma natural parameter averages
+        self._avg_eta1_beta = (1 - weight) * self._avg_eta1_beta + weight * self.eta1_beta
+        self._avg_eta2_beta = (1 - weight) * self._avg_eta2_beta + weight * self.eta2_beta
+        self._avg_eta1_eta = (1 - weight) * self._avg_eta1_eta + weight * self.eta1_eta
+        self._avg_eta2_eta = (1 - weight) * self._avg_eta2_eta + weight * self.eta2_eta
+
+        # Update Gaussian canonical parameter averages
+        self._avg_mu_v = (1 - weight) * self._avg_mu_v + weight * self.mu_v
+        self._avg_Sigma_v = (1 - weight) * self._avg_Sigma_v + weight * self.Sigma_v
+        self._avg_mu_gamma = (1 - weight) * self._avg_mu_gamma + weight * self.mu_gamma
+        self._avg_Sigma_gamma = (1 - weight) * self._avg_Sigma_gamma + weight * self.Sigma_gamma
+
+    def _apply_averaged_parameters(self):
+        """Replace current parameters with averaged versions."""
+        if self._avg_count == 0:
+            return  # No averaging done yet
+
+        # Apply averaged Gamma parameters
+        self.eta1_beta = self._avg_eta1_beta.copy()
+        self.eta2_beta = self._avg_eta2_beta.copy()
+        self.eta1_eta = self._avg_eta1_eta.copy()
+        self.eta2_eta = self._avg_eta2_eta.copy()
+
+        # Convert back to canonical
+        self.a_beta, self.b_beta = self._natural_to_gamma(self.eta1_beta, self.eta2_beta)
+        self.a_eta, self.b_eta = self._natural_to_gamma(self.eta1_eta, self.eta2_eta)
+
+        # Apply averaged Gaussian parameters
+        self.mu_v = self._avg_mu_v.copy()
+        self.Sigma_v = self._avg_Sigma_v.copy()
+        self.mu_gamma = self._avg_mu_gamma.copy()
+        self.Sigma_gamma = self._avg_Sigma_gamma.copy()
+
+        # Update expectations
+        self._compute_expectations()
+
+    # =========================================================================
+    # FULL-DATASET ELBO
+    # =========================================================================
+
+    def _compute_full_elbo(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        X_aux: np.ndarray
+    ) -> float:
+        """
+        Compute ELBO on the full dataset (not mini-batch).
+
+        More accurate but slower than batch ELBO.
+        """
+        # Optimize local parameters for all samples
+        a_theta, b_theta, a_xi, b_xi, zeta = self._update_local_parameters(
+            X, y, X_aux
+        )
+
+        # Compute ELBO with scale=1 (no extrapolation needed)
+        elbo = self._compute_elbo(
+            X, y, X_aux,
+            a_theta, b_theta, a_xi, b_xi, zeta,
+            scale=1.0
+        )
+
+        return elbo
+
+    # =========================================================================
+    # CONVERGENCE DETECTION
+    # =========================================================================
+
+    def _check_convergence(
+        self,
+        elbo_history: list,
+        window: int = 10
+    ) -> dict:
+        """
+        Check convergence criteria.
+
+        Returns dict with:
+        - converged: bool
+        - reason: str
+        - stats: dict of convergence statistics
+        """
+        if len(elbo_history) < window:
+            return {'converged': False, 'reason': 'insufficient_history', 'stats': {}}
+
+        recent = np.array([e[1] for e in elbo_history[-window:]])
+
+        # Compute statistics
+        mean_elbo = np.mean(recent)
+        std_elbo = np.std(recent)
+        cv = np.abs(std_elbo / mean_elbo) if mean_elbo != 0 else float('inf')
+
+        # Check for NaN/Inf
+        if not np.isfinite(mean_elbo):
+            return {
+                'converged': False,
+                'reason': 'numerical_instability',
+                'stats': {'mean': mean_elbo, 'std': std_elbo, 'cv': cv}
+            }
+
+        stats = {
+            'mean': mean_elbo,
+            'std': std_elbo,
+            'cv': cv,
+            'recent_values': recent
+        }
+
+        # Check CV threshold
+        if cv < self.convergence_cv_threshold:
+            return {
+                'converged': True,
+                'reason': f'cv_below_threshold (CV={cv:.4f} < {self.convergence_cv_threshold})',
+                'stats': stats
+            }
+
+        return {'converged': False, 'reason': 'still_varying', 'stats': stats}
+
     # =========================================================================
     # LOCAL PARAMETER UPDATES (Full optimization per mini-batch)
     # =========================================================================
@@ -353,24 +570,24 @@ class SVICorrected:
             for k in range(self.kappa):
                 y_k = y_batch[:, k] if y_batch.ndim > 1 else y_batch
                 lam = self._lambda_jj(zeta[:, k])
-                
+
                 # C^{(-ℓ)}_{ik} = Σ_{m≠ℓ} E[θ_im] E[v_km] + x^aux_i · E[γ_k]
                 # For each ℓ:
                 theta_v = E_theta @ self.E_v_effective[k]  # (batch,)
                 aux_term = X_aux_batch @ self.E_gamma[k] if self.p_aux > 0 else 0.0  # (batch,)
-                
+
                 # Vectorized over ℓ
-                C_minus_ell = (theta_v[:, np.newaxis] - 
+                C_minus_ell = (theta_v[:, np.newaxis] -
                               E_theta * self.E_v_effective[k][np.newaxis, :] +
                               aux_term if isinstance(aux_term, float) else aux_term[:, np.newaxis])  # (batch, d)
-                
+
                 E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
-                
+
                 # R_iℓ = -(y_ik - 0.5) v_kℓ + 2λ(ζ_ik) v_kℓ C^{(-ℓ)} + 2λ(ζ_ik) E[v²_kℓ] E[θ_iℓ]
                 R = (-(y_k - 0.5)[:, np.newaxis] * self.E_v_effective[k][np.newaxis, :] +
                      2 * lam[:, np.newaxis] * self.E_v_effective[k][np.newaxis, :] * C_minus_ell +
                      2 * lam[:, np.newaxis] * E_v_sq[np.newaxis, :] * E_theta)
-                
+
                 b_theta_new += self.regression_weight * R
             
             b_theta_new = np.maximum(b_theta_new, 1e-6)
@@ -473,58 +690,58 @@ class SVICorrected:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute intermediate v parameters.
-        
+
         v_k ~ N(0, σ_v² I)
         From JJ bound, the approximate posterior is Gaussian with:
         - Precision: (1/σ_v²) I + 2 Σ_i λ(ζ_ik) E[θ_i⊗θ_i]
         - Mean precision: Σ_i (y_ik - 0.5) E[θ_i] - 2λ(ζ_ik) E[θ_i](x^aux · γ_k)
-        
+
         For diagonal approximation (independent v_{kℓ}):
-        - precision_ℓ = 1/σ_v² + 2 Σ_i λ(ζ_ik) E[θ²_iℓ]  
+        - precision_ℓ = 1/σ_v² + 2 Σ_i λ(ζ_ik) E[θ²_iℓ]
         - mean·precision_ℓ = Σ_i [(y_ik - 0.5) - 2λ(ζ_ik) C_{ik}] E[θ_iℓ]
-        
+
         where C_{ik} = Σ_{m≠ℓ} E[θ_im] E[v_km] + x^aux · γ_k
         """
         mu_v_hat = np.zeros((self.kappa, self.d))
         Sigma_v_hat = np.zeros((self.kappa, self.d, self.d))
-        
+
         for k in range(self.kappa):
             y_k = y_batch[:, k] if y_batch.ndim > 1 else y_batch
             lam = self._lambda_jj(zeta[:, k])  # (batch,)
-            
+
             # E[θ²] = E[θ]² + Var[θ]
             Var_theta = a_theta / (b_theta**2)
             E_theta_sq = E_theta**2 + Var_theta  # (batch, d)
-            
+
             # Auxiliary contribution
             aux_contrib = X_aux_batch @ self.E_gamma[k] if self.p_aux > 0 else 0.0  # (batch,)
-            
+
             # Full model contribution (before removing ℓ-th factor)
             full_theta_v = E_theta @ self.E_v_effective[k]  # (batch,)
-            
+
             # Diagonal precision and mean for each factor ℓ
             precision = np.full(self.d, 1.0 / self.sigma_v**2)
             mean_contrib = np.zeros(self.d)
-            
+
             for ell in range(self.d):
                 # C_{ik}^{(-ℓ)} = full - E[θ_iℓ] E[v_kℓ] + aux
                 C_minus_ell = full_theta_v - E_theta[:, ell] * self.E_v_effective[k, ell] + aux_contrib
-                
+
                 # Precision contribution: 2 Σ_i λ(ζ_ik) E[θ²_iℓ]
                 precision[ell] += 2 * scale * np.sum(lam * E_theta_sq[:, ell])
-                
+
                 # Mean*precision contribution: Σ_i [(y_ik - 0.5) - 2λ(ζ_ik) C_{ik}^{(-ℓ)}] E[θ_iℓ]
                 mean_contrib[ell] = scale * np.sum(
                     ((y_k - 0.5) - 2 * lam * C_minus_ell) * E_theta[:, ell]
                 )
-            
+
             # Convert to mean and variance
             Sigma_v_hat[k] = np.diag(1.0 / precision)
             mu_v_hat[k] = mean_contrib / precision
-            
+
             # Clip for stability
             mu_v_hat[k] = np.clip(mu_v_hat[k], -10, 10)
-        
+
         return mu_v_hat, Sigma_v_hat
     
     def _compute_intermediate_gamma(
@@ -578,10 +795,10 @@ class SVICorrected:
     ):
         """
         SVI update.
-        
+
         For Gamma distributions, we use natural parameter updates:
         η^(t) = (1 - ρ_t) η^(t-1) + ρ_t η̂
-        
+
         For Gaussian distributions, we update canonical parameters directly
         (equivalent when done properly, but more numerically stable):
         μ^(t) = (1 - ρ_t) μ^(t-1) + ρ_t μ̂
@@ -592,13 +809,13 @@ class SVICorrected:
         self.eta1_beta = (1 - rho_t) * self.eta1_beta + rho_t * eta1_beta_hat
         self.eta2_beta = (1 - rho_t) * self.eta2_beta + rho_t * eta2_beta_hat
         self.a_beta, self.b_beta = self._natural_to_gamma(self.eta1_beta, self.eta2_beta)
-        
+
         # Eta: update natural parameters for Gamma
         eta1_eta_hat, eta2_eta_hat = self._gamma_to_natural(a_eta_hat, b_eta_hat)
         self.eta1_eta = (1 - rho_t) * self.eta1_eta + rho_t * eta1_eta_hat
         self.eta2_eta = (1 - rho_t) * self.eta2_eta + rho_t * eta2_eta_hat
         self.a_eta, self.b_eta = self._natural_to_gamma(self.eta1_eta, self.eta2_eta)
-        
+
         # v: update canonical parameters directly (more stable)
         for k in range(self.kappa):
             self.mu_v[k] = (1 - rho_t) * self.mu_v[k] + rho_t * mu_v_hat[k]
@@ -608,7 +825,7 @@ class SVICorrected:
             eigvals = np.linalg.eigvalsh(self.Sigma_v[k])
             if np.min(eigvals) < 1e-6:
                 self.Sigma_v[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.d)
-        
+
         # gamma: update canonical parameters directly
         if self.p_aux > 0:
             for k in range(self.kappa):
@@ -618,7 +835,7 @@ class SVICorrected:
                 eigvals = np.linalg.eigvalsh(self.Sigma_gamma[k])
                 if np.min(eigvals) < 1e-6:
                     self.Sigma_gamma[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.p_aux)
-        
+
         # Update expectations
         self._compute_expectations()
     
@@ -775,64 +992,85 @@ class SVICorrected:
     ):
         """
         Fit model using Stochastic Variational Inference.
+
+        Features:
+        - Data validation with warnings for problematic data
+        - Polyak-Ruppert iterate averaging for late-stage stabilization
+        - Full-dataset ELBO computation for accurate monitoring
+        - Early stopping with plateau detection
+        - Best parameter restoration
         """
         # Ensure y is 2D
         if y.ndim == 1:
             y = y[:, np.newaxis]
-        
+
+        # Validate data and warn about potential issues
+        self.data_stats_ = self._validate_data(X, verbose=verbose)
+
         # Initialize
         self._initialize_global_parameters(X, y, X_aux)
-        
+
         n_batches = max(1, self.n // self.batch_size)
         iteration = 0
-        self.elbo_history_ = []
-        
+        self.elbo_history_ = []           # Batch ELBO history
+        self.full_elbo_history_ = []      # Full-dataset ELBO history
+
         # Storage for final training set local parameters
         self.train_a_theta_ = None
         self.train_b_theta_ = None
         self.train_a_xi_ = None
         self.train_b_xi_ = None
-        
+
+        # Best parameter tracking
+        best_elbo = -np.inf
+        best_epoch = 0
+        best_params = None
+        epochs_without_improvement = 0
+
+        # Iterate averaging
+        averaging_start_epoch = int(self.averaging_start_fraction * max_epochs)
+        averaging_started = False
+
         start_time = time.time()
-        
+
         for epoch in range(max_epochs):
             # Shuffle data
             perm = self.rng.permutation(self.n)
-            
+
             # Storage for training parameters (overwritten each epoch)
             epoch_a_theta = np.zeros((self.n, self.d))
             epoch_b_theta = np.zeros((self.n, self.d))
             epoch_a_xi = np.zeros(self.n)
             epoch_b_xi = np.zeros(self.n)
-            
-            epoch_elbo = 0.0
-            
+
+            batch_elbo = 0.0
+
             for batch_idx in range(n_batches):
                 start = batch_idx * self.batch_size
                 end = min(start + self.batch_size, self.n)
                 idx = perm[start:end]
-                
+
                 X_batch = X[idx]
                 y_batch = y[idx]
                 X_aux_batch = X_aux[idx]
-                
+
                 actual_batch_size = end - start
                 scale = self.n / actual_batch_size
-                
+
                 # 1. Optimize local parameters
                 a_theta, b_theta, a_xi, b_xi, zeta = self._update_local_parameters(
                     X_batch, y_batch, X_aux_batch
                 )
-                
+
                 # Store training set parameters (final epoch will be retained)
                 epoch_a_theta[idx] = a_theta
                 epoch_b_theta[idx] = b_theta
                 epoch_a_xi[idx] = a_xi
                 epoch_b_xi[idx] = b_xi
-                
+
                 E_theta = a_theta / b_theta
                 E_log_theta = digamma(a_theta) - np.log(b_theta)
-                
+
                 # 2. Compute intermediate global parameters
                 a_beta_hat, b_beta_hat = self._compute_intermediate_beta(
                     X_batch, E_theta, E_log_theta, scale
@@ -844,7 +1082,7 @@ class SVICorrected:
                 mu_gamma_hat, Sigma_gamma_hat = self._compute_intermediate_gamma(
                     y_batch, X_aux_batch, E_theta, zeta, scale
                 )
-                
+
                 # 3. SVI update with natural gradients
                 rho_t = self._get_learning_rate(iteration)
                 self._svi_update_global(
@@ -854,8 +1092,17 @@ class SVICorrected:
                     mu_v_hat, Sigma_v_hat,
                     mu_gamma_hat, Sigma_gamma_hat
                 )
-                
-                # Compute ELBO periodically
+
+                # 4. Update iterate averaging (after burn-in)
+                if epoch >= averaging_start_epoch:
+                    if not averaging_started:
+                        self._init_averaging()
+                        averaging_started = True
+                        if verbose:
+                            print(f"  [Epoch {epoch}] Starting iterate averaging")
+                    self._update_averaging()
+
+                # Compute batch ELBO periodically
                 if iteration % elbo_freq == 0:
                     elbo = self._compute_elbo(
                         X_batch, y_batch, X_aux_batch,
@@ -863,28 +1110,130 @@ class SVICorrected:
                     )
                     if np.isfinite(elbo):
                         self.elbo_history_.append((iteration, elbo))
-                        epoch_elbo = elbo
-                
+                        batch_elbo = elbo
+
                 iteration += 1
-            
-            if verbose and epoch % 5 == 0:
-                beta_diversity = np.std(self.E_beta, axis=1).mean()
-                theta_diversity = np.std(E_theta, axis=1).mean() if 'E_theta' in dir() else 0
-                print(f"Epoch {epoch}: ELBO = {epoch_elbo:.2e}, ρ_t = {rho_t:.4f}, "
-                      f"v = {self.mu_v.ravel()[:3]}, β_div = {beta_diversity:.3f}")
-            
-            # Store final epoch's training parameters
+
+            # Store this epoch's training parameters
             self.train_a_theta_ = epoch_a_theta
             self.train_b_theta_ = epoch_b_theta
             self.train_a_xi_ = epoch_a_xi
             self.train_b_xi_ = epoch_b_xi
-        
+
+            # Compute full-dataset ELBO periodically
+            if self.full_elbo_freq > 0 and epoch % self.full_elbo_freq == 0:
+                full_elbo = self._compute_full_elbo(X, y, X_aux)
+                if np.isfinite(full_elbo):
+                    self.full_elbo_history_.append((epoch, full_elbo))
+
+                    # Check for improvement (for early stopping)
+                    relative_improvement = (full_elbo - best_elbo) / (abs(best_elbo) + 1e-10)
+                    if relative_improvement > self.early_stop_min_delta:
+                        best_elbo = full_elbo
+                        best_epoch = epoch
+                        epochs_without_improvement = 0
+                        # Save best parameters
+                        best_params = {
+                            'eta1_beta': self.eta1_beta.copy(),
+                            'eta2_beta': self.eta2_beta.copy(),
+                            'eta1_eta': self.eta1_eta.copy(),
+                            'eta2_eta': self.eta2_eta.copy(),
+                            'mu_v': self.mu_v.copy(),
+                            'Sigma_v': self.Sigma_v.copy(),
+                            'mu_gamma': self.mu_gamma.copy(),
+                            'Sigma_gamma': self.Sigma_gamma.copy(),
+                            'train_a_theta': epoch_a_theta.copy(),
+                            'train_b_theta': epoch_b_theta.copy(),
+                            'train_a_xi': epoch_a_xi.copy(),
+                            'train_b_xi': epoch_b_xi.copy(),
+                        }
+                    else:
+                        epochs_without_improvement += 1
+            else:
+                # Use batch ELBO for early stopping if full ELBO disabled
+                full_elbo = batch_elbo
+                if batch_elbo > best_elbo:
+                    best_elbo = batch_elbo
+                    best_epoch = epoch
+
+            # Verbose output
+            if verbose and epoch % 5 == 0:
+                beta_diversity = np.std(self.E_beta, axis=1).mean()
+                avg_status = f", avg_n={self._avg_count}" if averaging_started else ""
+                print(f"Epoch {epoch}: ELBO = {full_elbo:.2e}, ρ_t = {rho_t:.6f}, "
+                      f"v = {self.mu_v.ravel()[:3]}, β_div = {beta_diversity:.3f}{avg_status}")
+
+            # Check for early stopping
+            if self.full_elbo_freq > 0 and epochs_without_improvement >= self.early_stop_patience:
+                if verbose:
+                    print(f"\n  [Early stopping] No improvement for {self.early_stop_patience} epochs. "
+                          f"Best ELBO = {best_elbo:.2e} at epoch {best_epoch}")
+                break
+
+            # Check convergence via CV
+            if len(self.full_elbo_history_) >= 10:
+                conv = self._check_convergence(self.full_elbo_history_, window=10)
+                if conv['converged']:
+                    if verbose:
+                        print(f"\n  [Converged] {conv['reason']}")
+                    break
+
+        # Apply iterate averaging if it was used
+        if averaging_started and self._avg_count > 0:
+            if verbose:
+                print(f"\n  Applying averaged parameters from {self._avg_count} iterations")
+            self._apply_averaged_parameters()
+
+        # Optionally restore best parameters
+        if self.restore_best and best_params is not None:
+            if verbose:
+                current_elbo = self._compute_full_elbo(X, y, X_aux) if self.full_elbo_freq > 0 else batch_elbo
+                print(f"  Current ELBO: {current_elbo:.2e}, Best ELBO: {best_elbo:.2e} (epoch {best_epoch})")
+
+                # Only restore if averaged isn't better
+                if current_elbo < best_elbo * 0.99:  # Allow 1% tolerance
+                    print(f"  Restoring best parameters from epoch {best_epoch}")
+                    self._restore_parameters(best_params)
+                else:
+                    print(f"  Keeping current (averaged) parameters")
+
         self.training_time_ = time.time() - start_time
-        
+        self.best_epoch_ = best_epoch
+        self.best_elbo_ = best_elbo
+
         if verbose:
             print(f"\nTraining complete in {self.training_time_:.1f}s")
-        
+            print(f"Best ELBO: {best_elbo:.2e} at epoch {best_epoch}")
+            if self.full_elbo_history_:
+                final_cv = self._check_convergence(self.full_elbo_history_, window=min(10, len(self.full_elbo_history_)))
+                if 'cv' in final_cv['stats']:
+                    print(f"Final ELBO CV: {final_cv['stats']['cv']:.4f}")
+
         return self
+
+    def _restore_parameters(self, params: dict):
+        """Restore parameters from a saved state."""
+        self.eta1_beta = params['eta1_beta']
+        self.eta2_beta = params['eta2_beta']
+        self.eta1_eta = params['eta1_eta']
+        self.eta2_eta = params['eta2_eta']
+        self.mu_v = params['mu_v']
+        self.Sigma_v = params['Sigma_v']
+        self.mu_gamma = params['mu_gamma']
+        self.Sigma_gamma = params['Sigma_gamma']
+
+        # Convert natural to canonical
+        self.a_beta, self.b_beta = self._natural_to_gamma(self.eta1_beta, self.eta2_beta)
+        self.a_eta, self.b_eta = self._natural_to_gamma(self.eta1_eta, self.eta2_eta)
+
+        # Update expectations
+        self._compute_expectations()
+
+        # Restore training set local parameters
+        self.train_a_theta_ = params['train_a_theta']
+        self.train_b_theta_ = params['train_b_theta']
+        self.train_a_xi_ = params['train_a_xi']
+        self.train_b_xi_ = params['train_b_xi']
     
     def transform(self, X_new: np.ndarray, y_new: np.ndarray = None, 
                   X_aux_new: np.ndarray = None, n_iter: int = 50) -> dict:
