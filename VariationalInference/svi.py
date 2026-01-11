@@ -1678,7 +1678,10 @@ class SVI:
         method: str = 'platt',
         optimize_threshold: bool = True,
         threshold_metric: str = 'f1',
-        verbose: bool = False
+        verbose: bool = False,
+        skip_if_good: bool = True,
+        skip_threshold_auc: float = 0.95,
+        skip_threshold_acc: float = 0.95
     ) -> 'SVI':
         """
         Fit calibration parameters using validation data.
@@ -1709,6 +1712,14 @@ class SVI:
             - 'accuracy': Maximize accuracy
         verbose : bool, default=False
             Whether to print calibration information.
+        skip_if_good : bool, default=True
+            Whether to skip calibration if raw predictions already have good
+            AUC and accuracy. This saves computation when the model is already
+            well-calibrated.
+        skip_threshold_auc : float, default=0.95
+            Minimum AUC to consider skipping calibration.
+        skip_threshold_acc : float, default=0.95
+            Minimum accuracy to consider skipping calibration.
 
         Returns
         -------
@@ -1717,7 +1728,7 @@ class SVI:
         """
         from scipy.optimize import minimize_scalar, minimize
         from sklearn.isotonic import IsotonicRegression
-        from sklearn.metrics import f1_score, roc_curve
+        from sklearn.metrics import f1_score, roc_curve, roc_auc_score
 
         y_val = np.asarray(y_val).ravel()
 
@@ -1725,6 +1736,28 @@ class SVI:
         raw_probs = self.predict_proba(
             X_val, X_aux_val, verbose=False, use_regression=True
         ).ravel()
+
+        # Check if calibration can be skipped (already good performance)
+        if skip_if_good:
+            raw_preds = (raw_probs >= 0.5).astype(int)
+            raw_acc = np.mean(raw_preds == y_val)
+            try:
+                raw_auc = roc_auc_score(y_val, raw_probs)
+            except ValueError:
+                # Can happen with single class in y_val
+                raw_auc = 0.0
+
+            if raw_auc >= skip_threshold_auc and raw_acc >= skip_threshold_acc:
+                if verbose:
+                    print(f"Skipping calibration: raw AUC={raw_auc:.4f} >= {skip_threshold_auc}, "
+                          f"raw accuracy={raw_acc:.4f} >= {skip_threshold_acc}")
+                # Set identity calibration (no transformation)
+                self.calibration_a_ = 1.0
+                self.calibration_b_ = 0.0
+                self._calibration_method = 'identity'
+                self.is_calibrated_ = True
+                self.optimal_threshold_ = 0.5
+                return self
 
         # Convert to logits for calibration fitting
         # Clip to avoid log(0) or log(inf)
