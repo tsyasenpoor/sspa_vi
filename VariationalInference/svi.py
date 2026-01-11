@@ -468,6 +468,8 @@ class SVI:
                     + 2 * lam * self.E_v[k, ell] * E_C
                     + 2 * lam * E_theta[:, ell] * E_v_sq_ell
                 )
+                # Clip to prevent numerical instability (matches VI implementation)
+                regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
 
                 b_theta_new[:, ell] += self.regression_weight * regression_contrib
 
@@ -511,6 +513,8 @@ class SVI:
                 + 2 * lam[:, np.newaxis] * self.E_v[k] * E_C_all
                 + 2 * lam[:, np.newaxis] * E_theta * E_v_sq
             )
+            # Clip to prevent numerical instability (matches VI implementation)
+            regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
 
             b_theta_new += self.regression_weight * regression_contrib
 
@@ -1545,6 +1549,8 @@ class SVI:
                             + 2 * lam[:, np.newaxis] * self.E_v[k] * E_C_all
                             + 2 * lam[:, np.newaxis] * E_theta_batch * E_v_sq_all
                         )
+                        # Clip to prevent numerical instability (matches VI implementation)
+                        regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
 
                         b_theta_new[start:end] += self.regression_weight * regression_contrib
 

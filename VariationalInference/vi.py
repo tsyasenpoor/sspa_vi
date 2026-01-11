@@ -1620,6 +1620,8 @@ class VI:
                                 + 2 * lam * self.E_v[k, ell] * E_C
                                 + 2 * lam * E_theta_batch[:, ell] * E_v_sq_all[ell]
                             )
+                            # Clip to prevent numerical instability
+                            regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
 
                             b_theta_new[start:end, ell] += self.regression_weight * regression_contrib
 
