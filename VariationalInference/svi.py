@@ -1225,26 +1225,32 @@ class SVI:
                           f"Reducing learning rate by {self.lr_reduction_factor:.1f}x "
                           f"(multiplier now: {self._current_lr_multiplier:.4f})")
 
-                # Optionally restore best parameters and partially reset learning rate
-                if self.restore_best and best_checkpoint is not None:
-                    self._restore_global_checkpoint(best_checkpoint)
-
-                    # Partially recover learning rate to allow continued learning
-                    # Without this, the model gets stuck with very low learning rates
-                    if self.reset_lr_on_restore:
-                        # Recover learning rate by sqrt of reduction factor (e.g., 0.5 -> 0.707)
-                        # This gives a moderate boost without fully resetting
-                        self._current_lr_multiplier = min(
-                            self._current_lr_multiplier / np.sqrt(self.lr_reduction_factor),
-                            1.0  # Cap at original learning rate
-                        )
-                        if verbose:
-                            print(f"  📈 Learning rate partially recovered to {self._current_lr_multiplier:.4f}")
-
-                    if verbose:
-                        print(f"  ↩ Restored parameters from best epoch {best_epoch + 1} (ELBO: {best_elbo:.2f})")
-
                 degradation_counter = 0  # Reset counter after reduction
+
+            # Restore best parameters if degrading for too long (DECOUPLED from LR reduction)
+            # This ensures restoration happens even when LR is at minimum
+            if (degradation_counter >= self.lr_reduction_patience and
+                epoch >= self.warmup_epochs and
+                self.restore_best and best_checkpoint is not None):
+
+                self._restore_global_checkpoint(best_checkpoint)
+
+                # Partially recover learning rate to allow continued learning
+                # Without this, the model gets stuck with very low learning rates
+                if self.reset_lr_on_restore:
+                    # Recover learning rate by sqrt of reduction factor (e.g., 0.5 -> 0.707)
+                    # This gives a moderate boost without fully resetting
+                    self._current_lr_multiplier = min(
+                        self._current_lr_multiplier / np.sqrt(self.lr_reduction_factor),
+                        1.0  # Cap at original learning rate
+                    )
+                    if verbose:
+                        print(f"  📈 Learning rate partially recovered to {self._current_lr_multiplier:.4f}")
+
+                if verbose:
+                    print(f"  ↩ Restored parameters from best epoch {best_epoch + 1} (ELBO: {best_elbo:.2f})")
+
+                degradation_counter = 0  # Reset counter after restoration
 
             # Report epoch progress
             if verbose:
