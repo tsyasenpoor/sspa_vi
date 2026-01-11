@@ -58,8 +58,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 # Import VI components
 from VariationalInference.data_loader import DataLoader
-from VariationalInference.vi import VI
-from VariationalInference.config import VIConfig
+from VariationalInference.svi_corrected import SVI
 from VariationalInference.utils import compute_metrics
 
 # Configure logging
@@ -513,9 +512,11 @@ class VIObjective:
                        f"train_samples={X_train_sub.shape[0]}")
 
         try:
-            # Create model
-            model = VI(
+            # Create SVI model
+            model = SVI(
                 n_factors=n_factors,
+                batch_size=self.batch_size,
+                learning_rate=learning_rate,
                 alpha_theta=params.get('alpha_theta', 2.0),
                 alpha_beta=params.get('alpha_beta', 2.0),
                 alpha_xi=params.get('alpha_xi', 2.0),
@@ -527,56 +528,22 @@ class VIObjective:
                 pi_v=params.get('pi_v', 0.9),
                 pi_beta=params.get('pi_beta', 0.05),
                 regression_weight=params.get('regression_weight', 1.0),
+                use_spike_slab=params.get('use_spike_slab', False),
             )
 
             # Train model on subsampled data
-            if self.method == 'vi':
-                model.fit(
-                    X=X_train_sub,
-                    y=y_train_sub,
-                    X_aux=X_aux_train_sub,
-                    max_iter=self.max_iter,
-                    patience=self.early_stopping_patience,
-                    verbose=self.verbose
-                )
-            else:
-                # SVI - import if needed
-                from VariationalInference.svi import SVI
-                model = SVI(
-                    n_factors=n_factors,
-                    batch_size=self.batch_size,
-                    learning_rate=learning_rate,
-                    alpha_theta=params.get('alpha_theta', 2.0),
-                    alpha_beta=params.get('alpha_beta', 2.0),
-                    alpha_xi=params.get('alpha_xi', 2.0),
-                    alpha_eta=params.get('alpha_eta', 2.0),
-                    lambda_xi=params.get('lambda_xi', 1.5),
-                    lambda_eta=params.get('lambda_eta', 1.5),
-                    sigma_v=params.get('sigma_v', 0.2),
-                    sigma_gamma=params.get('sigma_gamma', 0.5),
-                    pi_v=params.get('pi_v', 0.9),
-                    pi_beta=params.get('pi_beta', 0.05),
-                    regression_weight=params.get('regression_weight', 100.0),
-                    count_scale=params.get('count_scale', 1000.0),
-                    use_spike_slab=params.get('use_spike_slab', True),
-                    rho_v_delay_epochs=params.get('rho_v_delay_epochs', 0),
-                    reset_lr_on_restore=params.get('reset_lr_on_restore', True),
-                    regression_lr_multiplier=params.get('regression_lr_multiplier', 10.0),
-                )
-                model.fit(
-                    X=X_train_sub,
-                    y=y_train_sub,
-                    X_aux=X_aux_train_sub,
-                    max_epochs=self.max_iter,
-                    patience=self.early_stopping_patience,
-                    verbose=self.verbose
-                )
+            model.fit(
+                X=X_train_sub,
+                y=y_train_sub,
+                X_aux=X_aux_train_sub,
+                max_epochs=self.max_iter,
+                verbose=self.verbose
+            )
 
             # Evaluate on validation set
             y_val_proba = model.predict_proba(
                 self._X_val,
-                self._X_aux_val,
-                verbose=False
+                self._X_aux_val
             )
 
             # Compute validation metrics

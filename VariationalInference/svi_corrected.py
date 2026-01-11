@@ -1067,3 +1067,7 @@ if __name__ == "__main__":
         print(f"Test AUC: {auc:.3f}")
     except ImportError:
         pass
+
+
+# Alias for backward compatibility - SVI is the standard name
+SVI = SVICorrected
