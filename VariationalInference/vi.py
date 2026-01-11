@@ -215,64 +215,107 @@ class VI:
         # Normal distributions: expectations are just the means
         self.E_gamma = self.mu_gamma
     
-    def get_sparse_beta(self, threshold: float = 0.5) -> np.ndarray:
+    def _get_adaptive_threshold(self, prior_prob: float, factor: float = 2.0) -> float:
+        """
+        Compute an adaptive threshold based on the prior probability.
+
+        For spike-and-slab priors, using threshold=0.5 is inappropriate when the prior
+        is far from 0.5. This computes a threshold based on when the posterior has
+        "moved away" from the prior.
+
+        Parameters
+        ----------
+        prior_prob : float
+            Prior probability (e.g., pi_beta or pi_v).
+        factor : float, default=2.0
+            How much larger than the prior the posterior should be to be considered active.
+
+        Returns
+        -------
+        float
+            Adaptive threshold value.
+        """
+        return min(prior_prob * factor, 0.5)
+
+    def get_sparse_beta(self, threshold: float = None, use_adaptive: bool = True) -> np.ndarray:
         """
         Get sparse version of E[beta] by thresholding spike-and-slab indicators.
-        
+
         Parameters:
         -----------
-        threshold : float
-            Probability threshold for inclusion. If rho_beta > threshold, 
-            use slab value; otherwise set to 0.
-            
+        threshold : float, optional
+            Fixed threshold to use. If None and use_adaptive=True, uses adaptive threshold.
+        use_adaptive : bool, default=True
+            Whether to use adaptive thresholding based on pi_beta.
+
         Returns:
         --------
         E_beta_sparse : np.ndarray, shape (p, d)
             Sparse expected values of beta
         """
+        if threshold is None and use_adaptive:
+            threshold = self._get_adaptive_threshold(self.pi_beta)
+        elif threshold is None:
+            threshold = 0.5
         return np.where(self.rho_beta > threshold, self.E_beta_slab, 0.0)
-    
-    def get_sparse_v(self, threshold: float = 0.5) -> np.ndarray:
+
+    def get_sparse_v(self, threshold: float = None, use_adaptive: bool = True) -> np.ndarray:
         """
         Get sparse version of E[v] by thresholding spike-and-slab indicators.
-        
+
         Parameters:
         -----------
-        threshold : float
-            Probability threshold for inclusion. If rho_v > threshold,
-            use slab value; otherwise set to 0.
-            
+        threshold : float, optional
+            Fixed threshold to use. If None and use_adaptive=True, uses adaptive threshold.
+        use_adaptive : bool, default=True
+            Whether to use adaptive thresholding based on pi_v.
+
         Returns:
         --------
         E_v_sparse : np.ndarray, shape (kappa, d)
             Sparse expected values of v
         """
+        if threshold is None and use_adaptive:
+            threshold = self._get_adaptive_threshold(self.pi_v)
+        elif threshold is None:
+            threshold = 0.5
         return np.where(self.rho_v > threshold, self.mu_v, 0.0)
-    
-    def get_active_factors(self, threshold: float = 0.5) -> dict:
+
+    def get_active_factors(self, threshold: float = None, use_adaptive: bool = True) -> dict:
         """
         Get indices of active factors for each outcome.
-        
+
         Parameters:
         -----------
-        threshold : float
-            Probability threshold for considering a factor active.
-            
+        threshold : float, optional
+            Fixed threshold to use. If None and use_adaptive=True, uses adaptive thresholds.
+        use_adaptive : bool, default=True
+            Whether to use adaptive thresholding based on prior probabilities.
+
         Returns:
         --------
         active : dict
             Dictionary with keys 'beta' and 'v', containing lists of active indices.
         """
-        active_beta = [np.where(self.rho_beta[:, ell] > threshold)[0] 
+        if threshold is None and use_adaptive:
+            beta_threshold = self._get_adaptive_threshold(self.pi_beta)
+            v_threshold = self._get_adaptive_threshold(self.pi_v)
+        else:
+            beta_threshold = threshold if threshold is not None else 0.5
+            v_threshold = threshold if threshold is not None else 0.5
+
+        active_beta = [np.where(self.rho_beta[:, ell] > beta_threshold)[0]
                        for ell in range(self.d)]
-        active_v = [np.where(self.rho_v[k, :] > threshold)[0] 
+        active_v = [np.where(self.rho_v[k, :] > v_threshold)[0]
                     for k in range(self.kappa)]
-        
+
         return {
             'beta': active_beta,  # List of arrays: active genes per factor
             'v': active_v,        # List of arrays: active factors per outcome
             'n_active_beta': sum(len(a) for a in active_beta),
-            'n_active_v': sum(len(a) for a in active_v)
+            'n_active_v': sum(len(a) for a in active_v),
+            'beta_threshold': beta_threshold,
+            'v_threshold': v_threshold
         }
     
     def _lambda_jj(self, zeta: np.ndarray) -> np.ndarray:

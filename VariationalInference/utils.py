@@ -450,25 +450,62 @@ def get_top_genes_per_program(
         program_name = f"GP{k+1}"
 
         # Get gene loadings for this program
-        loadings = model.E_beta[:, k]
+        # Use the full posterior mean E_beta which already incorporates spike-and-slab
+        # E_beta = rho_beta * E_beta_slab + (1 - rho_beta) * spike_value
+        loadings = model.E_beta[:, k].copy()
 
-        # Apply spike-and-slab threshold if available
+        # Apply soft weighting by rho_beta instead of hard threshold
+        # This preserves relative ranking while downweighting low-probability genes
         if hasattr(model, 'rho_beta'):
-            active_mask = model.rho_beta[:, k] > threshold
-            loadings = loadings * active_mask
+            # Use rho_beta as a soft weight rather than binary mask
+            # This ensures genes with high E_beta but low rho are still visible
+            # but ranked lower than genes with both high E_beta and high rho
+            loadings = loadings * model.rho_beta[:, k]
 
         # Get top genes
         top_indices = np.argsort(loadings)[::-1][:n_top]
-        top_genes = [(gene_list[i], float(loadings[i])) for i in top_indices]
+        # Report the original E_beta values (not the weighted ones) for interpretability
+        # along with the rho values for transparency
+        if hasattr(model, 'rho_beta'):
+            top_genes = [(gene_list[i], float(model.E_beta[i, k]), float(model.rho_beta[i, k]))
+                        for i in top_indices]
+        else:
+            top_genes = [(gene_list[i], float(loadings[i])) for i in top_indices]
 
         results[program_name] = top_genes
 
     return results
 
 
+def compute_adaptive_threshold(prior_prob: float, factor: float = 2.0) -> float:
+    """
+    Compute an adaptive threshold for spike-and-slab based on prior probability.
+
+    For spike-and-slab priors, using threshold=0.5 is inappropriate when the prior
+    is far from 0.5. Instead, use a threshold that considers when the posterior
+    has "moved away" from the prior.
+
+    Parameters
+    ----------
+    prior_prob : float
+        Prior probability of being in the slab (e.g., pi_beta or pi_v).
+    factor : float, default=2.0
+        How much larger than the prior the posterior should be to be considered active.
+        E.g., factor=2.0 means active if rho > 2 * prior_prob.
+
+    Returns
+    -------
+    float
+        Adaptive threshold value.
+    """
+    # Threshold at factor * prior, but cap at 0.5 to avoid being too lenient
+    return min(prior_prob * factor, 0.5)
+
+
 def get_active_programs(
     model: Any,
-    threshold: float = 0.5
+    threshold: float = None,
+    use_adaptive: bool = True
 ) -> Dict[str, Any]:
     """
     Get summary of active genes and factors based on spike-and-slab.
@@ -477,8 +514,11 @@ def get_active_programs(
     ----------
     model : VI
         Trained model with rho_beta and rho_v attributes.
-    threshold : float, default=0.5
-        Threshold for considering an indicator active.
+    threshold : float, optional
+        Threshold for considering an indicator active. If None and use_adaptive=True,
+        an adaptive threshold based on the prior will be computed.
+    use_adaptive : bool, default=True
+        Whether to use adaptive thresholding based on the model's prior probabilities.
 
     Returns
     -------
@@ -488,21 +528,51 @@ def get_active_programs(
     results = {}
 
     if hasattr(model, 'rho_beta'):
-        active_beta = model.rho_beta > threshold
+        # Determine threshold for beta
+        if threshold is not None:
+            beta_threshold = threshold
+        elif use_adaptive and hasattr(model, 'pi_beta'):
+            beta_threshold = compute_adaptive_threshold(model.pi_beta)
+        else:
+            beta_threshold = 0.5
+
+        active_beta = model.rho_beta > beta_threshold
         results['beta'] = {
             'n_active': int(active_beta.sum()),
             'n_total': model.rho_beta.size,
             'sparsity': float(1 - active_beta.mean()),
-            'active_per_program': [int(active_beta[:, k].sum()) for k in range(model.d)]
+            'active_per_program': [int(active_beta[:, k].sum()) for k in range(model.d)],
+            'threshold_used': float(beta_threshold),
+            'prior_prob': float(model.pi_beta) if hasattr(model, 'pi_beta') else None,
+            'rho_stats': {
+                'min': float(model.rho_beta.min()),
+                'max': float(model.rho_beta.max()),
+                'mean': float(model.rho_beta.mean())
+            }
         }
 
     if hasattr(model, 'rho_v'):
-        active_v = model.rho_v > threshold
+        # Determine threshold for v
+        if threshold is not None:
+            v_threshold = threshold
+        elif use_adaptive and hasattr(model, 'pi_v'):
+            v_threshold = compute_adaptive_threshold(model.pi_v)
+        else:
+            v_threshold = 0.5
+
+        active_v = model.rho_v > v_threshold
         results['v'] = {
             'n_active': int(active_v.sum()),
             'n_total': model.rho_v.size,
             'sparsity': float(1 - active_v.mean()),
-            'active_per_class': [int(active_v[k].sum()) for k in range(model.kappa)]
+            'active_per_class': [int(active_v[k].sum()) for k in range(model.kappa)],
+            'threshold_used': float(v_threshold),
+            'prior_prob': float(model.pi_v) if hasattr(model, 'pi_v') else None,
+            'rho_stats': {
+                'min': float(model.rho_v.min()),
+                'max': float(model.rho_v.max()),
+                'mean': float(model.rho_v.mean())
+            }
         }
 
     return results
@@ -547,16 +617,24 @@ def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> No
         print(f"  E[theta] shape: {model.E_theta.shape}")
         print(f"    range: [{model.E_theta.min():.4f}, {model.E_theta.max():.4f}]")
 
-    # Sparsity info
-    active_info = get_active_programs(model)
+    # Sparsity info with adaptive threshold
+    active_info = get_active_programs(model, use_adaptive=True)
     if active_info:
-        print(f"\nSparsity (threshold=0.5):")
+        print(f"\nSparsity (adaptive threshold):")
         if 'beta' in active_info:
-            print(f"  Beta: {active_info['beta']['sparsity']*100:.1f}% sparse")
-            print(f"    Active: {active_info['beta']['n_active']}/{active_info['beta']['n_total']}")
+            beta_info = active_info['beta']
+            print(f"  Beta (threshold={beta_info['threshold_used']:.4f}, prior={beta_info['prior_prob']}):")
+            print(f"    Sparsity: {beta_info['sparsity']*100:.1f}%")
+            print(f"    Active: {beta_info['n_active']}/{beta_info['n_total']}")
+            print(f"    rho_beta: min={beta_info['rho_stats']['min']:.4f}, "
+                  f"max={beta_info['rho_stats']['max']:.4f}, mean={beta_info['rho_stats']['mean']:.4f}")
         if 'v' in active_info:
-            print(f"  V: {active_info['v']['sparsity']*100:.1f}% sparse")
-            print(f"    Active: {active_info['v']['n_active']}/{active_info['v']['n_total']}")
+            v_info = active_info['v']
+            print(f"  V (threshold={v_info['threshold_used']:.4f}, prior={v_info['prior_prob']}):")
+            print(f"    Sparsity: {v_info['sparsity']*100:.1f}%")
+            print(f"    Active: {v_info['n_active']}/{v_info['n_total']}")
+            print(f"    rho_v: min={v_info['rho_stats']['min']:.4f}, "
+                  f"max={v_info['rho_stats']['max']:.4f}, mean={v_info['rho_stats']['mean']:.4f}")
 
     # Training info
     if hasattr(model, 'elbo_history_') and model.elbo_history_:
@@ -571,8 +649,13 @@ def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> No
         top_genes = get_top_genes_per_program(model, gene_list, n_top=5)
         most_influential = np.argmax(np.abs(model.E_v[0])) if hasattr(model, 'E_v') else 0
         print(f"\nTop 5 genes in most influential program (GP{most_influential + 1}):")
-        for gene, loading in top_genes[f'GP{most_influential + 1}']:
-            print(f"    {gene}: {loading:.4f}")
+        for item in top_genes[f'GP{most_influential + 1}']:
+            if len(item) == 3:
+                gene, loading, rho = item
+                print(f"    {gene}: {loading:.4f} (rho={rho:.4f})")
+            else:
+                gene, loading = item
+                print(f"    {gene}: {loading:.4f}")
 
     print("=" * 60)
 
