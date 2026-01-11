@@ -160,7 +160,7 @@ class SVI:
         restore_best: bool = True,
         regression_lr_multiplier: float = 10.0,
         count_scale: float = 1.0,
-        rho_v_delay_epochs: int = 10,
+        rho_v_delay_epochs: int = 0,
         reset_lr_on_restore: bool = True
     ):
         self.d = n_factors
@@ -327,11 +327,8 @@ class SVI:
         self.mu_v = 0.01 * self.rng.standard_normal((self.kappa, self.d))
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
 
-        # Initialize spike-and-slab indicators
-        # Initialize rho_v high (near 1.0) to ensure v is active during early training
-        # This helps break the bootstrap problem where v needs discriminative theta
-        # but theta needs active v to receive classification signal
-        self.rho_v = np.ones((self.kappa, self.d)) * 0.95  # Start with v nearly fully active
+        # Initialize spike-and-slab indicators based on prior
+        self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
         self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
 
         # Initialize gamma (auxiliary effects)
@@ -525,16 +522,12 @@ class SVI:
                 + 2 * lam[:, np.newaxis] * self.E_v[k] * E_C_all
                 + 2 * lam[:, np.newaxis] * E_theta * E_v_sq
             )
-            # Clip to prevent numerical instability
-            # Scale clip bounds by regression_weight to keep total contribution reasonable
-            max_contrib = 100.0 / max(self.regression_weight, 1.0)  # More conservative clipping
-            regression_contrib = np.clip(regression_contrib, -max_contrib, max_contrib)
+            # Clip to prevent numerical instability (permissive bounds)
+            regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
 
             b_theta_new += self.regression_weight * regression_contrib
 
-        # More conservative b_theta minimum to prevent E_theta explosion
-        # With b_theta_min=0.01 and a_theta=3.28, max E_theta = 328 (reasonable)
-        b_theta_new = np.clip(b_theta_new, 0.01, 1e6)
+        b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
         a_theta_new = np.clip(a_theta_new, 1.01, 1e6)
 
         return a_theta_new, b_theta_new
@@ -1078,7 +1071,8 @@ class SVI:
             print(f"  Learning rate: {self.learning_rate} * (τ + t)^(-κ) with τ={self.learning_rate_delay}, κ={self.learning_rate_decay}")
             print(f"  Learning rate min: {self.learning_rate_min}, Warmup epochs: {self.warmup_epochs}")
             print(f"  Regression weight: {self.regression_weight}")
-            print(f"  Spike-and-slab (v) delay: {self.rho_v_delay_epochs} epochs (rho_v updates start at epoch {self.rho_v_delay_epochs + 1})")
+            if self.rho_v_delay_epochs > 0:
+                print(f"  Spike-and-slab (v) delay: {self.rho_v_delay_epochs} epochs (rho_v updates start at epoch {self.rho_v_delay_epochs + 1})")
 
         for epoch in range(max_epochs):
             # Shuffle data at the start of each epoch
@@ -1258,8 +1252,8 @@ class SVI:
                 print(f"\nEpoch {epoch + 1}/{max_epochs}, ELBO: {epoch_end_elbo:.2f}, "
                       f"ρ_t: {rho_t:.4f} (epoch: {epoch_time:.2f}s, total: {total_time:.2f}s)")
 
-                # Notify when rho_v delay period ends
-                if epoch == self.rho_v_delay_epochs - 1:
+                # Notify when rho_v delay period ends (only if delay was enabled)
+                if self.rho_v_delay_epochs > 0 and epoch == self.rho_v_delay_epochs - 1:
                     print(f"  📊 Spike-and-slab updates for v now enabled (rho_v will be learned from data)")
 
                 if len(epoch_end_elbo_history) > 1:
