@@ -59,6 +59,7 @@ import numpy as np
 import pandas as pd
 from typing import Optional, List
 from scipy.special import expit
+from sklearn.metrics import precision_recall_curve
 
 
 def parse_args() -> argparse.Namespace:
@@ -437,7 +438,34 @@ def main():
     print(f"  Time:       {model.training_time_:.2f}s")
 
     # =========================================================================
-    # STEP 5: Evaluate on Validation Set
+    # STEP 5: Evaluate on Training Set
+    # =========================================================================
+    print("\n" + "=" * 80)
+    print("Training Set Evaluation")
+    print("=" * 80)
+
+    # Use the stored training parameters from the final epoch
+    # These are the actual θ values that were used during training
+    # E_theta_train = model.train_a_theta_ / model.train_b_theta_
+    print("Using stored training set θ from final epoch")
+
+    # Compute probabilities
+    y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=50)
+    if args.verbose:
+        print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
+    y_train_pred = (y_train_proba.ravel() > 0.5).astype(int)
+
+    train_metrics = compute_metrics(y_train, y_train_pred, y_train_proba.ravel())
+    print(f"\nTraining Results:")
+    print(f"  Accuracy:  {train_metrics['accuracy']:.4f}")
+    if 'auc' in train_metrics:
+        print(f"  AUC:       {train_metrics['auc']:.4f}")
+    print(f"  F1:        {train_metrics['f1']:.4f}")
+    print(f"  Precision: {train_metrics['precision']:.4f}")
+    print(f"  Recall:    {train_metrics['recall']:.4f}")
+
+    # =========================================================================
+    # STEP 6: Evaluate on Validation Set
     # =========================================================================
     print("\n" + "=" * 80)
     print("Validation Set Evaluation")
@@ -445,13 +473,21 @@ def main():
 
     # Infer theta for validation set
     val_result = model.transform(X_val, y_new=None, X_aux_new=X_aux_val, n_iter=50)
-    E_theta_val = val_result['E_theta']
+    # E_theta_val = val_result['E_theta']
 
     # Compute probabilities
     y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=50)
     if args.verbose:
         print(f"Predicted probabilities: min={y_val_proba.min():.4f}, max={y_val_proba.max():.4f}")
-    y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
+    
+    # Find optimal threshold on validation set
+    precision_curve, recall_curve, thresholds_curve = precision_recall_curve(y_val, y_val_proba.ravel())
+    f1_curve = 2 * precision_curve * recall_curve / (precision_curve + recall_curve + 1e-8)
+    optimal_idx = np.argmax(f1_curve[:-1])  # Last element is threshold=1.0
+    optimal_threshold = thresholds_curve[optimal_idx] if len(thresholds_curve) > 0 else 0.5
+    print(f"Optimal threshold (validation F1): {optimal_threshold:.4f}")
+    
+    y_val_pred = (y_val_proba.ravel() > optimal_threshold).astype(int)
 
     val_metrics = compute_metrics(y_val, y_val_pred, y_val_proba.ravel())
     print(f"\nValidation Results:")
@@ -463,7 +499,7 @@ def main():
     print(f"  Recall:    {val_metrics['recall']:.4f}")
 
     # =========================================================================
-    # STEP 6: Evaluate on Test Set
+    # STEP 7: Evaluate on Test Set
     # =========================================================================
     print("\n" + "=" * 80)
     print("Test Set Evaluation")
@@ -471,13 +507,14 @@ def main():
 
     # Infer theta for test set
     test_result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test, n_iter=50)
-    E_theta_test = test_result['E_theta']
+    # E_theta_test = test_result['E_theta']
 
     # Compute probabilities
     y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50)
     if args.verbose:
         print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
-    y_test_pred = (y_test_proba.ravel() > 0.5).astype(int)
+    print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")
+    y_test_pred = (y_test_proba.ravel() > optimal_threshold).astype(int)
 
     test_metrics = compute_metrics(y_test, y_test_pred, y_test_proba.ravel())
     print(f"\nTest Results:")
@@ -489,7 +526,7 @@ def main():
     print(f"  Recall:    {test_metrics['recall']:.4f}")
 
     # =========================================================================
-    # STEP 7: Save Results
+    # STEP 8: Save Results
     # =========================================================================
     print("\n" + "=" * 80)
     print("Saving Results")
@@ -503,30 +540,48 @@ def main():
         gene_list=gene_list,
         splits=splits,
         prefix=prefix,
-        compress=True
+        compress=True,
+        optimal_threshold=optimal_threshold
     )
 
-    # Save additional files
+    # # Save additional files
 
-    # Validation theta
-    theta_val_df = pd.DataFrame(
-        E_theta_val,
-        index=splits['val'],
-        columns=[f"GP{k+1}" for k in range(model.d)]
-    )
-    theta_val_df.to_csv(output_dir / f'{prefix}_theta_val.csv.gz', compression='gzip')
-    print(f"Saved validation theta to {output_dir / f'{prefix}_theta_val.csv.gz'}")
+    # # Training theta
+    # theta_train_df = pd.DataFrame(
+    #     E_theta_train,
+    #     index=splits['train'],
+    #     columns=[f"GP{k+1}" for k in range(model.d)]
+    # )
+    # theta_train_df.to_csv(output_dir / f'{prefix}_theta_train.csv.gz', compression='gzip')
+    # print(f"Saved training theta to {output_dir / f'{prefix}_theta_train.csv.gz'}")
 
-    # Test theta
-    theta_test_df = pd.DataFrame(
-        E_theta_test,
-        index=splits['test'],
-        columns=[f"GP{k+1}" for k in range(model.d)]
-    )
-    theta_test_df.to_csv(output_dir / f'{prefix}_theta_test.csv.gz', compression='gzip')
-    print(f"Saved test theta to {output_dir / f'{prefix}_theta_test.csv.gz'}")
+    # # Validation theta
+    # theta_val_df = pd.DataFrame(
+    #     E_theta_val,
+    #     index=splits['val'],
+    #     columns=[f"GP{k+1}" for k in range(model.d)]
+    # )
+    # theta_val_df.to_csv(output_dir / f'{prefix}_theta_val.csv.gz', compression='gzip')
+    # print(f"Saved validation theta to {output_dir / f'{prefix}_theta_val.csv.gz'}")
+
+    # # Test theta
+    # theta_test_df = pd.DataFrame(
+    #     E_theta_test,
+    #     index=splits['test'],
+    #     columns=[f"GP{k+1}" for k in range(model.d)]
+    # )
+    # theta_test_df.to_csv(output_dir / f'{prefix}_theta_test.csv.gz', compression='gzip')
+    # print(f"Saved test theta to {output_dir / f'{prefix}_theta_test.csv.gz'}")
 
     # Predictions
+    train_pred_df = pd.DataFrame({
+        'cell_id': splits['train'],
+        'true_label': y_train,
+        'pred_prob': y_train_proba.ravel(),
+        'pred_label': y_train_pred
+    })
+    train_pred_df.to_csv(output_dir / f'{prefix}_train_predictions.csv.gz', compression='gzip', index=False)
+
     val_pred_df = pd.DataFrame({
         'cell_id': splits['val'],
         'true_label': y_val,
@@ -623,8 +678,8 @@ def main():
     print(f"\nSaved files:")
     for name, path in saved_files.items():
         print(f"  - {path}")
-    print(f"  - {output_dir / f'{prefix}_theta_val.csv.gz'}")
-    print(f"  - {output_dir / f'{prefix}_theta_test.csv.gz'}")
+    # print(f"  - {output_dir / f'{prefix}_theta_val.csv.gz'}")
+    # print(f"  - {output_dir / f'{prefix}_theta_test.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_val_predictions.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_test_predictions.csv.gz'}")
 

@@ -252,7 +252,8 @@ def save_results(
     save_model: bool = True,
     compress: bool = True,
     save_full_model: bool = False,
-    feature_type: str = 'gene'
+    feature_type: str = 'gene',
+    optimal_threshold: float = 0.5
 ) -> Dict[str, Path]:
     """
     Save VI model results to files.
@@ -278,6 +279,8 @@ def save_results(
         essential parameters to reduce memory during save.
     feature_type : str, default='gene'
         Type of features ('gene' or 'pathway').
+    optimal_threshold : float, default=0.5
+        Optimal classification threshold tuned on validation set.
 
     Returns
     -------
@@ -391,6 +394,9 @@ def save_results(
             'training_time': getattr(model, 'training_time_', None),
             'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') else None,
             'n_iterations': model.elbo_history_[-1][0] if hasattr(model, 'elbo_history_') else None,
+        },
+        'classification': {
+            'optimal_threshold': optimal_threshold,
         }
     }
 

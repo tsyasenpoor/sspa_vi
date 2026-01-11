@@ -184,7 +184,7 @@ class SVICorrected:
         """Initialize global variational parameters with factor diversity."""
         self.n, self.p = X.shape
         self.kappa = 1 if y.ndim == 1 else y.shape[1]
-        self.p_aux = X_aux.shape[1]
+        self.p_aux = X_aux.shape[1] if X_aux is not None and X_aux.size > 0 else 0
         
         # β: Gene loadings, Gamma(a_β, b_β)
         # Initialize with factor-specific patterns to break symmetry
@@ -215,8 +215,12 @@ class SVICorrected:
         self.Sigma_v = np.array([np.eye(self.d) * self.sigma_v**2 for _ in range(self.kappa)])
         
         # γ: Auxiliary coefficients, N(μ_γ, Σ_γ)
-        self.mu_gamma = np.zeros((self.kappa, self.p_aux))
-        self.Sigma_gamma = np.array([np.eye(self.p_aux) * self.sigma_gamma**2 for _ in range(self.kappa)])
+        if self.p_aux > 0:
+            self.mu_gamma = np.zeros((self.kappa, self.p_aux))
+            self.Sigma_gamma = np.array([np.eye(self.p_aux) * self.sigma_gamma**2 for _ in range(self.kappa)])
+        else:
+            self.mu_gamma = np.zeros((self.kappa, 0))
+            self.Sigma_gamma = np.zeros((self.kappa, 0, 0))
         
         # Spike-and-slab indicators
         if self.use_spike_slab:
@@ -353,12 +357,12 @@ class SVICorrected:
                 # C^{(-ℓ)}_{ik} = Σ_{m≠ℓ} E[θ_im] E[v_km] + x^aux_i · E[γ_k]
                 # For each ℓ:
                 theta_v = E_theta @ self.E_v_effective[k]  # (batch,)
-                aux_term = X_aux_batch @ self.E_gamma[k]  # (batch,)
+                aux_term = X_aux_batch @ self.E_gamma[k] if self.p_aux > 0 else 0.0  # (batch,)
                 
                 # Vectorized over ℓ
                 C_minus_ell = (theta_v[:, np.newaxis] - 
                               E_theta * self.E_v_effective[k][np.newaxis, :] +
-                              aux_term[:, np.newaxis])  # (batch, d)
+                              aux_term if isinstance(aux_term, float) else aux_term[:, np.newaxis])  # (batch, d)
                 
                 E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
                 
@@ -382,7 +386,8 @@ class SVICorrected:
             # Update ζ (JJ auxiliary)
             # ζ_ik = sqrt(E[A²_ik])
             for k in range(self.kappa):
-                E_A = E_theta_new @ self.E_v_effective[k] + X_aux_batch @ self.E_gamma[k]
+                aux_contrib = X_aux_batch @ self.E_gamma[k] if self.p_aux > 0 else 0.0
+                E_A = E_theta_new @ self.E_v_effective[k] + aux_contrib
                 E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
                 Var_theta = a_theta_new / (b_theta_new**2)
                 E_A_sq = E_A**2 + (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
@@ -492,7 +497,7 @@ class SVICorrected:
             E_theta_sq = E_theta**2 + Var_theta  # (batch, d)
             
             # Auxiliary contribution
-            aux_contrib = X_aux_batch @ self.E_gamma[k]  # (batch,)
+            aux_contrib = X_aux_batch @ self.E_gamma[k] if self.p_aux > 0 else 0.0  # (batch,)
             
             # Full model contribution (before removing ℓ-th factor)
             full_theta_v = E_theta @ self.E_v_effective[k]  # (batch,)
@@ -531,6 +536,9 @@ class SVICorrected:
         scale: float
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Compute intermediate γ parameters."""
+        if self.p_aux == 0:
+            return np.zeros((self.kappa, 0)), np.zeros((self.kappa, 0, 0))
+        
         mu_gamma_hat = np.zeros((self.kappa, self.p_aux))
         Sigma_gamma_hat = np.zeros((self.kappa, self.p_aux, self.p_aux))
         
@@ -602,13 +610,14 @@ class SVICorrected:
                 self.Sigma_v[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.d)
         
         # gamma: update canonical parameters directly
-        for k in range(self.kappa):
-            self.mu_gamma[k] = (1 - rho_t) * self.mu_gamma[k] + rho_t * mu_gamma_hat[k]
-            self.Sigma_gamma[k] = (1 - rho_t) * self.Sigma_gamma[k] + rho_t * Sigma_gamma_hat[k]
-            self.Sigma_gamma[k] = 0.5 * (self.Sigma_gamma[k] + self.Sigma_gamma[k].T)
-            eigvals = np.linalg.eigvalsh(self.Sigma_gamma[k])
-            if np.min(eigvals) < 1e-6:
-                self.Sigma_gamma[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.p_aux)
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                self.mu_gamma[k] = (1 - rho_t) * self.mu_gamma[k] + rho_t * mu_gamma_hat[k]
+                self.Sigma_gamma[k] = (1 - rho_t) * self.Sigma_gamma[k] + rho_t * Sigma_gamma_hat[k]
+                self.Sigma_gamma[k] = 0.5 * (self.Sigma_gamma[k] + self.Sigma_gamma[k].T)
+                eigvals = np.linalg.eigvalsh(self.Sigma_gamma[k])
+                if np.min(eigvals) < 1e-6:
+                    self.Sigma_gamma[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.p_aux)
         
         # Update expectations
         self._compute_expectations()
@@ -658,7 +667,8 @@ class SVICorrected:
             y_k = y_batch[:, k] if y_batch.ndim > 1 else y_batch
             lam = self._lambda_jj(zeta[:, k])
             
-            E_A = E_theta @ self.E_v_effective[k] + X_aux_batch @ self.E_gamma[k]
+            aux_contrib = X_aux_batch @ self.E_gamma[k] if self.p_aux > 0 else 0.0
+            E_A = E_theta @ self.E_v_effective[k] + aux_contrib
             E_v_sq = self.mu_v[k]**2 + np.diag(self.Sigma_v[k])
             Var_theta = a_theta / (b_theta**2)
             E_A_sq = E_A**2 + (Var_theta * E_v_sq[np.newaxis, :]).sum(axis=1)
@@ -706,11 +716,12 @@ class SVICorrected:
         
         # p(γ)
         elbo_gamma = 0.0
-        for k in range(self.kappa):
-            elbo_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
-            elbo_gamma -= 0.5 / self.sigma_gamma**2 * (
-                np.sum(self.mu_gamma[k]**2) + np.trace(self.Sigma_gamma[k])
-            )
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                elbo_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
+                elbo_gamma -= 0.5 / self.sigma_gamma**2 * (
+                    np.sum(self.mu_gamma[k]**2) + np.trace(self.Sigma_gamma[k])
+                )
         elbo += elbo_gamma
         
         # === Entropy terms ===
@@ -741,10 +752,11 @@ class SVICorrected:
                 elbo += 0.5 * self.d * (1 + np.log(2 * np.pi)) + 0.5 * logdet
         
         # H[q(γ)]
-        for k in range(self.kappa):
-            sign, logdet = np.linalg.slogdet(self.Sigma_gamma[k])
-            if sign > 0:
-                elbo += 0.5 * self.p_aux * (1 + np.log(2 * np.pi)) + 0.5 * logdet
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                sign, logdet = np.linalg.slogdet(self.Sigma_gamma[k])
+                if sign > 0:
+                    elbo += 0.5 * self.p_aux * (1 + np.log(2 * np.pi)) + 0.5 * logdet
         
         return elbo
     
@@ -775,11 +787,23 @@ class SVICorrected:
         iteration = 0
         self.elbo_history_ = []
         
+        # Storage for final training set local parameters
+        self.train_a_theta_ = None
+        self.train_b_theta_ = None
+        self.train_a_xi_ = None
+        self.train_b_xi_ = None
+        
         start_time = time.time()
         
         for epoch in range(max_epochs):
             # Shuffle data
             perm = self.rng.permutation(self.n)
+            
+            # Storage for training parameters (overwritten each epoch)
+            epoch_a_theta = np.zeros((self.n, self.d))
+            epoch_b_theta = np.zeros((self.n, self.d))
+            epoch_a_xi = np.zeros(self.n)
+            epoch_b_xi = np.zeros(self.n)
             
             epoch_elbo = 0.0
             
@@ -799,6 +823,12 @@ class SVICorrected:
                 a_theta, b_theta, a_xi, b_xi, zeta = self._update_local_parameters(
                     X_batch, y_batch, X_aux_batch
                 )
+                
+                # Store training set parameters (final epoch will be retained)
+                epoch_a_theta[idx] = a_theta
+                epoch_b_theta[idx] = b_theta
+                epoch_a_xi[idx] = a_xi
+                epoch_b_xi[idx] = b_xi
                 
                 E_theta = a_theta / b_theta
                 E_log_theta = digamma(a_theta) - np.log(b_theta)
@@ -842,6 +872,12 @@ class SVICorrected:
                 theta_diversity = np.std(E_theta, axis=1).mean() if 'E_theta' in dir() else 0
                 print(f"Epoch {epoch}: ELBO = {epoch_elbo:.2e}, ρ_t = {rho_t:.4f}, "
                       f"v = {self.mu_v.ravel()[:3]}, β_div = {beta_diversity:.3f}")
+            
+            # Store final epoch's training parameters
+            self.train_a_theta_ = epoch_a_theta
+            self.train_b_theta_ = epoch_b_theta
+            self.train_a_xi_ = epoch_a_xi
+            self.train_b_xi_ = epoch_b_xi
         
         self.training_time_ = time.time() - start_time
         
@@ -868,7 +904,7 @@ class SVICorrected:
         """
         n_new = X_new.shape[0]
         if X_aux_new is None:
-            X_aux_new = np.zeros((n_new, self.p_aux))
+            X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
         if y_new is None:
             y_new = np.full((n_new, self.kappa), 0.5)  # Neutral labels
         y_new = y_new.reshape(-1, 1) if y_new.ndim == 1 else y_new
@@ -909,12 +945,18 @@ class SVICorrected:
             phi = np.exp(log_phi)
             
             # Update ζ (JJ bound)
-            aux_contrib = X_aux_new @ E_gamma.T  # (n_new, κ)
+            if self.p_aux > 0:
+                aux_contrib = X_aux_new @ E_gamma.T  # (n_new, κ)
+            else:
+                aux_contrib = 0.0
             theta_v = E_theta @ E_v.T            # (n_new, κ)
             E_A = theta_v + aux_contrib
-            E_A_sq = (E_theta_sq @ E_v_sq.T + 
-                      2 * theta_v * aux_contrib + 
-                      aux_contrib**2)
+            if self.p_aux > 0:
+                E_A_sq = (E_theta_sq @ E_v_sq.T + 
+                          2 * theta_v * aux_contrib + 
+                          aux_contrib**2)
+            else:
+                E_A_sq = E_theta_sq @ E_v_sq.T
             zeta = np.sqrt(np.maximum(E_A_sq, 1e-10))
             lam = np.tanh(zeta / 2) / (4 * zeta + 1e-10)
             
@@ -965,13 +1007,16 @@ class SVICorrected:
         """
         n_new = X_new.shape[0]
         if X_aux_new is None:
-            X_aux_new = np.zeros((n_new, self.p_aux))
+            X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
             
         result = self.transform(X_new, y_new=None, X_aux_new=X_aux_new, n_iter=n_iter)
         E_theta = result['E_theta']
         
         # Compute logits: θ @ v^T + X_aux @ γ^T
-        logits = E_theta @ self.mu_v.T + X_aux_new @ self.mu_gamma.T
+        if self.p_aux > 0:
+            logits = E_theta @ self.mu_v.T + X_aux_new @ self.mu_gamma.T
+        else:
+            logits = E_theta @ self.mu_v.T
         proba = expit(logits)
         
         return proba.squeeze()
