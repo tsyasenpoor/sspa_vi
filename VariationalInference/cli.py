@@ -294,6 +294,13 @@ def create_parser() -> argparse.ArgumentParser:
         default=1.0,
         help='Scaling factor for count data (divide counts by this value). Use values > 1 (e.g., 100, 1000) with large raw counts for numerical stability.'
     )
+    train_parser.add_argument(
+        '--normalize',
+        type=str,
+        choices=['none', 'size_factor'],
+        default='none',
+        help='Normalization method: none (raw counts), size_factor (library size normalization). Applied BEFORE count_scale.'
+    )
 
     # Output options
     train_parser.add_argument(
@@ -560,6 +567,15 @@ def cmd_train(args: argparse.Namespace) -> int:
     X_train, X_aux_train, y_train = data['train']
     X_val, X_aux_val, y_val = data['val']
     X_test, X_aux_test, y_test = data['test']
+
+    # Apply normalization if requested
+    if args.normalize == 'size_factor':
+        from VariationalInference.utils import size_factor_normalize
+        print("\nApplying size factor normalization...")
+        X_train = size_factor_normalize(X_train)
+        X_val = size_factor_normalize(X_val)
+        X_test = size_factor_normalize(X_test)
+        print(f"  Normalized to median library size")
 
     print(f"\nData shapes:")
     print(f"  Train: {X_train.shape[0]} samples, {X_train.shape[1]} genes, {X_aux_train.shape[1]} aux features")
