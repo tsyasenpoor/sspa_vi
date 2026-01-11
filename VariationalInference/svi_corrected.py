@@ -247,13 +247,14 @@ class SVICorrected:
             e1, e2 = self._gaussian_to_natural(self.mu_v[k], self.Sigma_v[k])
             self.eta1_v.append(e1)
             self.eta2_v.append(e2)
-        # gamma: Gaussian
+        # gamma: Gaussian (only if there are auxiliary features)
         self.eta1_gamma = []
         self.eta2_gamma = []
-        for k in range(self.kappa):
-            e1, e2 = self._gaussian_to_natural(self.mu_gamma[k], self.Sigma_gamma[k])
-            self.eta1_gamma.append(e1)
-            self.eta2_gamma.append(e2)
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                e1, e2 = self._gaussian_to_natural(self.mu_gamma[k], self.Sigma_gamma[k])
+                self.eta1_gamma.append(e1)
+                self.eta2_gamma.append(e2)
     
     def _convert_natural_to_canonical(self):
         """Convert natural back to canonical parameters."""
@@ -263,9 +264,12 @@ class SVICorrected:
             self.mu_v[k], self.Sigma_v[k] = self._natural_to_gaussian(
                 self.eta1_v[k], self.eta2_v[k]
             )
-            self.mu_gamma[k], self.Sigma_gamma[k] = self._natural_to_gaussian(
-                self.eta1_gamma[k], self.eta2_gamma[k]
-            )
+        # gamma: only if there are auxiliary features
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                self.mu_gamma[k], self.Sigma_gamma[k] = self._natural_to_gaussian(
+                    self.eta1_gamma[k], self.eta2_gamma[k]
+                )
     
     def _compute_expectations(self):
         """Compute expected sufficient statistics from current parameters."""
@@ -533,27 +537,31 @@ class SVICorrected:
         """Compute intermediate γ parameters."""
         mu_gamma_hat = np.zeros((self.kappa, self.p_aux))
         Sigma_gamma_hat = np.zeros((self.kappa, self.p_aux, self.p_aux))
-        
+
+        # Skip if no auxiliary features
+        if self.p_aux == 0:
+            return mu_gamma_hat, Sigma_gamma_hat
+
         for k in range(self.kappa):
             y_k = y_batch[:, k] if y_batch.ndim > 1 else y_batch
             lam = self._lambda_jj(zeta[:, k])
-            
+
             # Precision
             prec_prior = np.eye(self.p_aux) / self.sigma_gamma**2
             prec_lik = 2 * scale * X_aux_batch.T @ (lam[:, np.newaxis] * X_aux_batch)
             prec_hat = prec_prior + prec_lik
-            
+
             # Mean
             theta_v = E_theta @ self.E_v_effective[k]
             mean_contrib = scale * X_aux_batch.T @ (y_k - 0.5 - 2 * lam * theta_v)
-            
+
             try:
                 Sigma_gamma_hat[k] = np.linalg.inv(prec_hat)
                 mu_gamma_hat[k] = Sigma_gamma_hat[k] @ mean_contrib
             except np.linalg.LinAlgError:
                 Sigma_gamma_hat[k] = self.Sigma_gamma[k]
                 mu_gamma_hat[k] = self.mu_gamma[k]
-        
+
         return mu_gamma_hat, Sigma_gamma_hat
     
     # =========================================================================
@@ -601,14 +609,15 @@ class SVICorrected:
             if np.min(eigvals) < 1e-6:
                 self.Sigma_v[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.d)
         
-        # gamma: update canonical parameters directly
-        for k in range(self.kappa):
-            self.mu_gamma[k] = (1 - rho_t) * self.mu_gamma[k] + rho_t * mu_gamma_hat[k]
-            self.Sigma_gamma[k] = (1 - rho_t) * self.Sigma_gamma[k] + rho_t * Sigma_gamma_hat[k]
-            self.Sigma_gamma[k] = 0.5 * (self.Sigma_gamma[k] + self.Sigma_gamma[k].T)
-            eigvals = np.linalg.eigvalsh(self.Sigma_gamma[k])
-            if np.min(eigvals) < 1e-6:
-                self.Sigma_gamma[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.p_aux)
+        # gamma: update canonical parameters directly (only if there are auxiliary features)
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                self.mu_gamma[k] = (1 - rho_t) * self.mu_gamma[k] + rho_t * mu_gamma_hat[k]
+                self.Sigma_gamma[k] = (1 - rho_t) * self.Sigma_gamma[k] + rho_t * Sigma_gamma_hat[k]
+                self.Sigma_gamma[k] = 0.5 * (self.Sigma_gamma[k] + self.Sigma_gamma[k].T)
+                eigvals = np.linalg.eigvalsh(self.Sigma_gamma[k])
+                if np.min(eigvals) < 1e-6:
+                    self.Sigma_gamma[k] += (1e-6 - np.min(eigvals) + 1e-8) * np.eye(self.p_aux)
         
         # Update expectations
         self._compute_expectations()
@@ -704,14 +713,15 @@ class SVICorrected:
             )
         elbo += elbo_v
         
-        # p(γ)
-        elbo_gamma = 0.0
-        for k in range(self.kappa):
-            elbo_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
-            elbo_gamma -= 0.5 / self.sigma_gamma**2 * (
-                np.sum(self.mu_gamma[k]**2) + np.trace(self.Sigma_gamma[k])
-            )
-        elbo += elbo_gamma
+        # p(γ) - only if there are auxiliary features
+        if self.p_aux > 0:
+            elbo_gamma = 0.0
+            for k in range(self.kappa):
+                elbo_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
+                elbo_gamma -= 0.5 / self.sigma_gamma**2 * (
+                    np.sum(self.mu_gamma[k]**2) + np.trace(self.Sigma_gamma[k])
+                )
+            elbo += elbo_gamma
         
         # === Entropy terms ===
         # H[q(θ)]
@@ -740,11 +750,12 @@ class SVICorrected:
             if sign > 0:
                 elbo += 0.5 * self.d * (1 + np.log(2 * np.pi)) + 0.5 * logdet
         
-        # H[q(γ)]
-        for k in range(self.kappa):
-            sign, logdet = np.linalg.slogdet(self.Sigma_gamma[k])
-            if sign > 0:
-                elbo += 0.5 * self.p_aux * (1 + np.log(2 * np.pi)) + 0.5 * logdet
+        # H[q(γ)] - only if there are auxiliary features
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                sign, logdet = np.linalg.slogdet(self.Sigma_gamma[k])
+                if sign > 0:
+                    elbo += 0.5 * self.p_aux * (1 + np.log(2 * np.pi)) + 0.5 * logdet
         
         return elbo
     
