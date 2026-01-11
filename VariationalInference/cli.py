@@ -1,42 +1,29 @@
 #!/usr/bin/env python
 """
-Command-Line Interface for Variational Inference
-=================================================
+Command-Line Interface for Stochastic Variational Inference
+============================================================
 
-This module provides a command-line interface for running VI and SVI experiments
+This module provides a command-line interface for running SVI experiments
 on single-cell RNA-seq data.
 
 Usage:
-    # Basic usage with batch VI
+    # Basic usage
     python -m VariationalInference.cli train --data /path/to/data.h5ad --n-factors 50
 
-    # Use Stochastic VI (SVI) for large datasets
+    # Full example
     python -m VariationalInference.cli train \
         --data /path/to/data.h5ad \
         --n-factors 50 \
-        --method svi \
         --batch-size 128 \
-        --max-epochs 100
-
-    # With all options (VI)
-    python -m VariationalInference.cli train \
-        --data /path/to/data.h5ad \
-        --n-factors 50 \
-        --method vi \
-        --max-iter 200 \
+        --max-epochs 100 \
         --label-column t2dm \
         --aux-columns Sex \
         --output-dir ./results \
         --verbose
 
-    # Using a config file
-    python -m VariationalInference.cli train \
-        --data /path/to/data.h5ad \
-        --config config.json
-
     # Predict with trained model
     python -m VariationalInference.cli predict \
-        --model ./results/vi_model.pkl \
+        --model ./results/svi_model.pkl \
         --data /path/to/new_data.h5ad \
         --output predictions.csv
 """
@@ -52,7 +39,7 @@ def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser for the CLI."""
     parser = argparse.ArgumentParser(
         prog='VariationalInference',
-        description='Variational Inference for Single-Cell Analysis',
+        description='Stochastic Variational Inference for Single-Cell Analysis',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -80,15 +67,6 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help='Number of latent gene programs'
-    )
-
-    # Method selection
-    train_parser.add_argument(
-        '--method', '-m',
-        type=str,
-        choices=['vi', 'svi'],
-        default='vi',
-        help='Inference method: vi (batch) or svi (stochastic). Use svi for large datasets.'
     )
 
     # Data options
@@ -431,10 +409,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     import cProfile
     import pstats
     import io
-    from .vi import VI
-    from .svi import SVI
+    from .svi_corrected import SVI
     from .data_loader import DataLoader
-    from .config import VIConfig, SVIConfig
     from .utils import save_results, compute_metrics, print_model_summary
 
     # Initialize profiler if requested
@@ -444,100 +420,19 @@ def cmd_train(args: argparse.Namespace) -> int:
         profiler.enable()
         print("\n[PROFILER] Profiling enabled - measuring function execution times...")
 
-    use_svi = args.method.lower() == 'svi'
-    method_name = "STOCHASTIC VARIATIONAL INFERENCE" if use_svi else "VARIATIONAL INFERENCE"
-
     print("=" * 60)
-    print(f"{method_name} TRAINING")
+    print("STOCHASTIC VARIATIONAL INFERENCE TRAINING")
     print("=" * 60)
-
-    # Load config if provided
-    if args.config:
-        print(f"\nLoading config from: {args.config}")
-        # Try to detect config type from file content
-        import json
-        with open(args.config) as f:
-            config_dict = json.load(f)
-        if 'batch_size' in config_dict:
-            config = SVIConfig.from_dict(config_dict)
-            use_svi = True
-        else:
-            config = VIConfig.from_dict(config_dict)
-            use_svi = False
-    else:
-        if use_svi:
-            config = SVIConfig(
-                n_factors=args.n_factors,
-                batch_size=args.batch_size,
-                learning_rate=args.learning_rate,
-                learning_rate_decay=args.learning_rate_decay,
-                learning_rate_delay=args.learning_rate_delay,
-                learning_rate_min=args.learning_rate_min,
-                warmup_epochs=args.warmup_epochs,
-                local_iterations=args.local_iterations,
-                regression_weight=args.regression_weight,
-                lr_reduction_patience=args.lr_reduction_patience,
-                lr_reduction_factor=args.lr_reduction_factor,
-                restore_best=not args.no_restore_best,
-                count_scale=args.count_scale,
-                alpha_theta=args.alpha_theta,
-                alpha_beta=args.alpha_beta,
-                sigma_v=args.sigma_v,
-                pi_v=args.pi_v,
-                pi_beta=args.pi_beta,
-                max_epochs=args.max_epochs,
-                tol=args.tol,
-                rel_tol=args.rel_tol,
-                min_epochs=args.min_epochs,
-                patience=args.patience,
-                label_column=args.label_column,
-                aux_columns=args.aux_columns,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                min_cells_expressing=args.min_cells,
-                verbose=args.verbose,
-                debug=args.debug,
-                random_state=args.seed,
-            )
-        else:
-            config = VIConfig(
-                n_factors=args.n_factors,
-                alpha_theta=args.alpha_theta,
-                alpha_beta=args.alpha_beta,
-                sigma_v=args.sigma_v,
-                pi_v=args.pi_v,
-                pi_beta=args.pi_beta,
-                max_iter=args.max_iter,
-                tol=args.tol,
-                rel_tol=args.rel_tol,
-                min_iter=args.min_iter,
-                patience=args.patience,
-                label_column=args.label_column,
-                aux_columns=args.aux_columns,
-                train_ratio=args.train_ratio,
-                val_ratio=args.val_ratio,
-                min_cells_expressing=args.min_cells,
-                verbose=args.verbose,
-                debug=args.debug,
-                random_state=args.seed,
-            )
 
     # Print configuration
-    print(f"\nMethod: {'SVI (Stochastic)' if use_svi else 'VI (Batch)'}")
-    print(f"Data: {args.data}")
-    print(f"n_factors: {config.n_factors}")
-    if use_svi:
-        print(f"batch_size: {config.batch_size}")
-        print(f"max_epochs: {config.max_epochs}")
-        print(f"learning_rate: {config.learning_rate}")
-        print(f"learning_rate_min: {config.learning_rate_min}")
-        print(f"warmup_epochs: {config.warmup_epochs}")
-        print(f"regression_weight: {config.regression_weight}")
-    else:
-        print(f"max_iter: {config.max_iter}")
-    print(f"label_column: {config.label_column}")
-    print(f"aux_columns: {config.aux_columns}")
-    print(f"random_state: {config.random_state} {'(random)' if config.random_state is None else ''}")
+    print(f"\nData: {args.data}")
+    print(f"n_factors: {args.n_factors}")
+    print(f"batch_size: {args.batch_size}")
+    print(f"max_epochs: {args.max_epochs}")
+    print(f"learning_rate: {args.learning_rate}")
+    print(f"label_column: {args.label_column}")
+    print(f"aux_columns: {args.aux_columns}")
+    print(f"random_state: {args.seed if args.seed else 'None (random)'}")
 
     # Load and preprocess data
     print("\n" + "-" * 40)
@@ -552,30 +447,21 @@ def cmd_train(args: argparse.Namespace) -> int:
     )
 
     data = loader.load_and_preprocess(
-        label_column=config.label_column,
-        aux_columns=config.aux_columns,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        stratify_by=config.label_column,
-        min_cells_expressing=config.min_cells_expressing,
+        label_column=args.label_column,
+        aux_columns=args.aux_columns,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        stratify_by=args.label_column,
+        min_cells_expressing=args.min_cells,
         layer=args.layer,
         convert_to_ensembl=not args.no_ensembl,
         filter_protein_coding=not args.no_protein_coding,
-        random_state=config.random_state
+        random_state=args.seed
     )
 
     X_train, X_aux_train, y_train = data['train']
     X_val, X_aux_val, y_val = data['val']
     X_test, X_aux_test, y_test = data['test']
-
-    # Apply normalization if requested
-    if args.normalize == 'size_factor':
-        from VariationalInference.utils import size_factor_normalize
-        print("\nApplying size factor normalization...")
-        X_train = size_factor_normalize(X_train)
-        X_val = size_factor_normalize(X_val)
-        X_test = size_factor_normalize(X_test)
-        print(f"  Normalized to median library size")
 
     print(f"\nData shapes:")
     print(f"  Train: {X_train.shape[0]} samples, {X_train.shape[1]} genes, {X_aux_train.shape[1]} aux features")
@@ -585,19 +471,33 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     # Create and train model
     print("\n" + "-" * 40)
-    print(f"Training {'SVI' if use_svi else 'VI'} model...")
+    print("Training SVI model...")
     print("-" * 40)
 
-    if use_svi:
-        model = SVI(**config.model_params())
-    else:
-        model = VI(**config.model_params())
+    model = SVI(
+        n_factors=args.n_factors,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        learning_rate_decay=args.learning_rate_decay,
+        learning_rate_delay=args.learning_rate_delay,
+        learning_rate_min=args.learning_rate_min,
+        local_iterations=args.local_iterations,
+        regression_weight=args.regression_weight,
+        alpha_theta=args.alpha_theta,
+        alpha_beta=args.alpha_beta,
+        sigma_v=args.sigma_v,
+        pi_v=args.pi_v,
+        pi_beta=args.pi_beta,
+        random_state=args.seed
+    )
 
     model.fit(
         X=X_train,
         y=y_train,
         X_aux=X_aux_train,
-        **config.training_params()
+        max_epochs=args.max_epochs,
+        elbo_freq=10,
+        verbose=args.verbose
     )
 
     # Evaluate on validation set
@@ -605,13 +505,14 @@ def cmd_train(args: argparse.Namespace) -> int:
     print("Evaluating on validation set...")
     print("-" * 40)
 
-    y_val_proba = model.predict_proba(X_val, X_aux_val, verbose=args.verbose)
+    y_val_proba = model.predict_proba(X_val, X_aux_val)
     y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
 
     val_metrics = compute_metrics(y_val, y_val_pred, y_val_proba.ravel())
     print(f"\nValidation Metrics:")
     print(f"  Accuracy: {val_metrics['accuracy']:.4f}")
-    print(f"  AUC:      {val_metrics.get('auc', 'N/A'):.4f}" if 'auc' in val_metrics else "")
+    if 'auc' in val_metrics:
+        print(f"  AUC:      {val_metrics['auc']:.4f}")
     print(f"  F1:       {val_metrics['f1']:.4f}")
 
     # Evaluate on test set
@@ -619,13 +520,14 @@ def cmd_train(args: argparse.Namespace) -> int:
     print("Evaluating on test set...")
     print("-" * 40)
 
-    y_test_proba = model.predict_proba(X_test, X_aux_test, verbose=args.verbose)
+    y_test_proba = model.predict_proba(X_test, X_aux_test)
     y_test_pred = (y_test_proba.ravel() > 0.5).astype(int)
 
     test_metrics = compute_metrics(y_test, y_test_pred, y_test_proba.ravel())
     print(f"\nTest Metrics:")
     print(f"  Accuracy: {test_metrics['accuracy']:.4f}")
-    print(f"  AUC:      {test_metrics.get('auc', 'N/A'):.4f}" if 'auc' in test_metrics else "")
+    if 'auc' in test_metrics:
+        print(f"  AUC:      {test_metrics['auc']:.4f}")
     print(f"  F1:       {test_metrics['f1']:.4f}")
 
     # Save results
@@ -642,11 +544,6 @@ def cmd_train(args: argparse.Namespace) -> int:
         prefix=args.prefix,
         compress=not args.no_compress
     )
-
-    # Save config
-    config_path = output_dir / f'{args.prefix}_config.json'
-    config.to_json(str(config_path))
-    print(f"Saved config to {config_path}")
 
     # Print model summary
     if args.verbose:

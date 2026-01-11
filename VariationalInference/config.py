@@ -15,13 +15,11 @@ Usage:
     config = SVIConfig(n_factors=50, batch_size=128)
 
     # Load from JSON
-    config = VIConfig.from_json('my_config.json')
+    config = SVIConfig.from_json('my_config.json')
 
     # Create model from config
-    from VariationalInference.vi import VI
-    from VariationalInference.svi import SVI
+    from VariationalInference.svi_corrected import SVI
 
-    model = VI(**config.model_params())  # for VIConfig
     model = SVI(**config.model_params())  # for SVIConfig
 """
 
