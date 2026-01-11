@@ -165,6 +165,30 @@ def parse_args() -> argparse.Namespace:
         default=0.75,
         help='Learning rate decay exponent for SVI'
     )
+    parser.add_argument(
+        '--use-spike-slab',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        help='Use spike-and-slab priors (default: True). Set to False for simpler Normal/Gamma priors.'
+    )
+    parser.add_argument(
+        '--rho-v-delay-epochs',
+        type=int,
+        default=0,
+        help='Number of epochs to delay rho_v updates (default: 0)'
+    )
+    parser.add_argument(
+        '--reset-lr-on-restore',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        help='Reset LR multiplier when restoring parameters (default: True)'
+    )
+    parser.add_argument(
+        '--regression-lr-multiplier',
+        type=float,
+        default=10.0,
+        help='Learning rate multiplier for regression parameters v, gamma (default: 10.0)'
+    )
 
     # Output options
     parser.add_argument(
@@ -460,7 +484,11 @@ def main():
             lambda_xi=2.0,
             sigma_v=2.0,
             sigma_gamma=1.0,
-            random_state=args.seed
+            random_state=args.seed,
+            use_spike_slab=args.use_spike_slab,
+            rho_v_delay_epochs=args.rho_v_delay_epochs,
+            reset_lr_on_restore=args.reset_lr_on_restore,
+            regression_lr_multiplier=args.regression_lr_multiplier
         )
         
         model.fit(
