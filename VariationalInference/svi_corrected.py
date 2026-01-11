@@ -65,9 +65,9 @@ class SVICorrected:
         # Convergence and averaging
         averaging_start_fraction: float = 0.5,  # Start averaging after this fraction of epochs
         full_elbo_freq: int = 1,                # Compute full ELBO every N epochs (0 = never)
-        early_stop_patience: int = 10,          # Epochs without improvement before stopping
-        early_stop_min_delta: float = 0.001,    # Minimum relative ELBO improvement
-        convergence_cv_threshold: float = 0.05, # CV threshold for convergence detection
+        early_stop_patience: int = 50,          # Epochs without improvement before stopping (conservative for SVI)
+        early_stop_min_delta: float = 0.0001,   # Minimum relative ELBO improvement (0.01%)
+        convergence_cv_threshold: float = 0.02, # CV threshold for convergence detection (2%)
         restore_best: bool = True,              # Restore best parameters at end
 
         # Data preprocessing
@@ -1182,19 +1182,10 @@ class SVICorrected:
                 if np.isfinite(full_elbo):
                     self.full_elbo_history_.append((epoch, full_elbo))
 
-                    # Check for improvement (for early stopping)
-                    # Handle initial case where best_elbo = -inf
-                    if best_elbo == -np.inf:
-                        is_improvement = True
-                    else:
-                        relative_improvement = (full_elbo - best_elbo) / (abs(best_elbo) + 1e-10)
-                        is_improvement = relative_improvement > self.early_stop_min_delta
-
-                    if is_improvement:
+                    # Save best parameters (always track the best point)
+                    if full_elbo > best_elbo:
                         best_elbo = full_elbo
                         best_epoch = epoch
-                        epochs_without_improvement = 0
-                        # Save best parameters
                         best_params = {
                             'eta1_beta': self.eta1_beta.copy(),
                             'eta2_beta': self.eta2_beta.copy(),
@@ -1209,8 +1200,25 @@ class SVICorrected:
                             'train_a_xi': epoch_a_xi.copy(),
                             'train_b_xi': epoch_b_xi.copy(),
                         }
+
+                    # Check for improvement using rolling average comparison
+                    # Only check after we have enough history
+                    window = min(20, len(self.full_elbo_history_) // 2)
+                    if len(self.full_elbo_history_) >= 2 * window and window >= 5:
+                        recent_elbos = [e[1] for e in self.full_elbo_history_[-window:]]
+                        older_elbos = [e[1] for e in self.full_elbo_history_[-2*window:-window]]
+                        recent_mean = np.mean(recent_elbos)
+                        older_mean = np.mean(older_elbos)
+
+                        # Is the recent window improving over the older window?
+                        relative_improvement = (recent_mean - older_mean) / (abs(older_mean) + 1e-10)
+                        if relative_improvement > self.early_stop_min_delta:
+                            epochs_without_improvement = 0
+                        else:
+                            epochs_without_improvement += 1
                     else:
-                        epochs_without_improvement += 1
+                        # Not enough history yet, don't increment
+                        epochs_without_improvement = 0
             else:
                 # Use batch ELBO for early stopping if full ELBO disabled
                 full_elbo = batch_elbo
