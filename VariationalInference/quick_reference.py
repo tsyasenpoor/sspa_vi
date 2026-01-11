@@ -201,6 +201,13 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help='Scaling factor for count data (divide counts by this value). Use values > 1 (e.g., 100, 1000) with large raw counts for numerical stability.'
     )
+    parser.add_argument(
+        '--normalize',
+        type=str,
+        choices=['none', 'size_factor'],
+        default='none',
+        help='Normalization method: none (raw counts), size_factor (library size normalization). Applied BEFORE count_scale.'
+    )
 
     # Hyperparameter options (Priors & Regularization)
     parser.add_argument(
@@ -392,6 +399,15 @@ def main():
     X_test, X_aux_test, y_test = data['test']
     gene_list = data['gene_list']
     splits = data['splits']
+
+    # Apply normalization if requested
+    if args.normalize == 'size_factor':
+        from VariationalInference.utils import size_factor_normalize
+        print("\nApplying size factor normalization...")
+        X_train = size_factor_normalize(X_train)
+        X_val = size_factor_normalize(X_val)
+        X_test = size_factor_normalize(X_test)
+        print(f"  Normalized to median library size")
 
     print(f"\nData Summary:")
     print(f"  Genes:          {len(gene_list)}")
