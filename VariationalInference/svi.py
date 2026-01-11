@@ -161,7 +161,8 @@ class SVI:
         regression_lr_multiplier: float = 10.0,
         count_scale: float = 1.0,
         rho_v_delay_epochs: int = 0,
-        reset_lr_on_restore: bool = True
+        reset_lr_on_restore: bool = True,
+        use_spike_slab: bool = True
     ):
         self.d = n_factors
         self.count_scale = count_scale
@@ -199,6 +200,7 @@ class SVI:
         self.pi_beta = pi_beta
         self.spike_variance_v = spike_variance_v
         self.spike_value_beta = spike_value_beta
+        self.use_spike_slab = use_spike_slab  # If False, use simple Normal/Gamma priors
 
         # Adaptive learning rate parameters
         self.lr_reduction_patience = lr_reduction_patience
@@ -327,9 +329,15 @@ class SVI:
         self.mu_v = 0.01 * self.rng.standard_normal((self.kappa, self.d))
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
 
-        # Initialize spike-and-slab indicators based on prior
-        self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
-        self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
+        # Initialize spike-and-slab indicators
+        if self.use_spike_slab:
+            # Start at prior probabilities
+            self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
+            self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
+        else:
+            # All components active (no sparsity)
+            self.rho_v = np.ones((self.kappa, self.d))
+            self.rho_beta = np.ones((self.p, self.d))
 
         # Initialize gamma (auxiliary effects)
         self.mu_gamma = 0.01 * self.rng.standard_normal((self.kappa, self.p_aux))
@@ -766,8 +774,9 @@ class SVI:
         self.a_eta = (1 - rho_t) * self.a_eta + rho_t * a_eta_hat
         self.b_eta = (1 - rho_t) * self.b_eta + rho_t * b_eta_hat
 
-        # Update rho_beta
-        self.rho_beta = (1 - rho_t) * self.rho_beta + rho_t * rho_beta_hat
+        # Update rho_beta (only if using spike-and-slab)
+        if self.use_spike_slab:
+            self.rho_beta = (1 - rho_t) * self.rho_beta + rho_t * rho_beta_hat
 
         # Use higher learning rate for regression parameters to break bootstrap
         # problem. Cap at 1.0 to avoid overshooting.
@@ -781,8 +790,8 @@ class SVI:
         self.mu_gamma = (1 - rho_t_reg) * self.mu_gamma + rho_t_reg * mu_gamma_hat
         self.Sigma_gamma = (1 - rho_t_reg) * self.Sigma_gamma + rho_t_reg * Sigma_gamma_hat
 
-        # Update rho_v with higher learning rate (unless skipped during delay period)
-        if not skip_rho_v_update:
+        # Update rho_v with higher learning rate (only if using spike-and-slab and not in delay period)
+        if self.use_spike_slab and not skip_rho_v_update:
             self.rho_v = (1 - rho_t_reg) * self.rho_v + rho_t_reg * rho_v_hat
 
         # Recompute global expectations
@@ -911,25 +920,33 @@ class SVI:
         elbo_beta_eta -= self.lambda_eta * np.sum(self.E_eta)
         elbo_beta_eta += self.p * (self.alpha_eta * np.log(self.lambda_eta) - gammaln(self.alpha_eta))
 
+        # Beta prior: Gamma(alpha_beta, eta) - with or without spike-and-slab
         slab_contrib = ((self.alpha_beta - 1) * self.E_log_beta_slab +
                         self.alpha_beta * self.E_log_eta[:, np.newaxis] -
                         self.E_eta[:, np.newaxis] * self.E_beta_slab - gammaln(self.alpha_beta))
-        elbo_beta_eta += np.sum(self.rho_beta * slab_contrib)
-
-        # Spike-and-slab prior terms
-        rho_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
-        elbo_beta_eta += np.sum(self.rho_beta * np.log(self.pi_beta + 1e-10))
-        elbo_beta_eta += np.sum((1 - self.rho_beta) * np.log(1 - self.pi_beta + 1e-10))
+        if self.use_spike_slab:
+            elbo_beta_eta += np.sum(self.rho_beta * slab_contrib)
+            # Spike-and-slab prior terms for beta
+            elbo_beta_eta += np.sum(self.rho_beta * np.log(self.pi_beta + 1e-10))
+            elbo_beta_eta += np.sum((1 - self.rho_beta) * np.log(1 - self.pi_beta + 1e-10))
+        else:
+            # Simple Gamma prior (no spike) - all components are active
+            elbo_beta_eta += np.sum(slab_contrib)
         elbo += elbo_beta_eta
 
         # E[log p(v)] + E[log p(γ)] (vectorized)
         elbo_v_gamma = 0.0
         E_v_sq = self.mu_v**2 + np.diagonal(self.Sigma_v, axis1=1, axis2=2)
+        # v prior: Normal(0, sigma_v^2) - with or without spike-and-slab
         slab_contrib_v = -0.5 * np.log(2 * np.pi * self.sigma_v**2) - 0.5 * E_v_sq / self.sigma_v**2
-        spike_contrib_v = -0.5 * np.log(2 * np.pi * self.spike_variance_v) - 0.5 * E_v_sq / self.spike_variance_v
-        elbo_v_gamma += np.sum(self.rho_v * slab_contrib_v + (1 - self.rho_v) * spike_contrib_v)
-        elbo_v_gamma += np.sum(self.rho_v * np.log(self.pi_v + 1e-10))
-        elbo_v_gamma += np.sum((1 - self.rho_v) * np.log(1 - self.pi_v + 1e-10))
+        if self.use_spike_slab:
+            spike_contrib_v = -0.5 * np.log(2 * np.pi * self.spike_variance_v) - 0.5 * E_v_sq / self.spike_variance_v
+            elbo_v_gamma += np.sum(self.rho_v * slab_contrib_v + (1 - self.rho_v) * spike_contrib_v)
+            elbo_v_gamma += np.sum(self.rho_v * np.log(self.pi_v + 1e-10))
+            elbo_v_gamma += np.sum((1 - self.rho_v) * np.log(1 - self.pi_v + 1e-10))
+        else:
+            # Simple Normal prior (no spike) - all components are active
+            elbo_v_gamma += np.sum(slab_contrib_v)
 
         for k in range(self.kappa):
             elbo_v_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
@@ -959,16 +976,19 @@ class SVI:
                 entropy_gamma += 0.5 * (self.p_aux * (1 + np.log(2 * np.pi)) + logdet)
         elbo += entropy_gamma
 
-        # Spike-and-slab entropy (vectorized)
-        rho_beta_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
-        entropy_s_beta = -np.sum(rho_beta_safe * np.log(rho_beta_safe) +
-                                  (1 - rho_beta_safe) * np.log(1 - rho_beta_safe))
-        elbo += entropy_s_beta
+        # Spike-and-slab entropy (only if using spike-and-slab)
+        entropy_s_beta = 0.0
+        entropy_s_v = 0.0
+        if self.use_spike_slab:
+            rho_beta_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
+            entropy_s_beta = -np.sum(rho_beta_safe * np.log(rho_beta_safe) +
+                                      (1 - rho_beta_safe) * np.log(1 - rho_beta_safe))
+            elbo += entropy_s_beta
 
-        rho_v_safe = np.clip(self.rho_v, 1e-10, 1 - 1e-10)
-        entropy_s_v = -np.sum(rho_v_safe * np.log(rho_v_safe) +
-                               (1 - rho_v_safe) * np.log(1 - rho_v_safe))
-        elbo += entropy_s_v
+            rho_v_safe = np.clip(self.rho_v, 1e-10, 1 - 1e-10)
+            entropy_s_v = -np.sum(rho_v_safe * np.log(rho_v_safe) +
+                                   (1 - rho_v_safe) * np.log(1 - rho_v_safe))
+            elbo += entropy_s_v
 
         if debug_components:
             elbo_components['global_priors'] = elbo_beta_eta + elbo_v_gamma
