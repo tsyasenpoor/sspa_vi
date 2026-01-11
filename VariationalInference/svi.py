@@ -159,7 +159,9 @@ class SVI:
         lr_reduction_factor: float = 0.5,
         restore_best: bool = True,
         regression_lr_multiplier: float = 10.0,
-        count_scale: float = 1.0
+        count_scale: float = 1.0,
+        rho_v_delay_epochs: int = 10,
+        reset_lr_on_restore: bool = True
     ):
         self.d = n_factors
         self.count_scale = count_scale
@@ -208,6 +210,14 @@ class SVI:
         # This helps break the bootstrap problem where v needs class-discriminative
         # theta to learn, but theta needs v to receive class signal
         self.regression_lr_multiplier = regression_lr_multiplier
+
+        # Delay rho_v updates to let mu_v learn before spike-and-slab kicks in
+        # This addresses the bootstrap problem where rho_v collapses before v can learn
+        self.rho_v_delay_epochs = rho_v_delay_epochs
+
+        # Reset learning rate multiplier when restoring parameters
+        # This helps avoid getting stuck with very low learning rates
+        self.reset_lr_on_restore = reset_lr_on_restore
 
         # Calibration parameters (fitted via fit_calibration)
         self.calibration_a_ = None  # Platt scaling: sigmoid(a * logit + b)
@@ -318,8 +328,10 @@ class SVI:
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
 
         # Initialize spike-and-slab indicators
-        # Initialize rho_v based on prior - high pi_v means start with factors active
-        self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
+        # Initialize rho_v high (near 1.0) to ensure v is active during early training
+        # This helps break the bootstrap problem where v needs discriminative theta
+        # but theta needs active v to receive classification signal
+        self.rho_v = np.ones((self.kappa, self.d)) * 0.95  # Start with v nearly fully active
         self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
 
         # Initialize gamma (auxiliary effects)
@@ -513,12 +525,16 @@ class SVI:
                 + 2 * lam[:, np.newaxis] * self.E_v[k] * E_C_all
                 + 2 * lam[:, np.newaxis] * E_theta * E_v_sq
             )
-            # Clip to prevent numerical instability (matches VI implementation)
-            regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
+            # Clip to prevent numerical instability
+            # Scale clip bounds by regression_weight to keep total contribution reasonable
+            max_contrib = 100.0 / max(self.regression_weight, 1.0)  # More conservative clipping
+            regression_contrib = np.clip(regression_contrib, -max_contrib, max_contrib)
 
             b_theta_new += self.regression_weight * regression_contrib
 
-        b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
+        # More conservative b_theta minimum to prevent E_theta explosion
+        # With b_theta_min=0.01 and a_theta=3.28, max E_theta = 328 (reasonable)
+        b_theta_new = np.clip(b_theta_new, 0.01, 1e6)
         a_theta_new = np.clip(a_theta_new, 1.01, 1e6)
 
         return a_theta_new, b_theta_new
@@ -733,7 +749,8 @@ class SVI:
                                   rho_beta_hat,
                                   mu_v_hat, Sigma_v_hat,
                                   mu_gamma_hat, Sigma_gamma_hat,
-                                  rho_v_hat):
+                                  rho_v_hat,
+                                  skip_rho_v_update: bool = False):
         """
         Update global parameters using SVI update rule:
         λ^(t) = (1 - ρ_t) λ^(t-1) + ρ_t λ̂
@@ -741,6 +758,12 @@ class SVI:
         Uses a separate, higher learning rate for regression parameters (v, gamma)
         to help break the bootstrap problem where v needs class-discriminative
         theta to learn, but theta needs v to receive class signal.
+
+        Parameters
+        ----------
+        skip_rho_v_update : bool
+            If True, skip updating rho_v (spike-and-slab indicators for v).
+            Used during early training to let mu_v learn before sparsity kicks in.
         """
         # Update beta
         self.a_beta = (1 - rho_t) * self.a_beta + rho_t * a_beta_hat
@@ -765,8 +788,9 @@ class SVI:
         self.mu_gamma = (1 - rho_t_reg) * self.mu_gamma + rho_t_reg * mu_gamma_hat
         self.Sigma_gamma = (1 - rho_t_reg) * self.Sigma_gamma + rho_t_reg * Sigma_gamma_hat
 
-        # Update rho_v with higher learning rate
-        self.rho_v = (1 - rho_t_reg) * self.rho_v + rho_t_reg * rho_v_hat
+        # Update rho_v with higher learning rate (unless skipped during delay period)
+        if not skip_rho_v_update:
+            self.rho_v = (1 - rho_t_reg) * self.rho_v + rho_t_reg * rho_v_hat
 
         # Recompute global expectations
         self._compute_global_expectations()
@@ -1054,6 +1078,7 @@ class SVI:
             print(f"  Learning rate: {self.learning_rate} * (τ + t)^(-κ) with τ={self.learning_rate_delay}, κ={self.learning_rate_decay}")
             print(f"  Learning rate min: {self.learning_rate_min}, Warmup epochs: {self.warmup_epochs}")
             print(f"  Regression weight: {self.regression_weight}")
+            print(f"  Spike-and-slab (v) delay: {self.rho_v_delay_epochs} epochs (rho_v updates start at epoch {self.rho_v_delay_epochs + 1})")
 
         for epoch in range(max_epochs):
             # Shuffle data at the start of each epoch
@@ -1134,6 +1159,8 @@ class SVI:
                 )
 
                 # Update global parameters with learning rate
+                # Skip rho_v updates during delay period to let mu_v learn first
+                skip_rho_v = epoch < self.rho_v_delay_epochs
                 self._update_global_parameters(
                     rho_t,
                     a_beta_hat, b_beta_hat,
@@ -1141,7 +1168,8 @@ class SVI:
                     rho_beta_hat,
                     mu_v_hat, Sigma_v_hat,
                     mu_gamma_hat, Sigma_gamma_hat,
-                    rho_v_hat
+                    rho_v_hat,
+                    skip_rho_v_update=skip_rho_v
                 )
 
                 # Compute ELBO periodically
@@ -1197,9 +1225,22 @@ class SVI:
                           f"Reducing learning rate by {self.lr_reduction_factor:.1f}x "
                           f"(multiplier now: {self._current_lr_multiplier:.4f})")
 
-                # Optionally restore best parameters
+                # Optionally restore best parameters and partially reset learning rate
                 if self.restore_best and best_checkpoint is not None:
                     self._restore_global_checkpoint(best_checkpoint)
+
+                    # Partially recover learning rate to allow continued learning
+                    # Without this, the model gets stuck with very low learning rates
+                    if self.reset_lr_on_restore:
+                        # Recover learning rate by sqrt of reduction factor (e.g., 0.5 -> 0.707)
+                        # This gives a moderate boost without fully resetting
+                        self._current_lr_multiplier = min(
+                            self._current_lr_multiplier / np.sqrt(self.lr_reduction_factor),
+                            1.0  # Cap at original learning rate
+                        )
+                        if verbose:
+                            print(f"  📈 Learning rate partially recovered to {self._current_lr_multiplier:.4f}")
+
                     if verbose:
                         print(f"  ↩ Restored parameters from best epoch {best_epoch + 1} (ELBO: {best_elbo:.2f})")
 
@@ -1210,6 +1251,10 @@ class SVI:
                 total_time = time.time() - start_time
                 print(f"\nEpoch {epoch + 1}/{max_epochs}, ELBO: {epoch_end_elbo:.2f}, "
                       f"ρ_t: {rho_t:.4f} (epoch: {epoch_time:.2f}s, total: {total_time:.2f}s)")
+
+                # Notify when rho_v delay period ends
+                if epoch == self.rho_v_delay_epochs - 1:
+                    print(f"  📊 Spike-and-slab updates for v now enabled (rho_v will be learned from data)")
 
                 if len(epoch_end_elbo_history) > 1:
                     _, prev_epoch_elbo = epoch_end_elbo_history[-2]
