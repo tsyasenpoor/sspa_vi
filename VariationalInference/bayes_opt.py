@@ -193,6 +193,15 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
             'step': 150,
             'description': 'Number of latent factors (d)'
         },
+
+        # Numerical stability
+        'count_scale': {
+            'type': 'float',
+            'low': 500.0,
+            'high': 2000.0,
+            'log': False,
+            'description': 'Divide counts by this value for numerical stability with raw counts'
+        },
     }
 
 
@@ -547,7 +556,8 @@ class VIObjective:
                     sigma_gamma=params.get('sigma_gamma', 0.5),
                     pi_v=params.get('pi_v', 0.9),
                     pi_beta=params.get('pi_beta', 0.05),
-                    regression_weight=params.get('regression_weight', 1.0),
+                    regression_weight=params.get('regression_weight', 100.0),
+                    count_scale=params.get('count_scale', 1000.0),
                 )
                 model.fit(
                     X=X_train_sub,
