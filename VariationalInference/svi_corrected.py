@@ -70,6 +70,10 @@ class SVICorrected:
         convergence_cv_threshold: float = 0.05, # CV threshold for convergence detection
         restore_best: bool = True,              # Restore best parameters at end
 
+        # Data preprocessing
+        auto_scale_counts: bool = False,        # Automatically scale down large counts
+        target_max_count: float = 5000,         # Target maximum count after scaling
+
         random_state: Optional[int] = None
     ):
         self.d = n_factors  # Number of factors
@@ -104,6 +108,11 @@ class SVICorrected:
         self.early_stop_min_delta = early_stop_min_delta
         self.convergence_cv_threshold = convergence_cv_threshold
         self.restore_best = restore_best
+
+        # Data preprocessing
+        self.auto_scale_counts = auto_scale_counts
+        self.target_max_count = target_max_count
+        self.count_scale_factor_ = 1.0  # Will be set during fit if scaling is applied
 
         # RNG
         self.rng = np.random.default_rng(random_state)
@@ -372,6 +381,49 @@ class SVICorrected:
             print("="*70 + "\n")
 
         return stats
+
+    def _scale_counts(self, X: np.ndarray, verbose: bool = True) -> np.ndarray:
+        """
+        Scale down large counts to target range while preserving integers.
+
+        This helps with numerical stability when counts are very large (e.g., raw RNA-seq).
+        The scale factor is stored in self.count_scale_factor_ for later interpretation.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_genes)
+            Count matrix (will be copied, not modified in place)
+        verbose : bool
+            Print scaling information
+
+        Returns
+        -------
+        X_scaled : array of shape (n_samples, n_genes)
+            Scaled count matrix (integers)
+        """
+        max_count = X.max()
+
+        if max_count <= self.target_max_count:
+            # No scaling needed
+            self.count_scale_factor_ = 1.0
+            return X.copy()
+
+        # Compute scale factor
+        self.count_scale_factor_ = max_count / self.target_max_count
+
+        # Scale and round to integers
+        X_scaled = np.round(X / self.count_scale_factor_).astype(X.dtype)
+
+        # Ensure no negative values (shouldn't happen, but safety check)
+        X_scaled = np.maximum(X_scaled, 0)
+
+        if verbose:
+            print(f"  [Count scaling] Applied scale factor = {self.count_scale_factor_:.2f}")
+            print(f"    Original: max={max_count:.0f}, mean={X.mean():.1f}")
+            print(f"    Scaled:   max={X_scaled.max():.0f}, mean={X_scaled.mean():.1f}")
+            print(f"    Note: θ values will be scaled. To get original scale: θ_original = θ_fitted * {self.count_scale_factor_:.2f}")
+
+        return X_scaled
 
     # =========================================================================
     # ITERATE AVERAGING (Polyak-Ruppert)
@@ -1006,6 +1058,10 @@ class SVICorrected:
 
         # Validate data and warn about potential issues
         self.data_stats_ = self._validate_data(X, verbose=verbose)
+
+        # Optionally scale down large counts
+        if self.auto_scale_counts:
+            X = self._scale_counts(X, verbose=verbose)
 
         # Initialize
         self._initialize_global_parameters(X, y, X_aux)
