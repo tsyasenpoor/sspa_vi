@@ -163,28 +163,37 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
         },
         'pi_beta': {
             'type': 'float',
-            'low': 0.01,
-            'high': 1.0,
+            'low': 0.005,
+            'high': 0.1,
             'log': True,
-            'description': 'Prior prob of beta being active'
+            'description': 'Prior prob of beta being active (lower = more sparse)'
         },
 
         # Classification-reconstruction tradeoff
         'regression_weight': {
             'type': 'float',
-            'low': 0.1,
-            'high': 10.0,
+            'low': 50.0,
+            'high': 500.0,
             'log': True,
-            'description': 'Weight for classification objective'
+            'description': 'Weight for classification objective (higher = more focus on classification)'
         },
 
         # Model complexity
         'n_factors': {
             'type': 'int',
             'low': 50,
-            'high': 500,
+            'high': 200,
             'step': 10,
             'description': 'Number of latent factors (d)'
+        },
+
+        # Numerical stability
+        'count_scale': {
+            'type': 'float',
+            'low': 500.0,
+            'high': 2000.0,
+            'log': False,
+            'description': 'Divide counts by this value for numerical stability with raw counts'
         },
     }
 
@@ -540,7 +549,8 @@ class VIObjective:
                     sigma_gamma=params.get('sigma_gamma', 0.5),
                     pi_v=params.get('pi_v', 0.9),
                     pi_beta=params.get('pi_beta', 0.05),
-                    regression_weight=params.get('regression_weight', 1.0),
+                    regression_weight=params.get('regression_weight', 100.0),
+                    count_scale=params.get('count_scale', 1000.0),
                 )
                 model.fit(
                     X=X_train_sub,
