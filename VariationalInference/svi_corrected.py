@@ -1183,8 +1183,14 @@ class SVICorrected:
                     self.full_elbo_history_.append((epoch, full_elbo))
 
                     # Check for improvement (for early stopping)
-                    relative_improvement = (full_elbo - best_elbo) / (abs(best_elbo) + 1e-10)
-                    if relative_improvement > self.early_stop_min_delta:
+                    # Handle initial case where best_elbo = -inf
+                    if best_elbo == -np.inf:
+                        is_improvement = True
+                    else:
+                        relative_improvement = (full_elbo - best_elbo) / (abs(best_elbo) + 1e-10)
+                        is_improvement = relative_improvement > self.early_stop_min_delta
+
+                    if is_improvement:
                         best_elbo = full_elbo
                         best_epoch = epoch
                         epochs_without_improvement = 0
