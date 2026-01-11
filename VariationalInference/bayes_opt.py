@@ -558,6 +558,10 @@ class VIObjective:
                     pi_beta=params.get('pi_beta', 0.05),
                     regression_weight=params.get('regression_weight', 100.0),
                     count_scale=params.get('count_scale', 1000.0),
+                    use_spike_slab=params.get('use_spike_slab', True),
+                    rho_v_delay_epochs=params.get('rho_v_delay_epochs', 0),
+                    reset_lr_on_restore=params.get('reset_lr_on_restore', True),
+                    regression_lr_multiplier=params.get('regression_lr_multiplier', 10.0),
                 )
                 model.fit(
                     X=X_train_sub,

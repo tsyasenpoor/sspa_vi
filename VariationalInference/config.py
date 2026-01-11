@@ -351,6 +351,14 @@ class SVIConfig:
     restore_best : bool, default=True
         Whether to restore the best parameters when reducing learning rate or at end
         of training. This helps the model recover from overshooting the optimum.
+    regression_lr_multiplier : float, default=10.0
+        Multiplier for learning rate when updating regression parameters (v, gamma).
+    rho_v_delay_epochs : int, default=0
+        Number of epochs to delay rho_v updates to let mu_v learn first.
+    reset_lr_on_restore : bool, default=True
+        Whether to partially reset learning rate multiplier when restoring parameters.
+    use_spike_slab : bool, default=True
+        Whether to use spike-and-slab priors. If False, uses simple Normal/Gamma priors.
 
     Model Hyperparameters (Same as VI)
     ----------------------------------
@@ -394,6 +402,12 @@ class SVIConfig:
     lr_reduction_patience: int = 5
     lr_reduction_factor: float = 0.5
     restore_best: bool = True
+    regression_lr_multiplier: float = 10.0
+    rho_v_delay_epochs: int = 0
+    reset_lr_on_restore: bool = True
+
+    # Spike-and-slab toggle
+    use_spike_slab: bool = True
 
     # Numerical stability
     count_scale: float = 1.0  # Divide counts by this value for numerical stability
@@ -473,6 +487,10 @@ class SVIConfig:
             'lr_reduction_patience': self.lr_reduction_patience,
             'lr_reduction_factor': self.lr_reduction_factor,
             'restore_best': self.restore_best,
+            'regression_lr_multiplier': self.regression_lr_multiplier,
+            'rho_v_delay_epochs': self.rho_v_delay_epochs,
+            'reset_lr_on_restore': self.reset_lr_on_restore,
+            'use_spike_slab': self.use_spike_slab,
             'count_scale': self.count_scale,
             'alpha_theta': self.alpha_theta,
             'alpha_beta': self.alpha_beta,
