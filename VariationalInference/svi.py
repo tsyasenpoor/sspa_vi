@@ -160,8 +160,9 @@ class SVI:
         restore_best: bool = True,
         regression_lr_multiplier: float = 10.0,
         count_scale: float = 1.0,
-        rho_v_delay_epochs: int = 10,
-        reset_lr_on_restore: bool = True
+        rho_v_delay_epochs: int = 0,
+        reset_lr_on_restore: bool = True,
+        use_spike_slab: bool = True
     ):
         self.d = n_factors
         self.count_scale = count_scale
@@ -199,6 +200,7 @@ class SVI:
         self.pi_beta = pi_beta
         self.spike_variance_v = spike_variance_v
         self.spike_value_beta = spike_value_beta
+        self.use_spike_slab = use_spike_slab  # If False, use simple Normal/Gamma priors
 
         # Adaptive learning rate parameters
         self.lr_reduction_patience = lr_reduction_patience
@@ -328,11 +330,14 @@ class SVI:
         self.Sigma_v = np.tile(np.eye(self.d)[np.newaxis, :, :], (self.kappa, 1, 1))
 
         # Initialize spike-and-slab indicators
-        # Initialize rho_v high (near 1.0) to ensure v is active during early training
-        # This helps break the bootstrap problem where v needs discriminative theta
-        # but theta needs active v to receive classification signal
-        self.rho_v = np.ones((self.kappa, self.d)) * 0.95  # Start with v nearly fully active
-        self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
+        if self.use_spike_slab:
+            # Start at prior probabilities
+            self.rho_v = np.ones((self.kappa, self.d)) * self.pi_v
+            self.rho_beta = np.ones((self.p, self.d)) * self.pi_beta
+        else:
+            # All components active (no sparsity)
+            self.rho_v = np.ones((self.kappa, self.d))
+            self.rho_beta = np.ones((self.p, self.d))
 
         # Initialize gamma (auxiliary effects)
         self.mu_gamma = 0.01 * self.rng.standard_normal((self.kappa, self.p_aux))
@@ -525,16 +530,12 @@ class SVI:
                 + 2 * lam[:, np.newaxis] * self.E_v[k] * E_C_all
                 + 2 * lam[:, np.newaxis] * E_theta * E_v_sq
             )
-            # Clip to prevent numerical instability
-            # Scale clip bounds by regression_weight to keep total contribution reasonable
-            max_contrib = 100.0 / max(self.regression_weight, 1.0)  # More conservative clipping
-            regression_contrib = np.clip(regression_contrib, -max_contrib, max_contrib)
+            # Clip to prevent numerical instability (permissive bounds)
+            regression_contrib = np.clip(regression_contrib, -1e4, 1e4)
 
             b_theta_new += self.regression_weight * regression_contrib
 
-        # More conservative b_theta minimum to prevent E_theta explosion
-        # With b_theta_min=0.01 and a_theta=3.28, max E_theta = 328 (reasonable)
-        b_theta_new = np.clip(b_theta_new, 0.01, 1e6)
+        b_theta_new = np.clip(b_theta_new, 1e-6, 1e6)
         a_theta_new = np.clip(a_theta_new, 1.01, 1e6)
 
         return a_theta_new, b_theta_new
@@ -773,8 +774,9 @@ class SVI:
         self.a_eta = (1 - rho_t) * self.a_eta + rho_t * a_eta_hat
         self.b_eta = (1 - rho_t) * self.b_eta + rho_t * b_eta_hat
 
-        # Update rho_beta
-        self.rho_beta = (1 - rho_t) * self.rho_beta + rho_t * rho_beta_hat
+        # Update rho_beta (only if using spike-and-slab)
+        if self.use_spike_slab:
+            self.rho_beta = (1 - rho_t) * self.rho_beta + rho_t * rho_beta_hat
 
         # Use higher learning rate for regression parameters to break bootstrap
         # problem. Cap at 1.0 to avoid overshooting.
@@ -788,8 +790,8 @@ class SVI:
         self.mu_gamma = (1 - rho_t_reg) * self.mu_gamma + rho_t_reg * mu_gamma_hat
         self.Sigma_gamma = (1 - rho_t_reg) * self.Sigma_gamma + rho_t_reg * Sigma_gamma_hat
 
-        # Update rho_v with higher learning rate (unless skipped during delay period)
-        if not skip_rho_v_update:
+        # Update rho_v with higher learning rate (only if using spike-and-slab and not in delay period)
+        if self.use_spike_slab and not skip_rho_v_update:
             self.rho_v = (1 - rho_t_reg) * self.rho_v + rho_t_reg * rho_v_hat
 
         # Recompute global expectations
@@ -918,25 +920,33 @@ class SVI:
         elbo_beta_eta -= self.lambda_eta * np.sum(self.E_eta)
         elbo_beta_eta += self.p * (self.alpha_eta * np.log(self.lambda_eta) - gammaln(self.alpha_eta))
 
+        # Beta prior: Gamma(alpha_beta, eta) - with or without spike-and-slab
         slab_contrib = ((self.alpha_beta - 1) * self.E_log_beta_slab +
                         self.alpha_beta * self.E_log_eta[:, np.newaxis] -
                         self.E_eta[:, np.newaxis] * self.E_beta_slab - gammaln(self.alpha_beta))
-        elbo_beta_eta += np.sum(self.rho_beta * slab_contrib)
-
-        # Spike-and-slab prior terms
-        rho_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
-        elbo_beta_eta += np.sum(self.rho_beta * np.log(self.pi_beta + 1e-10))
-        elbo_beta_eta += np.sum((1 - self.rho_beta) * np.log(1 - self.pi_beta + 1e-10))
+        if self.use_spike_slab:
+            elbo_beta_eta += np.sum(self.rho_beta * slab_contrib)
+            # Spike-and-slab prior terms for beta
+            elbo_beta_eta += np.sum(self.rho_beta * np.log(self.pi_beta + 1e-10))
+            elbo_beta_eta += np.sum((1 - self.rho_beta) * np.log(1 - self.pi_beta + 1e-10))
+        else:
+            # Simple Gamma prior (no spike) - all components are active
+            elbo_beta_eta += np.sum(slab_contrib)
         elbo += elbo_beta_eta
 
         # E[log p(v)] + E[log p(γ)] (vectorized)
         elbo_v_gamma = 0.0
         E_v_sq = self.mu_v**2 + np.diagonal(self.Sigma_v, axis1=1, axis2=2)
+        # v prior: Normal(0, sigma_v^2) - with or without spike-and-slab
         slab_contrib_v = -0.5 * np.log(2 * np.pi * self.sigma_v**2) - 0.5 * E_v_sq / self.sigma_v**2
-        spike_contrib_v = -0.5 * np.log(2 * np.pi * self.spike_variance_v) - 0.5 * E_v_sq / self.spike_variance_v
-        elbo_v_gamma += np.sum(self.rho_v * slab_contrib_v + (1 - self.rho_v) * spike_contrib_v)
-        elbo_v_gamma += np.sum(self.rho_v * np.log(self.pi_v + 1e-10))
-        elbo_v_gamma += np.sum((1 - self.rho_v) * np.log(1 - self.pi_v + 1e-10))
+        if self.use_spike_slab:
+            spike_contrib_v = -0.5 * np.log(2 * np.pi * self.spike_variance_v) - 0.5 * E_v_sq / self.spike_variance_v
+            elbo_v_gamma += np.sum(self.rho_v * slab_contrib_v + (1 - self.rho_v) * spike_contrib_v)
+            elbo_v_gamma += np.sum(self.rho_v * np.log(self.pi_v + 1e-10))
+            elbo_v_gamma += np.sum((1 - self.rho_v) * np.log(1 - self.pi_v + 1e-10))
+        else:
+            # Simple Normal prior (no spike) - all components are active
+            elbo_v_gamma += np.sum(slab_contrib_v)
 
         for k in range(self.kappa):
             elbo_v_gamma -= 0.5 * self.p_aux * np.log(2 * np.pi * self.sigma_gamma**2)
@@ -966,16 +976,19 @@ class SVI:
                 entropy_gamma += 0.5 * (self.p_aux * (1 + np.log(2 * np.pi)) + logdet)
         elbo += entropy_gamma
 
-        # Spike-and-slab entropy (vectorized)
-        rho_beta_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
-        entropy_s_beta = -np.sum(rho_beta_safe * np.log(rho_beta_safe) +
-                                  (1 - rho_beta_safe) * np.log(1 - rho_beta_safe))
-        elbo += entropy_s_beta
+        # Spike-and-slab entropy (only if using spike-and-slab)
+        entropy_s_beta = 0.0
+        entropy_s_v = 0.0
+        if self.use_spike_slab:
+            rho_beta_safe = np.clip(self.rho_beta, 1e-10, 1 - 1e-10)
+            entropy_s_beta = -np.sum(rho_beta_safe * np.log(rho_beta_safe) +
+                                      (1 - rho_beta_safe) * np.log(1 - rho_beta_safe))
+            elbo += entropy_s_beta
 
-        rho_v_safe = np.clip(self.rho_v, 1e-10, 1 - 1e-10)
-        entropy_s_v = -np.sum(rho_v_safe * np.log(rho_v_safe) +
-                               (1 - rho_v_safe) * np.log(1 - rho_v_safe))
-        elbo += entropy_s_v
+            rho_v_safe = np.clip(self.rho_v, 1e-10, 1 - 1e-10)
+            entropy_s_v = -np.sum(rho_v_safe * np.log(rho_v_safe) +
+                                   (1 - rho_v_safe) * np.log(1 - rho_v_safe))
+            elbo += entropy_s_v
 
         if debug_components:
             elbo_components['global_priors'] = elbo_beta_eta + elbo_v_gamma
@@ -1078,7 +1091,8 @@ class SVI:
             print(f"  Learning rate: {self.learning_rate} * (τ + t)^(-κ) with τ={self.learning_rate_delay}, κ={self.learning_rate_decay}")
             print(f"  Learning rate min: {self.learning_rate_min}, Warmup epochs: {self.warmup_epochs}")
             print(f"  Regression weight: {self.regression_weight}")
-            print(f"  Spike-and-slab (v) delay: {self.rho_v_delay_epochs} epochs (rho_v updates start at epoch {self.rho_v_delay_epochs + 1})")
+            if self.rho_v_delay_epochs > 0:
+                print(f"  Spike-and-slab (v) delay: {self.rho_v_delay_epochs} epochs (rho_v updates start at epoch {self.rho_v_delay_epochs + 1})")
 
         for epoch in range(max_epochs):
             # Shuffle data at the start of each epoch
@@ -1225,26 +1239,32 @@ class SVI:
                           f"Reducing learning rate by {self.lr_reduction_factor:.1f}x "
                           f"(multiplier now: {self._current_lr_multiplier:.4f})")
 
-                # Optionally restore best parameters and partially reset learning rate
-                if self.restore_best and best_checkpoint is not None:
-                    self._restore_global_checkpoint(best_checkpoint)
-
-                    # Partially recover learning rate to allow continued learning
-                    # Without this, the model gets stuck with very low learning rates
-                    if self.reset_lr_on_restore:
-                        # Recover learning rate by sqrt of reduction factor (e.g., 0.5 -> 0.707)
-                        # This gives a moderate boost without fully resetting
-                        self._current_lr_multiplier = min(
-                            self._current_lr_multiplier / np.sqrt(self.lr_reduction_factor),
-                            1.0  # Cap at original learning rate
-                        )
-                        if verbose:
-                            print(f"  📈 Learning rate partially recovered to {self._current_lr_multiplier:.4f}")
-
-                    if verbose:
-                        print(f"  ↩ Restored parameters from best epoch {best_epoch + 1} (ELBO: {best_elbo:.2f})")
-
                 degradation_counter = 0  # Reset counter after reduction
+
+            # Restore best parameters if degrading for too long (DECOUPLED from LR reduction)
+            # This ensures restoration happens even when LR is at minimum
+            if (degradation_counter >= self.lr_reduction_patience and
+                epoch >= self.warmup_epochs and
+                self.restore_best and best_checkpoint is not None):
+
+                self._restore_global_checkpoint(best_checkpoint)
+
+                # Partially recover learning rate to allow continued learning
+                # Without this, the model gets stuck with very low learning rates
+                if self.reset_lr_on_restore:
+                    # Recover learning rate by sqrt of reduction factor (e.g., 0.5 -> 0.707)
+                    # This gives a moderate boost without fully resetting
+                    self._current_lr_multiplier = min(
+                        self._current_lr_multiplier / np.sqrt(self.lr_reduction_factor),
+                        1.0  # Cap at original learning rate
+                    )
+                    if verbose:
+                        print(f"  📈 Learning rate partially recovered to {self._current_lr_multiplier:.4f}")
+
+                if verbose:
+                    print(f"  ↩ Restored parameters from best epoch {best_epoch + 1} (ELBO: {best_elbo:.2f})")
+
+                degradation_counter = 0  # Reset counter after restoration
 
             # Report epoch progress
             if verbose:
@@ -1252,8 +1272,8 @@ class SVI:
                 print(f"\nEpoch {epoch + 1}/{max_epochs}, ELBO: {epoch_end_elbo:.2f}, "
                       f"ρ_t: {rho_t:.4f} (epoch: {epoch_time:.2f}s, total: {total_time:.2f}s)")
 
-                # Notify when rho_v delay period ends
-                if epoch == self.rho_v_delay_epochs - 1:
+                # Notify when rho_v delay period ends (only if delay was enabled)
+                if self.rho_v_delay_epochs > 0 and epoch == self.rho_v_delay_epochs - 1:
                     print(f"  📊 Spike-and-slab updates for v now enabled (rho_v will be learned from data)")
 
                 if len(epoch_end_elbo_history) > 1:
@@ -1658,7 +1678,10 @@ class SVI:
         method: str = 'platt',
         optimize_threshold: bool = True,
         threshold_metric: str = 'f1',
-        verbose: bool = False
+        verbose: bool = False,
+        skip_if_good: bool = True,
+        skip_threshold_auc: float = 0.95,
+        skip_threshold_acc: float = 0.95
     ) -> 'SVI':
         """
         Fit calibration parameters using validation data.
@@ -1689,6 +1712,14 @@ class SVI:
             - 'accuracy': Maximize accuracy
         verbose : bool, default=False
             Whether to print calibration information.
+        skip_if_good : bool, default=True
+            Whether to skip calibration if raw predictions already have good
+            AUC and accuracy. This saves computation when the model is already
+            well-calibrated.
+        skip_threshold_auc : float, default=0.95
+            Minimum AUC to consider skipping calibration.
+        skip_threshold_acc : float, default=0.95
+            Minimum accuracy to consider skipping calibration.
 
         Returns
         -------
@@ -1697,7 +1728,7 @@ class SVI:
         """
         from scipy.optimize import minimize_scalar, minimize
         from sklearn.isotonic import IsotonicRegression
-        from sklearn.metrics import f1_score, roc_curve
+        from sklearn.metrics import f1_score, roc_curve, roc_auc_score
 
         y_val = np.asarray(y_val).ravel()
 
@@ -1705,6 +1736,28 @@ class SVI:
         raw_probs = self.predict_proba(
             X_val, X_aux_val, verbose=False, use_regression=True
         ).ravel()
+
+        # Check if calibration can be skipped (already good performance)
+        if skip_if_good:
+            raw_preds = (raw_probs >= 0.5).astype(int)
+            raw_acc = np.mean(raw_preds == y_val)
+            try:
+                raw_auc = roc_auc_score(y_val, raw_probs)
+            except ValueError:
+                # Can happen with single class in y_val
+                raw_auc = 0.0
+
+            if raw_auc >= skip_threshold_auc and raw_acc >= skip_threshold_acc:
+                if verbose:
+                    print(f"Skipping calibration: raw AUC={raw_auc:.4f} >= {skip_threshold_auc}, "
+                          f"raw accuracy={raw_acc:.4f} >= {skip_threshold_acc}")
+                # Set identity calibration (no transformation)
+                self.calibration_a_ = 1.0
+                self.calibration_b_ = 0.0
+                self._calibration_method = 'identity'
+                self.is_calibrated_ = True
+                self.optimal_threshold_ = 0.5
+                return self
 
         # Convert to logits for calibration fitting
         # Clip to avoid log(0) or log(inf)
