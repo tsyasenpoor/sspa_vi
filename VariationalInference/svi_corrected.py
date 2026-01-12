@@ -244,6 +244,9 @@ class SVICorrected:
         self._update_natural_params()
         self._compute_expectations()
         
+        # Store initial v for tracking learning progress
+        self.initial_mu_v_ = self.mu_v.copy()
+
         # Debug: check initial diversity
         print(f"Initial beta diversity: {np.std(self.E_beta, axis=1).mean():.4f}")
         print(f"Initial v: {self.mu_v}")
@@ -996,7 +999,26 @@ class SVICorrected:
             print(f"\nTraining complete in {self.training_time_:.1f}s")
             print(f"Final ELBO: EMA = {self.final_elbo_ema_:.2e}, "
                   f"Mean = {self.final_elbo_mean_:.2e}, Std = {self.final_elbo_std_:.2e}")
-        
+
+            # v learning diagnostics
+            if hasattr(self, 'initial_mu_v_'):
+                v_change = self.mu_v - self.initial_mu_v_
+                v_change_norm = np.linalg.norm(v_change)
+                v_init_norm = np.linalg.norm(self.initial_mu_v_)
+                v_final_norm = np.linalg.norm(self.mu_v)
+                print(f"\nv Learning Diagnostics:")
+                print(f"  Initial v norm: {v_init_norm:.4f}")
+                print(f"  Final v norm:   {v_final_norm:.4f}")
+                print(f"  v change norm:  {v_change_norm:.4f}")
+                print(f"  Relative change: {v_change_norm / (v_init_norm + 1e-10):.4f}")
+                print(f"  Max |v| change:  {np.abs(v_change).max():.4f}")
+                print(f"  v range: [{self.mu_v.min():.4f}, {self.mu_v.max():.4f}]")
+                print(f"  v std:   {self.mu_v.std():.4f}")
+                if v_change_norm < 0.1:
+                    print(f"  WARNING: v barely changed from initialization!")
+                if self.mu_v.std() < 0.1:
+                    print(f"  WARNING: v is essentially flat - not learning discrimination!")
+
         return self
     
     def transform(self, X_new: np.ndarray, y_new: np.ndarray = None, 
