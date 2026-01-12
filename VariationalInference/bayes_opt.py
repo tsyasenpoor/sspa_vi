@@ -50,7 +50,7 @@ from sklearn.model_selection import train_test_split
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+sys.path.insert(0, parent_dir)  # Add BRay/ to path for VariationalInference imports
 
 # Suppress some warnings during optimization
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -202,6 +202,195 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
             'description': 'Divide counts by this value for numerical stability with raw counts'
         },
     }
+
+
+def get_simulation_search_space() -> Dict[str, Dict[str, Any]]:
+    """
+    Search space optimized for scdesign3 simulation data.
+    
+    Target: 1000 cells, 500 genes, balanced T2DM labels.
+    Based on successful run (sim_svi_1279359.out): AUC=0.9991, F1=0.9851.
+    
+    Key observations from run:
+    - n_factors=35 sufficient for 500 genes
+    - alpha_theta=alpha_beta=2.0 worked well (moderate sparsity)
+    - v coefficients evolved from ~0.07 to ~0.42 (disease signal present)
+    - Learning rate 0.05 was slow; EMA lagged significantly
+    
+    Optimizations:
+    - Aggressive learning rate schedule for faster convergence
+    - Narrower n_factors (small gene set doesn't need large d)
+    - Higher regression_weight (strong disease signal in simulation)
+    """
+    return {
+        # =====================================================================
+        # LEARNING RATE SCHEDULE (key for fast convergence)
+        # =====================================================================
+        'learning_rate': {
+            'type': 'float',
+            'low': 0.3,           # Much higher than default
+            'high': 1.0,          # Aggressive upper bound
+            'log': False,
+            'description': 'Initial learning rate (higher for small data)'
+        },
+        'learning_rate_decay': {
+            'type': 'float',
+            'low': 0.5,           # Slower decay (ρ_t ~ t^{-decay})
+            'high': 0.7,
+            'log': False,
+            'description': 'Robbins-Monro decay exponent'
+        },
+        'learning_rate_delay': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 10.0,
+            'log': False,
+            'description': 'Delay before decay kicks in (τ in (τ+t)^{-κ})'
+        },
+        
+        # =====================================================================
+        # MODEL COMPLEXITY (constrained for 500 genes)
+        # =====================================================================
+        'n_factors': {
+            'type': 'int',
+            'low': 20,
+            'high': 80,
+            'step': 10,
+            'description': 'Latent factors (20-80 for 500 genes)'
+        },
+        'local_iterations': {
+            'type': 'int',
+            'low': 15,
+            'high': 40,
+            'step': 5,
+            'description': 'Local CAVI iterations per mini-batch'
+        },
+        
+        # =====================================================================
+        # GAMMA PRIOR SHAPE (moderate sparsity worked well)
+        # =====================================================================
+        'alpha_theta': {
+            'type': 'float',
+            'low': 1.5,
+            'high': 4.0,
+            'log': False,
+            'description': 'Sample factor sparsity'
+        },
+        'alpha_beta': {
+            'type': 'float',
+            'low': 1.5,
+            'high': 4.0,
+            'log': False,
+            'description': 'Gene loading sparsity'
+        },
+        
+        # =====================================================================
+        # HIERARCHICAL SHRINKAGE
+        # =====================================================================
+        'alpha_xi': {
+            'type': 'float',
+            'low': 2.0,
+            'high': 5.0,
+            'log': False,
+            'description': 'Sample depth heterogeneity'
+        },
+        'alpha_eta': {
+            'type': 'float',
+            'low': 2.0,
+            'high': 5.0,
+            'log': False,
+            'description': 'Gene scale heterogeneity'
+        },
+        'lambda_xi': {
+            'type': 'float',
+            'low': 5.0,
+            'high': 15.0,
+            'log': False,
+            'description': 'Prior mean for sample depth'
+        },
+        'lambda_eta': {
+            'type': 'float',
+            'low': 0.5,
+            'high': 3.0,
+            'log': False,
+            'description': 'Prior mean for gene scaling'
+        },
+        
+        # =====================================================================
+        # REGRESSION (strong signal in simulation)
+        # =====================================================================
+        'sigma_v': {
+            'type': 'float',
+            'low': 0.3,
+            'high': 1.0,
+            'log': False,
+            'description': 'Disease effect regularization'
+        },
+        'sigma_gamma': {
+            'type': 'float',
+            'low': 0.2,
+            'high': 1.0,
+            'log': False,
+            'description': 'Auxiliary covariate regularization'
+        },
+        'regression_weight': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 20.0,
+            'log': True,
+            'description': 'Disease vs reconstruction tradeoff'
+        },
+        
+        # =====================================================================
+        # CONVERGENCE CRITERIA
+        # =====================================================================
+        'ema_decay': {
+            'type': 'float',
+            'low': 0.85,
+            'high': 0.95,
+            'log': False,
+            'description': 'EMA smoothing (lower=faster response)'
+        },
+        'convergence_tol': {
+            'type': 'float',
+            'low': 5e-4,
+            'high': 5e-3,
+            'log': True,
+            'description': 'Relative change threshold for stopping'
+        },
+    }
+
+
+def get_search_space_for_data(data_type: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Get appropriate search space based on data type.
+    
+    Args:
+        data_type: One of 'default', 'simulation', 'emtab', 'large'
+    
+    Returns:
+        Search space dictionary
+    """
+    if data_type == 'simulation':
+        return get_simulation_search_space()
+    elif data_type == 'emtab':
+        # EMTAB-specific space (larger gene set, more cells)
+        space = get_default_search_space()
+        space['n_factors'] = {
+            'type': 'int', 'low': 100, 'high': 300, 'step': 25,
+            'description': 'Latent factors for ~10k genes'
+        }
+        return space
+    elif data_type == 'large':
+        # Large dataset space (conservative learning rate)
+        space = get_default_search_space()
+        space['learning_rate'] = {
+            'type': 'float', 'low': 0.01, 'high': 0.2, 'log': True,
+            'description': 'Conservative learning rate for large data'
+        }
+        return space
+    else:
+        return get_default_search_space()
 
 
 def sample_hyperparameters(
@@ -873,53 +1062,41 @@ def export_results(
     except Exception as e:
         logger.warning(f"Failed to create plots: {e}")
 
-
 # =============================================================================
-# CONFIGURATION GENERATOR
+# CONFIGURATION GENERATOR (Legacy - kept for reference)
 # =============================================================================
 
-def generate_config_from_params(
-    params: Dict[str, Any],
-    base_config: Optional[VIConfig] = None
-) -> VIConfig:
-    """
-    Generate a VIConfig from optimized parameters.
+# Note: VIConfig is not imported; this function is provided for future use
+# if VIConfig becomes available. Currently, best parameters are exported as JSON.
 
-    Args:
-        params: Dictionary of optimized hyperparameters
-        base_config: Optional base config to modify
+# def generate_config_from_params(
+#     params: Dict[str, Any],
+#     base_config = None
+# ):
+#     """Generate a VIConfig from optimized parameters."""
+#     if base_config is None:
+#         base_config = VIConfig()
+#     updates = {}
+#     param_mapping = {
+#         'n_factors': 'n_factors',
+#         'alpha_theta': 'alpha_theta',
+#         'alpha_beta': 'alpha_beta',
+#         'alpha_xi': 'alpha_xi',
+#         'alpha_eta': 'alpha_eta',
+#         'lambda_xi': 'lambda_xi',
+#         'lambda_eta': 'lambda_eta',
+#         'sigma_v': 'sigma_v',
+#         'sigma_gamma': 'sigma_gamma',
+#         'pi_v': 'pi_v',
+#         'pi_beta': 'pi_beta',
+#         'regression_weight': 'regression_weight',
+#         'learning_rate': 'learning_rate',
+#     }
+#     for param_name, config_attr in param_mapping.items():
+#         if param_name in params:
+#             updates[config_attr] = params[param_name]
+#     return base_config.copy(**updates)
 
-    Returns:
-        VIConfig with optimized parameters
-    """
-    if base_config is None:
-        base_config = VIConfig()
-
-    # Create updates dict
-    updates = {}
-
-    # Map parameter names to config attributes
-    param_mapping = {
-        'n_factors': 'n_factors',
-        'alpha_theta': 'alpha_theta',
-        'alpha_beta': 'alpha_beta',
-        'alpha_xi': 'alpha_xi',
-        'alpha_eta': 'alpha_eta',
-        'lambda_xi': 'lambda_xi',
-        'lambda_eta': 'lambda_eta',
-        'sigma_v': 'sigma_v',
-        'sigma_gamma': 'sigma_gamma',
-        'pi_v': 'pi_v',
-        'pi_beta': 'pi_beta',
-        'regression_weight': 'regression_weight',
-        'learning_rate': 'learning_rate',
-    }
-
-    for param_name, config_attr in param_mapping.items():
-        if param_name in params:
-            updates[config_attr] = params[param_name]
-
-    return base_config.copy(**updates)
 
 
 # =============================================================================
@@ -1053,6 +1230,16 @@ Examples:
         default=None,
         help='JSON string of fixed parameter values'
     )
+    parser.add_argument(
+        '--data-type',
+        choices=['default', 'simulation', 'emtab', 'large'],
+        default='default',
+        help='Data type for search space selection: '
+             'simulation (scdesign3 ~1k cells, 500 genes), '
+             'emtab (~10k cells, 10k genes), '
+             'large (>50k cells), '
+             'default (generic). Default: auto-detect or default.'
+    )
 
     # Training arguments
     parser.add_argument(
@@ -1165,6 +1352,9 @@ def main():
     if args.seed is not None:
         np.random.seed(args.seed)
 
+    # Select search space based on data type
+    search_space = get_search_space_for_data(args.data_type)
+
     # Create study name
     study_name = args.study_name or f"vi_hyperopt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -1172,6 +1362,8 @@ def main():
     logger.info("BAYESIAN OPTIMIZATION FOR VI HYPERPARAMETERS")
     logger.info("=" * 60)
     logger.info(f"Data: {args.data}")
+    logger.info(f"Data type: {args.data_type}")
+    logger.info(f"Search space: {len(search_space)} parameters")
     logger.info(f"Label column: {args.label_column}")
     logger.info(f"Method: {args.method}")
     logger.info(f"Multi-objective: {args.multi_objective}")
@@ -1224,6 +1416,7 @@ def main():
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         random_state=args.seed,
+        search_space=search_space,  # Use data-type specific search space
         params_to_tune=args.params_to_tune,
         fixed_params=fixed_params,
         verbose=args.verbose,

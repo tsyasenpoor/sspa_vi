@@ -62,6 +62,11 @@ class SVICorrected:
         # Supervision
         regression_weight: float = 1.0,
         
+        # Convergence tracking
+        ema_decay: float = 0.95,
+        convergence_tol: float = 1e-4,
+        convergence_window: int = 10,
+        
         random_state: Optional[int] = None
     ):
         self.d = n_factors  # Number of factors
@@ -88,6 +93,11 @@ class SVICorrected:
         self.pi_v = pi_v
         
         self.regression_weight = regression_weight
+        
+        # Convergence tracking (EMA + Welford)
+        self.ema_decay = ema_decay
+        self.convergence_tol = convergence_tol
+        self.convergence_window = convergence_window
         
         # RNG
         self.rng = np.random.default_rng(random_state)
@@ -771,10 +781,23 @@ class SVICorrected:
         X_aux: np.ndarray,
         max_epochs: int = 100,
         elbo_freq: int = 10,
-        verbose: bool = True
+        verbose: bool = True,
+        early_stopping: bool = False
     ):
         """
         Fit model using Stochastic Variational Inference.
+        
+        Convergence tracked via EMA + Welford's online algorithm:
+        - elbo_ema_: Exponential moving average of batch ELBO
+        - elbo_welford_mean_: Running mean (Welford)
+        - elbo_welford_var_: Running variance (Welford)
+        - convergence_history_: List of (epoch, ema, mean, std, rel_change)
+        
+        Parameters
+        ----------
+        early_stopping : bool
+            If True, stop when EMA relative change < convergence_tol for 
+            convergence_window consecutive checks.
         """
         # Ensure y is 2D
         if y.ndim == 1:
@@ -783,9 +806,22 @@ class SVICorrected:
         # Initialize
         self._initialize_global_parameters(X, y, X_aux)
         
-        n_batches = max(1, self.n // self.batch_size)
+        # Use ceiling division to ensure all samples are processed
+        n_batches = max(1, (self.n + self.batch_size - 1) // self.batch_size)
         iteration = 0
         self.elbo_history_ = []
+        
+        # =====================================================================
+        # EMA + Welford initialization (O(1) memory)
+        # =====================================================================
+        self.elbo_ema_ = None           # Exponential moving average
+        self.elbo_ema_prev_ = None      # Previous EMA for relative change
+        self.elbo_welford_n_ = 0        # Welford count
+        self.elbo_welford_mean_ = 0.0   # Welford running mean
+        self.elbo_welford_M2_ = 0.0     # Welford sum of squared deviations
+        self.convergence_history_ = []  # (epoch, ema, mean, std, rel_change)
+        self.last_elbo_ = None          # Track last computed ELBO for display
+        consecutive_converged = 0
         
         # Storage for final training set local parameters
         self.train_a_theta_ = None
@@ -864,14 +900,76 @@ class SVICorrected:
                     if np.isfinite(elbo):
                         self.elbo_history_.append((iteration, elbo))
                         epoch_elbo = elbo
+                        self.last_elbo_ = elbo  # Track for display
+                        
+                        # =====================================================
+                        # EMA update: O(1)
+                        # =====================================================
+                        if self.elbo_ema_ is None:
+                            self.elbo_ema_ = elbo
+                        else:
+                            self.elbo_ema_ = (self.ema_decay * self.elbo_ema_ + 
+                                              (1 - self.ema_decay) * elbo)
+                        
+                        # =====================================================
+                        # Welford's online update: O(1)
+                        # Mean and variance without storing history
+                        # =====================================================
+                        self.elbo_welford_n_ += 1
+                        delta = elbo - self.elbo_welford_mean_
+                        self.elbo_welford_mean_ += delta / self.elbo_welford_n_
+                        delta2 = elbo - self.elbo_welford_mean_
+                        self.elbo_welford_M2_ += delta * delta2
                 
                 iteration += 1
             
+            # End of epoch: compute convergence diagnostics
+            if self.elbo_welford_n_ > 1:
+                welford_var = self.elbo_welford_M2_ / (self.elbo_welford_n_ - 1)
+                welford_std = np.sqrt(max(0, welford_var))
+            else:
+                welford_std = np.inf
+            
+            # Relative change in EMA
+            if self.elbo_ema_prev_ is not None and self.elbo_ema_ is not None:
+                rel_change = abs(self.elbo_ema_ - self.elbo_ema_prev_) / (abs(self.elbo_ema_prev_) + 1e-10)
+            else:
+                rel_change = np.inf
+            
+            self.elbo_ema_prev_ = self.elbo_ema_
+            
+            # Store convergence diagnostics (sparse: every 5 epochs or at elbo_freq boundaries)
+            if epoch % 5 == 0:
+                self.convergence_history_.append((
+                    epoch,
+                    self.elbo_ema_ if self.elbo_ema_ is not None else np.nan,
+                    self.elbo_welford_mean_,
+                    welford_std,
+                    rel_change
+                ))
+            
             if verbose and epoch % 5 == 0:
                 beta_diversity = np.std(self.E_beta, axis=1).mean()
-                theta_diversity = np.std(E_theta, axis=1).mean() if 'E_theta' in dir() else 0
-                print(f"Epoch {epoch}: ELBO = {epoch_elbo:.2e}, ρ_t = {rho_t:.4f}, "
+                # Include EMA and relative change in output
+                ema_str = f"{self.elbo_ema_:.2e}" if self.elbo_ema_ is not None else "N/A"
+                rel_str = f"{rel_change:.2e}" if rel_change != np.inf else "N/A"
+                # Use last_elbo_ to avoid showing 0 when no ELBO computed this epoch
+                elbo_str = f"{self.last_elbo_:.2e}" if self.last_elbo_ is not None else "N/A"
+                print(f"Epoch {epoch}: ELBO = {elbo_str}, EMA = {ema_str}, "
+                      f"Δrel = {rel_str}, ρ_t = {rho_t:.4f}, "
                       f"v = {self.mu_v.ravel()[:3]}, β_div = {beta_diversity:.3f}")
+            
+            # Early stopping check
+            if early_stopping and rel_change < self.convergence_tol:
+                consecutive_converged += 1
+                if consecutive_converged >= self.convergence_window:
+                    if verbose:
+                        print(f"\nEarly stopping at epoch {epoch}: "
+                              f"EMA rel_change < {self.convergence_tol} for "
+                              f"{self.convergence_window} consecutive checks")
+                    break
+            else:
+                consecutive_converged = 0
             
             # Store final epoch's training parameters
             self.train_a_theta_ = epoch_a_theta
@@ -881,8 +979,21 @@ class SVICorrected:
         
         self.training_time_ = time.time() - start_time
         
+        # Final convergence summary
+        if self.elbo_welford_n_ > 1:
+            final_var = self.elbo_welford_M2_ / (self.elbo_welford_n_ - 1)
+            final_std = np.sqrt(max(0, final_var))
+        else:
+            final_std = np.nan
+        
+        self.final_elbo_ema_ = self.elbo_ema_
+        self.final_elbo_mean_ = self.elbo_welford_mean_
+        self.final_elbo_std_ = final_std
+        
         if verbose:
             print(f"\nTraining complete in {self.training_time_:.1f}s")
+            print(f"Final ELBO: EMA = {self.final_elbo_ema_:.2e}, "
+                  f"Mean = {self.final_elbo_mean_:.2e}, Std = {self.final_elbo_std_:.2e}")
         
         return self
     

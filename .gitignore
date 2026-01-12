@@ -296,3 +296,6 @@ VariationalInference/vi_optimized.py
 jobs_sh/launch_optimized_svi_parallel.sh
 BRAY_FileTransfer/EMTAB11349/preprocessed/gene_expression_raw_processed.csv.gz
 jobs_sh/sim_svi.sh
+jobs_sh/ibd_svi_normalized.sh
+jobs_sh/ibd_svi.sh
+jobs_sh/sim_bayes_opt.sh

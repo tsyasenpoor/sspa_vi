@@ -475,12 +475,92 @@ class DataLoader:
         self._log(f"Kept {self.feature_type}s in >={min_cells} cells ({min_fraction*100:.1f}%): {n_before} -> {n_after}")
         return self.raw_df
 
+    def normalize_counts(
+        self,
+        target_sum: float = 1e4,
+        method: str = 'library_size'
+    ) -> pd.DataFrame:
+        """
+        Normalize count data to reduce overdispersion while preserving integers.
+
+        Parameters
+        ----------
+        target_sum : float, default=1e4
+            Target library size (counts per cell will sum to ~this value).
+        method : str, default='library_size'
+            Normalization method:
+            - 'library_size': Divide by cell total, multiply by target_sum, round.
+            - 'median_ratio': DESeq2-style median-of-ratios.
+
+        Returns
+        -------
+        pd.DataFrame
+            Normalized count matrix with integer values.
+        """
+        if self.raw_df is None:
+            raise ValueError("Must load expression data first")
+
+        X = self.raw_df.values.astype(np.float64)
+        n_cells, n_genes = X.shape
+
+        self._log(f"Normalizing counts (method={method}, target_sum={target_sum:.0f})")
+
+        # Pre-normalization stats
+        cell_sums_before = X.sum(axis=1)
+        var_before = X.var()
+        mean_before = X.mean()
+        vmi_before = var_before / mean_before if mean_before > 0 else np.nan
+        self._log(f"  Before: max={X.max():.0f}, mean_lib_size={cell_sums_before.mean():.0f}, var/mean={vmi_before:.1f}")
+
+        if method == 'library_size':
+            cell_sums = X.sum(axis=1, keepdims=True)
+            cell_sums = np.maximum(cell_sums, 1)
+            X_norm = (X / cell_sums) * target_sum
+
+        elif method == 'median_ratio':
+            log_X = np.log(X + 1)
+            geo_mean = np.exp(log_X.mean(axis=0))
+            geo_mean = np.maximum(geo_mean, 1e-10)
+            ratios = X / geo_mean
+            size_factors = np.median(ratios, axis=1, keepdims=True)
+            size_factors = np.maximum(size_factors, 1e-10)
+            X_norm = X / size_factors
+            current_median_sum = np.median(X_norm.sum(axis=1))
+            X_norm = X_norm * (target_sum / current_median_sum)
+
+        else:
+            raise ValueError(f"Unknown normalization method: {method}")
+
+        # Stochastic rounding to integers
+        X_int = np.floor(X_norm).astype(np.int64)
+        frac = X_norm - X_int
+        rng = np.random.default_rng()
+        X_int += (rng.random(X_norm.shape) < frac).astype(np.int64)
+
+        # Post-normalization stats
+        cell_sums_after = X_int.sum(axis=1)
+        var_after = X_int.var()
+        mean_after = X_int.mean()
+        vmi_after = var_after / mean_after if mean_after > 0 else np.nan
+        self._log(f"  After:  max={X_int.max():.0f}, mean_lib_size={cell_sums_after.mean():.0f}, var/mean={vmi_after:.1f}")
+
+        self.raw_df = pd.DataFrame(
+            X_int,
+            index=self.raw_df.index,
+            columns=self.raw_df.columns
+        )
+
+        return self.raw_df
+
     def preprocess(
         self,
         layer: str = 'raw',
         convert_to_ensembl: bool = True,
         filter_protein_coding: bool = True,
-        min_cells_expressing: float = 0.02
+        min_cells_expressing: float = 0.02,
+        normalize: bool = False,
+        normalize_target_sum: float = 1e4,
+        normalize_method: str = 'library_size'
     ) -> pd.DataFrame:
         """
         Run full preprocessing pipeline.
@@ -500,6 +580,12 @@ class DataLoader:
             Whether to filter for protein-coding genes (ignored for pathways/simulated).
         min_cells_expressing : float, default=0.02
             Minimum fraction of cells expressing each gene/pathway.
+        normalize : bool, default=False
+            Whether to normalize counts (library size normalization + integer rounding).
+        normalize_target_sum : float, default=1e4
+            Target library size for normalization.
+        normalize_method : str, default='library_size'
+            Normalization method: 'library_size' or 'median_ratio'.
 
         Returns
         -------
@@ -528,6 +614,12 @@ class DataLoader:
 
             self.filter_zero_genes()
             self.filter_min_cells(min_cells_expressing)
+
+            if normalize:
+                self.normalize_counts(
+                    target_sum=normalize_target_sum,
+                    method=normalize_method
+                )
 
             self.gene_list = self.raw_df.columns.tolist()
             self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
@@ -569,6 +661,12 @@ class DataLoader:
 
         self.filter_zero_genes()
         self.filter_min_cells(min_cells_expressing)
+
+        if normalize:
+            self.normalize_counts(
+                target_sum=normalize_target_sum,
+                method=normalize_method
+            )
 
         # Store results
         self.gene_list = self.raw_df.columns.tolist()
@@ -849,7 +947,10 @@ class DataLoader:
         layer: str = 'raw',
         convert_to_ensembl: bool = True,
         filter_protein_coding: bool = True,
-        random_state: Optional[int] = None
+        random_state: Optional[int] = None,
+        normalize: bool = False,
+        normalize_target_sum: float = 1e4,
+        normalize_method: str = 'library_size'
     ) -> Dict[str, Any]:
         """
         Complete data loading and preprocessing pipeline.
@@ -876,6 +977,12 @@ class DataLoader:
             Whether to filter for protein-coding genes.
         random_state : int, optional
             Random seed for splitting. None = random.
+        normalize : bool, default=False
+            Whether to normalize counts (library size + integer rounding).
+        normalize_target_sum : float, default=1e4
+            Target library size for normalization.
+        normalize_method : str, default='library_size'
+            Normalization method: 'library_size' or 'median_ratio'.
 
         Returns
         -------
@@ -892,7 +999,10 @@ class DataLoader:
             layer=layer,
             convert_to_ensembl=convert_to_ensembl,
             filter_protein_coding=filter_protein_coding,
-            min_cells_expressing=min_cells_expressing
+            min_cells_expressing=min_cells_expressing,
+            normalize=normalize,
+            normalize_target_sum=normalize_target_sum,
+            normalize_method=normalize_method
         )
 
         # Split

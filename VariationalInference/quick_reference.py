@@ -165,6 +165,26 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help='Compute ELBO every N iterations'
     )
+    
+    # Convergence options
+    parser.add_argument(
+        '--ema-decay',
+        type=float,
+        default=0.95,
+        help='EMA smoothing factor for ELBO tracking (lower=faster response, default: 0.95)'
+    )
+    parser.add_argument(
+        '--convergence-tol',
+        type=float,
+        default=1e-4,
+        help='Relative change threshold for convergence (default: 1e-4)'
+    )
+    parser.add_argument(
+        '--convergence-window',
+        type=int,
+        default=10,
+        help='Number of consecutive epochs below tol to trigger convergence (default: 10)'
+    )
 
     # Hyperparameter options (Priors & Regularization)
     parser.add_argument(
@@ -232,6 +252,26 @@ def parse_args() -> argparse.Namespace:
         type=lambda x: x.lower() in ('true', '1', 'yes'),
         default=False,
         help='Use spike-and-slab priors (default: False). Set to True for sparse priors.'
+    )
+
+    # Normalization options
+    parser.add_argument(
+        '--normalize',
+        action='store_true',
+        help='Normalize counts (library size normalization + integer rounding). Recommended for overdispersed data.'
+    )
+    parser.add_argument(
+        '--normalize-target-sum',
+        type=float,
+        default=1e4,
+        help='Target library size for normalization'
+    )
+    parser.add_argument(
+        '--normalize-method',
+        type=str,
+        default='library_size',
+        choices=['library_size', 'median_ratio'],
+        help='Normalization method'
     )
 
     # Output options
@@ -312,6 +352,8 @@ def main():
     print(f"  aux_columns:  {args.aux_columns}")
     print(f"  random_seed:  {args.seed if args.seed else 'None (random)'}")
     print(f"  output_dir:   {args.output_dir}")
+    if args.normalize:
+        print(f"  normalize:    True (target_sum={args.normalize_target_sum:.0f}, method={args.normalize_method})")
 
     # =========================================================================
     # STEP 2: Import Modules
@@ -345,7 +387,10 @@ def main():
         layer=args.layer,
         convert_to_ensembl=True,
         filter_protein_coding=args.gene_annotation is not None,
-        random_state=args.seed
+        random_state=args.seed,
+        normalize=args.normalize,
+        normalize_target_sum=args.normalize_target_sum,
+        normalize_method=args.normalize_method
     )
 
     # Unpack data
@@ -419,7 +464,10 @@ def main():
         pi_v=args.pi_v,
         pi_beta=args.pi_beta,
         random_state=args.seed,
-        use_spike_slab=args.use_spike_slab
+        use_spike_slab=args.use_spike_slab,
+        ema_decay=args.ema_decay,
+        convergence_tol=args.convergence_tol,
+        convergence_window=args.convergence_window
     )
 
     # Train model
