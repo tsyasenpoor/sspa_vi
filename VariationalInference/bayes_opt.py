@@ -247,6 +247,20 @@ def get_simulation_search_space() -> Dict[str, Dict[str, Any]]:
             'log': False,
             'description': 'Delay before decay kicks in (τ in (τ+t)^{-κ})'
         },
+        'learning_rate_min': {
+            'type': 'float',
+            'low': 1e-4,
+            'high': 5e-3,
+            'log': True,
+            'description': 'Minimum learning rate floor (prevents premature freezing)'
+        },
+        'batch_size': {
+            'type': 'int',
+            'low': 200,
+            'high': 500,
+            'step': 50,
+            'description': 'Mini-batch size (larger = lower variance)'
+        },
         
         # =====================================================================
         # MODEL COMPLEXITY (constrained for 500 genes)
@@ -342,14 +356,14 @@ def get_simulation_search_space() -> Dict[str, Dict[str, Any]]:
         },
         
         # =====================================================================
-        # CONVERGENCE CRITERIA
+        # CONVERGENCE CRITERIA (tuned for noisy mini-batch gradients)
         # =====================================================================
         'ema_decay': {
             'type': 'float',
             'low': 0.85,
             'high': 0.95,
             'log': False,
-            'description': 'EMA smoothing (lower=faster response)'
+            'description': 'EMA smoothing (lower=faster response to ELBO changes)'
         },
         'convergence_tol': {
             'type': 'float',

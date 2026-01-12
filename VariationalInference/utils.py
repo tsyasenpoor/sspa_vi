@@ -392,16 +392,30 @@ def save_results(
         'feature_type': feature_type,
         'training': {
             'training_time': getattr(model, 'training_time_', None),
-            'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') else None,
-            'n_iterations': model.elbo_history_[-1][0] if hasattr(model, 'elbo_history_') else None,
+            'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') and model.elbo_history_ else None,
+            'n_iterations': model.elbo_history_[-1][0] if hasattr(model, 'elbo_history_') and model.elbo_history_ else None,
+            # === NEW: EMA and convergence diagnostics for paper ===
+            'final_elbo_ema': getattr(model, 'elbo_ema_', None),
+            'elbo_welford_mean': getattr(model, 'elbo_welford_mean_', None),
+            'elbo_welford_std': (
+                np.sqrt(model.elbo_welford_M2_ / (model.elbo_welford_n_ - 1)) 
+                if hasattr(model, 'elbo_welford_n_') and model.elbo_welford_n_ > 1 
+                else None
+            ),
         },
         'classification': {
             'optimal_threshold': optimal_threshold,
         }
     }
 
+    # === Raw ELBO history (mini-batch, scaled) ===
     if hasattr(model, 'elbo_history_'):
         summary['elbo_history'] = model.elbo_history_
+    
+    # === NEW: Convergence history with EMA trajectory ===
+    # Format: [(epoch, ema, welford_mean, welford_std, rel_change), ...]
+    if hasattr(model, 'convergence_history_') and model.convergence_history_:
+        summary['convergence_history'] = model.convergence_history_
 
     summary_path = output_dir / f'{prefix}_summary.json'
     if compress:

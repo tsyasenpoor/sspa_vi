@@ -930,16 +930,18 @@ class SVICorrected:
             else:
                 welford_std = np.inf
             
-            # Relative change in EMA
+            # Relative change in EMA (only computed at print checkpoints)
+            # NOTE: rel_change computed but ema_prev updated only at checkpoints
+            # to avoid spurious zeros when ELBO isn't computed every epoch
             if self.elbo_ema_prev_ is not None and self.elbo_ema_ is not None:
                 rel_change = abs(self.elbo_ema_ - self.elbo_ema_prev_) / (abs(self.elbo_ema_prev_) + 1e-10)
             else:
                 rel_change = np.inf
             
-            self.elbo_ema_prev_ = self.elbo_ema_
-            
-            # Store convergence diagnostics (sparse: every 5 epochs or at elbo_freq boundaries)
+            # Store convergence diagnostics (sparse: every 5 epochs)
             if epoch % 5 == 0:
+                # Update ema_prev only at checkpoints to measure change over 5 epochs
+                self.elbo_ema_prev_ = self.elbo_ema_
                 self.convergence_history_.append((
                     epoch,
                     self.elbo_ema_ if self.elbo_ema_ is not None else np.nan,
