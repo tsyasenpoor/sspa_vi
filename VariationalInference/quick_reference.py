@@ -486,6 +486,35 @@ def main():
     print(f"  Time:       {model.training_time_:.2f}s")
 
     # =========================================================================
+    # DEBUG: v Parameter Diagnostics
+    # =========================================================================
+    print("\n" + "=" * 80)
+    print("DEBUG: Learned Parameter Diagnostics")
+    print("=" * 80)
+    print(f"mu_v shape: {model.mu_v.shape}")
+    print(f"mu_v range: [{model.mu_v.min():.6f}, {model.mu_v.max():.6f}]")
+    print(f"mu_v mean:  {model.mu_v.mean():.6f}")
+    print(f"mu_v std:   {model.mu_v.std():.6f}")
+    print(f"mu_v sum:   {model.mu_v.sum():.6f}")
+
+    # Check if v is essentially flat (not learned)
+    v_range = model.mu_v.max() - model.mu_v.min()
+    if v_range < 0.5:
+        print(f"  WARNING: v range ({v_range:.4f}) is very small - model may not have learned discrimination!")
+    if model.mu_v.std() < 0.1:
+        print(f"  WARNING: v std ({model.mu_v.std():.4f}) is very small - v is essentially flat!")
+
+    # Show top 5 largest and smallest v values
+    v_flat = model.mu_v.flatten()
+    sorted_indices = np.argsort(v_flat)
+    print(f"\nTop 5 positive v values (factors that increase P(y=1)):")
+    for i in sorted_indices[-5:][::-1]:
+        print(f"  Factor {i}: v = {v_flat[i]:.6f}")
+    print(f"\nTop 5 negative v values (factors that decrease P(y=1)):")
+    for i in sorted_indices[:5]:
+        print(f"  Factor {i}: v = {v_flat[i]:.6f}")
+
+    # =========================================================================
     # STEP 5: Evaluate on Training Set
     # =========================================================================
     print("\n" + "=" * 80)
@@ -501,6 +530,34 @@ def main():
     y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=50)
     if args.verbose:
         print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
+
+    # DEBUG: Compute logits and correlation with labels
+    train_result = model.transform(X_train, y_new=None, X_aux_new=X_aux_train, n_iter=50)
+    E_theta_train = train_result['E_theta']
+    train_logits = E_theta_train @ model.mu_v.T
+    if model.p_aux > 0 and model.mu_gamma is not None:
+        train_logits = train_logits + X_aux_train @ model.mu_gamma.T
+    train_logits = train_logits.flatten()
+
+    print(f"\nDEBUG: Training Logit Analysis")
+    print(f"  Logits range: [{train_logits.min():.4f}, {train_logits.max():.4f}]")
+    print(f"  Logits std:   {train_logits.std():.4f}")
+    logit_label_corr = np.corrcoef(train_logits, y_train.flatten())[0, 1]
+    print(f"  Logit-label correlation: {logit_label_corr:.4f}")
+    if logit_label_corr < 0:
+        print(f"  WARNING: Negative correlation! Model predictions are INVERTED!")
+    if np.abs(logit_label_corr) < 0.1:
+        print(f"  WARNING: Weak correlation! Model is not discriminating!")
+
+    # Show logit distribution by class
+    y_flat = y_train.flatten()
+    logits_class0 = train_logits[y_flat == 0]
+    logits_class1 = train_logits[y_flat == 1]
+    print(f"  Class 0 logits: mean={logits_class0.mean():.4f}, std={logits_class0.std():.4f}")
+    print(f"  Class 1 logits: mean={logits_class1.mean():.4f}, std={logits_class1.std():.4f}")
+    if logits_class1.mean() < logits_class0.mean():
+        print(f"  WARNING: Class 1 has LOWER logits than Class 0 - model learned wrong direction!")
+
     y_train_pred = (y_train_proba.ravel() > 0.5).astype(int)
 
     train_metrics = compute_metrics(y_train, y_train_pred, y_train_proba.ravel())
@@ -655,6 +712,57 @@ def main():
     print("=" * 80)
 
     print_model_summary(model, gene_list)
+
+    # =========================================================================
+    # DEBUG: Automatic Recommendations
+    # =========================================================================
+    issues_found = []
+    recommendations = []
+
+    # Check 1: Probability range too narrow
+    prob_range = y_train_proba.max() - y_train_proba.min()
+    if prob_range < 0.2:
+        issues_found.append(f"Probability range ({prob_range:.4f}) is very narrow - model not discriminating")
+        recommendations.append("Increase --regression-weight (try 100-200)")
+        recommendations.append("Increase --max-epochs (try 200-500)")
+        recommendations.append("Increase --learning-rate (try 0.5)")
+
+    # Check 2: AUC below 0.5
+    if 'auc' in train_metrics and train_metrics['auc'] < 0.5:
+        issues_found.append(f"Training AUC ({train_metrics['auc']:.4f}) < 0.5 - predictions inversely correlated")
+        recommendations.append("The model learned the wrong direction - try increasing --regression-weight")
+
+    # Check 3: v not learned
+    v_range = model.mu_v.max() - model.mu_v.min()
+    if v_range < 0.5:
+        issues_found.append(f"v parameter range ({v_range:.4f}) is very small - discrimination weights not learned")
+        recommendations.append("Learning rate may be dying too fast - try --learning-rate-decay 0.6")
+        recommendations.append("Try --learning-rate-min 0.01 (higher floor)")
+
+    # Check 4: Learning rate too aggressive decay
+    final_lr = args.learning_rate * (args.learning_rate_delay + model.elbo_history_[-1][0]) ** (-args.learning_rate_decay)
+    if final_lr < 0.001:
+        issues_found.append(f"Final learning rate ({final_lr:.6f}) is very small - may have stopped learning early")
+        recommendations.append("Try --learning-rate-decay 0.6 instead of 0.75")
+        recommendations.append("Try --learning-rate-min 0.01")
+
+    if issues_found:
+        print("\n" + "=" * 80)
+        print("DEBUG: Issues Detected & Recommendations")
+        print("=" * 80)
+        print("\nIssues found:")
+        for i, issue in enumerate(issues_found, 1):
+            print(f"  {i}. {issue}")
+        print("\nRecommendations:")
+        seen = set()
+        for rec in recommendations:
+            if rec not in seen:
+                print(f"  - {rec}")
+                seen.add(rec)
+        print("\nSuggested command:")
+        print(f"  python quick_reference.py --data {args.data} --n-factors {args.n_factors} \\")
+        print(f"    --regression-weight 100 --learning-rate 0.5 --learning-rate-decay 0.6 \\")
+        print(f"    --learning-rate-min 0.01 --max-epochs 200")
 
     # =========================================================================
     # Profiling Output (if enabled)
