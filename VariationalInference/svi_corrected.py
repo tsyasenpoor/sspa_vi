@@ -216,8 +216,12 @@ class SVICorrected:
                     self.a_beta[j, ell] += col_means[j] / self.d * 0.5 * (1 + 0.2 * self.rng.random())
         
         # η: Gene activities, Gamma(a_η, b_η)
+        # Complete conditional: η_j | β_j ~ Gamma(α_η + d*α_β, λ_η + Σ_ℓ β_jℓ)
+        # Initialize b_eta using current E[β] to avoid E[η] being unreasonably large
+        # (which would over-penalize β and collapse the model)
+        E_beta_init = self.a_beta / self.b_beta  # (p, d)
         self.a_eta = np.full(self.p, self.alpha_eta + self.d * self.alpha_beta)
-        self.b_eta = np.full(self.p, self.lambda_eta)
+        self.b_eta = self.lambda_eta + E_beta_init.sum(axis=1)  # (p,)
         
         # v: Regression coefficients, N(μ_v, Σ_v)
         # Initialize with small random values
