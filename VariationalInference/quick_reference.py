@@ -373,7 +373,7 @@ def main():
     # =========================================================================
     # STEP 2: Import Modules
     # =========================================================================
-    from BRay.VariationalInference.svi import SVI
+    from VariationalInference.svi_corrected import SVI
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
         compute_metrics, save_results, print_model_summary
@@ -557,13 +557,13 @@ def main():
     print(f"Using batched processing with batch_size={auto_batch_size} for memory efficiency")
 
     # Compute probabilities with batching
-    y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=50, batch_size=auto_batch_size)
+    y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=50)
     if args.verbose:
         print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
 
     # DEBUG: Compute logits and correlation with labels (batched)
-    train_result = model.transform_batched(X_train, y_new=None, X_aux_new=X_aux_train,
-                                          n_iter=50, batch_size=auto_batch_size)
+    train_result = model.transform(X_train, y_new=None, X_aux_new=X_aux_train,
+                                          n_iter=50)
     E_theta_train = train_result['E_theta']
     train_logits = E_theta_train @ model.mu_v.T
     if model.p_aux > 0 and model.mu_gamma is not None:
@@ -620,12 +620,12 @@ def main():
     print("=" * 80)
 
     # Infer theta for validation set (batched)
-    val_result = model.transform_batched(X_val, y_new=None, X_aux_new=X_aux_val,
-                                        n_iter=50, batch_size=auto_batch_size)
+    val_result = model.transform(X_val, y_new=None, X_aux_new=X_aux_val,
+                                        n_iter=50)
     # E_theta_val = val_result['E_theta']
 
     # Compute probabilities (batched)
-    y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=50, batch_size=auto_batch_size)
+    y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=50)
     if args.verbose:
         print(f"Predicted probabilities: min={y_val_proba.min():.4f}, max={y_val_proba.max():.4f}")
     
@@ -667,12 +667,12 @@ def main():
     print("=" * 80)
 
     # Infer theta for test set (batched)
-    test_result = model.transform_batched(X_test, y_new=None, X_aux_new=X_aux_test,
-                                         n_iter=50, batch_size=auto_batch_size)
+    test_result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test,
+                                         n_iter=50)
     # E_theta_test = test_result['E_theta']
 
     # Compute probabilities (batched)
-    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50, batch_size=auto_batch_size)
+    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50)
     if args.verbose:
         print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
     print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")

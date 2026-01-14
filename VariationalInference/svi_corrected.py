@@ -1282,86 +1282,8 @@ class SVICorrected:
             'b_xi': np.array(b_xi)
         }
 
-    def transform_batched(self, X_new: np.ndarray, y_new: np.ndarray = None,
-                          X_aux_new: np.ndarray = None, n_iter: int = 50,
-                          batch_size: int = 32) -> dict:
-        """
-        Memory-efficient batched version of transform.
-        
-        Parameters
-        ----------
-        X_new : (n_new, p) count matrix (dense or sparse)
-        y_new : (n_new,) or (n_new, κ) labels (optional)
-        X_aux_new : (n_new, p_aux) auxiliary covariates
-        n_iter : local VI iterations
-        batch_size : number of samples to process at once
-        
-        Returns
-        -------
-        dict with keys: 'E_theta', 'a_theta', 'b_theta', 'a_xi', 'b_xi'
-        """
-        n_new = X_new.shape[0]
-        
-        # Prepare auxiliary data
-        if X_aux_new is None:
-            X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
-        else:
-            X_aux_new = np.array(X_aux_new)
-        
-        if y_new is None:
-            y_new = np.full((n_new, self.kappa), 0.5)
-        else:
-            y_new = np.array(y_new)
-            y_new = y_new.reshape(-1, 1) if y_new.ndim == 1 else y_new
-        
-        # Initialize result arrays
-        E_theta_all = np.zeros((n_new, self.d))
-        a_theta_all = np.zeros((n_new, self.d))
-        b_theta_all = np.zeros((n_new, self.d))
-        a_xi_all = np.zeros(n_new)
-        b_xi_all = np.zeros(n_new)
-        
-        # Process in batches
-        n_batches = (n_new + batch_size - 1) // batch_size
-        for batch_idx in range(n_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, n_new)
-            
-            # Extract batch
-            if sp.issparse(X_new):
-                X_batch = X_new[start_idx:end_idx]
-            else:
-                X_batch = X_new[start_idx:end_idx]
-            
-            X_aux_batch = X_aux_new[start_idx:end_idx]
-            y_batch = y_new[start_idx:end_idx]
-            
-            # Process batch with regular transform
-            batch_result = self.transform(X_batch, y_new=y_batch,
-                                         X_aux_new=X_aux_batch, n_iter=n_iter)
-            
-            # Store results
-            E_theta_all[start_idx:end_idx] = batch_result['E_theta']
-            a_theta_all[start_idx:end_idx] = batch_result['a_theta']
-            b_theta_all[start_idx:end_idx] = batch_result['b_theta']
-            a_xi_all[start_idx:end_idx] = batch_result['a_xi']
-            b_xi_all[start_idx:end_idx] = batch_result['b_xi']
-            
-            # Clear GPU memory after each batch
-            if batch_idx % 5 == 0:  # Clear every 5 batches
-                import gc
-                gc.collect()
-        
-        return {
-            'E_theta': E_theta_all,
-            'a_theta': a_theta_all,
-            'b_theta': b_theta_all,
-            'a_xi': a_xi_all,
-            'b_xi': b_xi_all
-        }
-
     def predict_proba(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
-                      n_iter: int = 50, batch_size: int = None) -> np.ndarray:
+                      n_iter: int = 50) -> np.ndarray:
         """
         Predict class probabilities for new samples.
         
@@ -1370,7 +1292,6 @@ class SVICorrected:
         X_new : (n_new, p) count matrix (dense or sparse)
         X_aux_new : (n_new, p_aux) auxiliary covariates
         n_iter : local VI iterations for θ inference
-        batch_size : if specified, use batched processing for memory efficiency
         
         Returns
         -------
@@ -1381,21 +1302,8 @@ class SVICorrected:
             X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
         else:
             X_aux_new = np.array(X_aux_new)
-        
-        # Use batched processing if batch_size specified or if data is large
-        if batch_size is not None or (n_new * self.p * self.d > 1e9):  # >1GB tensor
-            if batch_size is None:
-                # Auto-determine batch size based on data dimensions
-                # Target ~500MB per batch
-                target_bytes = 500 * 1024 * 1024
-                bytes_per_sample = self.p * self.d * 8  # float64
-                batch_size = max(1, int(target_bytes / bytes_per_sample))
             
-            result = self.transform_batched(X_new, y_new=None, X_aux_new=X_aux_new,
-                                           n_iter=n_iter, batch_size=batch_size)
-        else:
-            result = self.transform(X_new, y_new=None, X_aux_new=X_aux_new, n_iter=n_iter)
-        
+        result = self.transform(X_new, y_new=None, X_aux_new=X_aux_new, n_iter=n_iter)
         E_theta = jnp.array(result['E_theta'])
         
         # Compute logits: θ @ v^T + X_aux @ γ^T
@@ -1408,7 +1316,7 @@ class SVICorrected:
         return np.array(proba).squeeze()
 
     def predict(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
-                n_iter: int = 50, threshold: float = 0.5, batch_size: int = None) -> np.ndarray:
+                n_iter: int = 50, threshold: float = 0.5) -> np.ndarray:
         """
         Predict class labels for new samples.
         
@@ -1418,13 +1326,12 @@ class SVICorrected:
         X_aux_new : (n_new, p_aux) auxiliary covariates
         n_iter : local VI iterations for θ inference
         threshold : classification threshold
-        batch_size : if specified, use batched processing for memory efficiency
         
         Returns
         -------
         labels : (n_new,) or (n_new, κ) predicted labels
         """
-        proba = self.predict_proba(X_new, X_aux_new, n_iter, batch_size=batch_size)
+        proba = self.predict_proba(X_new, X_aux_new, n_iter)
         return (proba >= threshold).astype(int)
 
 

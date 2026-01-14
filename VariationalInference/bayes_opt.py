@@ -62,7 +62,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 # Import VI components
 from VariationalInference.data_loader import DataLoader
-from BRay.VariationalInference.svi import SVI
+from VariationalInference.svi_corrected import SVI
 from VariationalInference.utils import compute_metrics
 
 # Configure logging

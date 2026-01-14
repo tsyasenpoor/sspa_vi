@@ -303,3 +303,5 @@ jobs_sh/ibd_svi_normalized.sh
 jobs_sh/ibd_svi.sh
 jobs_sh/sim_bayes_opt.sh
 sspa.ipynb
+BRAY_FileTransfer/goa_human.gaf.gz
+BRAY_FileTransfer/Covid19/gm_ctrl_covid.h5ad
