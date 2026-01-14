@@ -22,7 +22,7 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
-
+archive/
 # Project-specific
 miscc/
 
@@ -299,3 +299,4 @@ jobs_sh/sim_svi.sh
 jobs_sh/ibd_svi_normalized.sh
 jobs_sh/ibd_svi.sh
 jobs_sh/sim_bayes_opt.sh
+sspa.ipynb

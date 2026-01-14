@@ -44,6 +44,8 @@ For more information:
 For CLI usage:
     python -m VariationalInference.cli train --help
 """
+import os 
+os.environ['XLA_FLAGS'] = '--xla_gpu_enable_triton_gemm=false'
 
 import sys
 from pathlib import Path
@@ -55,6 +57,7 @@ if str(parent_dir) not in sys.path:
     sys.path.insert(0, str(parent_dir))
 
 import argparse
+import pickle
 import numpy as np
 import pandas as pd
 from typing import Optional, List
@@ -108,6 +111,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help='Path to gene annotation CSV for protein-coding filter'
+    )
+    parser.add_argument(
+        '--cache-dir',
+        type=str,
+        default='/labs/Aguiar/SSPA_BRAY/cache',
+        help='Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)'
     )
 
     # SVI Training options
@@ -253,6 +262,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help='Use spike-and-slab priors (default: False). Set to True for sparse priors.'
     )
+    parser.add_argument(
+        '--count-scale',
+        type=float,
+        default=None,
+        help='Count scaling factor for Poisson likelihood. None=auto (median library size)'
+    )
 
     # Normalization options
     parser.add_argument(
@@ -358,7 +373,7 @@ def main():
     # =========================================================================
     # STEP 2: Import Modules
     # =========================================================================
-    from VariationalInference.svi_corrected import SVI
+    from BRay.VariationalInference.svi import SVI
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
         compute_metrics, save_results, print_model_summary
@@ -374,6 +389,8 @@ def main():
     loader = DataLoader(
         data_path=args.data,
         gene_annotation_path=args.gene_annotation,
+        cache_dir=args.cache_dir,
+        use_cache=True,
         verbose=args.verbose
     )
 
@@ -435,6 +452,7 @@ def main():
     print(f"  sigma_gamma:  {args.sigma_gamma:.4f}")
     print(f"  pi_v:         {args.pi_v:.4f}")
     print(f"  pi_beta:      {args.pi_beta:.4f}")
+    print(f"  count_scale:  {args.count_scale if args.count_scale else 'auto'}")
 
     # =========================================================================
     # STEP 4: Train SVI Model
@@ -463,6 +481,7 @@ def main():
         sigma_gamma=args.sigma_gamma,
         pi_v=args.pi_v,
         pi_beta=args.pi_beta,
+        count_scale=args.count_scale,
         random_state=args.seed,
         use_spike_slab=args.use_spike_slab,
         ema_decay=args.ema_decay,
@@ -521,18 +540,30 @@ def main():
     print("Training Set Evaluation")
     print("=" * 80)
 
+    # Setup output directory for incremental saves
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     # Use the stored training parameters from the final epoch
     # These are the actual θ values that were used during training
     # E_theta_train = model.train_a_theta_ / model.train_b_theta_
     print("Using stored training set θ from final epoch")
+    
+    # Determine appropriate batch size for memory efficiency
+    # Target ~500MB per batch for the (n_batch, p, d) tensor
+    target_bytes = 500 * 1024 * 1024
+    bytes_per_sample = model.p * model.d * 8
+    auto_batch_size = max(1, int(target_bytes / bytes_per_sample))
+    print(f"Using batched processing with batch_size={auto_batch_size} for memory efficiency")
 
-    # Compute probabilities
-    y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=50)
+    # Compute probabilities with batching
+    y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=50, batch_size=auto_batch_size)
     if args.verbose:
         print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
 
-    # DEBUG: Compute logits and correlation with labels
-    train_result = model.transform(X_train, y_new=None, X_aux_new=X_aux_train, n_iter=50)
+    # DEBUG: Compute logits and correlation with labels (batched)
+    train_result = model.transform_batched(X_train, y_new=None, X_aux_new=X_aux_train,
+                                          n_iter=50, batch_size=auto_batch_size)
     E_theta_train = train_result['E_theta']
     train_logits = E_theta_train @ model.mu_v.T
     if model.p_aux > 0 and model.mu_gamma is not None:
@@ -568,6 +599,18 @@ def main():
     print(f"  F1:        {train_metrics['f1']:.4f}")
     print(f"  Precision: {train_metrics['precision']:.4f}")
     print(f"  Recall:    {train_metrics['recall']:.4f}")
+    
+    # Save training results immediately
+    train_results_path = output_dir / 'training_results.pkl'
+    with open(train_results_path, 'wb') as f:
+        pickle.dump({
+            'metrics': train_metrics,
+            'predictions': y_train_pred,
+            'probabilities': y_train_proba,
+            'logits': train_logits,
+            'E_theta': E_theta_train
+        }, f)
+    print(f"Training results saved to {train_results_path}")
 
     # =========================================================================
     # STEP 6: Evaluate on Validation Set
@@ -576,12 +619,13 @@ def main():
     print("Validation Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for validation set
-    val_result = model.transform(X_val, y_new=None, X_aux_new=X_aux_val, n_iter=50)
+    # Infer theta for validation set (batched)
+    val_result = model.transform_batched(X_val, y_new=None, X_aux_new=X_aux_val,
+                                        n_iter=50, batch_size=auto_batch_size)
     # E_theta_val = val_result['E_theta']
 
-    # Compute probabilities
-    y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=50)
+    # Compute probabilities (batched)
+    y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=50, batch_size=auto_batch_size)
     if args.verbose:
         print(f"Predicted probabilities: min={y_val_proba.min():.4f}, max={y_val_proba.max():.4f}")
     
@@ -602,6 +646,18 @@ def main():
     print(f"  F1:        {val_metrics['f1']:.4f}")
     print(f"  Precision: {val_metrics['precision']:.4f}")
     print(f"  Recall:    {val_metrics['recall']:.4f}")
+    
+    # Save validation results immediately
+    val_results_path = output_dir / 'validation_results.pkl'
+    with open(val_results_path, 'wb') as f:
+        pickle.dump({
+            'metrics': val_metrics,
+            'predictions': y_val_pred,
+            'probabilities': y_val_proba,
+            'optimal_threshold': optimal_threshold,
+            'E_theta': val_result['E_theta']
+        }, f)
+    print(f"Validation results saved to {val_results_path}")
 
     # =========================================================================
     # STEP 7: Evaluate on Test Set
@@ -610,12 +666,13 @@ def main():
     print("Test Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for test set
-    test_result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test, n_iter=50)
+    # Infer theta for test set (batched)
+    test_result = model.transform_batched(X_test, y_new=None, X_aux_new=X_aux_test,
+                                         n_iter=50, batch_size=auto_batch_size)
     # E_theta_test = test_result['E_theta']
 
-    # Compute probabilities
-    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50)
+    # Compute probabilities (batched)
+    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50, batch_size=auto_batch_size)
     if args.verbose:
         print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
     print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")
@@ -629,6 +686,17 @@ def main():
     print(f"  F1:        {test_metrics['f1']:.4f}")
     print(f"  Precision: {test_metrics['precision']:.4f}")
     print(f"  Recall:    {test_metrics['recall']:.4f}")
+    
+    # Save test results immediately
+    test_results_path = output_dir / 'test_results.pkl'
+    with open(test_results_path, 'wb') as f:
+        pickle.dump({
+            'metrics': test_metrics,
+            'predictions': y_test_pred,
+            'probabilities': y_test_proba,
+            'E_theta': test_result['E_theta']
+        }, f)
+    print(f"Test results saved to {test_results_path}")
 
     # =========================================================================
     # STEP 8: Save Results
@@ -637,7 +705,7 @@ def main():
     print("Saving Results")
     print("=" * 80)
 
-    output_dir = Path(args.output_dir)
+    # output_dir already defined earlier for incremental saves
     prefix = 'svi'
     saved_files = save_results(
         model=model,

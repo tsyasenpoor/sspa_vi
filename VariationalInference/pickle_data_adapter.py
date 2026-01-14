@@ -434,7 +434,7 @@ def main():
     print(f"  output_dir:   {args.output_dir}")
     
     # Import modules
-    from VariationalInference.svi_corrected import SVI
+    from BRay.VariationalInference.svi import SVI
     from VariationalInference.utils import (
         compute_metrics, save_results, print_model_summary
     )

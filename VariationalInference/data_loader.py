@@ -481,7 +481,7 @@ class DataLoader:
         method: str = 'library_size'
     ) -> pd.DataFrame:
         """
-        Normalize count data to reduce overdispersion while preserving integers.
+        Normalize count data to reduce overdispersion.
 
         Parameters
         ----------
@@ -489,13 +489,13 @@ class DataLoader:
             Target library size (counts per cell will sum to ~this value).
         method : str, default='library_size'
             Normalization method:
-            - 'library_size': Divide by cell total, multiply by target_sum, round.
+            - 'library_size': Divide by cell total, multiply by target_sum.
             - 'median_ratio': DESeq2-style median-of-ratios.
 
         Returns
         -------
         pd.DataFrame
-            Normalized count matrix with integer values.
+            Normalized count matrix with float values.
         """
         if self.raw_df is None:
             raise ValueError("Must load expression data first")
@@ -531,21 +531,16 @@ class DataLoader:
         else:
             raise ValueError(f"Unknown normalization method: {method}")
 
-        # Stochastic rounding to integers
-        X_int = np.floor(X_norm).astype(np.int64)
-        frac = X_norm - X_int
-        rng = np.random.default_rng()
-        X_int += (rng.random(X_norm.shape) < frac).astype(np.int64)
-
+        # Keep normalized values as floats (no rounding)
         # Post-normalization stats
-        cell_sums_after = X_int.sum(axis=1)
-        var_after = X_int.var()
-        mean_after = X_int.mean()
+        cell_sums_after = X_norm.sum(axis=1)
+        var_after = X_norm.var()
+        mean_after = X_norm.mean()
         vmi_after = var_after / mean_after if mean_after > 0 else np.nan
-        self._log(f"  After:  max={X_int.max():.0f}, mean_lib_size={cell_sums_after.mean():.0f}, var/mean={vmi_after:.1f}")
+        self._log(f"  After:  max={X_norm.max():.2f}, mean_lib_size={cell_sums_after.mean():.2f}, var/mean={vmi_after:.1f}")
 
         self.raw_df = pd.DataFrame(
-            X_int,
+            X_norm,
             index=self.raw_df.index,
             columns=self.raw_df.columns
         )
@@ -601,6 +596,24 @@ class DataLoader:
 
         # EMTAB DATA: Load from CSV directory with full preprocessing
         if self.is_emtab:
+            # Check cache first
+            if self.use_cache:
+                cache_key = self._get_cache_key()
+                cache_params = f"emtab_{convert_to_ensembl}_{filter_protein_coding}_{min_cells_expressing}_{normalize}_{normalize_target_sum}_{normalize_method}"
+                cache_file = self.cache_dir / f"preprocessed_{cache_key}_{hashlib.md5(cache_params.encode()).hexdigest()[:8]}.pkl"
+
+                if cache_file.exists():
+                    self._log(f"Loading preprocessed EMTAB data from cache: {cache_file.name}")
+                    with open(cache_file, 'rb') as f:
+                        cached = pickle.load(f)
+                        self.raw_df = cached['raw_df']
+                        self.gene_list = cached['gene_list']
+                        self.cell_ids = cached['cell_ids']
+                        self.responses_df = cached.get('responses_df')
+                        self.aux_data_df = cached.get('aux_data_df')
+                    self._log(f"Loaded from cache: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
+                    return self.raw_df
+
             self._log("Detected EMTAB format - loading from CSV directory")
             self.load_emtab_files()
 
@@ -623,6 +636,19 @@ class DataLoader:
 
             self.gene_list = self.raw_df.columns.tolist()
             self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
+
+            # Save to cache
+            if self.use_cache:
+                self._log(f"Saving preprocessed EMTAB data to cache: {cache_file.name}")
+                with open(cache_file, 'wb') as f:
+                    pickle.dump({
+                        'raw_df': self.raw_df,
+                        'gene_list': self.gene_list,
+                        'cell_ids': self.cell_ids,
+                        'responses_df': self.responses_df,
+                        'aux_data_df': self.aux_data_df
+                    }, f)
+
             return self.raw_df
 
         # Override settings for singscore data
@@ -882,8 +908,9 @@ class DataLoader:
         self,
         cell_ids: List[str],
         label_column: str,
-        aux_columns: Optional[List[str]] = None
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        aux_columns: Optional[List[str]] = None,
+        return_sparse: bool = True
+    ) -> Tuple[Union[np.ndarray, sp.csr_matrix], np.ndarray, np.ndarray]:
         """
         Get X, X_aux, y matrices for given cell IDs.
 
@@ -895,11 +922,13 @@ class DataLoader:
             Column name for labels.
         aux_columns : list of str, optional
             Column names for auxiliary features.
+        return_sparse : bool, default=True
+            If True, returns X as sparse CSR matrix. If False, returns dense array.
 
         Returns
         -------
-        X : np.ndarray
-            Expression matrix (n_cells, n_genes).
+        X : np.ndarray or scipy.sparse.csr_matrix
+            Expression matrix (n_cells, n_genes). Sparse by default for efficiency.
         X_aux : np.ndarray
             Auxiliary feature matrix (n_cells, n_aux).
         y : np.ndarray
@@ -908,8 +937,10 @@ class DataLoader:
         if self.raw_df is None:
             raise ValueError("Must preprocess data first")
 
-        # Get expression matrix
+        # Get expression matrix and convert to sparse if requested
         X = self.raw_df.loc[cell_ids].values
+        if return_sparse:
+            X = sp.csr_matrix(X)
 
         # Get labels (handles simulated vs EMTAB vs h5ad)
         if self.is_simulated:
@@ -934,6 +965,12 @@ class DataLoader:
 
         # No intercept - gamma only models auxiliary variable effects
         # The model prediction is: theta @ v + X_aux @ gamma
+        
+        # Log sparsity statistics if returning sparse
+        if return_sparse:
+            sparsity = 1 - (X.nnz / (X.shape[0] * X.shape[1]))
+            self._log(f"X matrix sparsity: {sparsity*100:.2f}% (saved memory)")
+        
         return X, X_aux, y
 
     def load_and_preprocess(
@@ -950,7 +987,8 @@ class DataLoader:
         random_state: Optional[int] = None,
         normalize: bool = False,
         normalize_target_sum: float = 1e4,
-        normalize_method: str = 'library_size'
+        normalize_method: str = 'library_size',
+        return_sparse: bool = True
     ) -> Dict[str, Any]:
         """
         Complete data loading and preprocessing pipeline.
@@ -983,6 +1021,8 @@ class DataLoader:
             Target library size for normalization.
         normalize_method : str, default='library_size'
             Normalization method: 'library_size' or 'median_ratio'.
+        return_sparse : bool, default=True
+            If True, returns expression matrices as sparse CSR matrices for memory efficiency.
 
         Returns
         -------
@@ -993,6 +1033,11 @@ class DataLoader:
             - 'test': (X_test, X_aux_test, y_test)
             - 'gene_list': list of gene names
             - 'splits': dict of cell ID lists
+            
+        Note
+        ----
+        Gene expression data (X matrices) are returned as sparse matrices by default
+        for memory efficiency, as scRNA-seq data is typically very sparse.
         """
         # Preprocess
         self.preprocess(
@@ -1013,15 +1058,15 @@ class DataLoader:
             random_state=random_state
         )
 
-        # Get matrices for each split
+        # Get matrices for each split (sparse by default for memory efficiency)
         X_train, X_aux_train, y_train = self.get_matrices(
-            splits['train'], label_column, aux_columns
+            splits['train'], label_column, aux_columns, return_sparse=return_sparse
         )
         X_val, X_aux_val, y_val = self.get_matrices(
-            splits['val'], label_column, aux_columns
+            splits['val'], label_column, aux_columns, return_sparse=return_sparse
         )
         X_test, X_aux_test, y_test = self.get_matrices(
-            splits['test'], label_column, aux_columns
+            splits['test'], label_column, aux_columns, return_sparse=return_sparse
         )
 
         return {
@@ -1067,21 +1112,31 @@ def load_data(
         Path to gene annotation CSV.
     **kwargs
         Additional arguments passed to load_and_preprocess().
+        Key argument: return_sparse=True to return sparse matrices (default).
 
     Returns
     -------
     dict
-        Preprocessed data dictionary.
+        Preprocessed data dictionary with sparse expression matrices by default.
 
     Examples
     --------
-    >>> # Load from h5ad
+    >>> # Load from h5ad with sparse matrices (default)
     >>> data = load_data(
     ...     '/path/to/Bcell_GEX.h5ad',
     ...     label_column='t2dm',
     ...     aux_columns=['Sex']
     ... )
     >>> X_train, X_aux_train, y_train = data['train']
+    >>> # X_train is scipy.sparse.csr_matrix
+    >>>
+    >>> # Load with dense matrices
+    >>> data = load_data(
+    ...     '/path/to/Bcell_GEX.h5ad',
+    ...     label_column='t2dm',
+    ...     aux_columns=['Sex'],
+    ...     return_sparse=False
+    ... )
     >>>
     >>> # Load from EMTAB directory
     >>> data = load_data(

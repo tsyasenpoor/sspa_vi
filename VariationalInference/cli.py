@@ -409,7 +409,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     import cProfile
     import pstats
     import io
-    from .svi_corrected import SVI
+    from .svi import SVI
     from .data_loader import DataLoader
     from .utils import save_results, compute_metrics, print_model_summary
 

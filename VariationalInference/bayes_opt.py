@@ -28,6 +28,8 @@ Usage:
 
 Author: Generated for VI hyperparameter optimization
 """
+import os 
+os.environ['XLA_FLAGS'] = '--xla_gpu_enable_triton_gemm=false'
 
 import argparse
 import json
@@ -47,6 +49,8 @@ from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner, SuccessiveHalvingPruner
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
+import scipy.sparse as sp
+import jax.numpy as jnp
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -58,7 +62,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 # Import VI components
 from VariationalInference.data_loader import DataLoader
-from VariationalInference.svi_corrected import SVI
+from BRay.VariationalInference.svi import SVI
 from VariationalInference.utils import compute_metrics
 
 # Configure logging
@@ -375,6 +379,178 @@ def get_simulation_search_space() -> Dict[str, Dict[str, Any]]:
     }
 
 
+def get_emtab_search_space() -> Dict[str, Dict[str, Any]]:
+    """
+    Full search space for EMTAB11349 data with comprehensive hyperparameter exploration.
+    
+    Dataset characteristics:
+    - ~590 cells, ~10k genes after filtering
+    - ~59% sparse after library size normalization
+    - Balanced binary labels (186/226 split)
+    
+    Based on successful run (ibd_svi_norm_1283703.out):
+    - n_factors=150: AUC 0.74, training time 149.8s
+    - Working hyperparameters provide starting point
+    
+    Full exploration strategy:
+    - n_factors: 100-2000 to find optimal capacity for 10k genes
+    - Spike-and-slab: Full range to discover optimal sparsity patterns
+    - All hyperparameters: Broad ranges for comprehensive search
+    """
+    return {
+        # =====================================================================
+        # MODEL CAPACITY (10k genes → try up to 2000 factors)
+        # =====================================================================
+        'n_factors': {
+            'type': 'int',
+            'low': 100,
+            'high': 2000,
+            'step': 100,
+            'description': 'Latent factors (100-2000 for 10k genes, exploring high capacity)'
+        },
+        
+        # =====================================================================
+        # LEARNING RATE SCHEDULE
+        # =====================================================================
+        'learning_rate': {
+            'type': 'float',
+            'low': 0.05,
+            'high': 0.8,
+            'log': True,
+            'description': 'Initial learning rate (broad range for different capacities)'
+        },
+        'learning_rate_decay': {
+            'type': 'float',
+            'low': 0.5,
+            'high': 0.8,
+            'log': False,
+            'description': 'Decay exponent (slower decay for large models)'
+        },
+        'learning_rate_min': {
+            'type': 'float',
+            'low': 0.001,
+            'high': 0.05,
+            'log': True,
+            'description': 'Minimum learning rate floor'
+        },
+        
+        # =====================================================================
+        # GAMMA PRIOR SHAPE (full range for sparsity exploration)
+        # =====================================================================
+        'alpha_theta': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 8.0,
+            'log': False,
+            'description': 'Sample factor sparsity (1.0=minimal, 8.0=heavy shrinkage)'
+        },
+        'alpha_beta': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 10.0,
+            'log': False,
+            'description': 'Gene loading sparsity (explore full range)'
+        },
+        
+        # =====================================================================
+        # HIERARCHICAL SHRINKAGE
+        # =====================================================================
+        'alpha_xi': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 6.0,
+            'log': False,
+            'description': 'Sample depth heterogeneity'
+        },
+        'alpha_eta': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 6.0,
+            'log': False,
+            'description': 'Gene scale heterogeneity'
+        },
+        'lambda_xi': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 20.0,
+            'log': True,
+            'description': 'Prior mean for sample depth'
+        },
+        'lambda_eta': {
+            'type': 'float',
+            'low': 0.1,
+            'high': 5.0,
+            'log': True,
+            'description': 'Prior mean for gene scaling'
+        },
+        
+        # =====================================================================
+        # REGRESSION REGULARIZATION
+        # =====================================================================
+        'sigma_v': {
+            'type': 'float',
+            'low': 0.5,
+            'high': 5.0,
+            'log': True,
+            'description': 'Disease effect regularization (broad range)'
+        },
+        'sigma_gamma': {
+            'type': 'float',
+            'low': 0.1,
+            'high': 2.0,
+            'log': True,
+            'description': 'Auxiliary covariate regularization'
+        },
+        
+        # =====================================================================
+        # CLASSIFICATION-RECONSTRUCTION TRADEOFF
+        # =====================================================================
+        'regression_weight': {
+            'type': 'float',
+            'low': 10.0,
+            'high': 500.0,
+            'log': True,
+            'description': 'Disease vs reconstruction balance (log scale for wide range)'
+        },
+        
+        # =====================================================================
+        # SPIKE-AND-SLAB SPARSITY (full exploration)
+        # =====================================================================
+        'pi_v': {
+            'type': 'float',
+            'low': 0.3,
+            'high': 1.0,
+            'log': False,
+            'description': 'Disease coefficient inclusion prob (0.3=sparse, 1.0=dense)'
+        },
+        'pi_beta': {
+            'type': 'float',
+            'low': 0.01,
+            'high': 1.0,
+            'log': True,
+            'description': 'Gene-program sparsity (0.01=very sparse, 1.0=dense)'
+        },
+        
+        # =====================================================================
+        # TRAINING DYNAMICS
+        # =====================================================================
+        'local_iterations': {
+            'type': 'int',
+            'low': 5,
+            'high': 20,
+            'step': 5,
+            'description': 'Local CAVI iterations (more for complex models)'
+        },
+        'batch_size': {
+            'type': 'int',
+            'low': 64,
+            'high': 256,
+            'step': 32,
+            'description': 'Mini-batch size (larger for stability with big models)'
+        },
+    }
+
+
 def get_search_space_for_data(data_type: str) -> Dict[str, Dict[str, Any]]:
     """
     Get appropriate search space based on data type.
@@ -388,13 +564,7 @@ def get_search_space_for_data(data_type: str) -> Dict[str, Dict[str, Any]]:
     if data_type == 'simulation':
         return get_simulation_search_space()
     elif data_type == 'emtab':
-        # EMTAB-specific space (larger gene set, more cells)
-        space = get_default_search_space()
-        space['n_factors'] = {
-            'type': 'int', 'low': 100, 'high': 300, 'step': 25,
-            'description': 'Latent factors for ~10k genes'
-        }
-        return space
+        return get_emtab_search_space()
     elif data_type == 'large':
         # Large dataset space (conservative learning rate)
         space = get_default_search_space()
@@ -470,6 +640,7 @@ class VIObjective:
         label_column: str,
         aux_columns: Optional[List[str]] = None,
         gene_annotation_path: Optional[str] = None,
+        cache_dir: Optional[str] = None,
         method: str = 'vi',
         max_iter: int = 100,
         batch_size: int = 128,
@@ -493,6 +664,7 @@ class VIObjective:
             label_column: Column name for binary labels (in adata.obs or responses.csv.gz)
             aux_columns: List of auxiliary feature column names
             gene_annotation_path: Path to gene annotation CSV (optional)
+            cache_dir: Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)
             method: 'vi' or 'svi'
             max_iter: Maximum iterations for training
             batch_size: Batch size for SVI
@@ -515,6 +687,7 @@ class VIObjective:
         self.label_column = label_column
         self.aux_columns = aux_columns or []
         self.gene_annotation_path = gene_annotation_path
+        self.cache_dir = cache_dir
         self.method = method
         self.max_iter = max_iter
         self.batch_size = batch_size
@@ -555,7 +728,9 @@ class VIObjective:
 
         loader = DataLoader(
             data_path=self.data_path,
-            gene_annotation_path=self.gene_annotation_path
+            gene_annotation_path=self.gene_annotation_path,
+            cache_dir=self.cache_dir,
+            use_cache=True
         )
 
         data = loader.load_and_preprocess(
@@ -571,9 +746,40 @@ class VIObjective:
         self._X_test, self._X_aux_test, self._y_test = data['test']
         self._gene_list = data['gene_list']
 
+        # Convert sparse matrices to dense JAX arrays ONCE for all trials
+        # This saves significant time as conversion happens only once instead of per trial
+        logger.info("Converting data to dense JAX arrays (one-time operation)...")
+        if sp.issparse(self._X_train):
+            self._X_train = jnp.array(self._X_train.toarray())
+        else:
+            self._X_train = jnp.array(self._X_train)
+        
+        if sp.issparse(self._X_val):
+            self._X_val = jnp.array(self._X_val.toarray())
+        else:
+            self._X_val = jnp.array(self._X_val)
+        
+        if sp.issparse(self._X_test):
+            self._X_test = jnp.array(self._X_test.toarray())
+        else:
+            self._X_test = jnp.array(self._X_test)
+        
+        # Convert auxiliary data to JAX arrays
+        if self._X_aux_train is not None:
+            self._X_aux_train = jnp.array(self._X_aux_train)
+        if self._X_aux_val is not None:
+            self._X_aux_val = jnp.array(self._X_aux_val)
+        if self._X_aux_test is not None:
+            self._X_aux_test = jnp.array(self._X_aux_test)
+        
+        # Convert labels to JAX arrays
+        self._y_train = jnp.array(self._y_train)
+        self._y_val = jnp.array(self._y_val)
+        self._y_test = jnp.array(self._y_test)
+
         self._data_loaded = True
 
-        logger.info(f"Data loaded: {self._X_train.shape[0]} train, "
+        logger.info(f"Data loaded and converted to JAX: {self._X_train.shape[0]} train, "
                    f"{self._X_val.shape[0]} val, {self._X_test.shape[0]} test samples")
         logger.info(f"Number of genes: {self._X_train.shape[1]}")
 
@@ -631,7 +837,8 @@ class VIObjective:
 
         # Stratified subsampling using train_test_split
         # We keep the "train" part which has subsample_frac of the data
-        y_flat = self._y_train.ravel()
+        # Convert JAX array to numpy for sklearn compatibility
+        y_flat = np.array(self._y_train).ravel()
 
         try:
             # Use stratified split - keep only the selected subset
@@ -643,6 +850,7 @@ class VIObjective:
                 random_state=trial_seed
             )
 
+            # Index JAX arrays and keep as JAX arrays
             X_sub = self._X_train[selected_indices]
             y_sub = self._y_train[selected_indices]
 
@@ -653,7 +861,7 @@ class VIObjective:
 
             if self.verbose:
                 # Log class distribution in subsample
-                pos_ratio = y_sub.sum() / len(y_sub)
+                pos_ratio = float(np.array(y_sub).sum()) / len(y_sub)
                 orig_pos_ratio = y_flat.sum() / len(y_flat)
                 logger.debug(
                     f"Trial {trial_number}: Subsampled {len(selected_indices)}/{n_train} samples "
@@ -671,6 +879,7 @@ class VIObjective:
             rng = np.random.RandomState(trial_seed)
             selected_indices = rng.choice(n_train, size=target_size, replace=False)
 
+            # Index JAX arrays and keep as JAX arrays
             X_sub = self._X_train[selected_indices]
             y_sub = self._y_train[selected_indices]
             X_aux_sub = self._X_aux_train[selected_indices] if self._X_aux_train is not None else None
@@ -749,10 +958,12 @@ class VIObjective:
                 self._X_aux_val
             )
 
-            # Compute validation metrics
-            val_auc = roc_auc_score(self._y_val.ravel(), y_val_proba.ravel())
-            y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
-            metrics = compute_metrics(self._y_val.ravel(), y_val_pred, y_val_proba.ravel())
+            # Compute validation metrics (convert JAX arrays to numpy for sklearn)
+            y_val_np = np.array(self._y_val).ravel()
+            y_val_proba_np = np.array(y_val_proba).ravel()
+            val_auc = roc_auc_score(y_val_np, y_val_proba_np)
+            y_val_pred = (y_val_proba_np > 0.5).astype(int)
+            metrics = compute_metrics(y_val_np, y_val_pred, y_val_proba_np)
             val_accuracy = metrics.get('accuracy', 0)
 
             # Log trial result
@@ -1193,6 +1404,11 @@ Examples:
         default=None,
         help='Path to gene annotation CSV file'
     )
+    parser.add_argument(
+        '--cache-dir',
+        default='/labs/Aguiar/SSPA_BRAY/cache',
+        help='Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)'
+    )
 
     # Optimization arguments
     parser.add_argument(
@@ -1376,6 +1592,7 @@ def main():
     logger.info("BAYESIAN OPTIMIZATION FOR VI HYPERPARAMETERS")
     logger.info("=" * 60)
     logger.info(f"Data: {args.data}")
+    logger.info(f"Cache directory: {args.cache_dir}")
     logger.info(f"Data type: {args.data_type}")
     logger.info(f"Search space: {len(search_space)} parameters")
     logger.info(f"Label column: {args.label_column}")
@@ -1424,6 +1641,7 @@ def main():
         label_column=args.label_column,
         aux_columns=args.aux_columns,
         gene_annotation_path=args.gene_annotation,
+        cache_dir=args.cache_dir,
         method=args.method,
         max_iter=args.max_iter,
         batch_size=args.batch_size,

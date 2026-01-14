@@ -417,6 +417,29 @@ def save_results(
     if hasattr(model, 'convergence_history_') and model.convergence_history_:
         summary['convergence_history'] = model.convergence_history_
 
+    # Convert JAX/NumPy types to JSON-serializable Python types
+    def convert_to_json_serializable(obj):
+        """Recursively convert JAX/NumPy types to native Python types."""
+        if isinstance(obj, dict):
+            return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_json_serializable(item) for item in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.floating, np.bool_)):
+            return obj.item()
+        elif hasattr(obj, '__array__'):  # JAX arrays and scalars
+            arr = np.array(obj)
+            if arr.ndim == 0:  # Scalar
+                return arr.item()
+            return arr.tolist()
+        elif obj is None or isinstance(obj, (int, float, str, bool)):
+            return obj
+        else:
+            return str(obj)  # Fallback for unknown types
+    
+    summary = convert_to_json_serializable(summary)
+    
     summary_path = output_dir / f'{prefix}_summary.json'
     if compress:
         summary_path = output_dir / f'{prefix}_summary.json.gz'
