@@ -22,9 +22,12 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
-archive/
+
 # Project-specific
 miscc/
+archive/
+cache/
+archive/old_implementations
 
 cytokine_de_results_no_outliers.csv
 cytoseed_ensembl_cache.pkl
