@@ -96,31 +96,38 @@ if (grepl("\\.h5ad$", input_file)) {
     cat("  Cell names found:", !is.null(cell_names), ifelse(!is.null(n_obs_from_names), paste0(" (n=", n_obs_from_names, ")"), ""), "\n")
 
     # Extract count matrix (X)
+    # Target: SCE format is var x obs (genes x cells), i.e., (n_var x n_obs)
+    n_obs <- if (!is.null(n_obs_from_names)) n_obs_from_names else NA
+    n_var <- if (!is.null(n_var_from_names)) n_var_from_names else NA
+
     if ("X" %in% names(h5_data)) {
         if (is.list(h5_data$X)) {
             # Sparse matrix format - could be CSR or CSC
             # CSR (row-compressed): indptr length = n_rows + 1, indices = column indices
             # CSC (col-compressed): indptr length = n_cols + 1, indices = row indices
+            cat("  Sparse matrix detected\n")
 
             indptr_len <- length(h5_data$X$indptr) - 1
-            max_index <- max(h5_data$X$indices) + 1  # +1 for 0-indexing
+            max_index <- if (length(h5_data$X$indices) > 0) max(h5_data$X$indices) + 1 else 0
+
+            cat("  indptr_len=", indptr_len, ", max_index=", max_index, "\n")
 
             # Determine format based on indptr length matching obs or var count
             # AnnData X is obs x var (cells x genes)
             is_csr <- FALSE
             is_csc <- FALSE
 
-            if (!is.null(n_obs_from_names) && !is.null(n_var_from_names)) {
-                if (indptr_len == n_obs_from_names) {
+            if (!is.na(n_obs) && !is.na(n_var)) {
+                if (indptr_len == n_obs) {
                     is_csr <- TRUE
-                    cat("  Detected CSR format (indptr matches n_obs=", n_obs_from_names, ")\n")
-                } else if (indptr_len == n_var_from_names) {
+                    cat("  Detected CSR format (indptr matches n_obs=", n_obs, ")\n")
+                } else if (indptr_len == n_var) {
                     is_csc <- TRUE
-                    cat("  Detected CSC format (indptr matches n_var=", n_var_from_names, ")\n")
+                    cat("  Detected CSC format (indptr matches n_var=", n_var, ")\n")
                 } else {
                     # Fallback: guess based on which dimension the indices fit
-                    cat("  WARNING: indptr_len (", indptr_len, ") matches neither n_obs (", n_obs_from_names, ") nor n_var (", n_var_from_names, ")\n")
-                    if (max_index <= n_var_from_names && indptr_len <= n_obs_from_names * 2) {
+                    cat("  WARNING: indptr_len (", indptr_len, ") matches neither n_obs (", n_obs, ") nor n_var (", n_var, ")\n")
+                    if (max_index <= n_var && indptr_len <= n_obs * 2) {
                         is_csr <- TRUE
                         cat("  Assuming CSR format\n")
                     } else {
@@ -134,8 +141,9 @@ if (grepl("\\.h5ad$", input_file)) {
                 cat("  No metadata dimensions, assuming CSR format\n")
             }
 
-            n_obs <- if (!is.null(n_obs_from_names)) n_obs_from_names else (if (is_csr) indptr_len else max_index)
-            n_var <- if (!is.null(n_var_from_names)) n_var_from_names else (if (is_csc) indptr_len else max_index)
+            # Set dimensions if not known from metadata
+            if (is.na(n_obs)) n_obs <- if (is_csr) indptr_len else max_index
+            if (is.na(n_var)) n_var <- if (is_csc) indptr_len else max_index
 
             cat("  Building sparse matrix: n_obs=", n_obs, ", n_var=", n_var, "\n")
 
@@ -169,11 +177,45 @@ if (grepl("\\.h5ad$", input_file)) {
             counts <- t(counts)
             cat("  After transpose (genes x cells): ", nrow(counts), " x ", ncol(counts), "\n")
         } else {
-            # Dense matrix
-            counts <- t(h5_data$X)  # Transpose for SCE format (genes x cells)
+            # Dense matrix - rhdf5 may transpose due to row-major vs column-major differences
+            cat("  Dense matrix detected\n")
+            raw_counts <- h5_data$X
+            cat("  Raw matrix dimensions: ", nrow(raw_counts), " x ", ncol(raw_counts), "\n")
+
+            # Check orientation and transpose if needed
+            # We want: rows = genes (n_var), cols = cells (n_obs)
+            if (!is.na(n_var) && !is.na(n_obs)) {
+                if (nrow(raw_counts) == n_var && ncol(raw_counts) == n_obs) {
+                    # Already in correct orientation (genes x cells)
+                    cat("  Matrix already in genes x cells format, no transpose needed\n")
+                    counts <- raw_counts
+                } else if (nrow(raw_counts) == n_obs && ncol(raw_counts) == n_var) {
+                    # Need to transpose (cells x genes -> genes x cells)
+                    cat("  Matrix in cells x genes format, transposing\n")
+                    counts <- t(raw_counts)
+                } else {
+                    cat("  WARNING: Matrix dimensions (", nrow(raw_counts), "x", ncol(raw_counts),
+                        ") don't match expected (", n_var, "x", n_obs, ") or (", n_obs, "x", n_var, ")\n")
+                    # Assume it's obs x var and transpose
+                    counts <- t(raw_counts)
+                }
+            } else {
+                # No metadata, just transpose (assume standard AnnData obs x var format)
+                counts <- t(raw_counts)
+            }
         }
     } else if ("layers" %in% names(h5_data) && "counts" %in% names(h5_data$layers)) {
-        counts <- t(h5_data$layers$counts)
+        raw_counts <- h5_data$layers$counts
+        # Same orientation logic as above
+        if (!is.na(n_var) && !is.na(n_obs)) {
+            if (nrow(raw_counts) == n_var && ncol(raw_counts) == n_obs) {
+                counts <- raw_counts
+            } else {
+                counts <- t(raw_counts)
+            }
+        } else {
+            counts <- t(raw_counts)
+        }
     } else {
         stop("Could not find count matrix in h5ad file")
     }
