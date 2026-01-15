@@ -379,6 +379,9 @@ class SVICorrected:
         - Slab: Gamma(α_β, η) for β, N(0, σ_v²) for v
 
         The inclusion probability ρ represents P(factor is active).
+
+        NOTE: We use a SOFT update for v to prevent collapse to uniform values.
+        The v inclusion probabilities are updated slowly to maintain factor diversity.
         """
         if not self.use_spike_slab:
             return
@@ -402,21 +405,37 @@ class SVICorrected:
         log_odds_beta = log_prior_odds_beta + log_lik_ratio_beta
         self.rho_beta = jsp.expit(jnp.clip(log_odds_beta, -20, 20))
 
-        # === Update ρ_v (regression coefficient inclusion) ===
+        # === Update ρ_v (regression coefficient inclusion) - SOFT UPDATE ===
         # Evidence for v factor inclusion: how much does factor ℓ contribute to prediction?
         # Use |μ_v| / σ_v as evidence (signal-to-noise ratio for factor importance)
         # Large |v| with small uncertainty → factor is important for prediction
 
+        # IMPORTANT: We use a much gentler update for v to prevent collapse
+        # The original update caused all v's to converge to the same value
+
         # Signal-to-noise ratio for each factor
         v_snr = jnp.abs(self.mu_v) / (jnp.sqrt(jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)) + 1e-10)
 
-        # Log-likelihood ratio based on SNR
-        # Higher SNR → stronger evidence for inclusion
-        log_lik_ratio_v = v_snr  # Simple: SNR directly as log-likelihood ratio
+        # Use relative SNR: compare each factor to the median
+        # This prevents all factors from being excluded when overall signal is weak
+        median_snr = jnp.median(v_snr, axis=1, keepdims=True)
+        relative_snr = v_snr / (median_snr + 1e-6)
 
-        # Posterior inclusion probability
+        # Softer log-likelihood ratio: use log(1 + relative_snr) instead of raw SNR
+        # This compresses the range and prevents extreme exclusion
+        log_lik_ratio_v = jnp.log1p(relative_snr)
+
+        # Posterior inclusion probability with soft update
         log_odds_v = log_prior_odds_v + log_lik_ratio_v
-        self.rho_v = jsp.expit(jnp.clip(log_odds_v, -20, 20))
+        rho_v_new = jsp.expit(jnp.clip(log_odds_v, -10, 10))  # Narrower clip range
+
+        # Soft update: blend with previous value (EMA-style) to prevent sudden collapse
+        # Keep at least 20% of original rho_v to maintain diversity
+        soft_update_rate = 0.3  # Only update 30% towards new value
+        self.rho_v = (1 - soft_update_rate) * self.rho_v + soft_update_rate * rho_v_new
+
+        # Floor: never let rho_v go below 0.1 to keep all factors somewhat active
+        self.rho_v = jnp.maximum(self.rho_v, 0.1)
 
         # Update effective expectations with new inclusion probabilities
         self._compute_expectations()
@@ -554,31 +573,46 @@ class SVICorrected:
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Compute intermediate β parameters using natural gradient.
-        
+
         From Hoffman et al., the intermediate parameter is:
         λ̂ = α + N · E[t(x, z)]
-        
+
         For β ~ Gamma(α_β, η_j), the complete conditional natural params are:
         η₁ = α_β - 1 + Σ_i z_ijℓ
         η₂ = -η_j - Σ_i θ_iℓ
+
+        DIVERSITY FIX: We add a soft orthogonality encouragement by slightly
+        boosting factors that have different gene loading patterns from the mean.
         """
         # Compute E[z_ijℓ] = x_ij · φ_ijℓ
         log_phi = E_log_theta[:, jnp.newaxis, :] + self.E_log_beta_effective[jnp.newaxis, :, :]
         log_phi = log_phi - logsumexp(log_phi, axis=2, keepdims=True)
         phi = jnp.exp(log_phi)
-        
+
         # Sufficient statistics
         # Σ_i z_ijℓ for each gene j and factor ℓ
         z_sum = (X_batch[:, :, jnp.newaxis] * phi).sum(axis=0)  # (p, d)
         theta_sum = E_theta.sum(axis=0)  # (d,)
-        
+
+        # DIVERSITY FIX: Add soft diversity encouragement
+        # Compare each factor's gene loading pattern to the mean pattern
+        # Factors that are different from the mean get a small boost
+        beta_mean_pattern = jnp.mean(self.E_beta, axis=1, keepdims=True)  # (p, 1) mean across factors
+        deviation_from_mean = jnp.abs(self.E_beta - beta_mean_pattern)  # (p, d)
+        # Normalize deviation to [0, 1] range
+        max_deviation = jnp.max(deviation_from_mean) + 1e-6
+        diversity_boost = 0.05 * deviation_from_mean / max_deviation  # Small boost for unique patterns
+
         # Intermediate natural parameters (pretend batch is full dataset)
         eta1_hat = (self.alpha_beta - 1) + scale * z_sum
+        # Add diversity boost to shape parameter (encourages larger values for unique factors)
+        eta1_hat = eta1_hat + diversity_boost * scale * 0.1
+
         eta2_hat = -self.E_eta[:, jnp.newaxis] - scale * theta_sum[jnp.newaxis, :]
-        
+
         # Convert to canonical
         a_beta_hat, b_beta_hat = self._natural_to_gamma(eta1_hat, eta2_hat)
-        
+
         return a_beta_hat, b_beta_hat
     
     def _compute_intermediate_eta(
@@ -616,38 +650,42 @@ class SVICorrected:
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Compute intermediate v parameters.
-        
+
         VECTORIZED: Computes all outcomes and factors simultaneously.
-        
+
         v_k ~ N(0, σ_v² I)
         From JJ bound, the approximate posterior is Gaussian with:
         - Precision: (1/σ_v²) I + 2 Σ_i λ(ζ_ik) E[θ_i⊗θ_i]
         - Mean precision: Σ_i (y_ik - 0.5) E[θ_i] - 2λ(ζ_ik) E[θ_i](x^aux · γ_k)
-        
+
         For diagonal approximation (independent v_{kℓ}):
-        - precision_ℓ = 1/σ_v² + 2 Σ_i λ(ζ_ik) E[θ²_iℓ]  
+        - precision_ℓ = 1/σ_v² + 2 Σ_i λ(ζ_ik) E[θ²_iℓ]
         - mean·precision_ℓ = Σ_i [(y_ik - 0.5) - 2λ(ζ_ik) C_{ik}] E[θ_iℓ]
-        
+
         where C_{ik} = Σ_{m≠ℓ} E[θ_im] E[v_km] + x^aux · γ_k
+
+        DIVERSITY FIX: We add per-factor regularization to prevent all v's from
+        collapsing to the same value. The precision is scaled per-factor based on
+        theta variability to ensure each factor receives appropriate gradient signal.
         """
         # Expand y to (batch, kappa)
         y_expanded = y_batch if y_batch.ndim > 1 else y_batch[:, jnp.newaxis]
-        
+
         lam = self._lambda_jj(zeta)  # (batch, kappa)
-        
+
         # E[θ²] = E[θ]² + Var[θ]
         Var_theta = a_theta / (b_theta**2)  # (batch, d)
         E_theta_sq = E_theta**2 + Var_theta  # (batch, d)
-        
+
         # Auxiliary contribution: (batch, kappa)
         if self.p_aux > 0:
             aux_contrib = X_aux_batch @ self.E_gamma.T  # (batch, kappa)
         else:
             aux_contrib = 0.0
-        
+
         # Full model contribution: (batch, kappa)
         full_theta_v = E_theta @ self.E_v_effective.T  # (batch, kappa)
-        
+
         # === VECTORIZED computation over all outcomes and factors ===
         # Precision for each (outcome, factor): (kappa, d)
         precision = jnp.full((self.kappa, self.d), 1.0 / self.sigma_v**2)
@@ -655,6 +693,18 @@ class SVICorrected:
         # Precision contribution: 2 Σ_i λ(ζ_ik) E[θ²_iℓ]
         # Shape: (kappa, d) += sum over batch of (batch, kappa, d)
         precision_contrib = 2 * scale * jnp.einsum('ik,id->kd', lam, E_theta_sq)
+
+        # DIVERSITY FIX: Scale precision per-factor to prevent collapse
+        # When all factors have similar theta values, precision becomes uniform
+        # This causes all v's to receive the same gradient signal
+        # We add per-factor scaling based on theta variability
+        theta_std_per_factor = jnp.std(E_theta, axis=0)  # (d,) std across samples
+        theta_scale = theta_std_per_factor / (jnp.mean(theta_std_per_factor) + 1e-6)
+        # Factors with higher variability get slightly lower precision (more uncertainty)
+        # This prevents collapse by maintaining diversity in the update magnitudes
+        factor_scaling = 1.0 / (0.5 + 0.5 * theta_scale)  # (d,)
+        precision_contrib = precision_contrib * factor_scaling[jnp.newaxis, :]
+
         precision = precision + precision_contrib
 
         # For each factor ℓ, compute C^{(-ℓ)} = sum_{m≠ℓ} E[θ_im]E[v_km] + aux_term
@@ -667,24 +717,30 @@ class SVICorrected:
             full_linear_predictor -  # Full contribution: θ·v + aux
             E_theta[:, jnp.newaxis, :] * self.E_v_effective[jnp.newaxis, :, :]  # Subtract ℓ-th term
         )
-        
+
         # Mean*precision contribution: Σ_i [(y_ik - 0.5) - 2λ(ζ_ik) C_{ik}^{(-ℓ)}] E[θ_iℓ]
         # Shape: (kappa, d)
         # Vectorized computation using einsum
         term1 = scale * jnp.einsum('ik,id->kd', y_expanded - 0.5, E_theta)
         term2 = 2 * scale * jnp.einsum('ik,ikd,id->kd', lam, C_minus_ell, E_theta)
         mean_contrib = term1 - term2
-        
+
         # Convert to mean and variance
         Sigma_v_hat = jnp.zeros((self.kappa, self.d, self.d))
         for k in range(self.kappa):
             Sigma_v_hat = Sigma_v_hat.at[k].set(jnp.diag(1.0 / precision[k]))
-        
+
         mu_v_hat = mean_contrib / precision
-        
-        # Clip for stability
-        mu_v_hat = jnp.clip(mu_v_hat, -10, 10)
-        
+
+        # DIVERSITY FIX: Add momentum from current v to prevent total collapse
+        # This blends the new estimate with the current value
+        # Prevents sudden jumps that lead to uniform values
+        momentum = 0.1  # Keep 10% of current v direction
+        mu_v_hat = mu_v_hat + momentum * self.mu_v
+
+        # Clip for stability but with wider range to allow diversity
+        mu_v_hat = jnp.clip(mu_v_hat, -15, 15)
+
         return mu_v_hat, Sigma_v_hat
     
     def _compute_intermediate_gamma(
@@ -1498,19 +1554,219 @@ class SVICorrected:
                 n_iter: int = 50, threshold: float = 0.5) -> np.ndarray:
         """
         Predict class labels for new samples.
-        
+
         Parameters
         ----------
         X_new : (n_new, p) count matrix (dense or sparse)
         X_aux_new : (n_new, p_aux) auxiliary covariates
         n_iter : local VI iterations for θ inference
         threshold : classification threshold
-        
+
         Returns
         -------
         labels : (n_new,) or (n_new, κ) predicted labels
         """
         proba = self.predict_proba(X_new, X_aux_new, n_iter)
+        return (proba >= threshold).astype(int)
+
+    def _compute_memory_efficient_batch_size(self, target_gb: float = 0.5) -> int:
+        """
+        Compute optimal batch size for memory efficiency.
+
+        The main memory bottleneck is the (batch, p, d) tensor in transform.
+        We target approximately target_gb GB per batch.
+
+        Parameters
+        ----------
+        target_gb : float
+            Target memory usage in GB per batch
+
+        Returns
+        -------
+        int : Optimal batch size
+        """
+        # Memory for (batch, p, d) tensor in float64
+        bytes_per_sample = self.p * self.d * 8
+        target_bytes = target_gb * 1024 * 1024 * 1024
+        batch_size = max(1, int(target_bytes / bytes_per_sample))
+        return batch_size
+
+    def transform_batched(self, X_new: np.ndarray, y_new: np.ndarray = None,
+                          X_aux_new: np.ndarray = None, n_iter: int = 50,
+                          batch_size: int = None, verbose: bool = False) -> dict:
+        """
+        Memory-efficient batched inference for θ on new samples.
+
+        This method processes samples in batches to avoid OOM errors when
+        dealing with large datasets (n × p × d tensor can be huge).
+
+        Parameters
+        ----------
+        X_new : (n_new, p) count matrix (dense or sparse)
+        y_new : (n_new,) or (n_new, κ) labels (optional, for ζ updates)
+        X_aux_new : (n_new, p_aux) auxiliary covariates
+        n_iter : local VI iterations per batch
+        batch_size : samples per batch (auto-computed if None)
+        verbose : print progress
+
+        Returns
+        -------
+        dict with keys: 'E_theta', 'a_theta', 'b_theta', 'a_xi', 'b_xi'
+        """
+        # Convert sparse to dense numpy if needed
+        if sp.issparse(X_new):
+            X_new = X_new.toarray()
+        else:
+            X_new = np.array(X_new)
+
+        n_new = X_new.shape[0]
+
+        if X_aux_new is None:
+            X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
+        else:
+            X_aux_new = np.array(X_aux_new)
+
+        if y_new is None:
+            y_new = np.full((n_new, self.kappa), 0.5)
+        else:
+            y_new = np.array(y_new)
+            if y_new.ndim == 1:
+                y_new = y_new[:, np.newaxis]
+
+        # Auto-compute batch size for ~500MB memory usage
+        if batch_size is None:
+            batch_size = self._compute_memory_efficient_batch_size(target_gb=0.5)
+
+        if verbose:
+            print(f"Using batch_size={batch_size} for memory efficiency "
+                  f"(p={self.p}, d={self.d})")
+
+        # Initialize output arrays
+        E_theta_all = np.zeros((n_new, self.d))
+        a_theta_all = np.zeros((n_new, self.d))
+        b_theta_all = np.zeros((n_new, self.d))
+        a_xi_all = np.zeros(n_new)
+        b_xi_all = np.zeros(n_new)
+
+        # Process in batches
+        n_batches = (n_new + batch_size - 1) // batch_size
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_new)
+
+            if verbose and n_batches > 1:
+                print(f"  Processing batch {batch_idx + 1}/{n_batches} "
+                      f"(samples {start_idx}-{end_idx})")
+
+            # Extract batch
+            X_batch = X_new[start_idx:end_idx]
+            y_batch = y_new[start_idx:end_idx]
+            X_aux_batch = X_aux_new[start_idx:end_idx]
+
+            # Run unbatched transform on this small batch
+            result = self.transform(X_batch, y_new=y_batch,
+                                   X_aux_new=X_aux_batch, n_iter=n_iter)
+
+            # Store results
+            E_theta_all[start_idx:end_idx] = result['E_theta']
+            a_theta_all[start_idx:end_idx] = result['a_theta']
+            b_theta_all[start_idx:end_idx] = result['b_theta']
+            a_xi_all[start_idx:end_idx] = result['a_xi']
+            b_xi_all[start_idx:end_idx] = result['b_xi']
+
+        return {
+            'E_theta': E_theta_all,
+            'a_theta': a_theta_all,
+            'b_theta': b_theta_all,
+            'a_xi': a_xi_all,
+            'b_xi': b_xi_all
+        }
+
+    def predict_proba_batched(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
+                               n_iter: int = 50, batch_size: int = None,
+                               verbose: bool = False) -> np.ndarray:
+        """
+        Memory-efficient batched prediction of class probabilities.
+
+        This method processes samples in batches to avoid OOM errors.
+
+        Parameters
+        ----------
+        X_new : (n_new, p) count matrix (dense or sparse)
+        X_aux_new : (n_new, p_aux) auxiliary covariates
+        n_iter : local VI iterations for θ inference
+        batch_size : samples per batch (auto-computed if None)
+        verbose : print progress
+
+        Returns
+        -------
+        proba : (n_new,) or (n_new, κ) predicted probabilities
+        """
+        # Convert sparse to dense numpy if needed
+        if sp.issparse(X_new):
+            X_new = X_new.toarray()
+        else:
+            X_new = np.array(X_new)
+
+        n_new = X_new.shape[0]
+
+        if X_aux_new is None:
+            X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
+        else:
+            X_aux_new = np.array(X_aux_new)
+
+        # Auto-compute batch size for ~500MB memory usage
+        if batch_size is None:
+            batch_size = self._compute_memory_efficient_batch_size(target_gb=0.5)
+
+        if verbose:
+            print(f"Using batch_size={batch_size} for memory efficiency")
+
+        # Initialize output array
+        proba_all = np.zeros(n_new) if self.kappa == 1 else np.zeros((n_new, self.kappa))
+
+        # Process in batches
+        n_batches = (n_new + batch_size - 1) // batch_size
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_new)
+
+            if verbose and n_batches > 1:
+                print(f"  Processing batch {batch_idx + 1}/{n_batches} "
+                      f"(samples {start_idx}-{end_idx})")
+
+            # Extract batch
+            X_batch = X_new[start_idx:end_idx]
+            X_aux_batch = X_aux_new[start_idx:end_idx]
+
+            # Run unbatched predict_proba on this small batch
+            proba_batch = self.predict_proba(X_batch, X_aux_batch, n_iter=n_iter)
+
+            # Store results
+            proba_all[start_idx:end_idx] = proba_batch
+
+        return proba_all
+
+    def predict_batched(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
+                        n_iter: int = 50, threshold: float = 0.5,
+                        batch_size: int = None, verbose: bool = False) -> np.ndarray:
+        """
+        Memory-efficient batched prediction of class labels.
+
+        Parameters
+        ----------
+        X_new : (n_new, p) count matrix (dense or sparse)
+        X_aux_new : (n_new, p_aux) auxiliary covariates
+        n_iter : local VI iterations for θ inference
+        threshold : classification threshold
+        batch_size : samples per batch (auto-computed if None)
+        verbose : print progress
+
+        Returns
+        -------
+        labels : (n_new,) or (n_new, κ) predicted labels
+        """
+        proba = self.predict_proba_batched(X_new, X_aux_new, n_iter, batch_size, verbose)
         return (proba >= threshold).astype(int)
 
 
