@@ -372,16 +372,14 @@ class SVICorrected:
         Update spike-and-slab inclusion probabilities.
 
         For β: ρ_jℓ uses log-odds ratio approach comparing slab vs spike contribution.
-        For v: ρ_kℓ uses magnitude-based evidence for factor importance.
+        For v: ρ_kℓ uses SNR-based evidence with log(1+SNR) compression.
 
         This implements a variational approximation to the spike-and-slab prior:
         - Spike: δ_0 (point mass at zero, factor inactive)
         - Slab: Gamma(α_β, η) for β, N(0, σ_v²) for v
 
         The inclusion probability ρ represents P(factor is active).
-
-        NOTE: We use a SOFT update for v to prevent collapse to uniform values.
-        The v inclusion probabilities are updated slowly to maintain factor diversity.
+        A floor of 0.1 is used for rho_v to keep all factors somewhat active.
         """
         if not self.use_spike_slab:
             return
@@ -405,36 +403,21 @@ class SVICorrected:
         log_odds_beta = log_prior_odds_beta + log_lik_ratio_beta
         self.rho_beta = jsp.expit(jnp.clip(log_odds_beta, -20, 20))
 
-        # === Update ρ_v (regression coefficient inclusion) - SOFT UPDATE ===
+        # === Update ρ_v (regression coefficient inclusion) ===
         # Evidence for v factor inclusion: how much does factor ℓ contribute to prediction?
         # Use |μ_v| / σ_v as evidence (signal-to-noise ratio for factor importance)
-        # Large |v| with small uncertainty → factor is important for prediction
-
-        # IMPORTANT: We use a much gentler update for v to prevent collapse
-        # The original update caused all v's to converge to the same value
 
         # Signal-to-noise ratio for each factor
         v_snr = jnp.abs(self.mu_v) / (jnp.sqrt(jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)) + 1e-10)
 
-        # Use relative SNR: compare each factor to the median
-        # This prevents all factors from being excluded when overall signal is weak
-        median_snr = jnp.median(v_snr, axis=1, keepdims=True)
-        relative_snr = v_snr / (median_snr + 1e-6)
+        # Use a soft threshold: log(1 + SNR) to compress range
+        log_lik_ratio_v = jnp.log1p(v_snr)
 
-        # Softer log-likelihood ratio: use log(1 + relative_snr) instead of raw SNR
-        # This compresses the range and prevents extreme exclusion
-        log_lik_ratio_v = jnp.log1p(relative_snr)
-
-        # Posterior inclusion probability with soft update
+        # Posterior inclusion probability
         log_odds_v = log_prior_odds_v + log_lik_ratio_v
-        rho_v_new = jsp.expit(jnp.clip(log_odds_v, -10, 10))  # Narrower clip range
+        self.rho_v = jsp.expit(jnp.clip(log_odds_v, -10, 10))
 
-        # Soft update: blend with previous value (EMA-style) to prevent sudden collapse
-        # Keep at least 20% of original rho_v to maintain diversity
-        soft_update_rate = 0.3  # Only update 30% towards new value
-        self.rho_v = (1 - soft_update_rate) * self.rho_v + soft_update_rate * rho_v_new
-
-        # Floor: never let rho_v go below 0.1 to keep all factors somewhat active
+        # Floor: keep all factors at least somewhat active
         self.rho_v = jnp.maximum(self.rho_v, 0.1)
 
         # Update effective expectations with new inclusion probabilities
@@ -580,9 +563,6 @@ class SVICorrected:
         For β ~ Gamma(α_β, η_j), the complete conditional natural params are:
         η₁ = α_β - 1 + Σ_i z_ijℓ
         η₂ = -η_j - Σ_i θ_iℓ
-
-        DIVERSITY FIX: We add a soft orthogonality encouragement by slightly
-        boosting factors that have different gene loading patterns from the mean.
         """
         # Compute E[z_ijℓ] = x_ij · φ_ijℓ
         log_phi = E_log_theta[:, jnp.newaxis, :] + self.E_log_beta_effective[jnp.newaxis, :, :]
@@ -594,20 +574,8 @@ class SVICorrected:
         z_sum = (X_batch[:, :, jnp.newaxis] * phi).sum(axis=0)  # (p, d)
         theta_sum = E_theta.sum(axis=0)  # (d,)
 
-        # DIVERSITY FIX: Add soft diversity encouragement
-        # Compare each factor's gene loading pattern to the mean pattern
-        # Factors that are different from the mean get a small boost
-        beta_mean_pattern = jnp.mean(self.E_beta, axis=1, keepdims=True)  # (p, 1) mean across factors
-        deviation_from_mean = jnp.abs(self.E_beta - beta_mean_pattern)  # (p, d)
-        # Normalize deviation to [0, 1] range
-        max_deviation = jnp.max(deviation_from_mean) + 1e-6
-        diversity_boost = 0.05 * deviation_from_mean / max_deviation  # Small boost for unique patterns
-
         # Intermediate natural parameters (pretend batch is full dataset)
         eta1_hat = (self.alpha_beta - 1) + scale * z_sum
-        # Add diversity boost to shape parameter (encourages larger values for unique factors)
-        eta1_hat = eta1_hat + diversity_boost * scale * 0.1
-
         eta2_hat = -self.E_eta[:, jnp.newaxis] - scale * theta_sum[jnp.newaxis, :]
 
         # Convert to canonical
@@ -664,9 +632,7 @@ class SVICorrected:
 
         where C_{ik} = Σ_{m≠ℓ} E[θ_im] E[v_km] + x^aux · γ_k
 
-        DIVERSITY FIX: We add per-factor regularization to prevent all v's from
-        collapsing to the same value. The precision is scaled per-factor based on
-        theta variability to ensure each factor receives appropriate gradient signal.
+        Output is clipped to [-5, 5] for numerical stability.
         """
         # Expand y to (batch, kappa)
         y_expanded = y_batch if y_batch.ndim > 1 else y_batch[:, jnp.newaxis]
@@ -693,18 +659,6 @@ class SVICorrected:
         # Precision contribution: 2 Σ_i λ(ζ_ik) E[θ²_iℓ]
         # Shape: (kappa, d) += sum over batch of (batch, kappa, d)
         precision_contrib = 2 * scale * jnp.einsum('ik,id->kd', lam, E_theta_sq)
-
-        # DIVERSITY FIX: Scale precision per-factor to prevent collapse
-        # When all factors have similar theta values, precision becomes uniform
-        # This causes all v's to receive the same gradient signal
-        # We add per-factor scaling based on theta variability
-        theta_std_per_factor = jnp.std(E_theta, axis=0)  # (d,) std across samples
-        theta_scale = theta_std_per_factor / (jnp.mean(theta_std_per_factor) + 1e-6)
-        # Factors with higher variability get slightly lower precision (more uncertainty)
-        # This prevents collapse by maintaining diversity in the update magnitudes
-        factor_scaling = 1.0 / (0.5 + 0.5 * theta_scale)  # (d,)
-        precision_contrib = precision_contrib * factor_scaling[jnp.newaxis, :]
-
         precision = precision + precision_contrib
 
         # For each factor ℓ, compute C^{(-ℓ)} = sum_{m≠ℓ} E[θ_im]E[v_km] + aux_term
@@ -732,14 +686,9 @@ class SVICorrected:
 
         mu_v_hat = mean_contrib / precision
 
-        # DIVERSITY FIX: Add momentum from current v to prevent total collapse
-        # This blends the new estimate with the current value
-        # Prevents sudden jumps that lead to uniform values
-        momentum = 0.1  # Keep 10% of current v direction
-        mu_v_hat = mu_v_hat + momentum * self.mu_v
-
-        # Clip for stability but with wider range to allow diversity
-        mu_v_hat = jnp.clip(mu_v_hat, -15, 15)
+        # Clip for stability - use moderate range to prevent extreme drift
+        # The -15 boundary was causing v's to get stuck at extremes
+        mu_v_hat = jnp.clip(mu_v_hat, -5, 5)
 
         return mu_v_hat, Sigma_v_hat
     
