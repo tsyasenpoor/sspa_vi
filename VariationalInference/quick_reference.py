@@ -548,22 +548,22 @@ def main():
     # These are the actual θ values that were used during training
     # E_theta_train = model.train_a_theta_ / model.train_b_theta_
     print("Using stored training set θ from final epoch")
-    
+
     # Determine appropriate batch size for memory efficiency
     # Target ~500MB per batch for the (n_batch, p, d) tensor
-    target_bytes = 500 * 1024 * 1024
-    bytes_per_sample = model.p * model.d * 8
-    auto_batch_size = max(1, int(target_bytes / bytes_per_sample))
+    auto_batch_size = model._compute_memory_efficient_batch_size(target_gb=0.5)
     print(f"Using batched processing with batch_size={auto_batch_size} for memory efficiency")
 
-    # Compute probabilities with batching
-    y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=50)
+    # Compute probabilities with BATCHED method to avoid OOM
+    y_train_proba = model.predict_proba_batched(X_train, X_aux_train, n_iter=50,
+                                                 batch_size=auto_batch_size, verbose=args.verbose)
     if args.verbose:
         print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
 
     # DEBUG: Compute logits and correlation with labels (batched)
-    train_result = model.transform(X_train, y_new=None, X_aux_new=X_aux_train,
-                                          n_iter=50)
+    train_result = model.transform_batched(X_train, y_new=None, X_aux_new=X_aux_train,
+                                           n_iter=50, batch_size=auto_batch_size,
+                                           verbose=args.verbose)
     E_theta_train = train_result['E_theta']
     train_logits = E_theta_train @ model.mu_v.T
     if model.p_aux > 0 and model.mu_gamma is not None:
@@ -619,13 +619,16 @@ def main():
     print("Validation Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for validation set (batched)
-    val_result = model.transform(X_val, y_new=None, X_aux_new=X_aux_val,
-                                        n_iter=50)
+    # Infer theta for validation set (BATCHED to avoid OOM)
+    val_result = model.transform_batched(X_val, y_new=None, X_aux_new=X_aux_val,
+                                         n_iter=50, batch_size=auto_batch_size,
+                                         verbose=args.verbose)
     # E_theta_val = val_result['E_theta']
 
-    # Compute probabilities (batched)
-    y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=50)
+    # Compute probabilities (BATCHED to avoid OOM)
+    y_val_proba = model.predict_proba_batched(X_val, X_aux_val, n_iter=50,
+                                               batch_size=auto_batch_size,
+                                               verbose=args.verbose)
     if args.verbose:
         print(f"Predicted probabilities: min={y_val_proba.min():.4f}, max={y_val_proba.max():.4f}")
     
@@ -666,13 +669,16 @@ def main():
     print("Test Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for test set (batched)
-    test_result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test,
-                                         n_iter=50)
+    # Infer theta for test set (BATCHED to avoid OOM)
+    test_result = model.transform_batched(X_test, y_new=None, X_aux_new=X_aux_test,
+                                          n_iter=50, batch_size=auto_batch_size,
+                                          verbose=args.verbose)
     # E_theta_test = test_result['E_theta']
 
-    # Compute probabilities (batched)
-    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50)
+    # Compute probabilities (BATCHED to avoid OOM)
+    y_test_proba = model.predict_proba_batched(X_test, X_aux_test, n_iter=50,
+                                                batch_size=auto_batch_size,
+                                                verbose=args.verbose)
     if args.verbose:
         print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
     print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")
