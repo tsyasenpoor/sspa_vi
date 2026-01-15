@@ -98,33 +98,76 @@ if (grepl("\\.h5ad$", input_file)) {
     # Extract count matrix (X)
     if ("X" %in% names(h5_data)) {
         if (is.list(h5_data$X)) {
-            # Sparse matrix format (CSR in AnnData)
-            # n_obs from indptr length
-            n_obs_from_sparse <- length(h5_data$X$indptr) - 1
+            # Sparse matrix format - could be CSR or CSC
+            # CSR (row-compressed): indptr length = n_rows + 1, indices = column indices
+            # CSC (col-compressed): indptr length = n_cols + 1, indices = row indices
 
-            # Prefer dimensions from obs/var names, fallback to sparse structure
-            n_obs <- if (!is.null(n_obs_from_names)) n_obs_from_names else n_obs_from_sparse
-            n_var <- if (!is.null(n_var_from_names)) n_var_from_names else (max(h5_data$X$indices) + 1)
+            indptr_len <- length(h5_data$X$indptr) - 1
+            max_index <- max(h5_data$X$indices) + 1  # +1 for 0-indexing
 
-            cat("  Sparse matrix dimensions: n_obs=", n_obs, ", n_var=", n_var, "\n")
+            # Determine format based on indptr length matching obs or var count
+            # AnnData X is obs x var (cells x genes)
+            is_csr <- FALSE
+            is_csc <- FALSE
 
-            # Build from triplets: expand CSR to COO format
-            row_indices <- rep(seq_len(n_obs_from_sparse), diff(h5_data$X$indptr))
-            col_indices <- h5_data$X$indices + 1  # R is 1-indexed
-
-            # Validate indices are within bounds
-            if (length(col_indices) > 0 && max(col_indices) > n_var) {
-                cat("  WARNING: max column index (", max(col_indices), ") > n_var (", n_var, "), adjusting n_var\n")
-                n_var <- max(col_indices)
+            if (!is.null(n_obs_from_names) && !is.null(n_var_from_names)) {
+                if (indptr_len == n_obs_from_names) {
+                    is_csr <- TRUE
+                    cat("  Detected CSR format (indptr matches n_obs=", n_obs_from_names, ")\n")
+                } else if (indptr_len == n_var_from_names) {
+                    is_csc <- TRUE
+                    cat("  Detected CSC format (indptr matches n_var=", n_var_from_names, ")\n")
+                } else {
+                    # Fallback: guess based on which dimension the indices fit
+                    cat("  WARNING: indptr_len (", indptr_len, ") matches neither n_obs (", n_obs_from_names, ") nor n_var (", n_var_from_names, ")\n")
+                    if (max_index <= n_var_from_names && indptr_len <= n_obs_from_names * 2) {
+                        is_csr <- TRUE
+                        cat("  Assuming CSR format\n")
+                    } else {
+                        is_csc <- TRUE
+                        cat("  Assuming CSC format\n")
+                    }
+                }
+            } else {
+                # No metadata, assume CSR (AnnData default for some versions)
+                is_csr <- TRUE
+                cat("  No metadata dimensions, assuming CSR format\n")
             }
 
-            counts <- sparseMatrix(
-                i = row_indices,
-                j = col_indices,
-                x = as.numeric(h5_data$X$data),
-                dims = c(n_obs_from_sparse, n_var)
-            )
-            counts <- t(counts)  # AnnData is obs x var, SCE is var x obs (genes x cells)
+            n_obs <- if (!is.null(n_obs_from_names)) n_obs_from_names else (if (is_csr) indptr_len else max_index)
+            n_var <- if (!is.null(n_var_from_names)) n_var_from_names else (if (is_csc) indptr_len else max_index)
+
+            cat("  Building sparse matrix: n_obs=", n_obs, ", n_var=", n_var, "\n")
+
+            if (is_csr) {
+                # CSR: indptr indexes rows (cells), indices are column indices (genes)
+                # Build obs x var matrix directly
+                row_indices <- rep(seq_len(indptr_len), diff(h5_data$X$indptr))
+                col_indices <- h5_data$X$indices + 1  # R is 1-indexed
+
+                counts <- sparseMatrix(
+                    i = row_indices,
+                    j = col_indices,
+                    x = as.numeric(h5_data$X$data),
+                    dims = c(n_obs, n_var)
+                )
+            } else {
+                # CSC: indptr indexes columns (genes), indices are row indices (cells)
+                # Build obs x var matrix
+                col_indices <- rep(seq_len(indptr_len), diff(h5_data$X$indptr))
+                row_indices <- h5_data$X$indices + 1  # R is 1-indexed
+
+                counts <- sparseMatrix(
+                    i = row_indices,
+                    j = col_indices,
+                    x = as.numeric(h5_data$X$data),
+                    dims = c(n_obs, n_var)
+                )
+            }
+
+            # Transpose: AnnData is obs x var (cells x genes), SCE needs var x obs (genes x cells)
+            counts <- t(counts)
+            cat("  After transpose (genes x cells): ", nrow(counts), " x ", ncol(counts), "\n")
         } else {
             # Dense matrix
             counts <- t(h5_data$X)  # Transpose for SCE format (genes x cells)
