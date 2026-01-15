@@ -60,34 +60,74 @@ if (grepl("\\.h5ad$", input_file)) {
     # Read the data
     h5_data <- h5read(input_file, "/")
 
+    # First, determine dimensions and names from obs/var groups
+    # This must be done BEFORE building the sparse matrix to ensure consistency
+
+    # Get gene names (var index)
+    if ("var" %in% names(h5_data) && "_index" %in% names(h5_data$var)) {
+        gene_names <- h5_data$var$`_index`
+    } else if ("var_names" %in% names(h5_data)) {
+        gene_names <- h5_data$var_names
+    } else {
+        gene_names <- NULL  # Will generate later
+    }
+
+    # Get cell names (obs index) - handle both string and numeric indices
+    if ("obs" %in% names(h5_data) && "_index" %in% names(h5_data$obs)) {
+        cell_names <- h5_data$obs$`_index`
+        # Convert numeric indices to strings if needed
+        if (is.numeric(cell_names)) {
+            cell_names <- paste0("Cell_", cell_names)
+        }
+    } else if ("obs_names" %in% names(h5_data)) {
+        cell_names <- h5_data$obs_names
+        if (is.numeric(cell_names)) {
+            cell_names <- paste0("Cell_", cell_names)
+        }
+    } else {
+        cell_names <- NULL  # Will generate later
+    }
+
+    # Determine n_obs and n_var from names if available
+    n_var_from_names <- if (!is.null(gene_names)) length(gene_names) else NULL
+    n_obs_from_names <- if (!is.null(cell_names)) length(cell_names) else NULL
+
+    cat("  Gene names found:", !is.null(gene_names), ifelse(!is.null(n_var_from_names), paste0(" (n=", n_var_from_names, ")"), ""), "\n")
+    cat("  Cell names found:", !is.null(cell_names), ifelse(!is.null(n_obs_from_names), paste0(" (n=", n_obs_from_names, ")"), ""), "\n")
+
     # Extract count matrix (X)
     if ("X" %in% names(h5_data)) {
         if (is.list(h5_data$X)) {
             # Sparse matrix format (CSR in AnnData)
-            # Dimensions from metadata
-            n_obs <- length(h5_data$X$indptr) - 1
-            if ("var" %in% names(h5_data) && "_index" %in% names(h5_data$var)) {
-                n_var <- length(h5_data$var$`_index`)
-            } else if ("var_names" %in% names(h5_data)) {
-                n_var <- length(h5_data$var_names)
-            } else {
-                n_var <- max(h5_data$X$indices) + 1
-            }
-            
+            # n_obs from indptr length
+            n_obs_from_sparse <- length(h5_data$X$indptr) - 1
+
+            # Prefer dimensions from obs/var names, fallback to sparse structure
+            n_obs <- if (!is.null(n_obs_from_names)) n_obs_from_names else n_obs_from_sparse
+            n_var <- if (!is.null(n_var_from_names)) n_var_from_names else (max(h5_data$X$indices) + 1)
+
+            cat("  Sparse matrix dimensions: n_obs=", n_obs, ", n_var=", n_var, "\n")
+
             # Build from triplets: expand CSR to COO format
-            row_indices <- rep(seq_len(n_obs), diff(h5_data$X$indptr))
+            row_indices <- rep(seq_len(n_obs_from_sparse), diff(h5_data$X$indptr))
             col_indices <- h5_data$X$indices + 1  # R is 1-indexed
-            
+
+            # Validate indices are within bounds
+            if (length(col_indices) > 0 && max(col_indices) > n_var) {
+                cat("  WARNING: max column index (", max(col_indices), ") > n_var (", n_var, "), adjusting n_var\n")
+                n_var <- max(col_indices)
+            }
+
             counts <- sparseMatrix(
                 i = row_indices,
                 j = col_indices,
                 x = as.numeric(h5_data$X$data),
-                dims = c(n_obs, n_var)
+                dims = c(n_obs_from_sparse, n_var)
             )
-            counts <- t(counts)  # AnnData is obs x var, SCE is var x obs
+            counts <- t(counts)  # AnnData is obs x var, SCE is var x obs (genes x cells)
         } else {
             # Dense matrix
-            counts <- t(h5_data$X)  # Transpose for SCE format
+            counts <- t(h5_data$X)  # Transpose for SCE format (genes x cells)
         }
     } else if ("layers" %in% names(h5_data) && "counts" %in% names(h5_data$layers)) {
         counts <- t(h5_data$layers$counts)
@@ -95,22 +135,38 @@ if (grepl("\\.h5ad$", input_file)) {
         stop("Could not find count matrix in h5ad file")
     }
 
-    # Get gene names
-    if ("var" %in% names(h5_data) && "_index" %in% names(h5_data$var)) {
-        gene_names <- h5_data$var$`_index`
-    } else if ("var_names" %in% names(h5_data)) {
-        gene_names <- h5_data$var_names
-    } else {
+    cat("  Count matrix dimensions: ", nrow(counts), " genes x ", ncol(counts), " cells\n")
+
+    # Generate names if not available
+    if (is.null(gene_names)) {
         gene_names <- paste0("Gene", 1:nrow(counts))
     }
-
-    # Get cell barcodes
-    if ("obs" %in% names(h5_data) && "_index" %in% names(h5_data$obs)) {
-        cell_names <- h5_data$obs$`_index`
-    } else if ("obs_names" %in% names(h5_data)) {
-        cell_names <- h5_data$obs_names
-    } else {
+    if (is.null(cell_names)) {
         cell_names <- paste0("Cell", 1:ncol(counts))
+    }
+
+    # Ensure names match matrix dimensions
+    if (length(gene_names) != nrow(counts)) {
+        cat("  WARNING: gene_names length (", length(gene_names), ") != nrow(counts) (", nrow(counts), ")\n")
+        if (length(gene_names) > nrow(counts)) {
+            cat("  Truncating gene_names to match matrix rows\n")
+            gene_names <- gene_names[1:nrow(counts)]
+        } else {
+            cat("  Padding gene_names to match matrix rows\n")
+            extra_names <- paste0("Gene", (length(gene_names)+1):nrow(counts))
+            gene_names <- c(gene_names, extra_names)
+        }
+    }
+    if (length(cell_names) != ncol(counts)) {
+        cat("  WARNING: cell_names length (", length(cell_names), ") != ncol(counts) (", ncol(counts), ")\n")
+        if (length(cell_names) > ncol(counts)) {
+            cat("  Truncating cell_names to match matrix columns\n")
+            cell_names <- cell_names[1:ncol(counts)]
+        } else {
+            cat("  Padding cell_names to match matrix columns\n")
+            extra_names <- paste0("Cell", (length(cell_names)+1):ncol(counts))
+            cell_names <- c(cell_names, extra_names)
+        }
     }
 
     rownames(counts) <- gene_names
@@ -121,11 +177,27 @@ if (grepl("\\.h5ad$", input_file)) {
     if ("obs" %in% names(h5_data)) {
         obs <- h5_data$obs
         for (col_name in names(obs)) {
-            if (col_name != "_index" && !is.list(obs[[col_name]])) {
-                col_data[[col_name]] <- obs[[col_name]]
+            if (col_name == "_index") next
+
+            col_value <- obs[[col_name]]
+
+            # Handle categorical encoding (h5ad stores categoricals with codes + categories)
+            if (is.list(col_value) && "codes" %in% names(col_value) && "categories" %in% names(col_value)) {
+                # Decode categorical: codes are 0-indexed
+                categories <- col_value$categories
+                codes <- col_value$codes
+                # Convert codes to 1-indexed for R and handle -1 (NA)
+                decoded <- ifelse(codes < 0, NA, categories[codes + 1])
+                col_data[[col_name]] <- decoded
+            } else if (!is.list(col_value)) {
+                # Simple non-list column
+                col_data[[col_name]] <- col_value
             }
+            # Skip other complex list structures
         }
     }
+
+    cat("  Metadata columns:", paste(colnames(col_data), collapse = ", "), "\n")
 
     # Create SingleCellExperiment
     sce <- SingleCellExperiment(
