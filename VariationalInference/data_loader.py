@@ -253,12 +253,12 @@ class DataLoader:
         df = pd.read_csv(self.data_path, index_col=0)
         
         # Check for t2dm column
-        if 't2dm' not in df.columns:
-            raise ValueError(f"Simulated CSV must contain 't2dm' label column. Found: {list(df.columns)}")
+        if 'covid' not in df.columns:
+            raise ValueError(f"Simulated CSV must contain 'covid' label column. Found: {list(df.columns)}")
         
         # Separate labels from expression data
-        self.label_data = df['t2dm'].copy()
-        self.raw_df = df.drop(columns=['t2dm'])
+        self.label_data = df['covid'].copy()
+        self.raw_df = df.drop(columns=['covid'])
         
         # Store metadata
         self.gene_list = self.raw_df.columns.tolist()
