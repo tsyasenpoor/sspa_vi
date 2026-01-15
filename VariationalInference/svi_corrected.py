@@ -365,7 +365,62 @@ class SVICorrected:
             self.E_beta_effective = self.E_beta
             self.E_log_beta_effective = self.E_log_beta
             self.E_v_effective = self.E_v
-    
+
+    def _update_spike_slab(self, E_theta: jnp.ndarray, E_beta: jnp.ndarray,
+                           a_theta: jnp.ndarray, b_theta: jnp.ndarray):
+        """
+        Update spike-and-slab inclusion probabilities.
+
+        For β: ρ_jℓ uses log-odds ratio approach comparing slab vs spike contribution.
+        For v: ρ_kℓ uses magnitude-based evidence for factor importance.
+
+        This implements a variational approximation to the spike-and-slab prior:
+        - Spike: δ_0 (point mass at zero, factor inactive)
+        - Slab: Gamma(α_β, η) for β, N(0, σ_v²) for v
+
+        The inclusion probability ρ represents P(factor is active).
+        """
+        if not self.use_spike_slab:
+            return
+
+        # Log prior odds for β and v
+        log_prior_odds_beta = jnp.log(self.pi_beta / (1 - self.pi_beta + 1e-10))
+        log_prior_odds_v = jnp.log(self.pi_v / (1 - self.pi_v + 1e-10))
+
+        # === Update ρ_β (gene loading inclusion) ===
+        # Compare expected contribution under slab vs spike
+        # Under slab: E[β_jℓ] contributes to likelihood
+        # Under spike: β_jℓ = 0, no contribution
+        # Use log-likelihood ratio: how much does having this β help explain data?
+        # Approximation: larger E[β] relative to threshold suggests inclusion
+
+        # Evidence for inclusion: magnitude of E[β] scaled by prior expectations
+        # Large E[β] → high inclusion probability
+        log_lik_ratio_beta = jnp.log(self.E_beta + 1e-10) - jnp.log(1e-6)  # vs spike at ε
+
+        # Posterior inclusion probability using sigmoid
+        log_odds_beta = log_prior_odds_beta + log_lik_ratio_beta
+        self.rho_beta = jsp.expit(jnp.clip(log_odds_beta, -20, 20))
+
+        # === Update ρ_v (regression coefficient inclusion) ===
+        # Evidence for v factor inclusion: how much does factor ℓ contribute to prediction?
+        # Use |μ_v| / σ_v as evidence (signal-to-noise ratio for factor importance)
+        # Large |v| with small uncertainty → factor is important for prediction
+
+        # Signal-to-noise ratio for each factor
+        v_snr = jnp.abs(self.mu_v) / (jnp.sqrt(jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)) + 1e-10)
+
+        # Log-likelihood ratio based on SNR
+        # Higher SNR → stronger evidence for inclusion
+        log_lik_ratio_v = v_snr  # Simple: SNR directly as log-likelihood ratio
+
+        # Posterior inclusion probability
+        log_odds_v = log_prior_odds_v + log_lik_ratio_v
+        self.rho_v = jsp.expit(jnp.clip(log_odds_v, -20, 20))
+
+        # Update effective expectations with new inclusion probabilities
+        self._compute_expectations()
+
     # =========================================================================
     # LOCAL PARAMETER UPDATES (Full optimization per mini-batch)
     # =========================================================================
@@ -430,12 +485,16 @@ class SVICorrected:
             else:
                 aux_term = 0.0
             
-            # For each factor ℓ, compute C^{(-ℓ)} = full_contrib - E[θ_iℓ]E[v_kℓ]
-            # Broadcasting: (batch, kappa, 1) - (batch, 1, d) * (1, kappa, d)
+            # For each factor ℓ, compute C^{(-ℓ)} = sum_{m≠ℓ} E[θ_im]E[v_km] + aux_term
+            # = (full θ·v + aux_term) - E[θ_iℓ]E[v_kℓ]
+            # Broadcasting: (batch, kappa, 1) -> (batch, kappa, d)
+            full_linear_predictor = theta_v[:, :, jnp.newaxis]  # (batch, kappa, 1)
+            if self.p_aux > 0:
+                full_linear_predictor = full_linear_predictor + aux_term[:, :, jnp.newaxis]
+
             C_minus_ell = (
-                theta_v[:, :, jnp.newaxis] -  # (batch, kappa, 1)
-                E_theta[:, jnp.newaxis, :] * self.E_v_effective[jnp.newaxis, :, :] +  # (batch, kappa, d)
-                (aux_term[:, :, jnp.newaxis] if self.p_aux > 0 else 0.0)  # (batch, kappa, 1) or scalar
+                full_linear_predictor -  # Full contribution: θ·v + aux
+                E_theta[:, jnp.newaxis, :] * self.E_v_effective[jnp.newaxis, :, :]  # Subtract ℓ-th term
             )  # Result: (batch, kappa, d)
             
             # E[v²_kℓ] for all outcomes: (kappa, d)
@@ -592,20 +651,22 @@ class SVICorrected:
         # === VECTORIZED computation over all outcomes and factors ===
         # Precision for each (outcome, factor): (kappa, d)
         precision = jnp.full((self.kappa, self.d), 1.0 / self.sigma_v**2)
-        
+
         # Precision contribution: 2 Σ_i λ(ζ_ik) E[θ²_iℓ]
         # Shape: (kappa, d) += sum over batch of (batch, kappa, d)
         precision_contrib = 2 * scale * jnp.einsum('ik,id->kd', lam, E_theta_sq)
         precision = precision + precision_contrib
-        
-        # For each factor ℓ, compute C^{(-ℓ)}
-        # Broadcasting: (batch, kappa, 1) - (batch, 1, d) * (1, kappa, d)
-        C_minus_ell = (
-            full_theta_v[:, :, jnp.newaxis] -  # (batch, kappa, 1)
-            E_theta[:, jnp.newaxis, :] * self.E_v_effective[jnp.newaxis, :, :]  # (batch, kappa, d)
-        )
+
+        # For each factor ℓ, compute C^{(-ℓ)} = sum_{m≠ℓ} E[θ_im]E[v_km] + aux_term
+        # = (full θ·v + aux_term) - E[θ_iℓ]E[v_kℓ]
+        full_linear_predictor = full_theta_v[:, :, jnp.newaxis]  # (batch, kappa, 1)
         if self.p_aux > 0:
-            C_minus_ell = C_minus_ell + aux_contrib[:, :, jnp.newaxis]
+            full_linear_predictor = full_linear_predictor + aux_contrib[:, :, jnp.newaxis]
+
+        C_minus_ell = (
+            full_linear_predictor -  # Full contribution: θ·v + aux
+            E_theta[:, jnp.newaxis, :] * self.E_v_effective[jnp.newaxis, :, :]  # Subtract ℓ-th term
+        )
         
         # Mean*precision contribution: Σ_i [(y_ik - 0.5) - 2λ(ζ_ik) C_{ik}^{(-ℓ)}] E[θ_iℓ]
         # Shape: (kappa, d)
@@ -900,11 +961,94 @@ class SVICorrected:
                 elbo += jnp.where(sign > 0, 0.5 * self.p_aux * (1 + jnp.log(2 * jnp.pi)) + 0.5 * logdet, 0.0)
         
         return float(elbo)
-    
+
+    def compute_heldout_loglik(
+        self,
+        X_heldout: np.ndarray,
+        y_heldout: np.ndarray,
+        X_aux_heldout: Optional[np.ndarray] = None,
+        n_iter: int = 30
+    ) -> float:
+        """
+        Compute held-out log-likelihood for convergence monitoring (Blei-style).
+
+        This provides an unbiased estimate of model fit by:
+        1. Inferring θ for held-out samples using frozen global params
+        2. Computing predictive log-likelihood for counts and labels
+
+        Following Hoffman et al. (2013), held-out LL is more reliable than
+        ELBO for tracking convergence since ELBO can increase due to
+        tighter variational approximation rather than better model fit.
+
+        Parameters
+        ----------
+        X_heldout : (n_heldout, p) count matrix
+        y_heldout : (n_heldout,) or (n_heldout, κ) labels
+        X_aux_heldout : (n_heldout, p_aux) auxiliary features
+        n_iter : number of local VI iterations for θ inference
+
+        Returns
+        -------
+        float : Average held-out log-likelihood per sample
+        """
+        # Convert to JAX arrays
+        if sp.issparse(X_heldout):
+            X_heldout = jnp.array(X_heldout.toarray())
+        else:
+            X_heldout = jnp.array(X_heldout)
+
+        y_heldout = jnp.array(y_heldout)
+        if y_heldout.ndim == 1:
+            y_heldout = y_heldout[:, jnp.newaxis]
+
+        n_heldout = X_heldout.shape[0]
+
+        if X_aux_heldout is None:
+            X_aux_heldout = jnp.zeros((n_heldout, self.p_aux if self.p_aux > 0 else 0))
+        else:
+            X_aux_heldout = jnp.array(X_aux_heldout)
+
+        # Infer θ for held-out samples with frozen global params
+        result = self.transform(
+            np.array(X_heldout),
+            y_new=np.array(y_heldout),
+            X_aux_new=np.array(X_aux_heldout),
+            n_iter=n_iter
+        )
+        E_theta = jnp.array(result['E_theta'])
+        E_log_theta = jsp.digamma(jnp.array(result['a_theta'])) - jnp.log(jnp.array(result['b_theta']))
+
+        # === Poisson log-likelihood for counts ===
+        # log p(x|θ,β) = Σ_ij [x_ij * log(Σ_ℓ θ_iℓ β_jℓ) - Σ_ℓ θ_iℓ β_jℓ - log(x_ij!)]
+        log_rates = E_log_theta[:, jnp.newaxis, :] + self.E_log_beta_effective[jnp.newaxis, :, :]
+        log_sum_rates = logsumexp(log_rates, axis=2)  # (n_heldout, p)
+
+        loglik_counts = jnp.sum(X_heldout * log_sum_rates)
+        loglik_counts -= jnp.sum(E_theta.sum(axis=1, keepdims=True) * self.E_beta_effective.sum(axis=0, keepdims=True))
+        loglik_counts -= jnp.sum(jsp.gammaln(X_heldout + 1))
+
+        # === Bernoulli log-likelihood for labels ===
+        # log p(y|θ,v,γ) using sigmoid approximation
+        if self.p_aux > 0:
+            logits = E_theta @ self.E_v_effective.T + X_aux_heldout @ self.E_gamma.T
+        else:
+            logits = E_theta @ self.E_v_effective.T
+
+        # Binary cross-entropy: y*log(σ) + (1-y)*log(1-σ)
+        # = y*logits - log(1 + exp(logits))
+        logits_clipped = jnp.clip(logits, -500, 500)
+        loglik_labels = jnp.sum(
+            y_heldout * logits_clipped - jnp.log1p(jnp.exp(logits_clipped))
+        )
+
+        # Combine and normalize
+        total_loglik = float(loglik_counts) + self.regression_weight * float(loglik_labels)
+        return total_loglik / n_heldout
+
     # =========================================================================
     # MAIN FITTING LOOP
     # =========================================================================
-    
+
     def fit(
         self,
         X: np.ndarray,
@@ -913,20 +1057,25 @@ class SVICorrected:
         max_epochs: int = 100,
         elbo_freq: int = 10,
         verbose: bool = True,
-        early_stopping: bool = False
+        early_stopping: bool = False,
+        X_heldout: Optional[np.ndarray] = None,
+        y_heldout: Optional[np.ndarray] = None,
+        X_aux_heldout: Optional[np.ndarray] = None,
+        heldout_freq: int = 5
     ):
         """
         Fit model using Stochastic Variational Inference.
-        
-        Handles both dense and sparse input matrices. Sparse matrices are 
+
+        Handles both dense and sparse input matrices. Sparse matrices are
         converted to dense on GPU for computation.
-        
+
         Convergence tracked via EMA + Welford's online algorithm:
         - elbo_ema_: Exponential moving average of batch ELBO
         - elbo_welford_mean_: Running mean (Welford)
         - elbo_welford_var_: Running variance (Welford)
         - convergence_history_: List of (epoch, ema, mean, std, rel_change)
-        
+        - heldout_loglik_history_: List of (epoch, heldout_ll) if held-out data provided
+
         Parameters
         ----------
         X : np.ndarray or scipy.sparse matrix
@@ -936,8 +1085,16 @@ class SVICorrected:
         X_aux : np.ndarray
             Auxiliary features (n_cells, n_aux)
         early_stopping : bool
-            If True, stop when EMA relative change < convergence_tol for 
+            If True, stop when EMA relative change < convergence_tol for
             convergence_window consecutive checks.
+        X_heldout : np.ndarray, optional
+            Held-out count data for convergence tracking (Blei-style)
+        y_heldout : np.ndarray, optional
+            Held-out labels for convergence tracking
+        X_aux_heldout : np.ndarray, optional
+            Held-out auxiliary features
+        heldout_freq : int
+            Frequency (in epochs) to compute held-out log-likelihood
         """
         # Convert sparse matrices to dense JAX arrays
         if sp.issparse(X):
@@ -970,6 +1127,10 @@ class SVICorrected:
         self.convergence_history_ = []  # (epoch, ema, mean, std, rel_change)
         self.last_elbo_ = None          # Track last computed ELBO for display
         consecutive_converged = 0
+
+        # Held-out log-likelihood tracking (Blei-style)
+        use_heldout = X_heldout is not None and y_heldout is not None
+        self.heldout_loglik_history_ = []  # (epoch, heldout_ll)
         
         # Storage for final training set local parameters
         self.train_a_theta_ = None
@@ -1038,7 +1199,11 @@ class SVICorrected:
                     mu_v_hat, Sigma_v_hat,
                     mu_gamma_hat, Sigma_gamma_hat
                 )
-                
+
+                # 4. Update spike-and-slab inclusion probabilities (if enabled)
+                if self.use_spike_slab:
+                    self._update_spike_slab(E_theta, self.E_beta, a_theta, b_theta)
+
                 # Compute ELBO periodically
                 if iteration % elbo_freq == 0:
                     elbo = self._compute_elbo(
@@ -1089,15 +1254,24 @@ class SVICorrected:
                     welford_std,
                     rel_change
                 ))
-            
+
+            # Compute held-out log-likelihood (Blei-style convergence tracking)
+            heldout_ll = None
+            if use_heldout and epoch % heldout_freq == 0:
+                heldout_ll = self.compute_heldout_loglik(
+                    X_heldout, y_heldout, X_aux_heldout, n_iter=20
+                )
+                self.heldout_loglik_history_.append((epoch, heldout_ll))
+
             if verbose and epoch % 5 == 0:
                 beta_diversity = np.std(np.array(self.E_beta), axis=1).mean()
                 ema_str = f"{self.elbo_ema_:.2e}" if self.elbo_ema_ is not None else "N/A"
                 rel_str = f"{rel_change:.2e}" if rel_change != np.inf else "N/A"
                 elbo_str = f"{self.last_elbo_:.2e}" if self.last_elbo_ is not None else "N/A"
+                heldout_str = f", HO-LL = {heldout_ll:.2f}" if heldout_ll is not None else ""
                 print(f"Epoch {epoch}: ELBO = {elbo_str}, EMA = {ema_str}, "
                       f"Δrel = {rel_str}, ρ_t = {rho_t:.4f}, "
-                      f"v = {np.array(self.mu_v).ravel()[:3]}, β_div = {beta_diversity:.3f}")
+                      f"v = {np.array(self.mu_v).ravel()[:3]}, β_div = {beta_diversity:.3f}{heldout_str}")
             
             # Early stopping check
             if early_stopping and rel_change < self.convergence_tol:
@@ -1134,6 +1308,11 @@ class SVICorrected:
             print(f"\nTraining complete in {self.training_time_:.1f}s")
             print(f"Final ELBO: EMA = {self.final_elbo_ema_:.2e}, "
                   f"Mean = {self.final_elbo_mean_:.2e}, Std = {self.final_elbo_std_:.2e}")
+
+            # Report final held-out LL if available
+            if len(self.heldout_loglik_history_) > 0:
+                final_heldout_ll = self.heldout_loglik_history_[-1][1]
+                print(f"Final Held-out LL: {final_heldout_ll:.4f} (per sample)")
 
             # v learning diagnostics
             if hasattr(self, 'initial_mu_v_'):
