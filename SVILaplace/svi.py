@@ -181,7 +181,10 @@ class SVILaplace:
         E_tau_inv : (κ, d) expected inverse of τ
         """
         v_second_moment = mu_v**2 + sigma_v_sq  # E[v²] = μ² + σ²
-        v_second_moment = jnp.maximum(v_second_moment, 1e-10)  # Numerical stability
+        # Use a reasonable floor to prevent shrinkage spiral
+        # With floor=0.01, max E[τ⁻¹] ≈ 1/(b*0.1) + 1/0.01 ≈ 111 + 100 = 211
+        # This prevents the prior from completely overwhelming the likelihood
+        v_second_moment = jnp.maximum(v_second_moment, 0.01)
         
         # E[τ⁻¹] for InvGaussian with our parameterization
         # Term 1: 1/(b · √(E[v²]))
