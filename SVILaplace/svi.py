@@ -217,7 +217,7 @@ class SVILaplace:
         self.kappa = 1 if y.ndim == 1 else y.shape[1]
         self.p_aux = X_aux.shape[1] if X_aux is not None and X_aux.size > 0 else 0
         
-        key1, key2, key3, key4, self.rng_key = random.split(self.rng_key, 5)
+        key1, key2, key3, key4, key5, self.rng_key = random.split(self.rng_key, 6)
 
         # -----------------------------------------------------------------
         # β: Gene loadings ~ Gamma(a_β, b_β)
@@ -242,6 +242,13 @@ class SVILaplace:
         # Each factor gets a different overall "strength" multiplier
         factor_scales = random.uniform(key4, (self.d,), minval=0.5, maxval=2.0)
         self.a_beta = self.a_beta * factor_scales[jnp.newaxis, :]
+
+        # CRITICAL: Also vary b_beta by factor to create contrast in E_log_beta
+        # E_log_beta = digamma(a_beta) - log(b_beta)
+        # digamma compresses differences, but log(b_beta) doesn't
+        # This ensures factors remain differentiated through the softmax
+        factor_b_scales = random.uniform(key5, (self.d,), minval=0.3, maxval=3.0)
+        self.b_beta = self.b_beta * factor_b_scales[jnp.newaxis, :]
 
         self.a_beta = jnp.maximum(self.a_beta, self.alpha_beta * 0.1)
         
