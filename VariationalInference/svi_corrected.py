@@ -397,7 +397,7 @@ class SVICorrected:
 
         # Evidence for inclusion: magnitude of E[β] scaled by prior expectations
         # Large E[β] → high inclusion probability
-        log_lik_ratio_beta = jnp.log(self.E_beta + 1e-10) - jnp.log(0.2)  # vs spike at ε
+        log_lik_ratio_beta = jnp.log(self.E_beta + 1e-10) - jnp.log(0.01)  # vs spike at ε
 
         # Posterior inclusion probability using sigmoid
         log_odds_beta = log_prior_odds_beta + log_lik_ratio_beta
