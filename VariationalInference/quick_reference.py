@@ -797,56 +797,56 @@ def main():
 
     print_model_summary(model, gene_list)
 
-    # =========================================================================
-    # DEBUG: Automatic Recommendations
-    # =========================================================================
-    issues_found = []
-    recommendations = []
+    # # =========================================================================
+    # # DEBUG: Automatic Recommendations
+    # # =========================================================================
+    # issues_found = []
+    # recommendations = []
 
-    # Check 1: Probability range too narrow
-    prob_range = y_train_proba.max() - y_train_proba.min()
-    if prob_range < 0.2:
-        issues_found.append(f"Probability range ({prob_range:.4f}) is very narrow - model not discriminating")
-        recommendations.append("Increase --regression-weight (try 100-200)")
-        recommendations.append("Increase --max-epochs (try 200-500)")
-        recommendations.append("Increase --learning-rate (try 0.5)")
+    # # Check 1: Probability range too narrow
+    # prob_range = y_train_proba.max() - y_train_proba.min()
+    # if prob_range < 0.2:
+    #     issues_found.append(f"Probability range ({prob_range:.4f}) is very narrow - model not discriminating")
+    #     recommendations.append("Increase --regression-weight (try 100-200)")
+    #     recommendations.append("Increase --max-epochs (try 200-500)")
+    #     recommendations.append("Increase --learning-rate (try 0.5)")
 
-    # Check 2: AUC below 0.5
-    if 'auc' in train_metrics and train_metrics['auc'] < 0.5:
-        issues_found.append(f"Training AUC ({train_metrics['auc']:.4f}) < 0.5 - predictions inversely correlated")
-        recommendations.append("The model learned the wrong direction - try increasing --regression-weight")
+    # # Check 2: AUC below 0.5
+    # if 'auc' in train_metrics and train_metrics['auc'] < 0.5:
+    #     issues_found.append(f"Training AUC ({train_metrics['auc']:.4f}) < 0.5 - predictions inversely correlated")
+    #     recommendations.append("The model learned the wrong direction - try increasing --regression-weight")
 
-    # Check 3: v not learned
-    v_range = model.mu_v.max() - model.mu_v.min()
-    if v_range < 0.5:
-        issues_found.append(f"v parameter range ({v_range:.4f}) is very small - discrimination weights not learned")
-        recommendations.append("Learning rate may be dying too fast - try --learning-rate-decay 0.6")
-        recommendations.append("Try --learning-rate-min 0.01 (higher floor)")
+    # # Check 3: v not learned
+    # v_range = model.mu_v.max() - model.mu_v.min()
+    # if v_range < 0.5:
+    #     issues_found.append(f"v parameter range ({v_range:.4f}) is very small - discrimination weights not learned")
+    #     recommendations.append("Learning rate may be dying too fast - try --learning-rate-decay 0.6")
+    #     recommendations.append("Try --learning-rate-min 0.01 (higher floor)")
 
-    # Check 4: Learning rate too aggressive decay
-    final_lr = args.learning_rate * (args.learning_rate_delay + model.elbo_history_[-1][0]) ** (-args.learning_rate_decay)
-    if final_lr < 0.001:
-        issues_found.append(f"Final learning rate ({final_lr:.6f}) is very small - may have stopped learning early")
-        recommendations.append("Try --learning-rate-decay 0.6 instead of 0.75")
-        recommendations.append("Try --learning-rate-min 0.01")
+    # # Check 4: Learning rate too aggressive decay
+    # final_lr = args.learning_rate * (args.learning_rate_delay + model.elbo_history_[-1][0]) ** (-args.learning_rate_decay)
+    # if final_lr < 0.001:
+    #     issues_found.append(f"Final learning rate ({final_lr:.6f}) is very small - may have stopped learning early")
+    #     recommendations.append("Try --learning-rate-decay 0.6 instead of 0.75")
+    #     recommendations.append("Try --learning-rate-min 0.01")
 
-    if issues_found:
-        print("\n" + "=" * 80)
-        print("DEBUG: Issues Detected & Recommendations")
-        print("=" * 80)
-        print("\nIssues found:")
-        for i, issue in enumerate(issues_found, 1):
-            print(f"  {i}. {issue}")
-        print("\nRecommendations:")
-        seen = set()
-        for rec in recommendations:
-            if rec not in seen:
-                print(f"  - {rec}")
-                seen.add(rec)
-        print("\nSuggested command:")
-        print(f"  python quick_reference.py --data {args.data} --n-factors {args.n_factors} \\")
-        print(f"    --regression-weight 100 --learning-rate 0.5 --learning-rate-decay 0.6 \\")
-        print(f"    --learning-rate-min 0.01 --max-epochs 200")
+    # if issues_found:
+    #     print("\n" + "=" * 80)
+    #     print("DEBUG: Issues Detected & Recommendations")
+    #     print("=" * 80)
+    #     print("\nIssues found:")
+    #     for i, issue in enumerate(issues_found, 1):
+    #         print(f"  {i}. {issue}")
+    #     print("\nRecommendations:")
+    #     seen = set()
+    #     for rec in recommendations:
+    #         if rec not in seen:
+    #             print(f"  - {rec}")
+    #             seen.add(rec)
+    #     print("\nSuggested command:")
+    #     print(f"  python quick_reference.py --data {args.data} --n-factors {args.n_factors} \\")
+    #     print(f"    --regression-weight 100 --learning-rate 0.5 --learning-rate-decay 0.6 \\")
+    #     print(f"    --learning-rate-min 0.01 --max-epochs 200")
 
     # =========================================================================
     # Profiling Output (if enabled)

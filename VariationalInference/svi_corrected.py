@@ -245,14 +245,14 @@ class SVICorrected:
         
         # Add large random variations to create diversity
         # Each factor gets different random gene subsets boosted
-        noise_scale = 5.0  # Increased from 0.2 to create MUCH more diversity
+        noise_scale = 0.5  # Increased from 0.2 to create MUCH more diversity
         random_boost = random.uniform(key1, (self.p, self.d), minval=0.1, maxval=3.0)
         
         # Add data-driven signal: scale by gene means
-        gene_scale = col_means[:, jnp.newaxis]  # (p, 1)
+        # gene_scale = col_means[:, jnp.newaxis]  # (p, 1)
         
         # Combine: base + gene_scale * random_boost
-        self.a_beta = self.a_beta + gene_scale * random_boost * noise_scale
+        self.a_beta = self.a_beta + random_boost * noise_scale
         
         # Create factor-specific "signatures" - each factor prefers different gene sets
         # Randomly assign genes to factors with varying strengths
@@ -262,7 +262,7 @@ class SVICorrected:
         sparsity_masks = random.bernoulli(key3, p=0.3, shape=(self.p, self.d))  # 30% active
         
         # Apply signature with sparsity
-        signature_boost = factor_signatures * sparsity_masks * gene_scale * 3.0
+        signature_boost = factor_signatures * sparsity_masks * 0.2
         self.a_beta = self.a_beta + signature_boost
         
         # Ensure all values are positive and reasonable
