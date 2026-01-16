@@ -1,5 +1,3 @@
-
-
 import jax
 import jax.numpy as jnp
 import jax.scipy.special as jsp
@@ -9,6 +7,7 @@ from typing import Tuple, Optional, Dict, Any
 import time
 import numpy as np
 import scipy.sparse as sp
+from scipy.special import expit, xlogy
 
 
 class SVILaplace:
@@ -128,6 +127,32 @@ class SVILaplace:
         a = jnp.maximum(eta1 + 1, 1.001)
         b = jnp.maximum(-eta2, 1e-6)
         return a, b
+    
+    @staticmethod
+    @jax.jit
+    def _gamma_entropy(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+        """
+        Gamma(shape=a, rate=b) differential entropy.
+        
+        H[Gamma(a,b)] = a - ln(b) + ln(Γ(a)) + (1-a)ψ(a)
+        
+        Numerically stable using gammaln and digamma.
+        """
+        a = jnp.maximum(a, 1e-6)
+        b = jnp.maximum(b, 1e-6)
+        return a - jnp.log(b) + jsp.gammaln(a) + (1.0 - a) * jsp.digamma(a)
+    
+    @staticmethod
+    @jax.jit
+    def _gaussian_entropy_2d(Sigma: jnp.ndarray) -> float:
+        """
+        Multivariate Gaussian entropy: H = 0.5 * (d * (1 + log(2π)) + log|Σ|)
+        
+        Uses slogdet for numerical stability.
+        """
+        d = Sigma.shape[0]
+        sign, logdet = jnp.linalg.slogdet(Sigma)
+        return 0.5 * (d * (1.0 + jnp.log(2.0 * jnp.pi)) + logdet)
     
     # =========================================================================
     # INVERSE GAUSSIAN EXPECTATIONS (for τ posterior)
@@ -621,7 +646,8 @@ class SVILaplace:
         E_A_sq = E_A**2 + (Var_theta @ self.E_v_sq.T)
         
         elbo_y = jnp.sum((y_expanded - 0.5) * E_A - lam * E_A_sq)
-        elbo_y += jnp.sum(lam * zeta**2 - 0.5 * zeta - jnp.log1p(jnp.exp(jnp.clip(zeta, -500, 500))))
+        # Polya-Gamma auxiliary: log(1 + exp(z)) = logaddexp(0, z) for numerical stability
+        elbo_y += jnp.sum(lam * zeta**2 - 0.5 * zeta - jnp.logaddexp(0.0, jnp.clip(zeta, -500, 500)))
         elbo += scale * self.regression_weight * elbo_y
         
         # === Local priors ===
@@ -689,29 +715,25 @@ class SVILaplace:
             elbo += elbo_gamma
         
         # === Entropy terms ===
-        # H[q(θ)]
-        H_theta = jnp.sum(a_theta - jnp.log(b_theta) + jsp.gammaln(a_theta) +
-                        (1 - a_theta) * jsp.digamma(a_theta))
+        # H[q(θ)] - Use stable gamma entropy helper
+        H_theta = jnp.sum(self._gamma_entropy(a_theta, b_theta))
         elbo += scale * H_theta
         
-        # H[q(ξ)]
-        H_xi = jnp.sum(a_xi - jnp.log(b_xi) + jsp.gammaln(a_xi) +
-                     (1 - a_xi) * jsp.digamma(a_xi))
+        # H[q(ξ)] - Use stable gamma entropy helper
+        H_xi = jnp.sum(self._gamma_entropy(a_xi, b_xi))
         elbo += scale * H_xi
         
-        # H[q(β)]
-        H_beta = jnp.sum(self.a_beta - jnp.log(self.b_beta) + jsp.gammaln(self.a_beta) +
-                       (1 - self.a_beta) * jsp.digamma(self.a_beta))
+        # H[q(β)] - Use stable gamma entropy helper
+        H_beta = jnp.sum(self._gamma_entropy(self.a_beta, self.b_beta))
         elbo += H_beta
         
-        # H[q(η)]
-        H_eta = jnp.sum(self.a_eta - jnp.log(self.b_eta) + jsp.gammaln(self.a_eta) +
-                      (1 - self.a_eta) * jsp.digamma(self.a_eta))
+        # H[q(η)] - Use stable gamma entropy helper
+        H_eta = jnp.sum(self._gamma_entropy(self.a_eta, self.b_eta))
         elbo += H_eta
         
         # H[q(v)] - Gaussian entropy per factor
         # H[N(μ, σ²)] = ½ log(2πeσ²) = ½ (1 + log(2π) + log(σ²))
-        H_v = 0.5 * jnp.sum(1 + jnp.log(2 * jnp.pi) + jnp.log(self.sigma_v_sq))
+        H_v = 0.5 * jnp.sum(1.0 + jnp.log(2.0 * jnp.pi) + jnp.log(jnp.maximum(self.sigma_v_sq, 1e-10)))
         elbo += H_v
         
         # H[q(τ)] - InvGaussian entropy (approximation)
@@ -720,17 +742,14 @@ class SVILaplace:
         # Var[τ] for InvGaussian(μ', λ') is μ'³/λ'
         # With our parameterization: μ' = b·√(E[v²]), λ' ≈ 1
         # Var[τ] ≈ b³ · (E[v²])^(3/2)
-        H_tau = 0.5 * self.kappa * self.d * (1 + jnp.log(2 * jnp.pi))
-        H_tau += 0.5 * jnp.sum(3 * jnp.log(self.b_laplace) + 1.5 * jnp.log(self.E_v_sq + 1e-10))
+        H_tau = 0.5 * self.kappa * self.d * (1.0 + jnp.log(2.0 * jnp.pi))
+        H_tau += 0.5 * jnp.sum(3.0 * jnp.log(self.b_laplace) + 1.5 * jnp.log(jnp.maximum(self.E_v_sq, 1e-10)))
         elbo += H_tau
         
-        # H[q(γ)]
+        # H[q(γ)] - Multivariate Gaussian entropy using stable slogdet
         if self.p_aux > 0:
             for k in range(self.kappa):
-                sign, logdet = jnp.linalg.slogdet(self.Sigma_gamma[k])
-                elbo += jnp.where(sign > 0, 
-                                 0.5 * self.p_aux * (1 + jnp.log(2 * jnp.pi)) + 0.5 * logdet, 
-                                 0.0)
+                elbo += self._gaussian_entropy_2d(self.Sigma_gamma[k])
         
         return float(elbo)
     
@@ -1082,7 +1101,8 @@ class SVILaplace:
             else:
                 logits = E_theta_batch @ mu_v_np.T
 
-            all_proba[start:end] = 1.0 / (1.0 + np.exp(-logits))
+            # Use numerically stable sigmoid to avoid overflow/underflow
+            all_proba[start:end] = expit(logits)
 
         return all_proba.squeeze()
 
@@ -1149,7 +1169,6 @@ if __name__ == "__main__":
     # Sparse true v: only 2 of 5 factors are relevant
     v_true = np.array([[2.0, -1.5, 0.0, 0.0, 0.0]])
     
-    from scipy.special import expit
     logits_train = theta_true_train @ v_true.T
     y_train = (expit(logits_train) > 0.5).astype(float).ravel()
     
