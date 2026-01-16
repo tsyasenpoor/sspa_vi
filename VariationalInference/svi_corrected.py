@@ -1341,22 +1341,11 @@ class SVICorrected:
         return self
     
     def transform(self, X_new: np.ndarray, y_new: np.ndarray = None, 
-                  X_aux_new: np.ndarray = None, n_iter: int = 50) -> dict:
+                  X_aux_new: np.ndarray = None, n_iter: int = 50,
+                  average_last_n: int = 10) -> dict:
         """
-        Infer θ for new samples with frozen global parameters (β, η, v, γ).
-        
-        VECTORIZED: Regression contributions computed in vectorized form.
-        
-        Parameters
-        ----------
-        X_new : (n_new, p) count matrix (dense or sparse)
-        y_new : (n_new,) or (n_new, κ) labels (optional, for ζ updates)
-        X_aux_new : (n_new, p_aux) auxiliary covariates
-        n_iter : local VI iterations
-        
-        Returns
-        -------
-        dict with keys: 'E_theta', 'a_theta', 'b_theta', 'a_xi', 'b_xi'
+        Infer θ for new samples with frozen global parameters.
+        Includes stabilizing averaging over the last iterations.
         """
         # Convert sparse to dense if needed
         if sp.issparse(X_new):
@@ -1371,12 +1360,12 @@ class SVICorrected:
             X_aux_new = jnp.array(X_aux_new)
             
         if y_new is None:
-            y_new = jnp.full((n_new, self.kappa), 0.5)  # Neutral labels
+            y_new = jnp.full((n_new, self.kappa), 0.5)
         else:
             y_new = jnp.array(y_new)
             y_new = y_new.reshape(-1, 1) if y_new.ndim == 1 else y_new
         
-        # Initialize local parameters with factor diversity
+        # Initialize
         row_sums = X_new.sum(axis=1, keepdims=True) + 1
         factor_scales = jnp.linspace(0.5, 2.0, self.d)
         
@@ -1386,17 +1375,20 @@ class SVICorrected:
         b_xi = jnp.full(n_new, self.lambda_xi)
         
         # Frozen global expectations
-        E_beta = self.a_beta / self.b_beta          # (p, d)
+        E_beta = self.a_beta / self.b_beta
         E_log_beta = jsp.digamma(self.a_beta) - jnp.log(self.b_beta)
-        E_v = self.mu_v                              # (κ, d)
+        E_v = self.mu_v
         E_v_sq = self.mu_v**2 + jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)
-        E_gamma = self.mu_gamma                      # (κ, p_aux)
+        E_gamma = self.mu_gamma
         
-        beta_col_sums = E_beta.sum(axis=0)  # (d,)
+        beta_col_sums = E_beta.sum(axis=0)
+        
+        # Accumulators for averaging
+        E_theta_sum = jnp.zeros((n_new, self.d))
         
         for it in range(n_iter):
             # Current local expectations
-            E_theta = a_theta / b_theta              # (n_new, d)
+            E_theta = a_theta / b_theta
             E_log_theta = jsp.digamma(a_theta) - jnp.log(b_theta)
             E_xi = a_xi / b_xi
             E_theta_sq = (a_theta * (a_theta + 1)) / b_theta**2
@@ -1406,57 +1398,48 @@ class SVICorrected:
             b_xi = self.lambda_xi + E_theta.sum(axis=1)
             E_xi = a_xi / b_xi
             
-            # Compute φ for auxiliary variable z
-            log_phi = E_log_theta[:, jnp.newaxis, :] + E_log_beta[jnp.newaxis, :, :]  # (n, p, d)
+            # Compute φ
+            log_phi = E_log_theta[:, jnp.newaxis, :] + E_log_beta[jnp.newaxis, :, :]
             log_phi -= logsumexp(log_phi, axis=2, keepdims=True)
             phi = jnp.exp(log_phi)
             
             # Update ζ (JJ bound)
             if self.p_aux > 0:
-                aux_contrib = X_aux_new @ E_gamma.T  # (n_new, κ)
+                aux_contrib = X_aux_new @ E_gamma.T
             else:
                 aux_contrib = 0.0
-            theta_v = E_theta @ E_v.T            # (n_new, κ)
+            theta_v = E_theta @ E_v.T
             E_A = theta_v + aux_contrib
             if self.p_aux > 0:
-                E_A_sq = (E_theta_sq @ E_v_sq.T + 
-                          2 * theta_v * aux_contrib + 
-                          aux_contrib**2)
+                E_A_sq = (E_theta_sq @ E_v_sq.T + 2 * theta_v * aux_contrib + aux_contrib**2)
             else:
                 E_A_sq = E_theta_sq @ E_v_sq.T
             zeta = jnp.sqrt(jnp.maximum(E_A_sq, 1e-10))
             lam = jnp.tanh(zeta / 2) / (4 * zeta + 1e-10)
             
             # Update θ
-            # Shape: sum over genes of X * φ
-            shape_contrib = jnp.einsum('ij,ijl->il', X_new, phi)  # (n_new, d)
+            shape_contrib = jnp.einsum('ij,ijl->il', X_new, phi)
             a_theta = self.alpha_theta + shape_contrib
-            
-            # Rate: ξ + sum_j β_jℓ + regression term R_iℓ
             b_theta = E_xi[:, jnp.newaxis] + beta_col_sums[jnp.newaxis, :]
             
-            # === VECTORIZED regression contribution ===
-            # For each factor ℓ, compute C^{(-ℓ)} vectorized over all outcomes
-            # Broadcasting: (n_new, kappa, 1) - (n_new, 1, d) * (1, kappa, d)
-            C_minus_ell = (
-                E_A[:, :, jnp.newaxis] -  # (n_new, kappa, 1)
-                E_theta[:, jnp.newaxis, :] * E_v[jnp.newaxis, :, :]  # (n_new, kappa, d)
-            )
+            # Regression contribution
+            C_minus_ell = (E_A[:, :, jnp.newaxis] - E_theta[:, jnp.newaxis, :] * E_v[jnp.newaxis, :, :])
+            R = (-(y_new[:, :, jnp.newaxis] - 0.5) * E_v[jnp.newaxis, :, :] +
+                  2 * lam[:, :, jnp.newaxis] * E_v[jnp.newaxis, :, :] * C_minus_ell +
+                  2 * lam[:, :, jnp.newaxis] * E_v_sq[jnp.newaxis, :, :] * E_theta[:, jnp.newaxis, :])
             
-            # R for all outcomes and factors: (n_new, kappa, d)
-            R = (
-                -(y_new[:, :, jnp.newaxis] - 0.5) * E_v[jnp.newaxis, :, :] +
-                2 * lam[:, :, jnp.newaxis] * E_v[jnp.newaxis, :, :] * C_minus_ell +
-                2 * lam[:, :, jnp.newaxis] * E_v_sq[jnp.newaxis, :, :] * E_theta[:, jnp.newaxis, :]
-            )
-            
-            # Sum over outcomes: (n_new, d)
-            R_sum = R.sum(axis=1)
-            
-            b_theta = b_theta + R_sum
+            b_theta = b_theta + R.sum(axis=1)
             b_theta = jnp.maximum(b_theta, 1e-10)
-        
-        E_theta_final = a_theta / b_theta
+
+            # Accumulate for averaging (Stability Fix)
+            if it >= (n_iter - average_last_n):
+                E_theta_sum = E_theta_sum + (a_theta / b_theta)
+
+        # Finalize average
+        if average_last_n > 0:
+            E_theta_final = E_theta_sum / average_last_n
+        else:
+            E_theta_final = a_theta / b_theta
         
         return {
             'E_theta': np.array(E_theta_final),
@@ -1467,19 +1450,12 @@ class SVICorrected:
         }
 
     def predict_proba(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
-                      n_iter: int = 50) -> np.ndarray:
+                      n_iter: int = 50, pip_threshold: float = None) -> np.ndarray:
         """
-        Predict class probabilities for new samples.
+        Predict class probabilities.
         
-        Parameters
-        ----------
-        X_new : (n_new, p) count matrix (dense or sparse)
-        X_aux_new : (n_new, p_aux) auxiliary covariates
-        n_iter : local VI iterations for θ inference
-        
-        Returns
-        -------
-        proba : (n_new,) or (n_new, κ) predicted probabilities
+        pip_threshold: If set (e.g., 0.5), coefficients with inclusion probability 
+                       rho_v < threshold are forced to ZERO (hard sparsity).
         """
         n_new = X_new.shape[0]
         if X_aux_new is None:
@@ -1487,17 +1463,70 @@ class SVICorrected:
         else:
             X_aux_new = np.array(X_aux_new)
             
-        result = self.transform(X_new, y_new=None, X_aux_new=X_aux_new, n_iter=n_iter)
+        # Use transform with averaging for stability
+        result = self.transform(X_new, y_new=None, X_aux_new=X_aux_new, 
+                                n_iter=n_iter, average_last_n=10)
         E_theta = jnp.array(result['E_theta'])
         
-        # Compute logits: θ @ v^T + X_aux @ γ^T
+        # Apply Hard Sparsity Mask
+        effective_v = self.mu_v
+        if pip_threshold is not None and self.use_spike_slab:
+            # Create boolean mask
+            active_mask = (self.rho_v > pip_threshold)
+            effective_v = self.mu_v * active_mask
+            
+        # Compute logits using EFFECTIVE v
         if self.p_aux > 0:
-            logits = E_theta @ self.mu_v.T + jnp.array(X_aux_new) @ self.mu_gamma.T
+            logits = E_theta @ effective_v.T + jnp.array(X_aux_new) @ self.mu_gamma.T
         else:
-            logits = E_theta @ self.mu_v.T
+            logits = E_theta @ effective_v.T
+            
         proba = jsp.expit(logits)
         
         return np.array(proba).squeeze()
+
+    def get_sparse_factors(self, pip_threshold: float = 0.5) -> dict:
+        """
+        Get factors that are active based on Posterior Inclusion Probability (PIP).
+        Returns indices where rho_v > threshold.
+        """
+        if not self.use_spike_slab:
+            return self._get_magnitude_factors(threshold=0.1)
+            
+        active_mask = np.array(self.rho_v > pip_threshold)
+        v_values = np.array(self.mu_v)
+        rho_values = np.array(self.rho_v)
+        
+        results = {
+            'active_factors': [],
+            'v_values': [],
+            'rho_values': [],
+            'direction': []
+        }
+        
+        for k in range(self.kappa):
+            for ell in range(self.d):
+                if active_mask[k, ell]:
+                    results['active_factors'].append((k, ell))
+                    results['v_values'].append(float(v_values[k, ell]))
+                    results['rho_values'].append(float(rho_values[k, ell]))
+                    results['direction'].append('risk' if v_values[k, ell] > 0 else 'protective')
+        
+        return results
+
+    def _get_magnitude_factors(self, threshold: float = 0.1) -> dict:
+        """Legacy helper for non-spike-slab models."""
+        v_abs = np.abs(np.array(self.mu_v))
+        active = v_abs > threshold
+        results = {'active_factors': [], 'v_values': [], 'rho_values': [], 'direction': []}
+        for k in range(self.kappa):
+            for ell in range(self.d):
+                if active[k, ell]:
+                    results['active_factors'].append((k, ell))
+                    results['v_values'].append(float(self.mu_v[k, ell]))
+                    results['rho_values'].append(1.0)
+                    results['direction'].append('risk' if self.mu_v[k, ell] > 0 else 'protective')
+        return results
 
     def predict(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
                 n_iter: int = 50, threshold: float = 0.5) -> np.ndarray:

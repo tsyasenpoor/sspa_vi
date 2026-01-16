@@ -669,20 +669,30 @@ def main():
     print("Test Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for test set (BATCHED to avoid OOM)
-    test_result = model.transform_batched(X_test, y_new=None, X_aux_new=X_aux_test,
-                                          n_iter=50, batch_size=auto_batch_size,
-                                          verbose=args.verbose)
-    # E_theta_test = test_result['E_theta']
+    # Infer theta for test set (uses stability averaging automatically now)
+    test_result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test, n_iter=50)
 
-    # Compute probabilities (BATCHED to avoid OOM)
-    y_test_proba = model.predict_proba_batched(X_test, X_aux_test, n_iter=50,
-                                                batch_size=auto_batch_size,
-                                                verbose=args.verbose)
+    # Compute probabilities with Exact Zero Logic
+    # Use 0.8 to be conservative: only factors with >80% probability are used
+    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50, pip_threshold=0.8)
+    
     if args.verbose:
         print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
+    
     print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")
     y_test_pred = (y_test_proba.ravel() > optimal_threshold).astype(int)
+
+    # Check which factors survived the threshold
+    if hasattr(model, 'get_sparse_factors'):
+        sparse_info = model.get_sparse_factors(pip_threshold=0.8)
+        n_active = len(sparse_info['active_factors'])
+        print(f"\nActive DRGPs (PIP > 0.8): {n_active} / {model.d}")
+        if n_active < 10:
+            for i in range(n_active):
+                f_idx = sparse_info['active_factors'][i][1]
+                v_val = sparse_info['v_values'][i]
+                direction = sparse_info['direction'][i]
+                print(f"  Factor {f_idx}: v={v_val:.4f} ({direction})")
 
     test_metrics = compute_metrics(y_test, y_test_pred, y_test_proba.ravel())
     print(f"\nTest Results:")
