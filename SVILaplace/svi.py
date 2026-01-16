@@ -478,11 +478,12 @@ class SVILaplace:
         
         # Precision: (κ, d)
         precision = E_tau_inv.copy()  # Prior contribution
-        
+
         # Likelihood contribution: 2·Σ_i λ(ζ_ik)·E[θ_iℓ²]
-        precision_contrib = 2 * scale * jnp.einsum('ik,id->kd', lam, E_theta_sq)
+        # Include regression_weight to match ELBO weighting
+        precision_contrib = 2 * scale * self.regression_weight * jnp.einsum('ik,id->kd', lam, E_theta_sq)
         precision = precision + precision_contrib
-        
+
         # =====================================================================
         # MEAN × PRECISION
         # =====================================================================
@@ -492,10 +493,11 @@ class SVILaplace:
             (aux_contrib[:, :, jnp.newaxis] if self.p_aux > 0 else 0.0) -
             E_theta[:, jnp.newaxis, :] * self.E_v[jnp.newaxis, :, :]
         )
-        
+
         # Mean × precision: Σ_i [(y_ik - ½) - 2λ(ζ_ik)·C_ik^(-ℓ)] · E[θ_iℓ]
-        term1 = scale * jnp.einsum('ik,id->kd', y_expanded - 0.5, E_theta)
-        term2 = 2 * scale * jnp.einsum('ik,ikd,id->kd', lam, C_minus_ell, E_theta)
+        # Include regression_weight to match ELBO weighting
+        term1 = scale * self.regression_weight * jnp.einsum('ik,id->kd', y_expanded - 0.5, E_theta)
+        term2 = 2 * scale * self.regression_weight * jnp.einsum('ik,ikd,id->kd', lam, C_minus_ell, E_theta)
         mean_times_precision = term1 - term2
         
         # =====================================================================
@@ -530,12 +532,14 @@ class SVILaplace:
         
         for k in range(self.kappa):
             prec_prior = jnp.eye(self.p_aux) / self.sigma_gamma**2
-            prec_lik = 2 * scale * (X_aux_batch.T * lam[:, k]) @ X_aux_batch
+            # Include regression_weight to match ELBO weighting
+            prec_lik = 2 * scale * self.regression_weight * (X_aux_batch.T * lam[:, k]) @ X_aux_batch
             prec_hat = prec_prior + prec_lik
-            
+
             theta_v = E_theta @ self.E_v[k]
-            mean_contrib = scale * X_aux_batch.T @ (y_expanded[:, k] - 0.5 - 2 * lam[:, k] * theta_v)
-            
+            # Include regression_weight to match ELBO weighting
+            mean_contrib = scale * self.regression_weight * X_aux_batch.T @ (y_expanded[:, k] - 0.5 - 2 * lam[:, k] * theta_v)
+
             Sigma_hat_k = jnp.linalg.inv(prec_hat + 1e-6 * jnp.eye(self.p_aux))
             mu_hat_k = Sigma_hat_k @ mean_contrib
             
