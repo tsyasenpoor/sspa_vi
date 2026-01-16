@@ -217,8 +217,8 @@ class SVILaplace:
         self.kappa = 1 if y.ndim == 1 else y.shape[1]
         self.p_aux = X_aux.shape[1] if X_aux is not None and X_aux.size > 0 else 0
         
-        key1, key2, key3, self.rng_key = random.split(self.rng_key, 4)
-        
+        key1, key2, key3, key4, self.rng_key = random.split(self.rng_key, 5)
+
         # -----------------------------------------------------------------
         # β: Gene loadings ~ Gamma(a_β, b_β)
         # Initialize with diversity to break symmetry
@@ -226,16 +226,23 @@ class SVILaplace:
         col_means = X.mean(axis=0) + 1
         self.a_beta = jnp.full((self.p, self.d), self.alpha_beta)
         self.b_beta = jnp.full((self.p, self.d), 1.0)
-        
+
         # Add random diversity
         random_boost = random.uniform(key1, (self.p, self.d), minval=0.1, maxval=3.0)
         gene_scale = col_means[:, jnp.newaxis]
         self.a_beta = self.a_beta + gene_scale * random_boost * 5.0
-        
+
         # Factor-specific signatures
         factor_signatures = random.uniform(key2, (self.p, self.d), minval=0.0, maxval=2.0)
         sparsity_masks = random.bernoulli(key3, p=0.3, shape=(self.p, self.d))
         self.a_beta = self.a_beta + factor_signatures * sparsity_masks * gene_scale * 3.0
+
+        # CRITICAL: Add factor-level scaling that survives sum over genes
+        # This prevents all factors from collapsing to identical values
+        # Each factor gets a different overall "strength" multiplier
+        factor_scales = random.uniform(key4, (self.d,), minval=0.5, maxval=2.0)
+        self.a_beta = self.a_beta * factor_scales[jnp.newaxis, :]
+
         self.a_beta = jnp.maximum(self.a_beta, self.alpha_beta * 0.1)
         
         # -----------------------------------------------------------------
