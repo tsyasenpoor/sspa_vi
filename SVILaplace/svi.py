@@ -58,6 +58,9 @@ class SVILaplace:
         self.learning_rate_min = learning_rate_min
         self.local_iterations = local_iterations
         
+        # Batch size for prediction (separate from training batch size)
+        self.predict_batch_size = min(batch_size, 512)  # Default to smaller batches for prediction
+
         # Poisson factorization priors
         self.alpha_theta = alpha_theta
         self.alpha_beta = alpha_beta
@@ -908,56 +911,45 @@ class SVILaplace:
     # INFERENCE FOR NEW DATA
     # =========================================================================
     
-    def transform(self, X_new: np.ndarray, y_new: np.ndarray = None,
-                  X_aux_new: np.ndarray = None, n_iter: int = 50) -> dict:
-        """Infer θ for new samples with frozen global parameters."""
-        if sp.issparse(X_new):
-            X_new = jnp.array(X_new.toarray())
-        else:
-            X_new = jnp.array(X_new)
-        
-        n_new = X_new.shape[0]
-        if X_aux_new is None:
-            X_aux_new = jnp.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
-        else:
-            X_aux_new = jnp.array(X_aux_new)
-        
-        if y_new is None:
-            y_new = jnp.full((n_new, self.kappa), 0.5)
-        else:
-            y_new = jnp.array(y_new)
-            y_new = y_new.reshape(-1, 1) if y_new.ndim == 1 else y_new
-        
+    def _transform_batch(self, X_batch: jnp.ndarray, y_batch: jnp.ndarray,
+                          X_aux_batch: jnp.ndarray, n_iter: int) -> dict:
+        """
+        Infer θ for a single batch of samples with frozen global parameters.
+
+        This is the core inference routine, called by transform() for each batch.
+        """
+        batch_size = X_batch.shape[0]
+
         # Initialize
-        row_sums = X_new.sum(axis=1, keepdims=True) + 1
+        row_sums = X_batch.sum(axis=1, keepdims=True) + 1
         factor_scales = jnp.linspace(0.5, 2.0, self.d)
-        
-        a_theta = jnp.full((n_new, self.d), self.alpha_theta + self.p * self.alpha_beta)
+
+        a_theta = jnp.full((batch_size, self.d), self.alpha_theta + self.p * self.alpha_beta)
         b_theta = row_sums / self.d * factor_scales
-        a_xi = jnp.full(n_new, self.alpha_xi + self.d * self.alpha_theta)
-        b_xi = jnp.full(n_new, self.lambda_xi)
-        
+        a_xi = jnp.full(batch_size, self.alpha_xi + self.d * self.alpha_theta)
+        b_xi = jnp.full(batch_size, self.lambda_xi)
+
         beta_col_sums = self.E_beta.sum(axis=0)
-        
+
         for _ in range(n_iter):
             E_theta = a_theta / b_theta
             E_log_theta = jsp.digamma(a_theta) - jnp.log(b_theta)
             E_xi = a_xi / b_xi
             E_theta_sq = (a_theta * (a_theta + 1)) / b_theta**2
-            
+
             # ξ update
             a_xi = self.alpha_xi + self.d * self.alpha_theta
             b_xi = self.lambda_xi + E_theta.sum(axis=1)
             E_xi = a_xi / b_xi
-            
+
             # φ and z
             log_phi = E_log_theta[:, jnp.newaxis, :] + self.E_log_beta[jnp.newaxis, :, :]
             log_phi -= logsumexp(log_phi, axis=2, keepdims=True)
             phi = jnp.exp(log_phi)
-            
+
             # ζ update
             if self.p_aux > 0:
-                aux_contrib = X_aux_new @ self.E_gamma.T
+                aux_contrib = X_aux_batch @ self.E_gamma.T
             else:
                 aux_contrib = 0.0
             theta_v = E_theta @ self.E_v.T
@@ -965,57 +957,142 @@ class SVILaplace:
             E_A_sq = E_theta_sq @ self.E_v_sq.T + (2 * theta_v * aux_contrib if self.p_aux > 0 else 0)
             zeta = jnp.sqrt(jnp.maximum(E_A_sq, 1e-10))
             lam = self._lambda_jj(zeta)
-            
+
             # θ update
-            shape_contrib = jnp.einsum('ij,ijl->il', X_new, phi)
+            shape_contrib = jnp.einsum('ij,ijl->il', X_batch, phi)
             a_theta = self.alpha_theta + shape_contrib
             b_theta = E_xi[:, jnp.newaxis] + beta_col_sums[jnp.newaxis, :]
-            
+
             # Regression contribution
             C_minus_ell = (
                 E_A[:, :, jnp.newaxis] +
                 (aux_contrib[:, :, jnp.newaxis] if self.p_aux > 0 else 0.0) -
                 E_theta[:, jnp.newaxis, :] * self.E_v[jnp.newaxis, :, :]
             )
-            
+
             R = (
-                -(y_new[:, :, jnp.newaxis] - 0.5) * self.E_v[jnp.newaxis, :, :] +
+                -(y_batch[:, :, jnp.newaxis] - 0.5) * self.E_v[jnp.newaxis, :, :] +
                 2 * lam[:, :, jnp.newaxis] * self.E_v[jnp.newaxis, :, :] * C_minus_ell +
                 2 * lam[:, :, jnp.newaxis] * self.E_v_sq[jnp.newaxis, :, :] * E_theta[:, jnp.newaxis, :]
             )
             R_sum = R.sum(axis=1)
-            
+
             b_theta = b_theta + R_sum
             b_theta = jnp.maximum(b_theta, 1e-10)
-        
+
         return {
-            'E_theta': np.array(a_theta / b_theta),
-            'a_theta': np.array(a_theta),
-            'b_theta': np.array(b_theta),
-            'a_xi': np.array(a_xi),
-            'b_xi': np.array(b_xi)
+            'E_theta': a_theta / b_theta,
+            'a_theta': a_theta,
+            'b_theta': b_theta,
+            'a_xi': a_xi,
+            'b_xi': b_xi
+        }
+
+    def transform(self, X_new: np.ndarray, y_new: np.ndarray = None,
+                  X_aux_new: np.ndarray = None, n_iter: int = 50) -> dict:
+        """
+        Infer θ for new samples with frozen global parameters.
+
+        Processes data in batches to avoid OOM errors on large datasets.
+        """
+        if sp.issparse(X_new):
+            X_new = jnp.array(X_new.toarray())
+        else:
+            X_new = jnp.array(X_new)
+
+        n_new = X_new.shape[0]
+        if X_aux_new is None:
+            X_aux_new = jnp.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
+        else:
+            X_aux_new = jnp.array(X_aux_new)
+
+        if y_new is None:
+            y_new = jnp.full((n_new, self.kappa), 0.5)
+        else:
+            y_new = jnp.array(y_new)
+            y_new = y_new.reshape(-1, 1) if y_new.ndim == 1 else y_new
+
+        # Process in batches to avoid OOM
+        batch_size = self.predict_batch_size
+        n_batches = (n_new + batch_size - 1) // batch_size
+
+        # Preallocate output arrays
+        all_E_theta = np.zeros((n_new, self.d))
+        all_a_theta = np.zeros((n_new, self.d))
+        all_b_theta = np.zeros((n_new, self.d))
+        all_a_xi = np.zeros(n_new)
+        all_b_xi = np.zeros(n_new)
+
+        for batch_idx in range(n_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, n_new)
+
+            X_batch = X_new[start:end]
+            y_batch = y_new[start:end]
+            X_aux_batch = X_aux_new[start:end]
+
+            result = self._transform_batch(X_batch, y_batch, X_aux_batch, n_iter)
+
+            all_E_theta[start:end] = np.array(result['E_theta'])
+            all_a_theta[start:end] = np.array(result['a_theta'])
+            all_b_theta[start:end] = np.array(result['b_theta'])
+            all_a_xi[start:end] = np.array(result['a_xi'])
+            all_b_xi[start:end] = np.array(result['b_xi'])
+
+        return {
+            'E_theta': all_E_theta,
+            'a_theta': all_a_theta,
+            'b_theta': all_b_theta,
+            'a_xi': all_a_xi,
+            'b_xi': all_b_xi
         }
     
     def predict_proba(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
                       n_iter: int = 50) -> np.ndarray:
-        """Predict class probabilities."""
+        """
+        Predict class probabilities.
+
+        Processes data in batches to avoid OOM errors on large datasets.
+        """
         n_new = X_new.shape[0]
         if X_aux_new is None:
             X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
-        
+
+        # transform already processes in batches
         result = self.transform(X_new, y_new=None, X_aux_new=X_aux_new, n_iter=n_iter)
-        E_theta = jnp.array(result['E_theta'])
-        
-        if self.p_aux > 0:
-            logits = E_theta @ self.mu_v.T + jnp.array(X_aux_new) @ self.mu_gamma.T
-        else:
-            logits = E_theta @ self.mu_v.T
-        
-        return np.array(jsp.expit(logits)).squeeze()
-    
+
+        # Compute logits in batches to avoid any remaining memory issues
+        batch_size = self.predict_batch_size
+        n_batches = (n_new + batch_size - 1) // batch_size
+
+        # Preallocate output
+        all_proba = np.zeros((n_new, self.kappa))
+
+        mu_v_np = np.array(self.mu_v)
+        mu_gamma_np = np.array(self.mu_gamma) if self.p_aux > 0 else None
+
+        for batch_idx in range(n_batches):
+            start = batch_idx * batch_size
+            end = min(start + batch_size, n_new)
+
+            E_theta_batch = result['E_theta'][start:end]
+
+            if self.p_aux > 0:
+                logits = E_theta_batch @ mu_v_np.T + X_aux_new[start:end] @ mu_gamma_np.T
+            else:
+                logits = E_theta_batch @ mu_v_np.T
+
+            all_proba[start:end] = 1.0 / (1.0 + np.exp(-logits))
+
+        return all_proba.squeeze()
+
     def predict(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
                 n_iter: int = 50, threshold: float = 0.5) -> np.ndarray:
-        """Predict class labels."""
+        """
+        Predict class labels.
+
+        Processes data in batches to avoid OOM errors on large datasets.
+        """
         proba = self.predict_proba(X_new, X_aux_new, n_iter)
         return (proba >= threshold).astype(int)
     
