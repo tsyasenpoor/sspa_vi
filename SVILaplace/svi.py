@@ -996,7 +996,8 @@ class SVILaplace:
             )
             R_sum = R.sum(axis=1)
 
-            b_theta = b_theta + R_sum
+            # Apply regression_weight to match training (fixes scale mismatch bug)
+            b_theta = b_theta + self.regression_weight * R_sum
             b_theta = jnp.maximum(b_theta, 1e-10)
 
         return {
