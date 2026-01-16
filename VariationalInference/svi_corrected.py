@@ -275,7 +275,7 @@ class SVICorrected:
         # v: Regression coefficients, N(μ_v, Σ_v)
         # Initialize with stronger signal to help learn discrimination
         # Use larger initial scale (0.5 instead of 0.1) for better exploration
-        v_init_scale = max(0.5, self.sigma_v * 2)  # At least 0.5, or 2*sigma_v if larger
+        v_init_scale = 0.5
         key_v1, key_v2 = random.split(key2, 2)
         self.mu_v = v_init_scale * random.normal(key_v1, (self.kappa, self.d))
         self.Sigma_v = jnp.array([jnp.eye(self.d) * self.sigma_v**2 for _ in range(self.kappa)])
@@ -397,7 +397,7 @@ class SVICorrected:
 
         # Evidence for inclusion: magnitude of E[β] scaled by prior expectations
         # Large E[β] → high inclusion probability
-        log_lik_ratio_beta = jnp.log(self.E_beta + 1e-10) - jnp.log(1e-6)  # vs spike at ε
+        log_lik_ratio_beta = jnp.log(self.E_beta + 1e-10) - jnp.log(0.2)  # vs spike at ε
 
         # Posterior inclusion probability using sigmoid
         log_odds_beta = log_prior_odds_beta + log_lik_ratio_beta
