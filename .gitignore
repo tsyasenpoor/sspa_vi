@@ -309,3 +309,5 @@ jobs_sh/ibd_svi_stable.sh
 .gitignore
 jobs_sh/ibd_svi_aggressive.sh
 jobs_sh/ibd_svi_masked.sh
+jobs_sh/ibd_svi_combined.sh
+jobs_sh/ibd_svi_path_init.sh
