@@ -412,8 +412,9 @@ def save_results(
             'n_test': len(splits['test']),
         },
         'feature_type': feature_type,
-        'mode': mode,  # unmasked, masked, or pathway_init
+        'mode': mode,  # unmasked, masked, pathway_init, or combined
         'program_names': program_names,  # Pathway names if using pathway modes
+        'n_pathway_factors': getattr(model, 'n_pathway_factors', None),  # For combined mode
         'training': {
             'training_time': getattr(model, 'training_time_', None),
             'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') and model.elbo_history_ else None,

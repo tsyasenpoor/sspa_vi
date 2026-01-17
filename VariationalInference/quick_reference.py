@@ -124,15 +124,16 @@ def parse_args() -> argparse.Namespace:
         '--mode',
         type=str,
         default='unmasked',
-        choices=['unmasked', 'masked', 'pathway_init'],
+        choices=['unmasked', 'masked', 'pathway_init', 'combined'],
         help='Model mode: unmasked (standard), masked (β fixed to pathway structure), '
-             'pathway_init (β initialized from pathways but free to deviate)'
+             'pathway_init (β initialized from pathways but free to deviate), '
+             'combined (pathway-constrained + unconstrained DRGPs)'
     )
     parser.add_argument(
         '--pathway-file',
         type=str,
         default='/archive/projects/SSPA_BRAY/sspa/c2.cp.v2024.1.Hs.symbols.gmt',
-        help='GMT file for pathway definitions (used in masked/pathway_init modes)'
+        help='GMT file for pathway definitions (used in masked/pathway_init/combined modes)'
     )
     parser.add_argument(
         '--pathway-min-genes',
@@ -145,6 +146,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=500,
         help='Maximum genes per pathway (for filtering)'
+    )
+    parser.add_argument(
+        '--n-drgps',
+        type=int,
+        default=50,
+        help='Number of unconstrained data-driven gene programs (DRGPs) for combined mode'
     )
 
     # SVI Training options
@@ -402,7 +409,7 @@ def main():
     print(f"  aux_columns:  {args.aux_columns}")
     print(f"  random_seed:  {args.seed if args.seed else 'None (random)'}")
     print(f"  output_dir:   {args.output_dir}")
-    if args.mode in ['masked', 'pathway_init']:
+    if args.mode in ['masked', 'pathway_init', 'combined']:
         print(f"  pathway_file: {args.pathway_file}")
         print(f"  pathway_size: [{args.pathway_min_genes}, {args.pathway_max_genes}]")
     if args.normalize:
@@ -470,7 +477,7 @@ def main():
     pathway_names = None
     n_factors = args.n_factors  # Default from CLI
     
-    if args.mode in ['masked', 'pathway_init']:
+    if args.mode in ['masked', 'pathway_init', 'combined']:
         print("\n" + "=" * 80)
         print(f"Loading Pathways for {args.mode.upper()} Mode")
         print("=" * 80)
@@ -532,12 +539,35 @@ def main():
         # Use pathway names
         pathway_names = pathway_names_raw
         
-        # In masked/pathway_init modes, n_factors = n_pathways
-        n_factors = n_pathways
-        print(f"\n  Setting n_factors = {n_factors} (number of pathways)")
-        
-        if args.n_factors != n_pathways:
-            print(f"  NOTE: --n-factors={args.n_factors} overridden by pathway count ({n_pathways})")
+        # Determine n_factors based on mode
+        if args.mode == 'combined':
+            # Combined mode: n_factors = n_pathways + n_drgps
+            n_drgps = args.n_drgps
+            n_factors = n_pathways + n_drgps
+            
+            # Extend pathway_mask to include unconstrained DRGP columns
+            # Pathway columns (0..n_pathways-1): constrained by pathway_mask
+            # DRGP columns (n_pathways..n_factors-1): all ones (unconstrained)
+            drgp_mask = np.ones((n_drgps, n_genes_expr), dtype=np.float32)
+            pathway_mask_combined = np.vstack([pathway_mask, drgp_mask])
+            
+            # Extend pathway names with DRGP labels
+            drgp_names = [f"DRGP_{i+1}" for i in range(n_drgps)]
+            pathway_names = pathway_names_raw + drgp_names
+            
+            # Replace pathway_mask with the extended version
+            pathway_mask = pathway_mask_combined
+            
+            print(f"\n  [COMBINED MODE] n_factors = {n_pathways} pathways + {n_drgps} DRGPs = {n_factors}")
+            print(f"    Pathway factors [0:{n_pathways}]: β constrained by pathway membership")
+            print(f"    DRGP factors [{n_pathways}:{n_factors}]: β unconstrained (all genes)")
+        else:
+            # masked/pathway_init modes: n_factors = n_pathways
+            n_factors = n_pathways
+            print(f"\n  Setting n_factors = {n_factors} (number of pathways)")
+            
+            if args.n_factors != n_pathways:
+                print(f"  NOTE: --n-factors={args.n_factors} overridden by pathway count ({n_pathways})")
     
     else:
         print(f"\n[UNMASKED MODE] Using {n_factors} latent factors (no pathway constraint)")
@@ -583,6 +613,14 @@ def main():
     print(f"  n_factors:    {n_factors}")
     if pathway_names is not None:
         print(f"  Pathways:     {len(pathway_names)}")
+    
+    # For combined mode, track the number of pathway factors
+    n_pathway_factors = None
+    if args.mode == 'combined':
+        # n_pathways was computed during pathway loading
+        n_pathway_factors = n_factors - args.n_drgps
+        print(f"  n_pathway_factors: {n_pathway_factors}")
+        print(f"  n_drgps:          {args.n_drgps}")
 
     # Create SVI model
     model = SVI(
@@ -613,7 +651,8 @@ def main():
         # Pathway mode settings
         mode=args.mode,
         pathway_mask=pathway_mask,
-        pathway_names=pathway_names
+        pathway_names=pathway_names,
+        n_pathway_factors=n_pathway_factors  # For combined mode boundary
     )
 
     # Train model

@@ -85,10 +85,11 @@ class SVICorrected:
         use_jit: bool = True,
         device: str = 'gpu',  # 'gpu' or 'cpu'
         
-        # Pathway mode: 'unmasked', 'masked', or 'pathway_init'
+        # Pathway mode: 'unmasked', 'masked', 'pathway_init', or 'combined'
         mode: str = 'unmasked',
         pathway_mask: Optional[np.ndarray] = None,  # (n_pathways, n_genes) binary matrix
         pathway_names: Optional[List[str]] = None,  # Pathway names for reporting
+        n_pathway_factors: Optional[int] = None,  # For combined mode: number of pathway-constrained factors
     ):
         self.d = n_factors  # Number of factors
         self.batch_size = batch_size
@@ -102,8 +103,15 @@ class SVICorrected:
         self.mode = mode
         self.pathway_mask = pathway_mask  # (n_pathways, n_genes) or None
         self.pathway_names = pathway_names
+        self.n_pathway_factors = n_pathway_factors  # For combined mode
+        
         if mode in ['masked', 'pathway_init'] and pathway_mask is None:
             raise ValueError(f"pathway_mask required for mode='{mode}'")
+        if mode == 'combined':
+            if pathway_mask is None:
+                raise ValueError("pathway_mask required for mode='combined'")
+            if n_pathway_factors is None:
+                raise ValueError("n_pathway_factors required for mode='combined'")
         if mode == 'masked':
             # In masked mode, disable spike-and-slab (sparsity from mask)
             use_spike_slab = False
@@ -259,11 +267,13 @@ class SVICorrected:
     def _initialize_global_parameters(self, X: jnp.ndarray, y: jnp.ndarray, X_aux: jnp.ndarray):
         """Initialize global variational parameters with factor diversity.
         
-        Supports three modes:
+        Supports four modes:
         - 'unmasked': Standard initialization with random diversity (original behavior)
         - 'masked': β fixed to pathway structure. β_jk = 0 if gene j not in pathway k,
                     β_jk learned if gene j in pathway k. #factors = #pathways.
         - 'pathway_init': β initialized from pathway mask but free to deviate during learning.
+        - 'combined': First n_pathway_factors are pathway-constrained (masked), remaining 
+                      are unconstrained DRGPs (free to learn any pattern).
         """
         self.n, self.p = X.shape
         self.kappa = 1 if y.ndim == 1 else y.shape[1]
@@ -275,7 +285,57 @@ class SVICorrected:
         # =====================================================================
         # MODE-SPECIFIC BETA INITIALIZATION
         # =====================================================================
-        if self.mode in ['masked', 'pathway_init']:
+        if self.mode == 'combined':
+            # Combined mode: pathway-constrained + unconstrained DRGPs
+            # pathway_mask is already (n_factors, n_genes) with first n_pathway_factors 
+            # being pathway masks and remaining being all-ones (unconstrained)
+            print(f"[COMBINED MODE] Initializing β: {self.n_pathway_factors} pathway factors + "
+                  f"{self.d - self.n_pathway_factors} DRGP factors")
+            
+            pathway_mask_T = self.pathway_mask.T  # (n_genes, n_factors) = (p, d)
+            mask_jnp = jnp.array(pathway_mask_T, dtype=jnp.float32)
+            
+            # Initialize beta for all factors
+            self.a_beta = jnp.full((self.p, self.d), self.alpha_beta)
+            self.b_beta = jnp.full((self.p, self.d), 1.0)
+            
+            # For pathway factors [0:n_pathway_factors]: masked initialization
+            # Where mask=0: small values (effectively β≈0)
+            # Where mask=1: normal initialization
+            random_init = random.uniform(key1, (self.p, self.d), minval=0.5, maxval=2.0)
+            
+            # Pathway columns: apply masking
+            pathway_cols = jnp.arange(self.n_pathway_factors)
+            for k in pathway_cols:
+                col_mask = mask_jnp[:, k]
+                # Masked-in genes: normal init; masked-out: small values
+                self.a_beta = self.a_beta.at[:, k].set(
+                    jnp.where(col_mask > 0.5, 
+                              self.alpha_beta + random_init[:, k],
+                              self.alpha_beta * 0.01)
+                )
+                self.b_beta = self.b_beta.at[:, k].set(
+                    jnp.where(col_mask > 0.5, 1.0, 10.0)
+                )
+            
+            # For DRGP factors [n_pathway_factors:]: diverse unconstrained initialization
+            drgp_cols = jnp.arange(self.n_pathway_factors, self.d)
+            random_boost = random.uniform(key2, (self.p, self.d - self.n_pathway_factors), minval=0.1, maxval=3.0)
+            factor_signatures = random.uniform(key3, (self.p, self.d - self.n_pathway_factors), minval=0.0, maxval=2.0)
+            key_sparse, _ = random.split(key3)
+            sparsity_masks = random.bernoulli(key_sparse, p=0.3, shape=(self.p, self.d - self.n_pathway_factors))
+            
+            for i, k in enumerate(drgp_cols):
+                # Diverse initialization like unmasked mode
+                a_col = self.alpha_beta + random_boost[:, i] * 0.5 + factor_signatures[:, i] * sparsity_masks[:, i] * 0.2
+                self.a_beta = self.a_beta.at[:, k].set(a_col)
+            
+            # Store the mask for pathway columns, None for DRGP columns
+            # Create a combined mask: pathway columns use the mask, DRGP columns are None (unconstrained)
+            # We'll store the full mask and track n_pathway_factors to know where constraint ends
+            self.beta_mask = mask_jnp[:, :self.n_pathway_factors]  # Only pathway columns have masks
+            
+        elif self.mode in ['masked', 'pathway_init']:
             # Pathway-based initialization
             # pathway_mask is (n_pathways, n_genes) - need to transpose to (n_genes, n_factors)
             # self.d should already equal n_pathways (set by caller)
@@ -868,6 +928,26 @@ class SVICorrected:
             self.a_beta = jnp.where(self.beta_mask > 0.5, self.a_beta, small_a)
             self.b_beta = jnp.where(self.beta_mask > 0.5, self.b_beta, large_b)
             # Also reset natural params to maintain consistency
+            self.eta1_beta, self.eta2_beta = self._gamma_to_natural(self.a_beta, self.b_beta)
+        
+        # COMBINED MODE: Enforce mask only on pathway factors [0:n_pathway_factors]
+        # DRGP factors [n_pathway_factors:d] remain unconstrained
+        elif self.mode == 'combined' and self.beta_mask is not None:
+            small_a = self.alpha_beta * 0.01
+            large_b = 10.0
+            # beta_mask is (p, n_pathway_factors) - only for pathway columns
+            # Apply masking only to first n_pathway_factors columns
+            pathway_a = jnp.where(self.beta_mask > 0.5, 
+                                   self.a_beta[:, :self.n_pathway_factors], 
+                                   small_a)
+            pathway_b = jnp.where(self.beta_mask > 0.5,
+                                   self.b_beta[:, :self.n_pathway_factors],
+                                   large_b)
+            # Update only pathway columns
+            self.a_beta = self.a_beta.at[:, :self.n_pathway_factors].set(pathway_a)
+            self.b_beta = self.b_beta.at[:, :self.n_pathway_factors].set(pathway_b)
+            # DRGP columns remain unchanged (free to learn)
+            # Reset natural params to maintain consistency
             self.eta1_beta, self.eta2_beta = self._gamma_to_natural(self.a_beta, self.b_beta)
         
         # Eta: clipped natural gradient update (relaxed clipping)
