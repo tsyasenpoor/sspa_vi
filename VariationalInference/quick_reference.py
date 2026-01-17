@@ -382,11 +382,37 @@ def main():
     import cProfile
     import pstats
     import io
+    import random
 
     # =========================================================================
     # STEP 1: Parse Arguments
     # =========================================================================
     args = parse_args()
+
+    # =========================================================================
+    # STEP 1.5: Set Random Seeds for Full Reproducibility
+    # =========================================================================
+    # CRITICAL: Set seeds BEFORE any random operations (imports, data loading, etc.)
+    # This ensures:
+    #   1. NumPy random (used for train/test split, epoch shuffling, etc.)
+    #   2. Python random (used by some libraries internally)
+    #   3. JAX random (handled by SVI class via random_state argument)
+    # are all deterministic given the same seed.
+    
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        # JAX random is handled separately in SVI class via random_state
+        print(f"[SEED] Set Python/NumPy random seed to {args.seed}")
+    else:
+        # Generate a random seed from system entropy and log it for reproducibility debugging
+        import time
+        auto_seed = int(time.time() * 1000) % (2**32)
+        random.seed(auto_seed)
+        np.random.seed(auto_seed)
+        # Store for logging
+        args._auto_seed = auto_seed
+        print(f"[SEED] No seed provided, using auto-generated seed: {auto_seed}")
 
     # Initialize profiler if requested
     profiler = None
@@ -407,7 +433,8 @@ def main():
     print(f"  learning_rate:{args.learning_rate}")
     print(f"  label_column: {args.label_column}")
     print(f"  aux_columns:  {args.aux_columns}")
-    print(f"  random_seed:  {args.seed if args.seed else 'None (random)'}")
+    seed_display = args.seed if args.seed else f"auto ({getattr(args, '_auto_seed', 'unknown')})"
+    print(f"  random_seed:  {seed_display}")
     print(f"  output_dir:   {args.output_dir}")
     if args.mode in ['masked', 'pathway_init', 'combined']:
         print(f"  pathway_file: {args.pathway_file}")
@@ -682,37 +709,17 @@ def main():
     print(f"mu_v mean:  {model.mu_v.mean():.6f}")
     print(f"mu_v std:   {model.mu_v.std():.6f}")
     print(f"mu_v sum:   {model.mu_v.sum():.6f}")
-
-    # Check if v is essentially flat (not learned)
-    v_range = model.mu_v.max() - model.mu_v.min()
-    if v_range < 0.5:
-        print(f"  WARNING: v range ({v_range:.4f}) is very small - model may not have learned discrimination!")
-    if model.mu_v.std() < 0.1:
-        print(f"  WARNING: v std ({model.mu_v.std():.4f}) is very small - v is essentially flat!")
-
-    # Show top 5 largest and smallest v values
-    # Use pathway names if available (masked/pathway_init modes)
-    v_flat = model.mu_v.flatten()
-    sorted_indices = np.argsort(v_flat)
     
-    def get_factor_label(idx):
-        """Get factor label - pathway name if available, else factor index."""
-        if pathway_names is not None and idx < len(pathway_names):
-            # Truncate long pathway names for display
-            name = pathway_names[idx]
-            if len(name) > 50:
-                name = name[:47] + "..."
-            return f"{name}"
-        return f"Factor {idx}"
-    
-    print(f"\nTop 5 positive v values (factors that increase P(y=1)):")
-    for i in sorted_indices[-5:][::-1]:
-        label = get_factor_label(i)
-        print(f"  {label}: v = {v_flat[i]:.6f}")
-    print(f"\nTop 5 negative v values (factors that decrease P(y=1)):")
-    for i in sorted_indices[:5]:
-        label = get_factor_label(i)
-        print(f"  {label}: v = {v_flat[i]:.6f}")
+    # STABILITY DIAGNOSTIC: Save v vector for cross-run comparison
+    # Run multiple seeds and compute: np.corrcoef(v_seed1, v_seed2) to check stability
+    seed_label = args.seed if args.seed else getattr(args, '_auto_seed', 'unknown')
+    v_stability_path = output_dir / f'v_vector_seed{seed_label}.npy'
+    np.save(v_stability_path, model.mu_v.flatten())
+    print(f"\n[STABILITY] Saved v vector to {v_stability_path}")
+    print(f"[STABILITY] To check stability across seeds, run:")
+    print(f"    v1 = np.load('v_vector_seed<A>.npy')")
+    print(f"    v2 = np.load('v_vector_seed<B>.npy')")
+    print(f"    print(f'Spearman r = {{spearmanr(v1, v2).correlation:.4f}}')")
 
     # =========================================================================
     # STEP 5: Evaluate on Training Set

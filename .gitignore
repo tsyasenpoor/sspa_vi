@@ -311,3 +311,4 @@ jobs_sh/ibd_svi_aggressive.sh
 jobs_sh/ibd_svi_masked.sh
 jobs_sh/ibd_svi_combined.sh
 jobs_sh/ibd_svi_path_init.sh
+jobs_sh/ibd_baselines.sh
