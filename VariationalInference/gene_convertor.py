@@ -67,7 +67,7 @@ class GeneIDConverter:
         else:
             return 'mixed'
     
-    def symbols_to_ensembl(self, gene_symbols, species='mouse', force_update=False):
+    def symbols_to_ensembl(self, gene_symbols, species='human', force_update=False):
         """
         Convert gene symbols to Ensembl IDs.
         Automatically detects if input is already in Ensembl format.
@@ -77,7 +77,7 @@ class GeneIDConverter:
         gene_symbols : list
             List of gene symbols or Ensembl IDs to convert
         species : str
-            Species name (default: 'mouse')
+            Species name (default: 'human')
         force_update : bool
             If True, bypass cache and force API call
             
@@ -147,7 +147,7 @@ class GeneIDConverter:
         ensembl_ids = [results_map.get(gene) for gene in gene_symbols]
         return results_map, ensembl_ids
     
-    def ensembl_to_symbols(self, ensembl_ids, species='mouse', force_update=False):
+    def ensembl_to_symbols(self, ensembl_ids, species='human', force_update=False):
         """
         Convert Ensembl IDs to gene symbols.
         Automatically detects if input is already in symbol format.
@@ -157,7 +157,7 @@ class GeneIDConverter:
         ensembl_ids : list
             List of Ensembl IDs or gene symbols to convert
         species : str
-            Species name (default: 'mouse')
+            Species name (default: 'human')
         force_update : bool
             If True, bypass cache and force API call
             

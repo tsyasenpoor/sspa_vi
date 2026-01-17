@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import jax.scipy.special as jsp
 from jax.scipy.special import logsumexp
 from jax import random
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
 import time
 import numpy as np
 import scipy.sparse as sp
@@ -83,7 +83,12 @@ class SVICorrected:
         
         # JAX-specific
         use_jit: bool = True,
-        device: str = 'gpu'  # 'gpu' or 'cpu'
+        device: str = 'gpu',  # 'gpu' or 'cpu'
+        
+        # Pathway mode: 'unmasked', 'masked', or 'pathway_init'
+        mode: str = 'unmasked',
+        pathway_mask: Optional[np.ndarray] = None,  # (n_pathways, n_genes) binary matrix
+        pathway_names: Optional[List[str]] = None,  # Pathway names for reporting
     ):
         self.d = n_factors  # Number of factors
         self.batch_size = batch_size
@@ -92,6 +97,16 @@ class SVICorrected:
         self.learning_rate_delay = learning_rate_delay
         self.learning_rate_min = learning_rate_min
         self.local_iterations = local_iterations
+        
+        # Pathway/mode settings
+        self.mode = mode
+        self.pathway_mask = pathway_mask  # (n_pathways, n_genes) or None
+        self.pathway_names = pathway_names
+        if mode in ['masked', 'pathway_init'] and pathway_mask is None:
+            raise ValueError(f"pathway_mask required for mode='{mode}'")
+        if mode == 'masked':
+            # In masked mode, disable spike-and-slab (sparsity from mask)
+            use_spike_slab = False
         
         # Prior hyperparameters
         self.alpha_theta = alpha_theta
@@ -121,7 +136,15 @@ class SVICorrected:
         self.device = device
         
         # RNG - JAX uses explicit random keys
-        self.rng_key = random.PRNGKey(random_state if random_state is not None else 0)
+        # If random_state is None, use system time for true randomness
+        if random_state is not None:
+            self.rng_key = random.PRNGKey(random_state)
+            self.seed_used_ = random_state
+        else:
+            import time
+            random_seed = int(time.time() * 1000) % (2**32)
+            self.rng_key = random.PRNGKey(random_seed)
+            self.seed_used_ = None  # Mark as random
         
         # Will be set during fit
         self.n = None  # num samples
@@ -178,10 +201,20 @@ class SVICorrected:
         """
         a = eta1 + 1
         b = -eta2
-        # Ensure valid parameters
-        a = jnp.maximum(a, 1.001)
-        b = jnp.maximum(b, 1e-6)
-        return a, b
+        return jnp.clip(a, 1e-6, 1e8), jnp.clip(b, 1e-8, 1e8)
+    
+    @staticmethod
+    @jax.jit
+    def _clip_natural_gradient(
+        eta_old: jnp.ndarray,
+        eta_new: jnp.ndarray,
+        max_norm: float = 10.0
+    ) -> jnp.ndarray:
+        """Clip natural parameter gradient by L2 norm (Pascanu et al. 2013)."""
+        grad_eta = eta_new - eta_old
+        grad_norm = jnp.sqrt(jnp.sum(grad_eta**2))
+        scale = jnp.minimum(1.0, max_norm / (grad_norm + 1e-10))
+        return eta_old + grad_eta * scale
     
     @staticmethod
     @jax.jit
@@ -224,7 +257,14 @@ class SVICorrected:
     # =========================================================================
     
     def _initialize_global_parameters(self, X: jnp.ndarray, y: jnp.ndarray, X_aux: jnp.ndarray):
-        """Initialize global variational parameters with factor diversity."""
+        """Initialize global variational parameters with factor diversity.
+        
+        Supports three modes:
+        - 'unmasked': Standard initialization with random diversity (original behavior)
+        - 'masked': β fixed to pathway structure. β_jk = 0 if gene j not in pathway k,
+                    β_jk learned if gene j in pathway k. #factors = #pathways.
+        - 'pathway_init': β initialized from pathway mask but free to deviate during learning.
+        """
         self.n, self.p = X.shape
         self.kappa = 1 if y.ndim == 1 else y.shape[1]
         self.p_aux = X_aux.shape[1] if X_aux is not None and X_aux.size > 0 else 0
@@ -232,41 +272,100 @@ class SVICorrected:
         # Split RNG key for different initializations
         key1, key2, key3, self.rng_key = random.split(self.rng_key, 4)
         
-        # β: Gene loadings, Gamma(a_β, b_β)
-        # Initialize with HIGH DIVERSITY to break symmetry and explore gene programs
-        col_means = X.mean(axis=0) + 1  # (p,)
-        
-        # Strategy: Each factor gets a random subset of genes with high loadings
-        # This creates diverse gene programs from the start
-        
-        # Base initialization - start from prior
-        self.a_beta = jnp.full((self.p, self.d), self.alpha_beta)
-        self.b_beta = jnp.full((self.p, self.d), 1.0)
-        
-        # Add large random variations to create diversity
-        # Each factor gets different random gene subsets boosted
-        noise_scale = 0.5  # Increased from 0.2 to create MUCH more diversity
-        random_boost = random.uniform(key1, (self.p, self.d), minval=0.1, maxval=3.0)
-        
-        # Add data-driven signal: scale by gene means
-        # gene_scale = col_means[:, jnp.newaxis]  # (p, 1)
-        
-        # Combine: base + gene_scale * random_boost
-        self.a_beta = self.a_beta + random_boost * noise_scale
-        
-        # Create factor-specific "signatures" - each factor prefers different gene sets
-        # Randomly assign genes to factors with varying strengths
-        factor_signatures = random.uniform(key2, (self.p, self.d), minval=0.0, maxval=2.0)
-        
-        # Make some factors sparse, some dense (varying sparsity patterns)
-        sparsity_masks = random.bernoulli(key3, p=0.3, shape=(self.p, self.d))  # 30% active
-        
-        # Apply signature with sparsity
-        signature_boost = factor_signatures * sparsity_masks * 0.2
-        self.a_beta = self.a_beta + signature_boost
+        # =====================================================================
+        # MODE-SPECIFIC BETA INITIALIZATION
+        # =====================================================================
+        if self.mode in ['masked', 'pathway_init']:
+            # Pathway-based initialization
+            # pathway_mask is (n_pathways, n_genes) - need to transpose to (n_genes, n_factors)
+            # self.d should already equal n_pathways (set by caller)
+            pathway_mask_T = self.pathway_mask.T  # (n_genes, n_pathways) = (p, d)
+            
+            if self.mode == 'masked':
+                # Masked mode: β_jk is learned only where mask=1, fixed to ~0 elsewhere
+                # Initialize a_beta with small values for masked-out entries
+                # and normal values for masked-in entries
+                print(f"[MASKED MODE] Initializing β from pathway mask ({self.pathway_mask.shape[0]} pathways)")
+                
+                # Base: small a_beta everywhere
+                self.a_beta = jnp.full((self.p, self.d), self.alpha_beta * 0.01)
+                self.b_beta = jnp.full((self.p, self.d), 10.0)  # High rate = small mean
+                
+                # Where mask=1: initialize with larger a_beta for learning
+                mask_jnp = jnp.array(pathway_mask_T, dtype=jnp.float32)
+                
+                # Add random initialization for masked-in genes
+                random_init = random.uniform(key1, (self.p, self.d), minval=0.5, maxval=2.0)
+                self.a_beta = jnp.where(mask_jnp > 0.5, 
+                                        self.alpha_beta + random_init,
+                                        self.a_beta)
+                self.b_beta = jnp.where(mask_jnp > 0.5,
+                                        1.0,  # Normal rate
+                                        self.b_beta)
+                
+                # Store mask for use in updates
+                self.beta_mask = mask_jnp
+                
+            else:  # pathway_init
+                # Pathway_init mode: Initialize from pathway structure but allow free learning
+                print(f"[PATHWAY_INIT MODE] Initializing β from pathway mask, then free to learn")
+                
+                mask_jnp = jnp.array(pathway_mask_T, dtype=jnp.float32)
+                
+                # Initialize: genes in pathway start with higher a_beta
+                base_a = self.alpha_beta
+                boost_a = 2.0  # Boost for genes in pathway
+                
+                random_base = random.uniform(key1, (self.p, self.d), minval=0.1, maxval=0.5)
+                random_boost = random.uniform(key2, (self.p, self.d), minval=0.5, maxval=2.0)
+                
+                # Genes in pathway: boosted initialization
+                # Genes outside pathway: small but non-zero initialization
+                self.a_beta = jnp.where(mask_jnp > 0.5,
+                                        base_a + boost_a * random_boost,
+                                        base_a * 0.5 + random_base)
+                self.b_beta = jnp.full((self.p, self.d), 1.0)
+                
+                # No fixed mask - allow free learning
+                self.beta_mask = None
+                
+        else:
+            # Unmasked mode: Original diverse initialization
+            # β: Gene loadings, Gamma(a_β, b_β)
+            # Initialize with HIGH DIVERSITY to break symmetry and explore gene programs
+            col_means = X.mean(axis=0) + 1  # (p,)
+            
+            # Strategy: Each factor gets a random subset of genes with high loadings
+            # This creates diverse gene programs from the start
+            
+            # Base initialization - start from prior
+            self.a_beta = jnp.full((self.p, self.d), self.alpha_beta)
+            self.b_beta = jnp.full((self.p, self.d), 1.0)
+            
+            # Add large random variations to create diversity
+            # Each factor gets different random gene subsets boosted
+            noise_scale = 0.5  # Increased from 0.2 to create MUCH more diversity
+            random_boost = random.uniform(key1, (self.p, self.d), minval=0.1, maxval=3.0)
+            
+            # Combine: base + gene_scale * random_boost
+            self.a_beta = self.a_beta + random_boost * noise_scale
+            
+            # Create factor-specific "signatures" - each factor prefers different gene sets
+            # Randomly assign genes to factors with varying strengths
+            factor_signatures = random.uniform(key2, (self.p, self.d), minval=0.0, maxval=2.0)
+            
+            # Make some factors sparse, some dense (varying sparsity patterns)
+            sparsity_masks = random.bernoulli(key3, p=0.3, shape=(self.p, self.d))  # 30% active
+            
+            # Apply signature with sparsity
+            signature_boost = factor_signatures * sparsity_masks * 0.2
+            self.a_beta = self.a_beta + signature_boost
+            
+            # No fixed mask in unmasked mode
+            self.beta_mask = None
         
         # Ensure all values are positive and reasonable
-        self.a_beta = jnp.maximum(self.a_beta, self.alpha_beta * 0.1)
+        self.a_beta = jnp.maximum(self.a_beta, self.alpha_beta * 0.01)
         
         # η: Gene activities, Gamma(a_η, b_η)
         self.a_eta = jnp.full(self.p, self.alpha_eta + self.d * self.alpha_beta)
@@ -748,60 +847,72 @@ class SVICorrected:
         mu_v_hat: jnp.ndarray, Sigma_v_hat: jnp.ndarray,
         mu_gamma_hat: jnp.ndarray, Sigma_gamma_hat: jnp.ndarray
     ):
-        """
-        SVI update.
+        """SVI update with gradient clipping and bounds.
         
-        For Gamma distributions, we use natural parameter updates:
-        η^(t) = (1 - ρ_t) η^(t-1) + ρ_t η̂
-        
-        For Gaussian distributions, we update canonical parameters directly
-        (equivalent when done properly, but more numerically stable):
-        μ^(t) = (1 - ρ_t) μ^(t-1) + ρ_t μ̂
-        Σ^(t) = (1 - ρ_t) Σ^(t-1) + ρ_t Σ̂
+        In masked mode, β values are fixed to ~0 for genes outside the pathway mask.
         """
-        # Beta: update natural parameters for Gamma
+        # Beta: clipped natural gradient update (relaxed clipping)
         eta1_beta_hat, eta2_beta_hat = self._gamma_to_natural(a_beta_hat, b_beta_hat)
-        self.eta1_beta = (1 - rho_t) * self.eta1_beta + rho_t * eta1_beta_hat
-        self.eta2_beta = (1 - rho_t) * self.eta2_beta + rho_t * eta2_beta_hat
+        eta1_beta_clip = self._clip_natural_gradient(self.eta1_beta, eta1_beta_hat, 50.0)
+        eta2_beta_clip = self._clip_natural_gradient(self.eta2_beta, eta2_beta_hat, 50.0)
+        self.eta1_beta = (1 - rho_t) * self.eta1_beta + rho_t * eta1_beta_clip
+        self.eta2_beta = (1 - rho_t) * self.eta2_beta + rho_t * eta2_beta_clip
         self.a_beta, self.b_beta = self._natural_to_gamma(self.eta1_beta, self.eta2_beta)
         
-        # Eta: update natural parameters for Gamma
+        # MASKED MODE: Enforce mask on β parameters
+        # Keep β fixed at small values where mask=0
+        if self.mode == 'masked' and self.beta_mask is not None:
+            # Where mask=0: reset to small fixed values (effectively β≈0)
+            small_a = self.alpha_beta * 0.01
+            large_b = 10.0  # Small mean = small_a / large_b ≈ 0
+            self.a_beta = jnp.where(self.beta_mask > 0.5, self.a_beta, small_a)
+            self.b_beta = jnp.where(self.beta_mask > 0.5, self.b_beta, large_b)
+            # Also reset natural params to maintain consistency
+            self.eta1_beta, self.eta2_beta = self._gamma_to_natural(self.a_beta, self.b_beta)
+        
+        # Eta: clipped natural gradient update (relaxed clipping)
         eta1_eta_hat, eta2_eta_hat = self._gamma_to_natural(a_eta_hat, b_eta_hat)
-        self.eta1_eta = (1 - rho_t) * self.eta1_eta + rho_t * eta1_eta_hat
-        self.eta2_eta = (1 - rho_t) * self.eta2_eta + rho_t * eta2_eta_hat
+        eta1_eta_clip = self._clip_natural_gradient(self.eta1_eta, eta1_eta_hat, 50.0)
+        eta2_eta_clip = self._clip_natural_gradient(self.eta2_eta, eta2_eta_hat, 50.0)
+        self.eta1_eta = (1 - rho_t) * self.eta1_eta + rho_t * eta1_eta_clip
+        self.eta2_eta = (1 - rho_t) * self.eta2_eta + rho_t * eta2_eta_clip
         self.a_eta, self.b_eta = self._natural_to_gamma(self.eta1_eta, self.eta2_eta)
         
-        # v: update canonical parameters directly (more stable)
+        # v: clipped canonical update
         for k in range(self.kappa):
-            self.mu_v = self.mu_v.at[k].set((1 - rho_t) * self.mu_v[k] + rho_t * mu_v_hat[k])
+            mu_grad = mu_v_hat[k] - self.mu_v[k]
+            mu_grad_norm = jnp.sqrt(jnp.sum(mu_grad**2))
+            mu_grad_scale = jnp.minimum(1.0, 5.0 / (mu_grad_norm + 1e-10))
+            mu_v_clip = self.mu_v[k] + mu_grad * mu_grad_scale
+            self.mu_v = self.mu_v.at[k].set(jnp.clip((1 - rho_t) * self.mu_v[k] + rho_t * mu_v_clip, -10, 10))
+            
             Sigma_new = (1 - rho_t) * self.Sigma_v[k] + rho_t * Sigma_v_hat[k]
-            # Ensure positive definiteness
             Sigma_new = 0.5 * (Sigma_new + Sigma_new.T)
             eigvals = jnp.linalg.eigvalsh(Sigma_new)
             min_eigval = jnp.min(eigvals)
-            Sigma_new = jnp.where(
-                min_eigval < 1e-6,
-                Sigma_new + (1e-6 - min_eigval + 1e-8) * jnp.eye(self.d),
-                Sigma_new
-            )
+            max_eigval = jnp.max(eigvals)
+            Sigma_new = jnp.where(min_eigval < 1e-4, Sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.d), Sigma_new)
+            Sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, Sigma_new + 1e-3 * jnp.eye(self.d), Sigma_new)
             self.Sigma_v = self.Sigma_v.at[k].set(Sigma_new)
         
-        # gamma: update canonical parameters directly
+        # gamma: clipped canonical update
         if self.p_aux > 0:
             for k in range(self.kappa):
-                self.mu_gamma = self.mu_gamma.at[k].set((1 - rho_t) * self.mu_gamma[k] + rho_t * mu_gamma_hat[k])
+                mu_grad = mu_gamma_hat[k] - self.mu_gamma[k]
+                mu_grad_norm = jnp.sqrt(jnp.sum(mu_grad**2))
+                mu_grad_scale = jnp.minimum(1.0, 5.0 / (mu_grad_norm + 1e-10))
+                mu_gamma_clip = self.mu_gamma[k] + mu_grad * mu_grad_scale
+                self.mu_gamma = self.mu_gamma.at[k].set(jnp.clip((1 - rho_t) * self.mu_gamma[k] + rho_t * mu_gamma_clip, -10, 10))
+                
                 Sigma_new = (1 - rho_t) * self.Sigma_gamma[k] + rho_t * Sigma_gamma_hat[k]
                 Sigma_new = 0.5 * (Sigma_new + Sigma_new.T)
                 eigvals = jnp.linalg.eigvalsh(Sigma_new)
                 min_eigval = jnp.min(eigvals)
-                Sigma_new = jnp.where(
-                    min_eigval < 1e-6,
-                    Sigma_new + (1e-6 - min_eigval + 1e-8) * jnp.eye(self.p_aux),
-                    Sigma_new
-                )
+                max_eigval = jnp.max(eigvals)
+                Sigma_new = jnp.where(min_eigval < 1e-4, Sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.p_aux), Sigma_new)
+                Sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, Sigma_new + 1e-3 * jnp.eye(self.p_aux), Sigma_new)
                 self.Sigma_gamma = self.Sigma_gamma.at[k].set(Sigma_new)
         
-        # Update expectations
         self._compute_expectations()
     
     # =========================================================================

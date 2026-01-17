@@ -13,6 +13,8 @@ Functions:
 - Analysis: get_top_genes_per_program
 """
 
+import os
+import sys
 import pickle
 import gzip
 import json
@@ -20,8 +22,16 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from pathlib import Path
+
+script_dir = Path(__file__).resolve().parent
+parent_dir = script_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+
+
 from typing import Optional, Dict, Any, List, Tuple, Union
-import os
+from VariationalInference.gene_convertor import *
+
 
 
 # =============================================================================
@@ -45,7 +55,6 @@ def save_cache(data: Any, cache_file: Union[str, Path]) -> None:
     with open(cache_file, 'wb') as f:
         pickle.dump(data, f)
     print(f"Saved cached data to {cache_file}")
-
 
 def load_cache(cache_file: Union[str, Path]) -> Optional[Any]:
     """
@@ -253,7 +262,9 @@ def save_results(
     compress: bool = True,
     save_full_model: bool = False,
     feature_type: str = 'gene',
-    optimal_threshold: float = 0.5
+    optimal_threshold: float = 0.5,
+    program_names: Optional[List[str]] = None,
+    mode: str = 'unmasked'
 ) -> Dict[str, Path]:
     """
     Save VI model results to files.
@@ -281,6 +292,11 @@ def save_results(
         Type of features ('gene' or 'pathway').
     optimal_threshold : float, default=0.5
         Optimal classification threshold tuned on validation set.
+    program_names : list of str, optional
+        Custom names for programs/factors (e.g., pathway names). If None,
+        defaults to GP1, GP2, etc.
+    mode : str, default='unmasked'
+        Model mode ('unmasked', 'masked', or 'pathway_init').
 
     Returns
     -------
@@ -343,10 +359,16 @@ def save_results(
             print(f"Saved essential model parameters to {model_path}")
 
     # Save gene/pathway programs (beta matrix)
+    # Use custom program names if provided (e.g., pathway names)
+    if program_names is not None:
+        prog_labels = program_names
+    else:
+        prog_labels = [f"GP{k+1}" for k in range(model.d)]
+    
     program_label = f"{feature_type}_program" if feature_type == 'pathway' else "gene_program"
     beta_df = pd.DataFrame(
         model.E_beta.T,  # Transpose: programs x genes/pathways
-        index=[f"GP{k+1}" for k in range(model.d)],
+        index=prog_labels,
         columns=gene_list
     )
 
@@ -365,7 +387,7 @@ def save_results(
         theta_train_df = pd.DataFrame(
             model.E_theta,
             index=splits['train'],
-            columns=[f"GP{k+1}" for k in range(model.d)]
+            columns=prog_labels
         )
         theta_path = output_dir / f'{prefix}_theta_train{ext}'
         theta_train_df.to_csv(theta_path, compression=compression)
@@ -390,6 +412,8 @@ def save_results(
             'n_test': len(splits['test']),
         },
         'feature_type': feature_type,
+        'mode': mode,  # unmasked, masked, or pathway_init
+        'program_names': program_names,  # Pathway names if using pathway modes
         'training': {
             'training_time': getattr(model, 'training_time_', None),
             'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') and model.elbo_history_ else None,
@@ -739,3 +763,212 @@ def filter_protein_coding_genes(
     filtered = [g for g in gene_list if g in protein_coding]
     print(f"Filtered to {len(filtered)}/{len(gene_list)} protein-coding genes")
     return filtered
+
+def load_pathways(
+    gmt_path: str = '/archive/projects/SSPA_BRAY/sspa/c2.cp.v2024.1.Hs.symbols.gmt',
+    convert_to_ensembl: bool = True,
+    species: str = 'human',
+    gene_filter: Optional[List[str]] = None,
+    min_genes: int = 5,
+    max_genes: int = 5000,
+    cache_dir: str = '/labs/Aguiar/SSPA_BRAY/cache',
+    use_cache: bool = True,
+    excluded_keywords: Optional[List[str]] = None,
+    require_prefix: Optional[str] = 'REACTOME'
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    """
+    Load pathway definitions from GMT file into a binary matrix.
+    
+    GMT format: PATHWAY_NAME<tab>URL<tab>GENE1<tab>GENE2<tab>...
+    
+    Caches the Ensembl-converted pathways to avoid repeated conversion overhead.
+    
+    Parameters
+    ----------
+    gmt_path : str
+        Path to GMT file.
+    convert_to_ensembl : bool, default=True
+        Convert gene symbols to Ensembl IDs.
+    species : str, default='human'
+        Species for gene ID conversion.
+    gene_filter : list of str, optional
+        If provided, only include genes in this list. Useful for filtering
+        to genes present in expression data.
+    min_genes : int, default=5
+        Minimum number of genes for a pathway to be included.
+    max_genes : int, default=500
+        Maximum number of genes for a pathway to be included.
+    cache_dir : str, default='/labs/Aguiar/SSPA_BRAY/cache'
+        Directory for caching converted pathways.
+    use_cache : bool, default=True
+        Whether to use cached converted pathways.
+    excluded_keywords : list of str, optional
+        Exclude pathways containing any of these keywords (case-insensitive).
+        Default: ["ADME", "DRUG", "MISCELLANEOUS", "EMT"]
+    require_prefix : str, optional
+        If provided, only keep pathways starting with this prefix.
+        Default: 'REACTOME' (set to None to keep all sources).
+    
+    Returns
+    -------
+    pathway_mat : np.ndarray
+        Binary matrix (n_pathways, n_genes) where pathway_mat[i,j]=1 if 
+        gene j is in pathway i.
+    pathway_names : list of str
+        Pathway names corresponding to rows.
+    gene_names : list of str
+        Gene names (Ensembl or symbol) corresponding to columns.
+    """
+    import hashlib
+    
+    # Default excluded keywords
+    if excluded_keywords is None:
+        excluded_keywords = ["ADME", "DRUG", "MISCELLANEOUS", "EMT"]
+    
+    # Cache key based on GMT file and conversion settings
+    gmt_hash = hashlib.md5(gmt_path.encode()).hexdigest()[:8]
+    cache_suffix = f"_ensembl_{species}" if convert_to_ensembl else "_symbols"
+    cache_file = Path(cache_dir) / f"pathways_{gmt_hash}{cache_suffix}.pkl"
+    
+    pathways = None
+    all_genes = None
+    
+    # Try loading from cache
+    if use_cache and cache_file.exists():
+        print(f"Loading cached pathways from {cache_file}...")
+        with open(cache_file, 'rb') as f:
+            cached = pickle.load(f)
+        pathways = cached['pathways']
+        all_genes = cached['all_genes']
+        print(f"  Loaded {len(pathways)} pathways with {len(all_genes)} genes from cache")
+    
+    # Parse GMT and convert if not cached
+    if pathways is None:
+        # Parse GMT file
+        pathways = {}  # pathway_name -> set of genes
+        all_genes = set()
+        
+        print(f"Loading pathways from {gmt_path}...")
+        with open(gmt_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) < 3:
+                    continue
+                pathway_name = parts[0]
+                # Skip URL (parts[1]), genes start at parts[2]
+                genes = set(parts[2:])
+                pathways[pathway_name] = genes
+                all_genes.update(genes)
+        
+        print(f"  Loaded {len(pathways)} pathways with {len(all_genes)} unique genes (symbols)")
+        
+        # Convert gene symbols to Ensembl if requested
+        if convert_to_ensembl:
+            converter = GeneIDConverter()
+            symbol_list = list(all_genes)
+            symbol_to_ensembl, ensembl_list = converter.symbols_to_ensembl(
+                symbol_list, species=species
+            )
+            
+            # Build reverse mapping for valid conversions
+            valid_genes = set()
+            symbol_to_final = {}
+            for sym, ens in zip(symbol_list, ensembl_list):
+                if ens is not None:
+                    symbol_to_final[sym] = ens
+                    valid_genes.add(ens)
+            
+            # Update pathway gene sets
+            pathways_converted = {}
+            for pathway_name, genes in pathways.items():
+                converted = {symbol_to_final[g] for g in genes if g in symbol_to_final}
+                if converted:
+                    pathways_converted[pathway_name] = converted
+            
+            pathways = pathways_converted
+            all_genes = valid_genes
+            print(f"  After Ensembl conversion: {len(all_genes)} genes with valid mappings")
+        
+        # Save to cache
+        if use_cache:
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump({'pathways': pathways, 'all_genes': all_genes}, f)
+            print(f"  Cached converted pathways to {cache_file}")
+    
+    # Apply pathway filtering by prefix
+    if require_prefix is not None:
+        n_before = len(pathways)
+        pathways = {k: v for k, v in pathways.items() if k.startswith(require_prefix)}
+        print(f"  After prefix filter '{require_prefix}': {len(pathways)}/{n_before} pathways")
+    
+    # Apply pathway filtering by excluded keywords
+    if excluded_keywords:
+        excluded_upper = [kw.upper() for kw in excluded_keywords]
+        n_before = len(pathways)
+        pathways = {
+            k: v for k, v in pathways.items()
+            if not any(kw in k.upper() for kw in excluded_upper)
+        }
+        print(f"  After keyword exclusion {excluded_keywords}: {len(pathways)}/{n_before} pathways")
+    
+    # Recompute all_genes after pathway filtering
+    all_genes = set()
+    for genes in pathways.values():
+        all_genes.update(genes)
+    
+    # Apply gene filter if provided
+    if gene_filter is not None:
+        gene_filter_set = set(gene_filter)
+        all_genes = all_genes & gene_filter_set
+        
+        # Update pathways to only include filtered genes
+        pathways_filtered = {}
+        for pathway_name, genes in pathways.items():
+            filtered = genes & gene_filter_set
+            if filtered:
+                pathways_filtered[pathway_name] = filtered
+        pathways = pathways_filtered
+        print(f"  After gene filter: {len(all_genes)} genes, {len(pathways)} pathways")
+    
+    # Filter pathways by size
+    pathways_sized = {
+        name: genes for name, genes in pathways.items()
+        if min_genes <= len(genes) <= max_genes
+    }
+    print(f"  After size filter [{min_genes}, {max_genes}]: {len(pathways_sized)} pathways")
+    pathways = pathways_sized
+    
+    # Collect only genes that appear in remaining pathways
+    genes_in_pathways = set()
+    for genes in pathways.values():
+        genes_in_pathways.update(genes)
+    all_genes = genes_in_pathways
+    
+    # Create ordered lists
+    gene_names = sorted(all_genes)
+    pathway_names = sorted(pathways.keys())
+    
+    gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+    
+    # Build binary matrix
+    n_pathways = len(pathway_names)
+    n_genes = len(gene_names)
+    pathway_mat = np.zeros((n_pathways, n_genes), dtype=np.int8)
+    
+    for i, pathway_name in enumerate(pathway_names):
+        for gene in pathways[pathway_name]:
+            if gene in gene_to_idx:
+                pathway_mat[i, gene_to_idx[gene]] = 1
+    
+    # Summary stats
+    genes_per_pathway = pathway_mat.sum(axis=1)
+    pathways_per_gene = pathway_mat.sum(axis=0)
+    print(f"\nPathway matrix: {n_pathways} pathways x {n_genes} genes")
+    print(f"  Genes/pathway: min={genes_per_pathway.min()}, max={genes_per_pathway.max()}, "
+          f"mean={genes_per_pathway.mean():.1f}")
+    print(f"  Pathways/gene: min={pathways_per_gene.min()}, max={pathways_per_gene.max()}, "
+          f"mean={pathways_per_gene.mean():.1f}")
+    print(f"  Matrix density: {pathway_mat.mean()*100:.2f}%")
+    
+    return pathway_mat, pathway_names, gene_names 

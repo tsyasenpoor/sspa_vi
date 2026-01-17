@@ -119,6 +119,34 @@ def parse_args() -> argparse.Namespace:
         help='Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)'
     )
 
+    # Mode selection
+    parser.add_argument(
+        '--mode',
+        type=str,
+        default='unmasked',
+        choices=['unmasked', 'masked', 'pathway_init'],
+        help='Model mode: unmasked (standard), masked (β fixed to pathway structure), '
+             'pathway_init (β initialized from pathways but free to deviate)'
+    )
+    parser.add_argument(
+        '--pathway-file',
+        type=str,
+        default='/archive/projects/SSPA_BRAY/sspa/c2.cp.v2024.1.Hs.symbols.gmt',
+        help='GMT file for pathway definitions (used in masked/pathway_init modes)'
+    )
+    parser.add_argument(
+        '--pathway-min-genes',
+        type=int,
+        default=5,
+        help='Minimum genes per pathway (for filtering)'
+    )
+    parser.add_argument(
+        '--pathway-max-genes',
+        type=int,
+        default=500,
+        help='Maximum genes per pathway (for filtering)'
+    )
+
     # SVI Training options
     parser.add_argument(
         '--batch-size',
@@ -193,6 +221,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help='Number of consecutive epochs below tol to trigger convergence (default: 10)'
+    )
+    parser.add_argument(
+        '--early-stopping',
+        action='store_true',
+        default=False,
+        help='Enable early stopping when ELBO converges (recommended for stability)'
     )
 
     # Hyperparameter options (Priors & Regularization)
@@ -359,7 +393,8 @@ def main():
     print("=" * 80)
     print(f"\nConfiguration:")
     print(f"  Data:         {args.data}")
-    print(f"  n_factors:    {args.n_factors}")
+    print(f"  Mode:         {args.mode}")
+    print(f"  n_factors:    {args.n_factors}" + (" (may be overridden by pathway count)" if args.mode != 'unmasked' else ""))
     print(f"  batch_size:   {args.batch_size}")
     print(f"  max_epochs:   {args.max_epochs}")
     print(f"  learning_rate:{args.learning_rate}")
@@ -367,6 +402,9 @@ def main():
     print(f"  aux_columns:  {args.aux_columns}")
     print(f"  random_seed:  {args.seed if args.seed else 'None (random)'}")
     print(f"  output_dir:   {args.output_dir}")
+    if args.mode in ['masked', 'pathway_init']:
+        print(f"  pathway_file: {args.pathway_file}")
+        print(f"  pathway_size: [{args.pathway_min_genes}, {args.pathway_max_genes}]")
     if args.normalize:
         print(f"  normalize:    True (target_sum={args.normalize_target_sum:.0f}, method={args.normalize_method})")
 
@@ -376,7 +414,7 @@ def main():
     from VariationalInference.svi_corrected import SVI
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
-        compute_metrics, save_results, print_model_summary
+        compute_metrics, save_results, print_model_summary, load_pathways
     )
 
     # =========================================================================
@@ -426,6 +464,85 @@ def main():
     print(f"  Label dist:     {np.bincount(y_train)}")
 
     # =========================================================================
+    # STEP 3.25: Load Pathways (for masked/pathway_init modes)
+    # =========================================================================
+    pathway_mask = None
+    pathway_names = None
+    n_factors = args.n_factors  # Default from CLI
+    
+    if args.mode in ['masked', 'pathway_init']:
+        print("\n" + "=" * 80)
+        print(f"Loading Pathways for {args.mode.upper()} Mode")
+        print("=" * 80)
+        
+        # Load pathways from GMT file, filtering to genes in our expression data
+        # Uses caching to avoid repeated Ensembl conversion (cache_dir from args)
+        pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
+            gmt_path=args.pathway_file,
+            convert_to_ensembl=True,
+            species='human',
+            gene_filter=gene_list,  # Only include genes in our expression data
+            min_genes=args.pathway_min_genes,
+            max_genes=args.pathway_max_genes,
+            cache_dir=args.cache_dir,  # Use same cache dir as data preprocessing
+            use_cache=True
+        )
+        
+        # Align pathway matrix columns to match gene_list order
+        # pathway_genes is the column order from load_pathways
+        # gene_list is the order of columns in X_train
+        print(f"\nAligning pathway matrix to expression data gene order...")
+        
+        # Create mapping from pathway gene order to expression data gene order
+        gene_to_expr_idx = {g: i for i, g in enumerate(gene_list)}
+        gene_to_pathway_idx = {g: i for i, g in enumerate(pathway_genes)}
+        
+        # Find common genes
+        common_genes = set(gene_list) & set(pathway_genes)
+        print(f"  Common genes: {len(common_genes)} / {len(gene_list)} expression genes")
+        
+        if len(common_genes) < 100:
+            raise ValueError(
+                f"Too few common genes ({len(common_genes)}) between expression data and pathways. "
+                f"Check gene ID format (should be Ensembl) or pathway file."
+            )
+        
+        # Build aligned pathway mask: (n_pathways, n_genes_in_expression)
+        # For genes not in any pathway, columns will be all zeros
+        n_pathways = pathway_mat.shape[0]
+        n_genes_expr = len(gene_list)
+        pathway_mask = np.zeros((n_pathways, n_genes_expr), dtype=np.float32)
+        
+        for gene in common_genes:
+            expr_idx = gene_to_expr_idx[gene]
+            pathway_idx = gene_to_pathway_idx[gene]
+            pathway_mask[:, expr_idx] = pathway_mat[:, pathway_idx]
+        
+        # Summary
+        genes_per_pathway = pathway_mask.sum(axis=1)
+        pathways_per_gene = pathway_mask.sum(axis=0)
+        genes_in_pathways = (pathways_per_gene > 0).sum()
+        
+        print(f"\nAligned pathway matrix: {n_pathways} pathways x {n_genes_expr} genes")
+        print(f"  Genes covered by pathways: {genes_in_pathways} / {n_genes_expr}")
+        print(f"  Genes/pathway: min={genes_per_pathway.min():.0f}, max={genes_per_pathway.max():.0f}, "
+              f"mean={genes_per_pathway.mean():.1f}")
+        print(f"  Matrix density: {pathway_mask.mean()*100:.2f}%")
+        
+        # Use pathway names
+        pathway_names = pathway_names_raw
+        
+        # In masked/pathway_init modes, n_factors = n_pathways
+        n_factors = n_pathways
+        print(f"\n  Setting n_factors = {n_factors} (number of pathways)")
+        
+        if args.n_factors != n_pathways:
+            print(f"  NOTE: --n-factors={args.n_factors} overridden by pathway count ({n_pathways})")
+    
+    else:
+        print(f"\n[UNMASKED MODE] Using {n_factors} latent factors (no pathway constraint)")
+
+    # =========================================================================
     # STEP 3.5: Set Hyperparameters
     # =========================================================================
     n_train = X_train.shape[0]
@@ -460,10 +577,16 @@ def main():
     print("\n" + "=" * 80)
     print("Training SVI Model")
     print("=" * 80)
+    
+    print(f"\nModel Configuration:")
+    print(f"  Mode:         {args.mode}")
+    print(f"  n_factors:    {n_factors}")
+    if pathway_names is not None:
+        print(f"  Pathways:     {len(pathway_names)}")
 
     # Create SVI model
     model = SVI(
-        n_factors=args.n_factors,
+        n_factors=n_factors,  # Use n_factors (may be overridden by pathway count)
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         learning_rate_decay=args.learning_rate_decay,
@@ -486,7 +609,11 @@ def main():
         use_spike_slab=args.use_spike_slab,
         ema_decay=args.ema_decay,
         convergence_tol=args.convergence_tol,
-        convergence_window=args.convergence_window
+        convergence_window=args.convergence_window,
+        # Pathway mode settings
+        mode=args.mode,
+        pathway_mask=pathway_mask,
+        pathway_names=pathway_names
     )
 
     # Train model
@@ -496,7 +623,8 @@ def main():
         X_aux=X_aux_train,
         max_epochs=args.max_epochs,
         elbo_freq=args.elbo_freq,
-        verbose=True
+        verbose=True,
+        early_stopping=args.early_stopping
     )
 
     print("\nTraining complete!")
@@ -524,14 +652,28 @@ def main():
         print(f"  WARNING: v std ({model.mu_v.std():.4f}) is very small - v is essentially flat!")
 
     # Show top 5 largest and smallest v values
+    # Use pathway names if available (masked/pathway_init modes)
     v_flat = model.mu_v.flatten()
     sorted_indices = np.argsort(v_flat)
+    
+    def get_factor_label(idx):
+        """Get factor label - pathway name if available, else factor index."""
+        if pathway_names is not None and idx < len(pathway_names):
+            # Truncate long pathway names for display
+            name = pathway_names[idx]
+            if len(name) > 50:
+                name = name[:47] + "..."
+            return f"{name}"
+        return f"Factor {idx}"
+    
     print(f"\nTop 5 positive v values (factors that increase P(y=1)):")
     for i in sorted_indices[-5:][::-1]:
-        print(f"  Factor {i}: v = {v_flat[i]:.6f}")
+        label = get_factor_label(i)
+        print(f"  {label}: v = {v_flat[i]:.6f}")
     print(f"\nTop 5 negative v values (factors that decrease P(y=1)):")
     for i in sorted_indices[:5]:
-        print(f"  Factor {i}: v = {v_flat[i]:.6f}")
+        label = get_factor_label(i)
+        print(f"  {label}: v = {v_flat[i]:.6f}")
 
     # =========================================================================
     # STEP 5: Evaluate on Training Set
@@ -730,7 +872,9 @@ def main():
         splits=splits,
         prefix=prefix,
         compress=True,
-        optimal_threshold=optimal_threshold
+        optimal_threshold=optimal_threshold,
+        program_names=pathway_names,  # Use pathway names if in masked/pathway_init mode
+        mode=args.mode
     )
 
     # # Save additional files
