@@ -63,7 +63,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 # Import VI components
 from VariationalInference.data_loader import DataLoader
 from VariationalInference.svi_corrected import SVI
-from VariationalInference.utils import compute_metrics
+from VariationalInference.utils import compute_metrics, load_pathways
 
 # Configure logging
 logging.basicConfig(
@@ -554,10 +554,10 @@ def get_emtab_search_space() -> Dict[str, Dict[str, Any]]:
 def get_search_space_for_data(data_type: str) -> Dict[str, Dict[str, Any]]:
     """
     Get appropriate search space based on data type.
-    
+
     Args:
         data_type: One of 'default', 'simulation', 'emtab', 'large'
-    
+
     Returns:
         Search space dictionary
     """
@@ -577,18 +577,82 @@ def get_search_space_for_data(data_type: str) -> Dict[str, Dict[str, Any]]:
         return get_default_search_space()
 
 
+def get_search_space_for_mode(
+    mode: str,
+    data_type: str = 'default',
+    n_pathways: Optional[int] = None
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Get search space adjusted for the model mode.
+
+    In pathway_init and masked modes, n_factors is fixed to n_pathways,
+    so we remove it from the search space.
+
+    In combined mode, we tune n_drpgs (number of data-driven gene programs)
+    instead of n_factors, since n_factors = n_pathways + n_drpgs.
+
+    In unmasked mode, n_factors is tunable.
+
+    Args:
+        mode: Model mode ('unmasked', 'masked', 'pathway_init', 'combined')
+        data_type: Data type for base search space
+        n_pathways: Number of pathways (required for masked/pathway_init/combined)
+
+    Returns:
+        Search space dictionary adjusted for the mode
+    """
+    # Start with base search space for data type
+    space = get_search_space_for_data(data_type)
+
+    if mode in ['masked', 'pathway_init']:
+        # n_factors is fixed to n_pathways, remove from search space
+        if 'n_factors' in space:
+            del space['n_factors']
+        logger.info(f"Mode '{mode}': n_factors fixed to n_pathways ({n_pathways}), not tuning n_factors")
+
+    elif mode == 'combined':
+        # Replace n_factors with n_drpgs (data-driven gene programs)
+        if 'n_factors' in space:
+            del space['n_factors']
+
+        # Add n_drpgs as tunable parameter
+        space['n_drpgs'] = {
+            'type': 'int',
+            'low': 20,
+            'high': 200,
+            'step': 10,
+            'description': 'Number of unconstrained data-driven gene programs (DRGPs)'
+        }
+        logger.info(f"Mode 'combined': tuning n_drpgs instead of n_factors")
+        logger.info(f"  n_factors will be n_pathways ({n_pathways}) + n_drpgs")
+
+    # In unmasked mode, n_factors remains tunable (no changes needed)
+
+    return space
+
+
+def round_to_precision(value: float, decimals: int = 2) -> float:
+    """Round a float value to specified decimal places."""
+    return round(value, decimals)
+
+
 def sample_hyperparameters(
     trial: optuna.Trial,
     search_space: Dict[str, Dict[str, Any]],
-    params_to_tune: Optional[List[str]] = None
+    params_to_tune: Optional[List[str]] = None,
+    float_precision: int = 2
 ) -> Dict[str, Any]:
     """
     Sample hyperparameters from the search space for a given Optuna trial.
+
+    Float values are rounded to `float_precision` decimal places to avoid
+    overly precise hyperparameter values that don't meaningfully affect results.
 
     Args:
         trial: Optuna trial object
         search_space: Dictionary defining the search space
         params_to_tune: List of parameter names to tune (None = all)
+        float_precision: Number of decimal places for float values (default: 2)
 
     Returns:
         Dictionary of sampled hyperparameter values
@@ -603,12 +667,16 @@ def sample_hyperparameters(
         param_type = spec['type']
 
         if param_type == 'float':
-            params[name] = trial.suggest_float(
+            # Sample the float value
+            raw_value = trial.suggest_float(
                 name,
                 spec['low'],
                 spec['high'],
                 log=spec.get('log', False)
             )
+            # Round to specified precision (default 2 decimal places)
+            params[name] = round_to_precision(raw_value, float_precision)
+
         elif param_type == 'int':
             params[name] = trial.suggest_int(
                 name,
@@ -655,6 +723,12 @@ class VIObjective:
         multi_objective: bool = False,
         subsample_ratio: Optional[float] = None,
         subsample_size: Optional[int] = None,
+        # Pathway mode parameters
+        mode: str = 'unmasked',
+        pathway_mask: Optional[np.ndarray] = None,
+        pathway_names: Optional[List[str]] = None,
+        n_pathways: Optional[int] = None,
+        n_drpgs: int = 50,
     ):
         """
         Initialize the objective function.
@@ -682,6 +756,11 @@ class VIObjective:
                             Stratified sampling preserves class proportions.
             subsample_size: Exact number of training samples per trial.
                            Takes precedence over subsample_ratio if both specified.
+            mode: Model mode ('unmasked', 'masked', 'pathway_init', 'combined')
+            pathway_mask: Binary matrix (n_pathways, n_genes) for pathway modes
+            pathway_names: List of pathway names for reporting
+            n_pathways: Number of pathways (for masked/pathway_init, this is n_factors)
+            n_drpgs: Default number of data-driven gene programs for combined mode
         """
         self.data_path = data_path
         self.label_column = label_column
@@ -702,6 +781,20 @@ class VIObjective:
         self.multi_objective = multi_objective
         self.subsample_ratio = subsample_ratio
         self.subsample_size = subsample_size
+
+        # Pathway mode settings
+        self.mode = mode
+        self.pathway_mask = pathway_mask
+        self.pathway_names = pathway_names
+        self.n_pathways = n_pathways
+        self.n_drpgs = n_drpgs
+
+        # Validate pathway mode requirements
+        if mode in ['masked', 'pathway_init', 'combined']:
+            if pathway_mask is None:
+                raise ValueError(f"pathway_mask required for mode='{mode}'")
+            if n_pathways is None:
+                raise ValueError(f"n_pathways required for mode='{mode}'")
 
         # Data will be loaded once and cached
         self._data_loaded = False
@@ -910,8 +1003,22 @@ class VIObjective:
         # Merge with fixed parameters
         params = {**sampled_params, **self.fixed_params}
 
-        # Extract n_factors and learning_rate separately
-        n_factors = params.pop('n_factors', 50)
+        # Determine n_factors based on mode
+        if self.mode in ['masked', 'pathway_init']:
+            # n_factors is fixed to number of pathways
+            n_factors = self.n_pathways
+            n_pathway_factors = None  # Not used in these modes
+        elif self.mode == 'combined':
+            # n_factors = n_pathways + n_drpgs
+            # n_drpgs may be tuned or use default
+            n_drpgs = params.pop('n_drpgs', self.n_drpgs)
+            n_factors = self.n_pathways + n_drpgs
+            n_pathway_factors = self.n_pathways
+        else:
+            # unmasked mode: n_factors is tunable
+            n_factors = params.pop('n_factors', 50)
+            n_pathway_factors = None
+
         learning_rate = params.pop('learning_rate', 0.01)
 
         # Get subsampled training data (stratified to preserve class proportions)
@@ -919,12 +1026,17 @@ class VIObjective:
         X_train_sub, X_aux_train_sub, y_train_sub = self._get_subsampled_train_data(trial.number)
 
         if self.verbose:
+            mode_info = f", mode={self.mode}"
+            if self.mode == 'combined':
+                mode_info += f", n_pathways={self.n_pathways}, n_drpgs={n_drpgs}"
+            elif self.mode in ['masked', 'pathway_init']:
+                mode_info += f", n_pathways={self.n_pathways}"
             logger.info(f"Trial {trial.number}: n_factors={n_factors}, "
-                       f"learning_rate={learning_rate:.4f}, "
-                       f"train_samples={X_train_sub.shape[0]}")
+                       f"learning_rate={learning_rate:.2f}, "
+                       f"train_samples={X_train_sub.shape[0]}{mode_info}")
 
         try:
-            # Create SVI model
+            # Create SVI model with mode-specific parameters
             model = SVI(
                 n_factors=n_factors,
                 batch_size=self.batch_size,
@@ -941,6 +1053,11 @@ class VIObjective:
                 pi_beta=params.get('pi_beta', 0.05),
                 regression_weight=params.get('regression_weight', 1.0),
                 use_spike_slab=params.get('use_spike_slab', False),
+                # Pathway mode parameters
+                mode=self.mode,
+                pathway_mask=self.pathway_mask,
+                pathway_names=self.pathway_names,
+                n_pathway_factors=n_pathway_factors,
             )
 
             # Train model on subsampled data
@@ -1379,6 +1496,42 @@ Examples:
       --method svi \\
       --max-iter 50 \\
       --n-trials 100
+
+  # ====== PATHWAY MODE EXAMPLES ======
+
+  # Pathway-initialized mode: n_factors = n_pathways (not tuned)
+  # Beta initialized from pathway structure but free to deviate
+  python -m VariationalInference.bayes_opt \\
+      --data data.h5ad \\
+      --label-column t2dm \\
+      --mode pathway_init \\
+      --gmt-file /path/to/pathways.gmt \\
+      --n-trials 100
+
+  # Masked mode: n_factors = n_pathways, beta fixed to pathway structure
+  python -m VariationalInference.bayes_opt \\
+      --data data.h5ad \\
+      --label-column t2dm \\
+      --mode masked \\
+      --gmt-file /path/to/pathways.gmt \\
+      --n-trials 100
+
+  # Combined mode: pathway factors + tunable DRGPs
+  # n_factors = n_pathways + n_drpgs, where n_drpgs is tunable
+  python -m VariationalInference.bayes_opt \\
+      --data data.h5ad \\
+      --label-column t2dm \\
+      --mode combined \\
+      --gmt-file /path/to/pathways.gmt \\
+      --n-drpgs 50 \\
+      --n-trials 100
+
+  # Unmasked mode (default): n_factors is tunable
+  python -m VariationalInference.bayes_opt \\
+      --data data.h5ad \\
+      --label-column t2dm \\
+      --mode unmasked \\
+      --n-trials 100
         """
     )
 
@@ -1469,6 +1622,45 @@ Examples:
              'emtab (~10k cells, 10k genes), '
              'large (>50k cells), '
              'default (generic). Default: auto-detect or default.'
+    )
+
+    # Model mode arguments
+    parser.add_argument(
+        '--mode',
+        choices=['unmasked', 'masked', 'pathway_init', 'combined'],
+        default='unmasked',
+        help='Model mode: unmasked (standard, n_factors tunable), '
+             'masked (beta fixed to pathway structure, n_factors=n_pathways), '
+             'pathway_init (beta initialized from pathways, n_factors=n_pathways), '
+             'combined (pathway-constrained + unconstrained DRGPs)'
+    )
+    parser.add_argument(
+        '--gmt-file',
+        default='/archive/projects/SSPA_BRAY/sspa/c2.cp.v2024.1.Hs.symbols.gmt',
+        help='GMT file for pathway definitions (used in masked/pathway_init/combined modes)'
+    )
+    parser.add_argument(
+        '--n-drpgs',
+        type=int,
+        default=50,
+        help='Number of unconstrained data-driven gene programs for combined mode (default: 50)'
+    )
+    parser.add_argument(
+        '--min-pathway-genes',
+        type=int,
+        default=5,
+        help='Minimum number of genes for a pathway to be included (default: 5)'
+    )
+    parser.add_argument(
+        '--max-pathway-genes',
+        type=int,
+        default=5000,
+        help='Maximum number of genes for a pathway to be included (default: 5000)'
+    )
+    parser.add_argument(
+        '--pathway-prefix',
+        default='REACTOME',
+        help='Only include pathways starting with this prefix (default: REACTOME, use "None" for all)'
     )
 
     # Training arguments
@@ -1582,11 +1774,92 @@ def main():
     if args.seed is not None:
         np.random.seed(args.seed)
 
-    # Select search space based on data type
-    search_space = get_search_space_for_data(args.data_type)
+    # Handle pathway prefix argument
+    pathway_prefix = args.pathway_prefix
+    if pathway_prefix and pathway_prefix.lower() == 'none':
+        pathway_prefix = None
+
+    # Load pathways if needed for pathway modes
+    pathway_mask = None
+    pathway_names = None
+    n_pathways = None
+    pathway_genes = None
+
+    if args.mode in ['masked', 'pathway_init', 'combined']:
+        logger.info("=" * 60)
+        logger.info(f"Loading pathways for {args.mode.upper()} mode")
+        logger.info("=" * 60)
+
+        # First, we need to know which genes are in the data
+        # Load data once to get gene list, then filter pathways
+        logger.info("Pre-loading data to get gene list for pathway filtering...")
+
+        loader = DataLoader(
+            data_path=args.data,
+            gene_annotation_path=args.gene_annotation,
+            cache_dir=args.cache_dir,
+            use_cache=True
+        )
+
+        # Load data to get gene list (this will be cached for the objective function)
+        temp_data = loader.load_and_preprocess(
+            label_column=args.label_column,
+            aux_columns=args.aux_columns if args.aux_columns else None,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            random_state=args.seed
+        )
+        data_gene_list = temp_data['gene_list']
+        logger.info(f"Data contains {len(data_gene_list)} genes")
+
+        # Load pathways, filtering to genes in the data
+        logger.info(f"Loading pathways from {args.gmt_file}...")
+        pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
+            gmt_path=args.gmt_file,
+            gene_filter=data_gene_list,
+            min_genes=args.min_pathway_genes,
+            max_genes=args.max_pathway_genes,
+            cache_dir=args.cache_dir,
+            require_prefix=pathway_prefix
+        )
+
+        # Reorder pathway_mat columns to match data gene order
+        # pathway_genes is the column order from load_pathways
+        gene_to_idx = {g: i for i, g in enumerate(pathway_genes)}
+        data_gene_indices = []
+        for gene in data_gene_list:
+            if gene in gene_to_idx:
+                data_gene_indices.append(gene_to_idx[gene])
+            else:
+                # Gene not in pathways - will be masked out
+                data_gene_indices.append(-1)
+
+        # Build reordered pathway mask (n_pathways x n_data_genes)
+        n_pathways = pathway_mat.shape[0]
+        n_data_genes = len(data_gene_list)
+        pathway_mask = np.zeros((n_pathways, n_data_genes), dtype=np.float32)
+
+        for j, idx in enumerate(data_gene_indices):
+            if idx >= 0:
+                pathway_mask[:, j] = pathway_mat[:, idx]
+
+        pathway_names = pathway_names_raw
+        logger.info(f"Loaded {n_pathways} pathways covering {(pathway_mask.sum(axis=0) > 0).sum()}/{n_data_genes} genes")
+
+        if args.mode == 'combined':
+            logger.info(f"Combined mode: will add {args.n_drpgs} tunable DRGPs")
+            logger.info(f"  Pathway factors: {n_pathways} (fixed)")
+            logger.info(f"  DRGP factors: {args.n_drpgs} (tunable)")
+
+    # Select search space based on data type AND mode
+    search_space = get_search_space_for_mode(
+        mode=args.mode,
+        data_type=args.data_type,
+        n_pathways=n_pathways
+    )
 
     # Create study name
-    study_name = args.study_name or f"vi_hyperopt_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    study_name = args.study_name or f"vi_hyperopt_{args.mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("=" * 60)
     logger.info("BAYESIAN OPTIMIZATION FOR VI HYPERPARAMETERS")
@@ -1594,6 +1867,15 @@ def main():
     logger.info(f"Data: {args.data}")
     logger.info(f"Cache directory: {args.cache_dir}")
     logger.info(f"Data type: {args.data_type}")
+    logger.info(f"Model mode: {args.mode}")
+    if args.mode in ['masked', 'pathway_init', 'combined']:
+        logger.info(f"  Pathways: {n_pathways} loaded from {args.gmt_file}")
+        if args.mode in ['masked', 'pathway_init']:
+            logger.info(f"  n_factors: {n_pathways} (fixed = n_pathways)")
+        elif args.mode == 'combined':
+            logger.info(f"  n_factors: {n_pathways} + n_drpgs (n_drpgs tunable)")
+    else:
+        logger.info(f"  n_factors: tunable")
     logger.info(f"Search space: {len(search_space)} parameters")
     logger.info(f"Label column: {args.label_column}")
     logger.info(f"Method: {args.method}")
@@ -1635,7 +1917,7 @@ def main():
     else:
         pruner = optuna.pruners.NopPruner()
 
-    # Create objective function
+    # Create objective function with pathway mode parameters
     objective = VIObjective(
         data_path=args.data,
         label_column=args.label_column,
@@ -1648,13 +1930,19 @@ def main():
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         random_state=args.seed,
-        search_space=search_space,  # Use data-type specific search space
+        search_space=search_space,  # Use mode-aware search space
         params_to_tune=args.params_to_tune,
         fixed_params=fixed_params,
         verbose=args.verbose,
         multi_objective=args.multi_objective,
         subsample_ratio=args.subsample_ratio,
         subsample_size=args.subsample_size,
+        # Pathway mode parameters
+        mode=args.mode,
+        pathway_mask=pathway_mask,
+        pathway_names=pathway_names,
+        n_pathways=n_pathways,
+        n_drpgs=args.n_drpgs,
     )
 
     # Create or load study
