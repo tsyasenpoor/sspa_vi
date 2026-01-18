@@ -701,6 +701,10 @@ def main():
     # =========================================================================
     # DEBUG: v Parameter Diagnostics
     # =========================================================================
+    # Setup output directory early for incremental saves
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     print("\n" + "=" * 80)
     print("DEBUG: Learned Parameter Diagnostics")
     print("=" * 80)
@@ -727,10 +731,6 @@ def main():
     print("\n" + "=" * 80)
     print("Training Set Evaluation")
     print("=" * 80)
-
-    # Setup output directory for incremental saves
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Use the stored training parameters from the final epoch
     # These are the actual θ values that were used during training
