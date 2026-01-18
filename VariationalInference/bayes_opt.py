@@ -1902,8 +1902,19 @@ def main():
     logger.info("=" * 60)
 
     # Create sampler
+    # TPE defaults: n_startup_trials=10 (random), then KDE-based
+    # For high-dim (16 params), increase startup and enable multivariate
+    n_params = len(search_space)
+    n_startup = max(10, min(n_params * 2, 30))  # Scale with dimensionality
+    
     if args.sampler == 'tpe':
-        sampler = TPESampler(seed=args.seed)
+        sampler = TPESampler(
+            seed=args.seed,
+            n_startup_trials=n_startup,
+            multivariate=True,  # Model parameter correlations
+            n_ei_candidates=max(24, n_params * 3),  # More EI candidates for high-dim
+        )
+        logger.info(f"TPESampler: n_startup_trials={n_startup}, multivariate=True")
     elif args.sampler == 'random':
         sampler = optuna.samplers.RandomSampler(seed=args.seed)
     elif args.sampler == 'cmaes':
