@@ -1213,30 +1213,26 @@ class SVICorrected:
         # Restore Beta parameters
         self.a_beta = jnp.array(checkpoint['a_beta'])
         self.b_beta = jnp.array(checkpoint['b_beta'])
-        self._update_beta_expectations()
 
         # Restore Eta parameters
         self.a_eta = jnp.array(checkpoint['a_eta'])
         self.b_eta = jnp.array(checkpoint['b_eta'])
-        self._update_eta_expectations()
 
         # Restore v parameters
         self.mu_v = jnp.array(checkpoint['mu_v'])
         self.Sigma_v = jnp.array(checkpoint['Sigma_v'])
-        self._update_v_expectations()
 
         # Restore gamma parameters
         self.mu_gamma = jnp.array(checkpoint['mu_gamma'])
         self.Sigma_gamma = jnp.array(checkpoint['Sigma_gamma'])
-        self._update_gamma_expectations()
 
         # Restore spike-and-slab if used
         if self.use_spike_slab and 'rho_beta' in checkpoint:
             self.rho_beta = jnp.array(checkpoint['rho_beta'])
             self.rho_v = jnp.array(checkpoint['rho_v'])
-            # Recompute effective expectations with spike-and-slab
-            self._update_beta_expectations()
-            self._update_v_expectations()
+
+        # Recompute all expectations from restored parameters
+        self._compute_expectations()
 
     def compute_heldout_loglik(
         self,

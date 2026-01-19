@@ -235,6 +235,37 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help='Enable early stopping when ELBO converges (recommended for stability)'
     )
+    parser.add_argument(
+        '--early-stopping-metric',
+        type=str,
+        default='elbo',
+        choices=['elbo', 'heldout_ll'],
+        help='Metric for early stopping: elbo (training) or heldout_ll (validation)'
+    )
+    parser.add_argument(
+        '--heldout-ll-patience',
+        type=int,
+        default=10,
+        help='Epochs without HO-LL improvement before stopping (only for heldout_ll metric)'
+    )
+    parser.add_argument(
+        '--heldout-ll-ema-decay',
+        type=float,
+        default=0.9,
+        help='EMA smoothing for HO-LL tracking (lower=faster response)'
+    )
+    parser.add_argument(
+        '--restore-best-heldout',
+        action='store_true',
+        default=True,
+        help='Restore parameters to best HO-LL epoch on early stop'
+    )
+    parser.add_argument(
+        '--min-epochs-before-stopping',
+        type=int,
+        default=20,
+        help='Minimum epochs before early stopping can trigger'
+    )
 
     # Hyperparameter options (Priors & Regularization)
     parser.add_argument(
@@ -675,6 +706,12 @@ def main():
         ema_decay=args.ema_decay,
         convergence_tol=args.convergence_tol,
         convergence_window=args.convergence_window,
+        # Early stopping settings
+        early_stopping_metric=args.early_stopping_metric,
+        heldout_ll_patience=args.heldout_ll_patience,
+        heldout_ll_ema_decay=args.heldout_ll_ema_decay,
+        restore_best_heldout=args.restore_best_heldout,
+        min_epochs_before_stopping=args.min_epochs_before_stopping,
         # Pathway mode settings
         mode=args.mode,
         pathway_mask=pathway_mask,
