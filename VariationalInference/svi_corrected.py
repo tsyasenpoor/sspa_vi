@@ -78,7 +78,14 @@ class SVICorrected:
         ema_decay: float = 0.95,
         convergence_tol: float = 1e-4,
         convergence_window: int = 10,
-        
+
+        # Early stopping based on held-out log-likelihood
+        early_stopping_metric: str = 'elbo',  # 'elbo' or 'heldout_ll'
+        heldout_ll_patience: int = 10,  # epochs without improvement before stopping
+        heldout_ll_ema_decay: float = 0.9,  # EMA smoothing for HO-LL
+        restore_best_heldout: bool = True,  # restore to best HO-LL epoch
+        min_epochs_before_stopping: int = 20,  # minimum epochs before early stopping kicks in
+
         random_state: Optional[int] = None,
         
         # JAX-specific
@@ -138,6 +145,13 @@ class SVICorrected:
         self.convergence_tol = convergence_tol
         self.convergence_window = convergence_window
         self.count_scale = count_scale  # Optional count scaling (for compatibility)
+
+        # Early stopping based on held-out log-likelihood
+        self.early_stopping_metric = early_stopping_metric
+        self.heldout_ll_patience = heldout_ll_patience
+        self.heldout_ll_ema_decay = heldout_ll_ema_decay
+        self.restore_best_heldout = restore_best_heldout
+        self.min_epochs_before_stopping = min_epochs_before_stopping
         
         # JAX settings
         self.use_jit = use_jit
@@ -1158,6 +1172,72 @@ class SVICorrected:
         
         return float(elbo)
 
+    def _checkpoint_params(self) -> Dict[str, Any]:
+        """
+        Checkpoint current global parameters for potential restoration.
+
+        Returns a dictionary containing copies of all global parameters.
+        Used for restoring to the best model based on held-out log-likelihood.
+        """
+        checkpoint = {
+            # Beta (factor loadings)
+            'a_beta': np.array(self.a_beta),
+            'b_beta': np.array(self.b_beta),
+            # Eta (factor-specific rates)
+            'a_eta': np.array(self.a_eta),
+            'b_eta': np.array(self.b_eta),
+            # v (regression coefficients for factors)
+            'mu_v': np.array(self.mu_v),
+            'Sigma_v': np.array(self.Sigma_v),
+            # gamma (regression coefficients for auxiliary)
+            'mu_gamma': np.array(self.mu_gamma),
+            'Sigma_gamma': np.array(self.Sigma_gamma),
+        }
+
+        # Spike-and-slab inclusion probabilities if used
+        if self.use_spike_slab:
+            checkpoint['rho_beta'] = np.array(self.rho_beta)
+            checkpoint['rho_v'] = np.array(self.rho_v)
+
+        return checkpoint
+
+    def _restore_params(self, checkpoint: Dict[str, Any]) -> None:
+        """
+        Restore global parameters from a checkpoint.
+
+        Parameters
+        ----------
+        checkpoint : dict
+            Dictionary from _checkpoint_params() containing saved parameters
+        """
+        # Restore Beta parameters
+        self.a_beta = jnp.array(checkpoint['a_beta'])
+        self.b_beta = jnp.array(checkpoint['b_beta'])
+        self._update_beta_expectations()
+
+        # Restore Eta parameters
+        self.a_eta = jnp.array(checkpoint['a_eta'])
+        self.b_eta = jnp.array(checkpoint['b_eta'])
+        self._update_eta_expectations()
+
+        # Restore v parameters
+        self.mu_v = jnp.array(checkpoint['mu_v'])
+        self.Sigma_v = jnp.array(checkpoint['Sigma_v'])
+        self._update_v_expectations()
+
+        # Restore gamma parameters
+        self.mu_gamma = jnp.array(checkpoint['mu_gamma'])
+        self.Sigma_gamma = jnp.array(checkpoint['Sigma_gamma'])
+        self._update_gamma_expectations()
+
+        # Restore spike-and-slab if used
+        if self.use_spike_slab and 'rho_beta' in checkpoint:
+            self.rho_beta = jnp.array(checkpoint['rho_beta'])
+            self.rho_v = jnp.array(checkpoint['rho_v'])
+            # Recompute effective expectations with spike-and-slab
+            self._update_beta_expectations()
+            self._update_v_expectations()
+
     def compute_heldout_loglik(
         self,
         X_heldout: np.ndarray,
@@ -1328,7 +1408,14 @@ class SVICorrected:
         # Held-out log-likelihood tracking (Blei-style)
         use_heldout = X_heldout is not None and y_heldout is not None
         self.heldout_loglik_history_ = []  # (epoch, heldout_ll)
-        
+
+        # HO-LL based early stopping tracking
+        self.heldout_ll_ema_ = None  # EMA of held-out log-likelihood
+        self.best_heldout_ll_ = -np.inf  # Best HO-LL seen
+        self.best_epoch_ = 0  # Epoch with best HO-LL
+        heldout_ll_no_improve = 0  # Counter for epochs without improvement
+        self.best_params_ = None  # Checkpoint of best model parameters
+
         # Storage for final training set local parameters
         self.train_a_theta_ = None
         self.train_b_theta_ = None
@@ -1454,33 +1541,77 @@ class SVICorrected:
 
             # Compute held-out log-likelihood (Blei-style convergence tracking)
             heldout_ll = None
+            heldout_ll_improved = False
             if use_heldout and epoch % heldout_freq == 0:
                 heldout_ll = self.compute_heldout_loglik(
                     X_heldout, y_heldout, X_aux_heldout, n_iter=20
                 )
                 self.heldout_loglik_history_.append((epoch, heldout_ll))
 
+                # Update HO-LL EMA
+                if self.heldout_ll_ema_ is None:
+                    self.heldout_ll_ema_ = heldout_ll
+                else:
+                    self.heldout_ll_ema_ = (
+                        self.heldout_ll_ema_decay * self.heldout_ll_ema_ +
+                        (1 - self.heldout_ll_ema_decay) * heldout_ll
+                    )
+
+                # Check for improvement (higher HO-LL is better)
+                if heldout_ll > self.best_heldout_ll_:
+                    self.best_heldout_ll_ = heldout_ll
+                    self.best_epoch_ = epoch
+                    heldout_ll_improved = True
+                    heldout_ll_no_improve = 0
+                    # Checkpoint parameters if we want to restore later
+                    if self.restore_best_heldout:
+                        self.best_params_ = self._checkpoint_params()
+                else:
+                    heldout_ll_no_improve += 1
+
             if verbose and epoch % 5 == 0:
                 beta_diversity = np.std(np.array(self.E_beta), axis=1).mean()
                 ema_str = f"{self.elbo_ema_:.2e}" if self.elbo_ema_ is not None else "N/A"
                 rel_str = f"{rel_change:.2e}" if rel_change != np.inf else "N/A"
                 elbo_str = f"{self.last_elbo_:.2e}" if self.last_elbo_ is not None else "N/A"
-                heldout_str = f", HO-LL = {heldout_ll:.2f}" if heldout_ll is not None else ""
+                # Enhanced HO-LL status display
+                if heldout_ll is not None:
+                    improve_marker = "↑" if heldout_ll_improved else "↓"
+                    heldout_str = (f", HO-LL = {heldout_ll:.2f} {improve_marker} "
+                                   f"(best={self.best_heldout_ll_:.2f}@{self.best_epoch_}, "
+                                   f"patience={heldout_ll_no_improve}/{self.heldout_ll_patience})")
+                else:
+                    heldout_str = ""
                 print(f"Epoch {epoch}: ELBO = {elbo_str}, EMA = {ema_str}, "
                       f"Δrel = {rel_str}, ρ_t = {rho_t:.4f}, "
                       f"v = {np.array(self.mu_v).ravel()[:3]}, β_div = {beta_diversity:.3f}{heldout_str}")
             
-            # Early stopping check
-            if early_stopping and rel_change < self.convergence_tol:
-                consecutive_converged += 1
-                if consecutive_converged >= self.convergence_window:
-                    if verbose:
-                        print(f"\nEarly stopping at epoch {epoch}: "
-                              f"EMA rel_change < {self.convergence_tol} for "
-                              f"{self.convergence_window} consecutive checks")
-                    break
-            else:
-                consecutive_converged = 0
+            # Early stopping check - supports both ELBO and HO-LL based stopping
+            should_stop = False
+            stop_reason = ""
+
+            if early_stopping and epoch >= self.min_epochs_before_stopping:
+                if self.early_stopping_metric == 'heldout_ll' and use_heldout:
+                    # HO-LL based early stopping: stop when HO-LL hasn't improved
+                    if heldout_ll_no_improve >= self.heldout_ll_patience:
+                        should_stop = True
+                        stop_reason = (f"HO-LL hasn't improved for {self.heldout_ll_patience} checks. "
+                                       f"Best HO-LL = {self.best_heldout_ll_:.4f} at epoch {self.best_epoch_}")
+                elif self.early_stopping_metric == 'elbo':
+                    # ELBO based early stopping (original behavior)
+                    if rel_change < self.convergence_tol:
+                        consecutive_converged += 1
+                        if consecutive_converged >= self.convergence_window:
+                            should_stop = True
+                            stop_reason = (f"ELBO EMA rel_change < {self.convergence_tol} for "
+                                           f"{self.convergence_window} consecutive checks")
+                    else:
+                        consecutive_converged = 0
+
+            if should_stop:
+                if verbose:
+                    print(f"\n*** Early stopping at epoch {epoch}: {stop_reason}")
+                break
             
             # Store final epoch's training parameters
             self.train_a_theta_ = epoch_a_theta
@@ -1489,7 +1620,21 @@ class SVICorrected:
             self.train_b_xi_ = epoch_b_xi
         
         self.training_time_ = time.time() - start_time
-        
+
+        # Restore best model if using HO-LL based early stopping
+        self.restored_to_best_ = False
+        if (self.restore_best_heldout and use_heldout and
+            self.best_params_ is not None and
+            self.early_stopping_metric == 'heldout_ll'):
+            # Check if current epoch is significantly past the best
+            final_epoch = epoch
+            if final_epoch > self.best_epoch_:
+                if verbose:
+                    print(f"\n*** Restoring parameters from best epoch {self.best_epoch_} "
+                          f"(HO-LL = {self.best_heldout_ll_:.4f}) ***")
+                self._restore_params(self.best_params_)
+                self.restored_to_best_ = True
+
         # Final convergence summary
         if self.elbo_welford_n_ > 1:
             final_var = self.elbo_welford_M2_ / (self.elbo_welford_n_ - 1)
@@ -1506,10 +1651,13 @@ class SVICorrected:
             print(f"Final ELBO: EMA = {self.final_elbo_ema_:.2e}, "
                   f"Mean = {self.final_elbo_mean_:.2e}, Std = {self.final_elbo_std_:.2e}")
 
-            # Report final held-out LL if available
+            # Report held-out LL summary if available
             if len(self.heldout_loglik_history_) > 0:
                 final_heldout_ll = self.heldout_loglik_history_[-1][1]
                 print(f"Final Held-out LL: {final_heldout_ll:.4f} (per sample)")
+                print(f"Best Held-out LL: {self.best_heldout_ll_:.4f} at epoch {self.best_epoch_}")
+                if self.restored_to_best_:
+                    print(f"Model restored to best epoch {self.best_epoch_}")
 
             # v learning diagnostics
             if hasattr(self, 'initial_mu_v_'):
