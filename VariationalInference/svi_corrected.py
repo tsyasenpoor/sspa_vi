@@ -2372,3 +2372,6 @@ class SVICorrected:
             threshold = getattr(self, 'optimal_threshold_', 0.5)
         
         return (proba_cal >= threshold).astype(int)
+
+
+SVI = SVICorrected # Alias for backward compatibility
