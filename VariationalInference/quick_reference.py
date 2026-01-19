@@ -682,7 +682,7 @@ def main():
         n_pathway_factors=n_pathway_factors  # For combined mode boundary
     )
 
-    # Train model
+    # Train model with held-out validation data for convergence tracking
     model.fit(
         X=X_train,
         y=y_train,
@@ -690,7 +690,12 @@ def main():
         max_epochs=args.max_epochs,
         elbo_freq=args.elbo_freq,
         verbose=True,
-        early_stopping=args.early_stopping
+        early_stopping=args.early_stopping,
+        # Held-out data for Blei-style convergence tracking
+        X_heldout=X_val,
+        y_heldout=y_val,
+        X_aux_heldout=X_aux_val,
+        heldout_freq=5  # Compute held-out LL every 5 epochs
     )
 
     print("\nTraining complete!")
@@ -860,9 +865,8 @@ def main():
     # Infer theta for test set (uses stability averaging automatically now)
     test_result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test, n_iter=50)
 
-    # Compute probabilities with Exact Zero Logic
-    # Use 0.8 to be conservative: only factors with >80% probability are used
-    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50, pip_threshold=0.8)
+    # Compute raw probabilities (no hard PIP threshold - use all factors)
+    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50)
     
     if args.verbose:
         print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
@@ -870,11 +874,13 @@ def main():
     print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")
     y_test_pred = (y_test_proba.ravel() > optimal_threshold).astype(int)
 
-    # Check which factors survived the threshold
-    if hasattr(model, 'get_sparse_factors'):
-        sparse_info = model.get_sparse_factors(pip_threshold=0.8)
+    # Report factor summary (soft sparsity via rho_v, no hard threshold)
+    if hasattr(model, 'get_sparse_factors') and model.use_spike_slab:
+        # Use median PIP as adaptive threshold for reporting
+        rho_v_median = float(np.median(np.array(model.rho_v)))
+        sparse_info = model.get_sparse_factors(pip_threshold=rho_v_median)
         n_active = len(sparse_info['active_factors'])
-        print(f"\nActive DRGPs (PIP > 0.8): {n_active} / {model.d}")
+        print(f"\nActive DRGPs (PIP > {rho_v_median:.2f} median): {n_active} / {model.d}")
         if n_active < 10:
             for i in range(n_active):
                 f_idx = sparse_info['active_factors'][i][1]

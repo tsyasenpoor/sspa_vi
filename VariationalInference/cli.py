@@ -497,7 +497,12 @@ def cmd_train(args: argparse.Namespace) -> int:
         X_aux=X_aux_train,
         max_epochs=args.max_epochs,
         elbo_freq=10,
-        verbose=args.verbose
+        verbose=args.verbose,
+        # Held-out data for Blei-style convergence tracking
+        X_heldout=X_val,
+        y_heldout=y_val,
+        X_aux_heldout=X_aux_val,
+        heldout_freq=5
     )
 
     # Evaluate on validation set

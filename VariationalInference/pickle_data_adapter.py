@@ -16,7 +16,6 @@ USAGE:
         --features /path/to/features.pkl \
         --label-column t2dm \
         --n-factors 10 \
-        --method svi \
         --batch-size 128 \
         --max-epochs 128 \
         --learning-rate 0.5 \
@@ -27,7 +26,7 @@ This script will:
 1. Load df.pkl (gene expression matrix)
 2. Load features.pkl (labels)
 3. Create train/val/test splits
-4. Run the VI/SVI model directly
+4. Run the SVI model directly
 5. Save results
 
 The main quick_reference.py remains unchanged and can still be used
@@ -78,15 +77,6 @@ def parse_args() -> argparse.Namespace:
         help='Number of latent gene programs to discover'
     )
 
-    # Method selection
-    parser.add_argument(
-        '--method', '-m',
-        type=str,
-        choices=['vi', 'svi'],
-        default='vi',
-        help='Inference method: vi (batch) or svi (stochastic)'
-    )
-
     # Data options
     parser.add_argument(
         '--label-column',
@@ -114,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         help='Proportion of data for validation'
     )
 
-    # VI Training options
+    # SVI Training options
     parser.add_argument(
         '--max-iter',
         type=int,
@@ -411,23 +401,16 @@ def main():
         profiler.enable()
         print("\n[PROFILER] Profiling enabled...")
     
-    use_svi = args.method.lower() == 'svi'
-    method_name = "STOCHASTIC VARIATIONAL INFERENCE" if use_svi else "VARIATIONAL INFERENCE"
-    
     print("=" * 80)
-    print(f"{method_name} - PICKLE DATA ADAPTER")
+    print("STOCHASTIC VARIATIONAL INFERENCE - PICKLE DATA ADAPTER")
     print("=" * 80)
     print(f"\nConfiguration:")
-    print(f"  Method:       {'SVI (Stochastic)' if use_svi else 'VI (Batch)'}")
     print(f"  Data (df):    {args.df}")
     print(f"  Features:     {args.features}")
     print(f"  n_factors:    {args.n_factors}")
-    if use_svi:
-        print(f"  batch_size:   {args.batch_size}")
-        print(f"  max_epochs:   {args.max_epochs}")
-        print(f"  learning_rate:{args.learning_rate}")
-    else:
-        print(f"  max_iter:     {args.max_iter}")
+    print(f"  batch_size:   {args.batch_size}")
+    print(f"  max_epochs:   {args.max_epochs}")
+    print(f"  learning_rate:{args.learning_rate}")
     print(f"  label_column: {args.label_column}")
     print(f"  aux_columns:  {args.aux_columns}")
     print(f"  random_seed:  {args.seed if args.seed else 'None (random)'}")
@@ -468,72 +451,45 @@ def main():
     
     # Train model
     print("\n" + "=" * 80)
-    print(f"Training {'SVI' if use_svi else 'VI'} Model")
+    print("Training SVI Model")
     print("=" * 80)
     
-    if use_svi:
-        model = SVI(
-            n_factors=args.n_factors,
-            batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            learning_rate_decay=args.learning_rate_decay,
-            alpha_theta=0.5,
-            alpha_beta=2.0,
-            alpha_xi=2.0,
-            lambda_xi=2.0,
-            sigma_v=2.0,
-            sigma_gamma=1.0,
-            random_state=args.seed,
-            use_spike_slab=args.use_spike_slab,
-            rho_v_delay_epochs=args.rho_v_delay_epochs,
-            reset_lr_on_restore=args.reset_lr_on_restore,
-            regression_lr_multiplier=args.regression_lr_multiplier
-        )
-        
-        model.fit(
-            X=X_train,
-            y=y_train,
-            X_aux=X_aux_train,
-            max_epochs=args.max_epochs,
-            tol=10.0,
-            rel_tol=2e-4,
-            elbo_freq=10,
-            min_epochs=args.min_epochs,
-            patience=args.patience,
-            verbose=True,
-            debug=args.debug
-        )
-    else:
-        model = VI(
-            n_factors=args.n_factors,
-            alpha_theta=0.5,
-            alpha_beta=2.0,
-            alpha_xi=2.0,
-            lambda_xi=2.0,
-            sigma_v=2.0,
-            sigma_gamma=1.0,
-            random_state=args.seed
-        )
-        
-        model.fit(
-            X=X_train,
-            y=y_train,
-            X_aux=X_aux_train,
-            max_iter=args.max_iter,
-            tol=10.0,
-            rel_tol=2e-4,
-            elbo_freq=10,
-            min_iter=args.min_iter,
-            patience=args.patience,
-            verbose=True,
-            theta_damping=0.8,
-            beta_damping=0.8,
-            v_damping=0.7,
-            gamma_damping=0.7,
-            xi_damping=0.9,
-            eta_damping=0.9,
-            debug=args.debug
-        )
+    model = SVI(
+        n_factors=args.n_factors,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        learning_rate_decay=args.learning_rate_decay,
+        alpha_theta=0.5,
+        alpha_beta=2.0,
+        alpha_xi=2.0,
+        lambda_xi=2.0,
+        sigma_v=2.0,
+        sigma_gamma=1.0,
+        random_state=args.seed,
+        use_spike_slab=args.use_spike_slab,
+        rho_v_delay_epochs=args.rho_v_delay_epochs,
+        reset_lr_on_restore=args.reset_lr_on_restore,
+        regression_lr_multiplier=args.regression_lr_multiplier
+    )
+    
+    model.fit(
+        X=X_train,
+        y=y_train,
+        X_aux=X_aux_train,
+        max_epochs=args.max_epochs,
+        tol=10.0,
+        rel_tol=2e-4,
+        elbo_freq=10,
+        min_epochs=args.min_epochs,
+        patience=args.patience,
+        verbose=True,
+        debug=args.debug,
+        # Held-out data for Blei-style convergence tracking
+        X_heldout=X_val,
+        y_heldout=y_val,
+        X_aux_heldout=X_aux_val,
+        heldout_freq=5
+    )
     
     print("\nTraining complete!")
     print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
@@ -672,7 +628,7 @@ def main():
     print("=" * 80)
     
     output_dir = Path(args.output_dir)
-    prefix = 'svi' if use_svi else 'vi'
+    prefix = 'svi'
     saved_files = save_results(
         model=model,
         output_dir=output_dir,

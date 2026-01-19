@@ -442,6 +442,13 @@ def save_results(
     if hasattr(model, 'convergence_history_') and model.convergence_history_:
         summary['convergence_history'] = model.convergence_history_
 
+    # === NEW: Held-out log-likelihood history (Blei-style convergence) ===
+    # Format: [(epoch, heldout_ll), ...]
+    if hasattr(model, 'heldout_loglik_history_') and model.heldout_loglik_history_:
+        summary['heldout_loglik_history'] = model.heldout_loglik_history_
+        # Also store final held-out LL in training section for quick access
+        summary['training']['final_heldout_loglik'] = model.heldout_loglik_history_[-1][1]
+
     # Convert JAX/NumPy types to JSON-serializable Python types
     def convert_to_json_serializable(obj):
         """Recursively convert JAX/NumPy types to native Python types."""
@@ -972,4 +979,4 @@ def load_pathways(
           f"mean={pathways_per_gene.mean():.1f}")
     print(f"  Matrix density: {pathway_mat.mean()*100:.2f}%")
     
-    return pathway_mat, pathway_names, gene_names 
+    return pathway_mat, pathway_names, gene_names

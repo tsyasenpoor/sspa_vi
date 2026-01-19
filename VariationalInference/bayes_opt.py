@@ -62,7 +62,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 # Import VI components
 from VariationalInference.data_loader import DataLoader
-from VariationalInference.svi_corrected import SVI
+from VariationalInference.svi_corrected import SVICorrected as SVI
 from VariationalInference.utils import compute_metrics, load_pathways
 
 # Configure logging
@@ -95,8 +95,8 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
         # Learning rate (for SVI) - refined range
         'learning_rate': {
             'type': 'float',
-            'low': 1e-4,
-            'high': 0.1,
+            'low': 1e-3,
+            'high': 1.0,
             'log': True,
             'description': 'Natural gradient step size'
         },
@@ -150,7 +150,7 @@ def get_default_search_space() -> Dict[str, Dict[str, Any]]:
         # Spike-and-slab sparsity priors (CORRECTED)
         'pi_v': {
             'type': 'float',
-            'low': 0.5,
+            'low': 0.25,
             'high': 0.95,
             'log': False,
             'description': 'Disease coefficient inclusion prob'
@@ -694,9 +694,9 @@ def sample_hyperparameters(
 # OBJECTIVE FUNCTION
 # =============================================================================
 
-class VIObjective:
+class SVIObjective:
     """
-    Optuna objective class for VI hyperparameter optimization.
+    Optuna objective class for SVI hyperparameter optimization.
 
     This class encapsulates the data loading, model training, and evaluation
     logic needed for each trial.
@@ -709,7 +709,6 @@ class VIObjective:
         aux_columns: Optional[List[str]] = None,
         gene_annotation_path: Optional[str] = None,
         cache_dir: Optional[str] = None,
-        method: str = 'vi',
         max_iter: int = 100,
         batch_size: int = 128,
         train_ratio: float = 0.7,
@@ -739,7 +738,6 @@ class VIObjective:
             aux_columns: List of auxiliary feature column names
             gene_annotation_path: Path to gene annotation CSV (optional)
             cache_dir: Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)
-            method: 'vi' or 'svi'
             max_iter: Maximum iterations for training
             batch_size: Batch size for SVI
             train_ratio: Fraction of data for training
@@ -767,7 +765,6 @@ class VIObjective:
         self.aux_columns = aux_columns or []
         self.gene_annotation_path = gene_annotation_path
         self.cache_dir = cache_dir
-        self.method = method
         self.max_iter = max_iter
         self.batch_size = batch_size
         self.train_ratio = train_ratio
@@ -1060,13 +1057,18 @@ class VIObjective:
                 n_pathway_factors=n_pathway_factors,
             )
 
-            # Train model on subsampled data
+            # Train model on subsampled data with held-out validation tracking
             model.fit(
                 X=X_train_sub,
                 y=y_train_sub,
                 X_aux=X_aux_train_sub,
                 max_epochs=self.max_iter,
-                verbose=self.verbose
+                verbose=self.verbose,
+                # Held-out data for Blei-style convergence tracking
+                X_heldout=self._X_val,
+                y_heldout=self._y_val,
+                X_aux_heldout=self._X_aux_val,
+                heldout_freq=10  # Less frequent for HPO (speed)
             )
 
             # Evaluate on validation set
@@ -1489,11 +1491,10 @@ Examples:
       --subsample-ratio 0.4 \\
       --n-trials 100
 
-  # SVI with more iterations
+  # With more iterations
   python -m VariationalInference.bayes_opt \\
       --data data.h5ad \\
       --label-column t2dm \\
-      --method svi \\
       --max-iter 50 \\
       --n-trials 100
 
@@ -1648,14 +1649,14 @@ Examples:
     parser.add_argument(
         '--min-pathway-genes',
         type=int,
-        default=5,
-        help='Minimum number of genes for a pathway to be included (default: 5)'
+        default=30,
+        help='Minimum number of genes for a pathway to be included (default: 30)'
     )
     parser.add_argument(
         '--max-pathway-genes',
         type=int,
-        default=5000,
-        help='Maximum number of genes for a pathway to be included (default: 5000)'
+        default=200,
+        help='Maximum number of genes for a pathway to be included (default: 200)'
     )
     parser.add_argument(
         '--pathway-prefix',
@@ -1664,12 +1665,6 @@ Examples:
     )
 
     # Training arguments
-    parser.add_argument(
-        '--method',
-        choices=['vi', 'svi'],
-        default='vi',
-        help='Training method (default: vi)'
-    )
     parser.add_argument(
         '--max-iter',
         type=int,
@@ -1878,7 +1873,6 @@ def main():
         logger.info(f"  n_factors: tunable")
     logger.info(f"Search space: {len(search_space)} parameters")
     logger.info(f"Label column: {args.label_column}")
-    logger.info(f"Method: {args.method}")
     logger.info(f"Multi-objective: {args.multi_objective}")
     if args.multi_objective:
         logger.info("Optimizing: AUC + Accuracy (Pareto front)")
@@ -1929,13 +1923,12 @@ def main():
         pruner = optuna.pruners.NopPruner()
 
     # Create objective function with pathway mode parameters
-    objective = VIObjective(
+    objective = SVIObjective(
         data_path=args.data,
         label_column=args.label_column,
         aux_columns=args.aux_columns,
         gene_annotation_path=args.gene_annotation,
         cache_dir=args.cache_dir,
-        method=args.method,
         max_iter=args.max_iter,
         batch_size=args.batch_size,
         train_ratio=args.train_ratio,

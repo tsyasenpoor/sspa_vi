@@ -1187,13 +1187,13 @@ class SVICorrected:
         -------
         float : Average held-out log-likelihood per sample
         """
-        # Convert to JAX arrays
+        # Convert to JAX arrays (input normalization - single conversion)
         if sp.issparse(X_heldout):
             X_heldout = jnp.array(X_heldout.toarray())
-        else:
+        elif not isinstance(X_heldout, jnp.ndarray):
             X_heldout = jnp.array(X_heldout)
 
-        y_heldout = jnp.array(y_heldout)
+        y_heldout = jnp.array(y_heldout) if not isinstance(y_heldout, jnp.ndarray) else y_heldout
         if y_heldout.ndim == 1:
             y_heldout = y_heldout[:, jnp.newaxis]
 
@@ -1201,18 +1201,19 @@ class SVICorrected:
 
         if X_aux_heldout is None:
             X_aux_heldout = jnp.zeros((n_heldout, self.p_aux if self.p_aux > 0 else 0))
-        else:
+        elif not isinstance(X_aux_heldout, jnp.ndarray):
             X_aux_heldout = jnp.array(X_aux_heldout)
 
-        # Infer θ for held-out samples with frozen global params
+        # Infer θ for held-out samples with frozen global params (keep as JAX)
         result = self.transform(
-            np.array(X_heldout),
-            y_new=np.array(y_heldout),
-            X_aux_new=np.array(X_aux_heldout),
-            n_iter=n_iter
+            X_heldout,
+            y_new=y_heldout,
+            X_aux_new=X_aux_heldout,
+            n_iter=n_iter,
+            as_numpy=False  # Keep JAX arrays to avoid roundtrip
         )
-        E_theta = jnp.array(result['E_theta'])
-        E_log_theta = jsp.digamma(jnp.array(result['a_theta'])) - jnp.log(jnp.array(result['b_theta']))
+        E_theta = result['E_theta']  # Already JAX array
+        E_log_theta = jsp.digamma(result['a_theta']) - jnp.log(result['b_theta'])
 
         # === Poisson log-likelihood for counts ===
         # log p(x|θ,β) = Σ_ij [x_ij * log(Σ_ℓ θ_iℓ β_jℓ) - Σ_ℓ θ_iℓ β_jℓ - log(x_ij!)]
@@ -1533,12 +1534,18 @@ class SVICorrected:
     
     def transform(self, X_new: np.ndarray, y_new: np.ndarray = None, 
                   X_aux_new: np.ndarray = None, n_iter: int = 50,
-                  average_last_n: int = 10) -> dict:
+                  average_last_n: int = 10, as_numpy: bool = True) -> dict:
         """
         Infer θ for new samples with frozen global parameters.
         Includes stabilizing averaging over the last iterations.
+        
+        Parameters
+        ----------
+        as_numpy : bool
+            If True (default), return numpy arrays for API compatibility.
+            If False, return JAX arrays for internal use (avoids GPU→CPU transfer).
         """
-        # Convert sparse to dense if needed
+        # Convert sparse to dense JAX arrays (all computation on GPU)
         if sp.issparse(X_new):
             X_new = jnp.array(X_new.toarray())
         else:
@@ -1556,7 +1563,7 @@ class SVICorrected:
             y_new = jnp.array(y_new)
             y_new = y_new.reshape(-1, 1) if y_new.ndim == 1 else y_new
         
-        # Initialize
+        # Initialize (all JAX arrays)
         row_sums = X_new.sum(axis=1, keepdims=True) + 1
         factor_scales = jnp.linspace(0.5, 2.0, self.d)
         
@@ -1632,13 +1639,24 @@ class SVICorrected:
         else:
             E_theta_final = a_theta / b_theta
         
-        return {
-            'E_theta': np.array(E_theta_final),
-            'a_theta': np.array(a_theta),
-            'b_theta': np.array(b_theta),
-            'a_xi': np.array(a_xi),
-            'b_xi': np.array(b_xi)
-        }
+        # Return JAX or numpy arrays based on as_numpy flag
+        if as_numpy:
+            return {
+                'E_theta': np.array(E_theta_final),
+                'a_theta': np.array(a_theta),
+                'b_theta': np.array(b_theta),
+                'a_xi': np.array(a_xi),
+                'b_xi': np.array(b_xi)
+            }
+        else:
+            # Keep on GPU for internal use
+            return {
+                'E_theta': E_theta_final,
+                'a_theta': a_theta,
+                'b_theta': b_theta,
+                'a_xi': a_xi,
+                'b_xi': b_xi
+            }
 
     def predict_proba(self, X_new: np.ndarray, X_aux_new: np.ndarray = None,
                       n_iter: int = 50, pip_threshold: float = None) -> np.ndarray:
@@ -1648,16 +1666,10 @@ class SVICorrected:
         pip_threshold: If set (e.g., 0.5), coefficients with inclusion probability 
                        rho_v < threshold are forced to ZERO (hard sparsity).
         """
-        n_new = X_new.shape[0]
-        if X_aux_new is None:
-            X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
-        else:
-            X_aux_new = np.array(X_aux_new)
-            
-        # Use transform with averaging for stability
+        # Use transform with as_numpy=False to keep JAX arrays on GPU
         result = self.transform(X_new, y_new=None, X_aux_new=X_aux_new, 
-                                n_iter=n_iter, average_last_n=10)
-        E_theta = jnp.array(result['E_theta'])
+                                n_iter=n_iter, average_last_n=10, as_numpy=False)
+        E_theta = result['E_theta']  # Already JAX array
         
         # Apply Hard Sparsity Mask
         effective_v = self.mu_v
@@ -1666,14 +1678,23 @@ class SVICorrected:
             active_mask = (self.rho_v > pip_threshold)
             effective_v = self.mu_v * active_mask
             
-        # Compute logits using EFFECTIVE v
+        # Compute logits using EFFECTIVE v (all JAX operations)
         if self.p_aux > 0:
-            logits = E_theta @ effective_v.T + jnp.array(X_aux_new) @ self.mu_gamma.T
+            # Convert X_aux_new to JAX if needed
+            if X_aux_new is None:
+                n_new = E_theta.shape[0]
+                X_aux_jnp = jnp.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
+            elif not isinstance(X_aux_new, jnp.ndarray):
+                X_aux_jnp = jnp.array(X_aux_new)
+            else:
+                X_aux_jnp = X_aux_new
+            logits = E_theta @ effective_v.T + X_aux_jnp @ self.mu_gamma.T
         else:
             logits = E_theta @ effective_v.T
             
         proba = jsp.expit(logits)
         
+        # Only convert to numpy at the API boundary
         return np.array(proba).squeeze()
 
     def get_sparse_factors(self, pip_threshold: float = 0.5) -> dict:
@@ -1737,6 +1758,213 @@ class SVICorrected:
         """
         proba = self.predict_proba(X_new, X_aux_new, n_iter)
         return (proba >= threshold).astype(int)
+
+    # =========================================================================
+    # CALIBRATION METHODS
+    # =========================================================================
+    
+    def fit_calibration(
+        self,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray,
+        X_aux_cal: np.ndarray = None,
+        method: str = 'platt',
+        n_iter: int = 50,
+        optimize_threshold: bool = True,
+        threshold_metric: str = 'f1',
+        verbose: bool = False
+    ):
+        """
+        Fit probability calibration on validation/calibration data.
+        
+        When raw probabilities are concentrated in a narrow range (e.g., [0.4, 0.6]),
+        calibration rescales them to better utilize [0, 1] for improved decision
+        boundary selection.
+        
+        Parameters
+        ----------
+        X_cal : (n_cal, p) count matrix for calibration
+        y_cal : (n_cal,) binary labels
+        X_aux_cal : (n_cal, p_aux) auxiliary covariates
+        method : 'platt' (logistic regression) or 'isotonic' (monotonic regression)
+        n_iter : local VI iterations for θ inference
+        optimize_threshold : if True, find optimal classification threshold
+        threshold_metric : 'f1', 'youden', or 'accuracy' for threshold optimization
+        verbose : print calibration diagnostics
+        
+        Stores
+        ------
+        self.calibrator_ : fitted calibration model
+        self.calibration_method_ : method used
+        self.optimal_threshold_ : optimal classification threshold (if optimized)
+        """
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.isotonic import IsotonicRegression
+        from sklearn.metrics import f1_score, roc_curve
+        
+        # Get raw probabilities
+        y_raw_proba = self.predict_proba(X_cal, X_aux_cal, n_iter=n_iter)
+        if y_raw_proba.ndim > 1:
+            y_raw_proba = y_raw_proba.ravel()
+        y_cal = np.asarray(y_cal).ravel()
+        
+        if verbose:
+            print(f"Raw probability range: [{y_raw_proba.min():.4f}, {y_raw_proba.max():.4f}]")
+            print(f"Raw probability std: {y_raw_proba.std():.4f}")
+        
+        # Fit calibrator
+        if method == 'platt':
+            # Platt scaling: logistic regression on raw probabilities
+            # Transform to logit space for fitting, then back
+            logits = np.clip(y_raw_proba, 1e-6, 1-1e-6)
+            logits = np.log(logits / (1 - logits))
+            
+            self.calibrator_ = LogisticRegression(
+                solver='lbfgs',
+                max_iter=1000,
+                C=1e6  # Near-unregularized for pure calibration
+            )
+            self.calibrator_.fit(logits.reshape(-1, 1), y_cal)
+            
+        elif method == 'isotonic':
+            # Isotonic regression: non-parametric monotonic calibration
+            self.calibrator_ = IsotonicRegression(
+                y_min=0.0, y_max=1.0, out_of_bounds='clip'
+            )
+            self.calibrator_.fit(y_raw_proba, y_cal)
+            
+        else:
+            raise ValueError(f"Unknown calibration method: {method}. Use 'platt' or 'isotonic'.")
+        
+        self.calibration_method_ = method
+        
+        # Apply calibration and check range
+        y_cal_proba = self._apply_calibration(y_raw_proba)
+        
+        if verbose:
+            print(f"Calibrated probability range: [{y_cal_proba.min():.4f}, {y_cal_proba.max():.4f}]")
+            print(f"Calibrated probability std: {y_cal_proba.std():.4f}")
+        
+        # Optimize threshold
+        if optimize_threshold:
+            self.optimal_threshold_ = self._find_optimal_threshold(
+                y_cal, y_cal_proba, metric=threshold_metric
+            )
+            if verbose:
+                print(f"Optimal threshold ({threshold_metric}): {self.optimal_threshold_:.4f}")
+        else:
+            self.optimal_threshold_ = 0.5
+    
+    def _apply_calibration(self, y_proba: np.ndarray) -> np.ndarray:
+        """
+        Apply fitted calibration to raw probabilities.
+        
+        Parameters
+        ----------
+        y_proba : (n,) or (n, 1) raw probabilities
+        
+        Returns
+        -------
+        calibrated : (n,) calibrated probabilities in [0, 1]
+        """
+        if not hasattr(self, 'calibrator_'):
+            return np.asarray(y_proba).ravel()
+        
+        y_proba = np.asarray(y_proba).ravel()
+        
+        if self.calibration_method_ == 'platt':
+            # Transform to logit, predict, get probability
+            logits = np.clip(y_proba, 1e-6, 1-1e-6)
+            logits = np.log(logits / (1 - logits))
+            calibrated = self.calibrator_.predict_proba(logits.reshape(-1, 1))[:, 1]
+        else:  # isotonic
+            calibrated = self.calibrator_.predict(y_proba)
+        
+        return np.clip(calibrated, 0, 1)
+    
+    def _find_optimal_threshold(
+        self,
+        y_true: np.ndarray,
+        y_proba: np.ndarray,
+        metric: str = 'f1'
+    ) -> float:
+        """
+        Find optimal classification threshold.
+        
+        Parameters
+        ----------
+        y_true : (n,) binary labels
+        y_proba : (n,) predicted probabilities
+        metric : 'f1', 'youden', or 'accuracy'
+        
+        Returns
+        -------
+        threshold : optimal threshold in [0, 1]
+        """
+        from sklearn.metrics import f1_score, roc_curve
+        
+        if metric == 'youden':
+            # Youden's J = sensitivity + specificity - 1 = TPR - FPR
+            fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+            j_scores = tpr - fpr
+            best_idx = np.argmax(j_scores)
+            return thresholds[best_idx]
+        
+        elif metric == 'f1':
+            # Grid search for best F1
+            best_f1 = 0
+            best_thresh = 0.5
+            for thresh in np.linspace(0.1, 0.9, 81):
+                y_pred = (y_proba >= thresh).astype(int)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_thresh = thresh
+            return best_thresh
+        
+        elif metric == 'accuracy':
+            # Grid search for best accuracy
+            best_acc = 0
+            best_thresh = 0.5
+            for thresh in np.linspace(0.1, 0.9, 81):
+                y_pred = (y_proba >= thresh).astype(int)
+                acc = (y_pred == y_true).mean()
+                if acc > best_acc:
+                    best_acc = acc
+                    best_thresh = thresh
+            return best_thresh
+        
+        else:
+            raise ValueError(f"Unknown metric: {metric}. Use 'f1', 'youden', or 'accuracy'.")
+    
+    def predict_calibrated(
+        self,
+        X_new: np.ndarray,
+        X_aux_new: np.ndarray = None,
+        n_iter: int = 50,
+        threshold: float = None
+    ) -> np.ndarray:
+        """
+        Predict with calibration applied.
+        
+        Parameters
+        ----------
+        X_new : (n_new, p) count matrix
+        X_aux_new : (n_new, p_aux) auxiliary covariates
+        n_iter : local VI iterations
+        threshold : classification threshold (uses optimal_threshold_ if None)
+        
+        Returns
+        -------
+        labels : (n_new,) predicted labels
+        """
+        proba_raw = self.predict_proba(X_new, X_aux_new, n_iter=n_iter)
+        proba_cal = self._apply_calibration(proba_raw)
+        
+        if threshold is None:
+            threshold = getattr(self, 'optimal_threshold_', 0.5)
+        
+        return (proba_cal >= threshold).astype(int)
 
     def _compute_memory_efficient_batch_size(self, target_gb: float = 0.5) -> int:
         """
@@ -1938,83 +2166,209 @@ class SVICorrected:
         proba = self.predict_proba_batched(X_new, X_aux_new, n_iter, batch_size, verbose)
         return (proba >= threshold).astype(int)
 
-
-if __name__ == "__main__":
-    # Test with train/test split
-    print("Testing JAX-optimized SVI model...")
-    np.random.seed(42)
-    n_train, n_test, p, d = 200, 50, 50, 5
+    # =========================================================================
+    # CALIBRATION METHODS
+    # =========================================================================
     
-    # Generate synthetic data
-    theta_true_train = np.random.gamma(2, 1, (n_train, d))
-    theta_true_test = np.random.gamma(2, 1, (n_test, d))
-    beta_true = np.random.gamma(2, 1, (p, d))
+    def fit_calibration(
+        self,
+        X_cal: np.ndarray,
+        y_cal: np.ndarray,
+        X_aux_cal: np.ndarray = None,
+        method: str = 'platt',
+        n_iter: int = 50,
+        optimize_threshold: bool = True,
+        threshold_metric: str = 'f1',
+        verbose: bool = False
+    ):
+        """
+        Fit probability calibration on validation/calibration data.
+        
+        When raw probabilities are concentrated in a narrow range (e.g., [0.4, 0.6]),
+        calibration rescales them to better utilize [0, 1] for improved decision
+        boundary selection.
+        
+        Parameters
+        ----------
+        X_cal : (n_cal, p) count matrix for calibration
+        y_cal : (n_cal,) binary labels
+        X_aux_cal : (n_cal, p_aux) auxiliary covariates
+        method : 'platt' (logistic regression) or 'isotonic' (monotonic regression)
+        n_iter : local VI iterations for θ inference
+        optimize_threshold : if True, find optimal classification threshold
+        threshold_metric : 'f1', 'youden', or 'accuracy' for threshold optimization
+        verbose : print calibration diagnostics
+        
+        Stores
+        ------
+        self.calibrator_ : fitted calibration model
+        self.calibration_method_ : method used
+        self.optimal_threshold_ : optimal classification threshold (if optimized)
+        """
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.isotonic import IsotonicRegression
+        from sklearn.metrics import f1_score, roc_curve
+        
+        # Get raw probabilities
+        y_raw_proba = self.predict_proba(X_cal, X_aux_cal, n_iter=n_iter)
+        if y_raw_proba.ndim > 1:
+            y_raw_proba = y_raw_proba.ravel()
+        y_cal = np.asarray(y_cal).ravel()
+        
+        if verbose:
+            print(f"Raw probability range: [{y_raw_proba.min():.4f}, {y_raw_proba.max():.4f}]")
+            print(f"Raw probability std: {y_raw_proba.std():.4f}")
+        
+        # Fit calibrator
+        if method == 'platt':
+            # Platt scaling: logistic regression on raw probabilities
+            # Transform to logit space for fitting, then back
+            logits = np.clip(y_raw_proba, 1e-6, 1-1e-6)
+            logits = np.log(logits / (1 - logits))
+            
+            self.calibrator_ = LogisticRegression(
+                solver='lbfgs',
+                max_iter=1000,
+                C=1e6  # Near-unregularized for pure calibration
+            )
+            self.calibrator_.fit(logits.reshape(-1, 1), y_cal)
+            
+        elif method == 'isotonic':
+            # Isotonic regression: non-parametric monotonic calibration
+            self.calibrator_ = IsotonicRegression(
+                y_min=0.0, y_max=1.0, out_of_bounds='clip'
+            )
+            self.calibrator_.fit(y_raw_proba, y_cal)
+            
+        else:
+            raise ValueError(f"Unknown calibration method: {method}. Use 'platt' or 'isotonic'.")
+        
+        self.calibration_method_ = method
+        
+        # Apply calibration and check range
+        y_cal_proba = self._apply_calibration(y_raw_proba)
+        
+        if verbose:
+            print(f"Calibrated probability range: [{y_cal_proba.min():.4f}, {y_cal_proba.max():.4f}]")
+            print(f"Calibrated probability std: {y_cal_proba.std():.4f}")
+        
+        # Optimize threshold
+        if optimize_threshold:
+            self.optimal_threshold_ = self._find_optimal_threshold(
+                y_cal, y_cal_proba, metric=threshold_metric
+            )
+            if verbose:
+                print(f"Optimal threshold ({threshold_metric}): {self.optimal_threshold_:.4f}")
+        else:
+            self.optimal_threshold_ = 0.5
     
-    X_train = np.random.poisson(theta_true_train @ beta_true.T)
-    X_test = np.random.poisson(theta_true_test @ beta_true.T)
+    def _apply_calibration(self, y_proba: np.ndarray) -> np.ndarray:
+        """
+        Apply fitted calibration to raw probabilities.
+        
+        Parameters
+        ----------
+        y_proba : (n,) or (n, 1) raw probabilities
+        
+        Returns
+        -------
+        calibrated : (n,) calibrated probabilities in [0, 1]
+        """
+        if not hasattr(self, 'calibrator_'):
+            return np.asarray(y_proba).ravel()
+        
+        y_proba = np.asarray(y_proba).ravel()
+        
+        if self.calibration_method_ == 'platt':
+            # Transform to logit, predict, get probability
+            logits = np.clip(y_proba, 1e-6, 1-1e-6)
+            logits = np.log(logits / (1 - logits))
+            calibrated = self.calibrator_.predict_proba(logits.reshape(-1, 1))[:, 1]
+        else:  # isotonic
+            calibrated = self.calibrator_.predict(y_proba)
+        
+        return np.clip(calibrated, 0, 1)
     
-    v_true = np.array([[1, -1, 0.5, 0, 0]])
+    def _find_optimal_threshold(
+        self,
+        y_true: np.ndarray,
+        y_proba: np.ndarray,
+        metric: str = 'f1'
+    ) -> float:
+        """
+        Find optimal classification threshold.
+        
+        Parameters
+        ----------
+        y_true : (n,) binary labels
+        y_proba : (n,) predicted probabilities
+        metric : 'f1', 'youden', or 'accuracy'
+        
+        Returns
+        -------
+        threshold : optimal threshold in [0, 1]
+        """
+        from sklearn.metrics import f1_score, roc_curve
+        
+        if metric == 'youden':
+            # Youden's J = sensitivity + specificity - 1 = TPR - FPR
+            fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+            j_scores = tpr - fpr
+            best_idx = np.argmax(j_scores)
+            return thresholds[best_idx]
+        
+        elif metric == 'f1':
+            # Grid search for best F1
+            best_f1 = 0
+            best_thresh = 0.5
+            for thresh in np.linspace(0.1, 0.9, 81):
+                y_pred = (y_proba >= thresh).astype(int)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_thresh = thresh
+            return best_thresh
+        
+        elif metric == 'accuracy':
+            # Grid search for best accuracy
+            best_acc = 0
+            best_thresh = 0.5
+            for thresh in np.linspace(0.1, 0.9, 81):
+                y_pred = (y_proba >= thresh).astype(int)
+                acc = (y_pred == y_true).mean()
+                if acc > best_acc:
+                    best_acc = acc
+                    best_thresh = thresh
+            return best_thresh
+        
+        else:
+            raise ValueError(f"Unknown metric: {metric}. Use 'f1', 'youden', or 'accuracy'.")
     
-    from scipy.special import expit
-    logits_train = theta_true_train @ v_true.T
-    y_train = (expit(logits_train) > 0.5).astype(float).ravel()
-    
-    logits_test = theta_true_test @ v_true.T
-    y_test = (expit(logits_test) > 0.5).astype(float).ravel()
-    
-    X_aux_train = np.random.randn(n_train, 2)
-    X_aux_test = np.random.randn(n_test, 2)
-    
-    # Train model
-    model = SVICorrected(
-        n_factors=d, 
-        batch_size=64, 
-        learning_rate=0.5,
-        learning_rate_decay=0.6,
-        learning_rate_min=0.01,
-        local_iterations=20,
-        random_state=42,
-        use_jit=True,
-        device='gpu'
-    )
-    model.fit(X_train, y_train, X_aux_train, max_epochs=100, verbose=True)
-    
-    print(f"\n{'='*50}")
-    print("RESULTS")
-    print(f"{'='*50}")
-    print(f"Final v:\n{np.array(model.mu_v)}")
-    print(f"True v:\n{v_true}")
-    print(f"v correlation: {np.corrcoef(np.array(model.mu_v).ravel(), v_true.ravel())[0,1]:.3f}")
-    
-    # Test transform on held-out data
-    print(f"\n{'='*50}")
-    print("TEST SET INFERENCE")
-    print(f"{'='*50}")
-    
-    result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test, n_iter=50)
-    E_theta_test = result['E_theta']
-    
-    # Check theta recovery (correlation with true theta per factor)
-    print("θ recovery (correlation per factor):")
-    for ell in range(d):
-        corr = np.corrcoef(E_theta_test[:, ell], theta_true_test[:, ell])[0, 1]
-        print(f"  Factor {ell}: {corr:.3f}")
-    
-    # Prediction performance
-    y_pred_proba = model.predict_proba(X_test, X_aux_test, n_iter=50)
-    y_pred = model.predict(X_test, X_aux_test, n_iter=50)
-    
-    accuracy = (y_pred == y_test).mean()
-    print(f"\nTest accuracy: {accuracy:.3f}")
-    
-    # AUC if sklearn available
-    try:
-        from sklearn.metrics import roc_auc_score
-        auc = roc_auc_score(y_test, y_pred_proba)
-        print(f"Test AUC: {auc:.3f}")
-    except ImportError:
-        pass
-
-
-# Alias for backward compatibility - SVI is the standard name
-SVI = SVICorrected
+    def predict_calibrated(
+        self,
+        X_new: np.ndarray,
+        X_aux_new: np.ndarray = None,
+        n_iter: int = 50,
+        threshold: float = None
+    ) -> np.ndarray:
+        """
+        Predict with calibration applied.
+        
+        Parameters
+        ----------
+        X_new : (n_new, p) count matrix
+        X_aux_new : (n_new, p_aux) auxiliary covariates
+        n_iter : local VI iterations
+        threshold : classification threshold (uses optimal_threshold_ if None)
+        
+        Returns
+        -------
+        labels : (n_new,) predicted labels
+        """
+        proba_raw = self.predict_proba(X_new, X_aux_new, n_iter=n_iter)
+        proba_cal = self._apply_calibration(proba_raw)
+        
+        if threshold is None:
+            threshold = getattr(self, 'optimal_threshold_', 0.5)
+        
+        return (proba_cal >= threshold).astype(int)
