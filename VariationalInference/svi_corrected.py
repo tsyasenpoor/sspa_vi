@@ -1553,17 +1553,20 @@ class SVICorrected:
                         (1 - self.heldout_ll_ema_decay) * heldout_ll
                     )
 
-                # Check for improvement (higher HO-LL is better)
-                if heldout_ll > self.best_heldout_ll_:
-                    self.best_heldout_ll_ = heldout_ll
-                    self.best_epoch_ = epoch
-                    heldout_ll_improved = True
-                    heldout_ll_no_improve = 0
-                    # Checkpoint parameters if we want to restore later
-                    if self.restore_best_heldout:
-                        self.best_params_ = self._checkpoint_params()
-                else:
-                    heldout_ll_no_improve += 1
+                # Only start tracking best HO-LL and counting patience AFTER warmup
+                # This prevents the model from stopping at epoch 0 before learning
+                if epoch >= self.min_epochs_before_stopping:
+                    # Check for improvement (higher HO-LL is better)
+                    if heldout_ll > self.best_heldout_ll_:
+                        self.best_heldout_ll_ = heldout_ll
+                        self.best_epoch_ = epoch
+                        heldout_ll_improved = True
+                        heldout_ll_no_improve = 0
+                        # Checkpoint parameters if we want to restore later
+                        if self.restore_best_heldout:
+                            self.best_params_ = self._checkpoint_params()
+                    else:
+                        heldout_ll_no_improve += 1
 
             if verbose and epoch % 5 == 0:
                 beta_diversity = np.std(np.array(self.E_beta), axis=1).mean()
@@ -1572,10 +1575,14 @@ class SVICorrected:
                 elbo_str = f"{self.last_elbo_:.2e}" if self.last_elbo_ is not None else "N/A"
                 # Enhanced HO-LL status display
                 if heldout_ll is not None:
-                    improve_marker = "↑" if heldout_ll_improved else "↓"
-                    heldout_str = (f", HO-LL = {heldout_ll:.2f} {improve_marker} "
-                                   f"(best={self.best_heldout_ll_:.2f}@{self.best_epoch_}, "
-                                   f"patience={heldout_ll_no_improve}/{self.heldout_ll_patience})")
+                    if epoch < self.min_epochs_before_stopping:
+                        # Warmup phase - not yet tracking best or counting patience
+                        heldout_str = f", HO-LL = {heldout_ll:.2f} [warmup until epoch {self.min_epochs_before_stopping}]"
+                    else:
+                        improve_marker = "↑" if heldout_ll_improved else "↓"
+                        heldout_str = (f", HO-LL = {heldout_ll:.2f} {improve_marker} "
+                                       f"(best={self.best_heldout_ll_:.2f}@{self.best_epoch_}, "
+                                       f"patience={heldout_ll_no_improve}/{self.heldout_ll_patience})")
                 else:
                     heldout_str = ""
                 print(f"Epoch {epoch}: ELBO = {elbo_str}, EMA = {ema_str}, "
