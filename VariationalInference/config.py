@@ -381,6 +381,20 @@ class SVIConfig:
         Absolute ELBO tolerance.
     rel_tol : float, default=2e-4
         Relative ELBO tolerance.
+
+    Early Stopping (HO-LL) Parameters
+    ---------------------------------
+    early_stopping_metric : str, default='elbo'
+        Metric to use for early stopping: 'elbo' or 'heldout_ll'.
+        When 'heldout_ll', stops when held-out log-likelihood hasn't improved.
+    heldout_ll_patience : int, default=10
+        Number of epochs without HO-LL improvement before stopping.
+    heldout_ll_ema_decay : float, default=0.9
+        Exponential moving average decay for smoothing HO-LL.
+    restore_best_heldout : bool, default=True
+        Whether to restore model parameters from the epoch with best HO-LL.
+    min_epochs_before_stopping : int, default=20
+        Minimum epochs to train before early stopping can trigger.
     """
 
     # Required
@@ -431,6 +445,13 @@ class SVIConfig:
     patience: int = 5
     tol: float = 10.0
     rel_tol: float = 2e-4
+
+    # Early stopping based on held-out log-likelihood
+    early_stopping_metric: str = 'elbo'  # 'elbo' or 'heldout_ll'
+    heldout_ll_patience: int = 10  # epochs without improvement before stopping
+    heldout_ll_ema_decay: float = 0.9  # EMA smoothing for HO-LL
+    restore_best_heldout: bool = True  # restore to best HO-LL epoch
+    min_epochs_before_stopping: int = 20  # minimum epochs before early stopping
 
     # Data parameters
     label_column: str = 't2dm'
@@ -503,6 +524,12 @@ class SVIConfig:
             'pi_beta': self.pi_beta,
             'spike_variance_v': self.spike_variance_v,
             'spike_value_beta': self.spike_value_beta,
+            # Early stopping parameters
+            'early_stopping_metric': self.early_stopping_metric,
+            'heldout_ll_patience': self.heldout_ll_patience,
+            'heldout_ll_ema_decay': self.heldout_ll_ema_decay,
+            'restore_best_heldout': self.restore_best_heldout,
+            'min_epochs_before_stopping': self.min_epochs_before_stopping,
         }
 
     def training_params(self) -> Dict[str, Any]:
