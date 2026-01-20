@@ -424,6 +424,34 @@ class SVIConfig:
     # Numerical stability
     count_scale: float = 1.0  # Divide counts by this value for numerical stability
 
+    # ==========================================================================
+    # V-COLLAPSE MITIGATION OPTIONS
+    # These options help prevent v (regression coefficients) from collapsing
+    # to near-zero values, which causes poor classification despite good
+    # reconstruction. Choose ONE approach or combine bias + another.
+    # ==========================================================================
+
+    # Option 1: Bias/Intercept term in logit
+    # Adds a learnable intercept b to: logit = theta @ v + aux @ gamma + b
+    # This separates "base probability" from "factor contributions"
+    use_intercept: bool = False
+    sigma_intercept: float = 1.0  # Prior std for intercept (wider = less regularized)
+
+    # Option 2: Two-step training (staged inference)
+    # Phase 1: Learn gene programs with regression_weight=0 (reconstruction only)
+    # Phase 2: Learn regression with frozen/low-lr beta
+    two_step_training: bool = False
+    two_step_phase1_ratio: float = 0.3  # Fraction of epochs for phase 1 (0.3 = 30%)
+    two_step_freeze_beta: bool = True  # If True, freeze beta in phase 2; else use low lr
+    two_step_phase2_beta_lr_mult: float = 0.1  # Beta lr multiplier in phase 2 (if not frozen)
+
+    # Option 3: Adaptive regression weight scheduling
+    # Gradually increases regression_weight from 0 to target over warmup period
+    # Allows reconstruction to stabilize before adding classification pressure
+    adaptive_regression_weight: bool = False
+    regression_weight_warmup_epochs: int = 100  # Epochs to ramp up regression_weight
+    regression_weight_schedule: str = 'linear'  # 'linear', 'cosine', or 'exponential'
+
     # Model hyperparameters (same as VI)
     alpha_theta: float = 2.0
     alpha_beta: float = 2.0
@@ -530,6 +558,16 @@ class SVIConfig:
             'heldout_ll_ema_decay': self.heldout_ll_ema_decay,
             'restore_best_heldout': self.restore_best_heldout,
             'min_epochs_before_stopping': self.min_epochs_before_stopping,
+            # V-collapse mitigation options
+            'use_intercept': self.use_intercept,
+            'sigma_intercept': self.sigma_intercept,
+            'two_step_training': self.two_step_training,
+            'two_step_phase1_ratio': self.two_step_phase1_ratio,
+            'two_step_freeze_beta': self.two_step_freeze_beta,
+            'two_step_phase2_beta_lr_mult': self.two_step_phase2_beta_lr_mult,
+            'adaptive_regression_weight': self.adaptive_regression_weight,
+            'regression_weight_warmup_epochs': self.regression_weight_warmup_epochs,
+            'regression_weight_schedule': self.regression_weight_schedule,
         }
 
     def training_params(self) -> Dict[str, Any]:
