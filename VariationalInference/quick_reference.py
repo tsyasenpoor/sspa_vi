@@ -341,6 +341,68 @@ def parse_args() -> argparse.Namespace:
         help='Count scaling factor for Poisson likelihood. None=auto (median library size)'
     )
 
+    # V-collapse mitigation options
+    # Option 1: Intercept term
+    parser.add_argument(
+        '--use-intercept',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=False,
+        help='Add learnable intercept term to logit (helps with v-collapse)'
+    )
+    parser.add_argument(
+        '--sigma-intercept',
+        type=float,
+        default=1.0,
+        help='Gaussian prior std for intercept term'
+    )
+
+    # Option 2: Two-step training
+    parser.add_argument(
+        '--two-step-training',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=False,
+        help='Use two-step training: learn gene programs first, then regression'
+    )
+    parser.add_argument(
+        '--two-step-phase1-ratio',
+        type=float,
+        default=0.3,
+        help='Fraction of epochs for phase 1 (reconstruction only)'
+    )
+    parser.add_argument(
+        '--two-step-freeze-beta',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        help='Freeze beta during phase 2 (default: True)'
+    )
+    parser.add_argument(
+        '--two-step-phase2-beta-lr-mult',
+        type=float,
+        default=0.1,
+        help='Learning rate multiplier for beta in phase 2 (if not frozen)'
+    )
+
+    # Option 3: Adaptive regression weight
+    parser.add_argument(
+        '--adaptive-regression-weight',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=False,
+        help='Gradually warm up regression_weight during training'
+    )
+    parser.add_argument(
+        '--regression-weight-warmup-epochs',
+        type=int,
+        default=100,
+        help='Number of epochs to warm up regression weight'
+    )
+    parser.add_argument(
+        '--regression-weight-schedule',
+        type=str,
+        default='linear',
+        choices=['linear', 'cosine', 'exponential'],
+        help='Schedule for regression weight warmup'
+    )
+
     # Normalization options
     parser.add_argument(
         '--normalize',
@@ -716,7 +778,17 @@ def main():
         mode=args.mode,
         pathway_mask=pathway_mask,
         pathway_names=pathway_names,
-        n_pathway_factors=n_pathway_factors  # For combined mode boundary
+        n_pathway_factors=n_pathway_factors,  # For combined mode boundary
+        # V-collapse mitigation options
+        use_intercept=args.use_intercept,
+        sigma_intercept=args.sigma_intercept,
+        two_step_training=args.two_step_training,
+        two_step_phase1_ratio=args.two_step_phase1_ratio,
+        two_step_freeze_beta=args.two_step_freeze_beta,
+        two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
+        adaptive_regression_weight=args.adaptive_regression_weight,
+        regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
+        regression_weight_schedule=args.regression_weight_schedule
     )
 
     # Train model with held-out validation data for convergence tracking

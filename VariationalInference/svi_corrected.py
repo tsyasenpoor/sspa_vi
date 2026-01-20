@@ -86,6 +86,20 @@ class SVICorrected:
         restore_best_heldout: bool = True,  # restore to best HO-LL epoch
         min_epochs_before_stopping: int = 20,  # minimum epochs before early stopping kicks in
 
+        # V-collapse mitigation options
+        # Option 1: Bias/intercept term
+        use_intercept: bool = False,
+        sigma_intercept: float = 1.0,
+        # Option 2: Two-step training
+        two_step_training: bool = False,
+        two_step_phase1_ratio: float = 0.3,
+        two_step_freeze_beta: bool = True,
+        two_step_phase2_beta_lr_mult: float = 0.1,
+        # Option 3: Adaptive regression weight
+        adaptive_regression_weight: bool = False,
+        regression_weight_warmup_epochs: int = 100,
+        regression_weight_schedule: str = 'linear',
+
         random_state: Optional[int] = None,
         
         # JAX-specific
@@ -152,7 +166,23 @@ class SVICorrected:
         self.heldout_ll_ema_decay = heldout_ll_ema_decay
         self.restore_best_heldout = restore_best_heldout
         self.min_epochs_before_stopping = min_epochs_before_stopping
-        
+
+        # V-collapse mitigation options
+        # Option 1: Bias/intercept
+        self.use_intercept = use_intercept
+        self.sigma_intercept = sigma_intercept
+        # Option 2: Two-step training
+        self.two_step_training = two_step_training
+        self.two_step_phase1_ratio = two_step_phase1_ratio
+        self.two_step_freeze_beta = two_step_freeze_beta
+        self.two_step_phase2_beta_lr_mult = two_step_phase2_beta_lr_mult
+        # Option 3: Adaptive regression weight
+        self.adaptive_regression_weight = adaptive_regression_weight
+        self.regression_weight_warmup_epochs = regression_weight_warmup_epochs
+        self.regression_weight_schedule = regression_weight_schedule
+        # Store the target regression weight (original value) for scheduling
+        self.regression_weight_target = regression_weight
+
         # JAX settings
         self.use_jit = use_jit
         self.device = device
@@ -181,7 +211,76 @@ class SVICorrected:
         """
         rho = self.learning_rate * (self.learning_rate_delay + t) ** (-self.learning_rate_decay)
         return max(rho, self.learning_rate_min)
-    
+
+    def _get_effective_regression_weight(self, epoch: int, max_epochs: int) -> float:
+        """
+        Get the effective regression weight for current epoch.
+
+        Handles three scenarios:
+        1. Two-step training: phase1 = 0.0, phase2 = target weight
+        2. Adaptive scheduling: gradual warmup from 0 to target
+        3. Default: constant regression_weight
+
+        Parameters
+        ----------
+        epoch : int
+            Current epoch number (0-indexed)
+        max_epochs : int
+            Total number of epochs
+
+        Returns
+        -------
+        float
+            Effective regression weight for this epoch
+        """
+        # Two-step training takes precedence
+        if self.two_step_training:
+            phase1_epochs = int(max_epochs * self.two_step_phase1_ratio)
+            if epoch < phase1_epochs:
+                # Phase 1: no regression (learn gene programs only)
+                return 0.0
+            else:
+                # Phase 2: full regression weight
+                return self.regression_weight_target
+
+        # Adaptive regression weight scheduling
+        if self.adaptive_regression_weight:
+            warmup_epochs = self.regression_weight_warmup_epochs
+            if epoch >= warmup_epochs:
+                return self.regression_weight_target
+
+            # Progress through warmup
+            progress = epoch / warmup_epochs
+
+            if self.regression_weight_schedule == 'linear':
+                return progress * self.regression_weight_target
+            elif self.regression_weight_schedule == 'cosine':
+                # Cosine annealing from 0 to target
+                return (1 - np.cos(progress * np.pi)) / 2 * self.regression_weight_target
+            elif self.regression_weight_schedule == 'exponential':
+                # Exponential warmup (slower start, faster finish)
+                return (np.exp(progress * 3) - 1) / (np.exp(3) - 1) * self.regression_weight_target
+            else:
+                return progress * self.regression_weight_target
+
+        # Default: constant weight
+        return self.regression_weight
+
+    def _get_intercept_contrib(self, batch_size: int) -> jnp.ndarray:
+        """
+        Get intercept contribution to logit for a batch.
+
+        Returns
+        -------
+        jnp.ndarray
+            Shape (batch_size, kappa) - intercept broadcast to batch
+        """
+        if self.use_intercept:
+            # Broadcast intercept to batch: (kappa,) -> (1, kappa) -> (batch, kappa)
+            return jnp.broadcast_to(self.mu_intercept[jnp.newaxis, :], (batch_size, self.kappa))
+        else:
+            return 0.0
+
     @staticmethod
     @jax.jit
     def _lambda_jj(zeta: jnp.ndarray) -> jnp.ndarray:
@@ -460,7 +559,20 @@ class SVICorrected:
         else:
             self.mu_gamma = jnp.zeros((self.kappa, 0))
             self.Sigma_gamma = jnp.zeros((self.kappa, 0, 0))
-        
+
+        # Intercept/bias term: b ~ N(μ_b, σ_b²)
+        # Adds learnable intercept to logit: A = θ @ v + aux @ γ + b
+        if self.use_intercept:
+            # Initialize intercept near 0 (log-odds of 0 = 50% probability)
+            # But use small random perturbation for symmetry breaking
+            key_intercept, self.rng_key = random.split(self.rng_key)
+            self.mu_intercept = random.normal(key_intercept, (self.kappa,)) * 0.1
+            self.sigma_sq_intercept = jnp.full(self.kappa, self.sigma_intercept**2)
+        else:
+            # Placeholder values (not used)
+            self.mu_intercept = jnp.zeros(self.kappa)
+            self.sigma_sq_intercept = jnp.ones(self.kappa)
+
         # Spike-and-slab indicators
         if self.use_spike_slab:
             self.rho_beta = jnp.full((self.p, self.d), self.pi_beta)
@@ -704,10 +816,14 @@ class SVICorrected:
                 aux_contrib = X_aux_batch @ self.E_gamma.T  # (batch, kappa)
             else:
                 aux_contrib = 0.0
-            
-            E_A = E_theta_new @ self.E_v_effective.T + aux_contrib  # (batch, kappa)
+
+            # Add intercept contribution if enabled
+            intercept_contrib = self._get_intercept_contrib(E_theta_new.shape[0])
+
+            E_A = E_theta_new @ self.E_v_effective.T + aux_contrib + intercept_contrib  # (batch, kappa)
             Var_theta = a_theta_new / (b_theta_new**2)  # (batch, d)
             # E[A²] = E[A]² + Var[A], where Var[A] = sum_ell Var[θ_iℓ] E[v²_kℓ]
+            # Note: intercept is deterministic (point estimate), so doesn't add variance
             E_A_sq = E_A**2 + (Var_theta @ E_v_sq.T)  # (batch, kappa)
             zeta = jnp.sqrt(jnp.maximum(E_A_sq, 1e-8))
             
@@ -908,7 +1024,62 @@ class SVICorrected:
             Sigma_gamma_hat = Sigma_gamma_hat.at[k].set(Sigma_gamma_hat_k)
         
         return mu_gamma_hat, Sigma_gamma_hat
-    
+
+    def _compute_intermediate_intercept(
+        self,
+        y_batch: jnp.ndarray,
+        X_aux_batch: jnp.ndarray,
+        E_theta: jnp.ndarray,
+        zeta: jnp.ndarray,
+        scale: float
+    ) -> jnp.ndarray:
+        """
+        Compute intermediate intercept parameters.
+
+        For intercept b with prior N(0, σ_b²), the optimal posterior is:
+        - Precision: 1/σ_b² + 2 * scale * Σ_i λ(ζ_i)
+        - Mean: precision^{-1} * scale * Σ_i (y_i - 0.5 - 2*λ(ζ_i) * C_minus_b_i)
+
+        where C_minus_b = θ @ v + aux @ γ is the linear predictor without intercept.
+
+        Returns
+        -------
+        mu_intercept_hat : jnp.ndarray
+            Shape (kappa,) - intermediate intercept means
+        """
+        if not self.use_intercept:
+            return self.mu_intercept  # Return unchanged if not using intercept
+
+        # Expand y to (batch, kappa)
+        y_expanded = y_batch if y_batch.ndim > 1 else y_batch[:, jnp.newaxis]
+
+        lam = self._lambda_jj(zeta)  # (batch, kappa)
+
+        mu_intercept_hat = jnp.zeros(self.kappa)
+
+        for k in range(self.kappa):
+            # Precision
+            prec_prior = 1.0 / self.sigma_intercept**2
+            prec_lik = 2 * scale * jnp.sum(lam[:, k])
+            prec_hat = prec_prior + prec_lik
+
+            # Linear predictor without intercept
+            theta_v = E_theta @ self.E_v_effective[k]  # (batch,)
+            if self.p_aux > 0:
+                aux_contrib = X_aux_batch @ self.E_gamma[k]  # (batch,)
+            else:
+                aux_contrib = 0.0
+            C_minus_b = theta_v + aux_contrib  # (batch,)
+
+            # Mean contribution
+            mean_contrib = scale * jnp.sum(y_expanded[:, k] - 0.5 - 2 * lam[:, k] * C_minus_b)
+
+            # Posterior mean
+            mu_intercept_hat_k = mean_contrib / prec_hat
+            mu_intercept_hat = mu_intercept_hat.at[k].set(mu_intercept_hat_k)
+
+        return mu_intercept_hat
+
     # =========================================================================
     # SVI UPDATES (Natural Gradient)
     # =========================================================================
@@ -919,10 +1090,11 @@ class SVICorrected:
         a_beta_hat: jnp.ndarray, b_beta_hat: jnp.ndarray,
         a_eta_hat: jnp.ndarray, b_eta_hat: jnp.ndarray,
         mu_v_hat: jnp.ndarray, Sigma_v_hat: jnp.ndarray,
-        mu_gamma_hat: jnp.ndarray, Sigma_gamma_hat: jnp.ndarray
+        mu_gamma_hat: jnp.ndarray, Sigma_gamma_hat: jnp.ndarray,
+        mu_intercept_hat: Optional[jnp.ndarray] = None
     ):
         """SVI update with gradient clipping and bounds.
-        
+
         In masked mode, β values are fixed to ~0 for genes outside the pathway mask.
         """
         # Beta: clipped natural gradient update (relaxed clipping)
@@ -1006,7 +1178,19 @@ class SVICorrected:
                 Sigma_new = jnp.where(min_eigval < 1e-4, Sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.p_aux), Sigma_new)
                 Sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, Sigma_new + 1e-3 * jnp.eye(self.p_aux), Sigma_new)
                 self.Sigma_gamma = self.Sigma_gamma.at[k].set(Sigma_new)
-        
+
+        # Intercept: simple SVI update
+        if self.use_intercept and mu_intercept_hat is not None:
+            # Clipped update with same learning rate as gamma
+            mu_grad = mu_intercept_hat - self.mu_intercept
+            mu_grad_norm = jnp.sqrt(jnp.sum(mu_grad**2))
+            mu_grad_scale = jnp.minimum(1.0, 5.0 / (mu_grad_norm + 1e-10))
+            mu_intercept_clip = self.mu_intercept + mu_grad * mu_grad_scale
+            self.mu_intercept = jnp.clip(
+                (1 - rho_t) * self.mu_intercept + rho_t * mu_intercept_clip,
+                -10, 10
+            )
+
         self._compute_expectations()
     
     # =========================================================================
@@ -1073,12 +1257,15 @@ class SVICorrected:
             aux_contrib = X_aux_batch @ self.E_gamma.T  # (batch, kappa)
         else:
             aux_contrib = 0.0
-        
-        E_A = E_theta @ self.E_v_effective.T + aux_contrib  # (batch, kappa)
+
+        # Add intercept contribution if enabled
+        intercept_contrib = self._get_intercept_contrib(E_theta.shape[0])
+
+        E_A = E_theta @ self.E_v_effective.T + aux_contrib + intercept_contrib  # (batch, kappa)
         E_v_sq = self.mu_v**2 + jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)  # (kappa, d)
         Var_theta = a_theta / (b_theta**2)  # (batch, d)
         E_A_sq = E_A**2 + (Var_theta @ E_v_sq.T)  # (batch, kappa)
-        
+
         # JJ bound for all outcomes
         elbo_y = jnp.sum((y_expanded - 0.5) * E_A - lam * E_A_sq)
         elbo_y += jnp.sum(lam * zeta**2 - 0.5 * zeta - jnp.log1p(jnp.exp(jnp.clip(zeta, -500, 500))))
@@ -1135,7 +1322,18 @@ class SVICorrected:
                     jnp.sum(self.mu_gamma[k]**2) + jnp.trace(self.Sigma_gamma[k])
                 )
         elbo += elbo_gamma
-        
+
+        # p(b) - Intercept prior: N(0, σ_intercept² I)
+        # log p(b) = -kappa/2 * log(2πσ_b²) - 1/(2σ_b²) * (μ_b'μ_b + tr(Σ_b))
+        # Since we use point estimate, Σ_b contribution is the prior variance
+        elbo_intercept = 0.0
+        if self.use_intercept:
+            for k in range(self.kappa):
+                elbo_intercept -= 0.5 * jnp.log(2 * jnp.pi * self.sigma_intercept**2)
+                # Point estimate: just the squared mean term
+                elbo_intercept -= 0.5 / self.sigma_intercept**2 * self.mu_intercept[k]**2
+        elbo += elbo_intercept
+
         # === Entropy terms ===
         # H[q(θ)] - Gamma entropy: H[Γ(a,b)] = a - log(b) + log(Γ(a)) + (1-a)ψ(a)
         # where ψ is the digamma function (derivative of log Γ)
@@ -1194,6 +1392,11 @@ class SVICorrected:
             'Sigma_gamma': np.array(self.Sigma_gamma),
         }
 
+        # Intercept if used
+        if self.use_intercept:
+            checkpoint['mu_intercept'] = np.array(self.mu_intercept)
+            checkpoint['sigma_sq_intercept'] = np.array(self.sigma_sq_intercept)
+
         # Spike-and-slab inclusion probabilities if used
         if self.use_spike_slab:
             checkpoint['rho_beta'] = np.array(self.rho_beta)
@@ -1225,6 +1428,11 @@ class SVICorrected:
         # Restore gamma parameters
         self.mu_gamma = jnp.array(checkpoint['mu_gamma'])
         self.Sigma_gamma = jnp.array(checkpoint['Sigma_gamma'])
+
+        # Restore intercept if used
+        if self.use_intercept and 'mu_intercept' in checkpoint:
+            self.mu_intercept = jnp.array(checkpoint['mu_intercept'])
+            self.sigma_sq_intercept = jnp.array(checkpoint['sigma_sq_intercept'])
 
         # Restore spike-and-slab if used
         if self.use_spike_slab and 'rho_beta' in checkpoint:
@@ -1301,11 +1509,15 @@ class SVICorrected:
         loglik_counts -= jnp.sum(jsp.gammaln(X_heldout + 1))
 
         # === Bernoulli log-likelihood for labels ===
-        # log p(y|θ,v,γ) using sigmoid approximation
+        # log p(y|θ,v,γ,b) using sigmoid approximation
         if self.p_aux > 0:
             logits = E_theta @ self.E_v_effective.T + X_aux_heldout @ self.E_gamma.T
         else:
             logits = E_theta @ self.E_v_effective.T
+
+        # Add intercept if enabled
+        if self.use_intercept:
+            logits = logits + self.mu_intercept[jnp.newaxis, :]
 
         # Binary cross-entropy: y*log(σ) + (1-y)*log(1-σ)
         # = y*logits - log(1 + exp(logits))
@@ -1420,7 +1632,35 @@ class SVICorrected:
         
         start_time = time.time()
         
+        # Track phase changes for logging
+        last_phase = None
+
         for epoch in range(max_epochs):
+            # Update effective regression weight for this epoch
+            self.regression_weight = self._get_effective_regression_weight(epoch, max_epochs)
+
+            # Log phase changes for two-step training
+            if self.two_step_training:
+                phase1_epochs = int(max_epochs * self.two_step_phase1_ratio)
+                current_phase = 1 if epoch < phase1_epochs else 2
+                if current_phase != last_phase:
+                    if current_phase == 1:
+                        if verbose:
+                            print(f"\n[TWO-STEP] Phase 1 (epochs 0-{phase1_epochs-1}): "
+                                  f"Learning gene programs (regression_weight=0)")
+                    else:
+                        freeze_str = "frozen" if self.two_step_freeze_beta else f"lr_mult={self.two_step_phase2_beta_lr_mult}"
+                        if verbose:
+                            print(f"\n[TWO-STEP] Phase 2 (epochs {phase1_epochs}-{max_epochs-1}): "
+                                  f"Learning regression (beta {freeze_str}, regression_weight={self.regression_weight_target})")
+                    last_phase = current_phase
+
+            # Log adaptive weight warmup progress periodically
+            if self.adaptive_regression_weight and epoch > 0 and epoch % 50 == 0:
+                if verbose and epoch < self.regression_weight_warmup_epochs:
+                    print(f"  [ADAPTIVE] regression_weight = {self.regression_weight:.4f} "
+                          f"(warmup {epoch}/{self.regression_weight_warmup_epochs})")
+
             # Shuffle data - use numpy for permutation then convert to JAX
             perm = np.random.permutation(self.n)
             
@@ -1469,15 +1709,37 @@ class SVICorrected:
                 mu_gamma_hat, Sigma_gamma_hat = self._compute_intermediate_gamma(
                     y_batch, X_aux_batch, E_theta, zeta, scale
                 )
-                
+
+                # Compute intermediate intercept if enabled
+                mu_intercept_hat = self._compute_intermediate_intercept(
+                    y_batch, X_aux_batch, E_theta, zeta, scale
+                )
+
                 # 3. SVI update with natural gradients
                 rho_t = self._get_learning_rate(iteration)
+
+                # Handle two-step training: modify beta learning rate in phase 2
+                if self.two_step_training:
+                    phase1_epochs = int(max_epochs * self.two_step_phase1_ratio)
+                    in_phase2 = epoch >= phase1_epochs
+                    if in_phase2 and self.two_step_freeze_beta:
+                        # Freeze beta by not updating it (set a/b_hat to current values)
+                        a_beta_hat = self.a_beta
+                        b_beta_hat = self.b_beta
+                    elif in_phase2 and not self.two_step_freeze_beta:
+                        # Use reduced learning rate for beta
+                        # We'll handle this by interpolating towards current with high weight
+                        beta_blend = 1.0 - self.two_step_phase2_beta_lr_mult
+                        a_beta_hat = beta_blend * self.a_beta + (1 - beta_blend) * a_beta_hat
+                        b_beta_hat = beta_blend * self.b_beta + (1 - beta_blend) * b_beta_hat
+
                 self._svi_update_global(
                     rho_t,
                     a_beta_hat, b_beta_hat,
                     a_eta_hat, b_eta_hat,
                     mu_v_hat, Sigma_v_hat,
-                    mu_gamma_hat, Sigma_gamma_hat
+                    mu_gamma_hat, Sigma_gamma_hat,
+                    mu_intercept_hat
                 )
 
                 # 4. Update spike-and-slab inclusion probabilities (if enabled)
@@ -1757,8 +2019,15 @@ class SVICorrected:
                 aux_contrib = X_aux_new @ E_gamma.T
             else:
                 aux_contrib = 0.0
+
+            # Add intercept contribution if enabled
+            if self.use_intercept:
+                intercept_contrib = self.mu_intercept[jnp.newaxis, :]  # (1, kappa) broadcast
+            else:
+                intercept_contrib = 0.0
+
             theta_v = E_theta @ E_v.T
-            E_A = theta_v + aux_contrib
+            E_A = theta_v + aux_contrib + intercept_contrib
             if self.p_aux > 0:
                 E_A_sq = (E_theta_sq @ E_v_sq.T + 2 * theta_v * aux_contrib + aux_contrib**2)
             else:
@@ -1842,7 +2111,11 @@ class SVICorrected:
             logits = E_theta @ effective_v.T + X_aux_jnp @ self.mu_gamma.T
         else:
             logits = E_theta @ effective_v.T
-            
+
+        # Add intercept if enabled
+        if self.use_intercept:
+            logits = logits + self.mu_intercept[jnp.newaxis, :]
+
         proba = jsp.expit(logits)
         
         # Only convert to numpy at the API boundary

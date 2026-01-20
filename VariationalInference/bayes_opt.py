@@ -1055,6 +1055,16 @@ class SVIObjective:
                 pathway_mask=self.pathway_mask,
                 pathway_names=self.pathway_names,
                 n_pathway_factors=n_pathway_factors,
+                # V-collapse mitigation options
+                use_intercept=params.get('use_intercept', False),
+                sigma_intercept=params.get('sigma_intercept', 1.0),
+                two_step_training=params.get('two_step_training', False),
+                two_step_phase1_ratio=params.get('two_step_phase1_ratio', 0.3),
+                two_step_freeze_beta=params.get('two_step_freeze_beta', True),
+                two_step_phase2_beta_lr_mult=params.get('two_step_phase2_beta_lr_mult', 0.1),
+                adaptive_regression_weight=params.get('adaptive_regression_weight', False),
+                regression_weight_warmup_epochs=params.get('regression_weight_warmup_epochs', 100),
+                regression_weight_schedule=params.get('regression_weight_schedule', 'linear'),
             )
 
             # Train model on subsampled data with held-out validation tracking
