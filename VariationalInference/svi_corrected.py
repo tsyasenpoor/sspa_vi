@@ -105,7 +105,10 @@ class SVICorrected:
         # JAX-specific
         use_jit: bool = True,
         device: str = 'gpu',  # 'gpu' or 'cpu'
-        
+
+        # Memory optimization
+        target_memory_gb: float = 0.5,  # Target memory per batch for transform/heldout operations
+
         # Pathway mode: 'unmasked', 'masked', 'pathway_init', or 'combined'
         mode: str = 'unmasked',
         pathway_mask: Optional[np.ndarray] = None,  # (n_pathways, n_genes) binary matrix
@@ -186,7 +189,10 @@ class SVICorrected:
         # JAX settings
         self.use_jit = use_jit
         self.device = device
-        
+
+        # Memory optimization
+        self.target_memory_gb = target_memory_gb
+
         # RNG - JAX uses explicit random keys
         # If random_state is None, use system time for true randomness
         if random_state is not None:
@@ -1530,6 +1536,145 @@ class SVICorrected:
         total_loglik = float(loglik_counts) + self.regression_weight * float(loglik_labels)
         return total_loglik / n_heldout
 
+    def compute_heldout_loglik_batched(
+        self,
+        X_heldout: np.ndarray,
+        y_heldout: np.ndarray,
+        X_aux_heldout: Optional[np.ndarray] = None,
+        n_iter: int = 30,
+        batch_size: Optional[int] = None,
+        verbose: bool = False
+    ) -> float:
+        """
+        Memory-efficient batched computation of held-out log-likelihood.
+
+        This is the memory-optimized version of compute_heldout_loglik that
+        processes samples in batches to avoid OOM errors on large datasets.
+
+        For a dataset with 10k cells × 10k genes × 1k factors, the unbatched
+        version would require ~800GB for the (n, p, d) tensor. This batched
+        version targets ~500MB per batch by default.
+
+        Parameters
+        ----------
+        X_heldout : (n_heldout, p) count matrix
+        y_heldout : (n_heldout,) or (n_heldout, κ) labels
+        X_aux_heldout : (n_heldout, p_aux) auxiliary features
+        n_iter : number of local VI iterations for θ inference
+        batch_size : samples per batch (auto-computed if None based on target_memory_gb)
+        verbose : print progress
+
+        Returns
+        -------
+        float : Average held-out log-likelihood per sample
+        """
+        # Convert sparse to dense numpy if needed (keep on CPU until batching)
+        if sp.issparse(X_heldout):
+            X_heldout = X_heldout.toarray()
+        X_heldout = np.array(X_heldout)
+
+        y_heldout = np.array(y_heldout)
+        if y_heldout.ndim == 1:
+            y_heldout = y_heldout[:, np.newaxis]
+
+        n_heldout = X_heldout.shape[0]
+
+        if X_aux_heldout is None:
+            X_aux_heldout = np.zeros((n_heldout, self.p_aux if self.p_aux > 0 else 0))
+        else:
+            X_aux_heldout = np.array(X_aux_heldout)
+
+        # Auto-compute batch size for memory efficiency
+        if batch_size is None:
+            batch_size = self._compute_memory_efficient_batch_size(
+                target_gb=self.target_memory_gb
+            )
+
+        # For small datasets, just use the non-batched version
+        if n_heldout <= batch_size:
+            return self.compute_heldout_loglik(
+                X_heldout, y_heldout, X_aux_heldout, n_iter
+            )
+
+        if verbose:
+            print(f"Computing held-out LL in batches (batch_size={batch_size}, "
+                  f"n_batches={(n_heldout + batch_size - 1) // batch_size})")
+
+        # Accumulate log-likelihoods across batches
+        total_loglik_counts = 0.0
+        total_loglik_labels = 0.0
+        total_samples = 0
+
+        n_batches = (n_heldout + batch_size - 1) // batch_size
+
+        # Precompute global expectations (shared across batches)
+        E_log_beta = jsp.digamma(self.a_beta) - jnp.log(self.b_beta)
+
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, n_heldout)
+            batch_n = end_idx - start_idx
+
+            if verbose:
+                print(f"  Batch {batch_idx + 1}/{n_batches} "
+                      f"(samples {start_idx}-{end_idx})")
+
+            # Extract batch
+            X_batch = jnp.array(X_heldout[start_idx:end_idx])
+            y_batch = jnp.array(y_heldout[start_idx:end_idx])
+            X_aux_batch = jnp.array(X_aux_heldout[start_idx:end_idx])
+
+            # Infer θ for this batch with frozen global params
+            result = self.transform(
+                X_batch,
+                y_new=y_batch,
+                X_aux_new=X_aux_batch,
+                n_iter=n_iter,
+                as_numpy=False  # Keep JAX arrays
+            )
+            E_theta = result['E_theta']
+            E_log_theta = jsp.digamma(result['a_theta']) - jnp.log(result['b_theta'])
+
+            # === Poisson log-likelihood for counts (batched) ===
+            # log_rates: (batch_n, p, d) - this is the memory bottleneck
+            log_rates = E_log_theta[:, jnp.newaxis, :] + E_log_beta[jnp.newaxis, :, :]
+            log_sum_rates = logsumexp(log_rates, axis=2)  # (batch_n, p)
+
+            batch_loglik_counts = jnp.sum(X_batch * log_sum_rates)
+            batch_loglik_counts -= jnp.sum(
+                E_theta.sum(axis=1, keepdims=True) *
+                self.E_beta_effective.sum(axis=0, keepdims=True)
+            )
+            batch_loglik_counts -= jnp.sum(jsp.gammaln(X_batch + 1))
+
+            # === Bernoulli log-likelihood for labels (batched) ===
+            if self.p_aux > 0:
+                logits = E_theta @ self.E_v_effective.T + X_aux_batch @ self.E_gamma.T
+            else:
+                logits = E_theta @ self.E_v_effective.T
+
+            # Add intercept if enabled
+            if self.use_intercept:
+                logits = logits + self.mu_intercept[jnp.newaxis, :]
+
+            logits_clipped = jnp.clip(logits, -500, 500)
+            batch_loglik_labels = jnp.sum(
+                y_batch * logits_clipped - jnp.log1p(jnp.exp(logits_clipped))
+            )
+
+            # Accumulate
+            total_loglik_counts += float(batch_loglik_counts)
+            total_loglik_labels += float(batch_loglik_labels)
+            total_samples += batch_n
+
+            # Explicit memory cleanup (helps with JAX GPU memory)
+            del log_rates, log_sum_rates, E_theta, E_log_theta
+            del X_batch, y_batch, X_aux_batch, result
+
+        # Combine and normalize
+        total_loglik = total_loglik_counts + self.regression_weight * total_loglik_labels
+        return total_loglik / total_samples
+
     # =========================================================================
     # MAIN FITTING LOOP
     # =========================================================================
@@ -1798,10 +1943,11 @@ class SVICorrected:
                 ))
 
             # Compute held-out log-likelihood (Blei-style convergence tracking)
+            # Uses memory-efficient batched version to avoid OOM on large datasets
             heldout_ll = None
             heldout_ll_improved = False
             if use_heldout and epoch % heldout_freq == 0:
-                heldout_ll = self.compute_heldout_loglik(
+                heldout_ll = self.compute_heldout_loglik_batched(
                     X_heldout, y_heldout, X_aux_heldout, n_iter=20
                 )
                 self.heldout_loglik_history_.append((epoch, heldout_ll))

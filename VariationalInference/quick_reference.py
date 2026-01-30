@@ -403,6 +403,16 @@ def parse_args() -> argparse.Namespace:
         help='Schedule for regression weight warmup'
     )
 
+    # Memory optimization
+    parser.add_argument(
+        '--target-memory-gb',
+        type=float,
+        default=0.5,
+        help='Target GPU memory per batch in GB for transform/heldout operations. '
+             'Lower values reduce memory usage but increase computation time. '
+             'For large datasets (10k+ cells × 10k+ genes × 1k factors), use 0.5-1.0 GB.'
+    )
+
     # Normalization options
     parser.add_argument(
         '--normalize',
@@ -788,7 +798,9 @@ def main():
         two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
         adaptive_regression_weight=args.adaptive_regression_weight,
         regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
-        regression_weight_schedule=args.regression_weight_schedule
+        regression_weight_schedule=args.regression_weight_schedule,
+        # Memory optimization
+        target_memory_gb=args.target_memory_gb
     )
 
     # Train model with held-out validation data for convergence tracking
