@@ -337,6 +337,16 @@ def create_parser() -> argparse.ArgumentParser:
         help='Schedule for regression weight warmup'
     )
 
+    # Memory optimization
+    train_parser.add_argument(
+        '--target-memory-gb',
+        type=float,
+        default=0.5,
+        help='Target GPU memory per batch in GB for transform/heldout operations. '
+             'Lower values reduce memory usage but increase computation time. '
+             'Default 0.5 GB works well for most GPUs.'
+    )
+
     # Output options
     train_parser.add_argument(
         '--output-dir', '-o',
@@ -555,7 +565,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
         adaptive_regression_weight=args.adaptive_regression_weight,
         regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
-        regression_weight_schedule=args.regression_weight_schedule
+        regression_weight_schedule=args.regression_weight_schedule,
+        # Memory optimization
+        target_memory_gb=args.target_memory_gb
     )
 
     model.fit(
