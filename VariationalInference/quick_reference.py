@@ -65,6 +65,44 @@ from scipy.special import expit
 from sklearn.metrics import precision_recall_curve
 
 
+def compute_proba_from_theta(model, E_theta, X_aux=None, verbose=False):
+    """
+    Compute class probabilities directly from E_theta.
+    
+    This avoids redundant transform calls when E_theta is already available
+    from a previous transform_batched() call.
+    
+    Parameters
+    ----------
+    model : trained SVI model
+    E_theta : (n, d) expected theta values from transform_batched
+    X_aux : (n, p_aux) auxiliary covariates, or None
+    verbose : print debug info
+    
+    Returns
+    -------
+    proba : (n,) predicted probabilities
+    """
+    # Compute logits: E_theta @ mu_v.T
+    logits = E_theta @ np.array(model.mu_v).T
+    
+    # Add auxiliary covariate contribution if present
+    if model.p_aux > 0 and model.mu_gamma is not None and X_aux is not None:
+        logits = logits + X_aux @ np.array(model.mu_gamma).T
+    
+    # Add intercept if enabled
+    if hasattr(model, 'use_intercept') and model.use_intercept:
+        logits = logits + np.array(model.mu_intercept)[np.newaxis, :]
+    
+    # Apply sigmoid to get probabilities
+    proba = expit(logits).squeeze()
+    
+    if verbose:
+        print(f"Predicted probabilities: min={proba.min():.4f}, max={proba.max():.4f}")
+    
+    return proba
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -138,13 +176,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--pathway-min-genes',
         type=int,
-        default=30,
+        default=0,
         help='Minimum genes per pathway (for filtering)'
     )
     parser.add_argument(
         '--pathway-max-genes',
         type=int,
-        default=2000,
+        default=200000,
         help='Maximum genes per pathway (for filtering)'
     )
     parser.add_argument(
@@ -852,6 +890,41 @@ def main():
     print(f"    print(f'Spearman r = {{spearmanr(v1, v2).correlation:.4f}}')")
 
     # =========================================================================
+    # CHECKPOINT: Save model parameters immediately after training
+    # This prevents data loss if downstream inference (transform) OOMs
+    # =========================================================================
+    print("\n[CHECKPOINT] Saving model parameters immediately after training...")
+    checkpoint_params = {
+        'n_factors': model.d,
+        'alpha_theta': float(model.alpha_theta),
+        'alpha_beta': float(model.alpha_beta),
+        'sigma_v': float(model.sigma_v),
+        'E_beta': np.array(model.E_beta),
+        'E_log_beta': np.array(model.E_log_beta),
+        'mu_v': np.array(model.mu_v),
+        'Sigma_v': np.array(model.Sigma_v),
+        'mu_gamma': np.array(model.mu_gamma),
+        'Sigma_gamma': np.array(model.Sigma_gamma),
+        'n': model.n,
+        'p': model.p,
+        'kappa': model.kappa,
+        'p_aux': model.p_aux,
+        'elbo_history': model.elbo_history_,
+        'training_time': model.training_time_,
+    }
+    if hasattr(model, 'rho_v'):
+        checkpoint_params['rho_v'] = np.array(model.rho_v)
+    if hasattr(model, 'rho_beta'):
+        checkpoint_params['rho_beta'] = np.array(model.rho_beta)
+    if hasattr(model, 'use_intercept') and model.use_intercept:
+        checkpoint_params['mu_intercept'] = np.array(model.mu_intercept)
+    
+    checkpoint_path = output_dir / 'model_checkpoint.npz'
+    np.savez_compressed(checkpoint_path, **checkpoint_params)
+    print(f"[CHECKPOINT] Saved to {checkpoint_path}")
+    print(f"[CHECKPOINT] If downstream OOMs, model can be reconstructed from this file")
+
+    # =========================================================================
     # STEP 5: Evaluate on Training Set
     # =========================================================================
     print("\n" + "=" * 80)
@@ -868,18 +941,17 @@ def main():
     auto_batch_size = model._compute_memory_efficient_batch_size(target_gb=0.5)
     print(f"Using batched processing with batch_size={auto_batch_size} for memory efficiency")
 
-    # Compute probabilities with BATCHED method to avoid OOM
-    y_train_proba = model.predict_proba_batched(X_train, X_aux_train, n_iter=50,
-                                                 batch_size=auto_batch_size, verbose=args.verbose)
-    if args.verbose:
-        print(f"Predicted probabilities: min={y_train_proba.min():.4f}, max={y_train_proba.max():.4f}")
-
-    # DEBUG: Compute logits and correlation with labels (batched)
+    # Compute E_theta via transform_batched (ONCE)
     train_result = model.transform_batched(X_train, y_new=None, X_aux_new=X_aux_train,
                                            n_iter=50, batch_size=auto_batch_size,
                                            verbose=args.verbose)
     E_theta_train = train_result['E_theta']
-    train_logits = E_theta_train @ model.mu_v.T
+    
+    # Compute probabilities directly from E_theta (no redundant transform call)
+    y_train_proba = compute_proba_from_theta(model, E_theta_train, X_aux_train, verbose=args.verbose)
+
+    # DEBUG: Compute logits and correlation with labels
+    train_logits = E_theta_train @ np.array(model.mu_v).T
     if model.p_aux > 0 and model.mu_gamma is not None:
         train_logits = train_logits + X_aux_train @ model.mu_gamma.T
     train_logits = train_logits.flatten()
@@ -937,14 +1009,10 @@ def main():
     val_result = model.transform_batched(X_val, y_new=None, X_aux_new=X_aux_val,
                                          n_iter=50, batch_size=auto_batch_size,
                                          verbose=args.verbose)
-    # E_theta_val = val_result['E_theta']
+    E_theta_val = val_result['E_theta']
 
-    # Compute probabilities (BATCHED to avoid OOM)
-    y_val_proba = model.predict_proba_batched(X_val, X_aux_val, n_iter=50,
-                                               batch_size=auto_batch_size,
-                                               verbose=args.verbose)
-    if args.verbose:
-        print(f"Predicted probabilities: min={y_val_proba.min():.4f}, max={y_val_proba.max():.4f}")
+    # Compute probabilities directly from E_theta (no redundant transform call)
+    y_val_proba = compute_proba_from_theta(model, E_theta_val, X_aux_val, verbose=args.verbose)
     
     # Find optimal threshold on validation set
     precision_curve, recall_curve, thresholds_curve = precision_recall_curve(y_val, y_val_proba.ravel())
@@ -972,7 +1040,7 @@ def main():
             'predictions': y_val_pred,
             'probabilities': y_val_proba,
             'optimal_threshold': optimal_threshold,
-            'E_theta': val_result['E_theta']
+            'E_theta': E_theta_val
         }, f)
     print(f"Validation results saved to {val_results_path}")
 
@@ -983,14 +1051,18 @@ def main():
     print("Test Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for test set (uses stability averaging automatically now)
-    test_result = model.transform(X_test, y_new=None, X_aux_new=X_aux_test, n_iter=50)
-
-    # Compute raw probabilities (no hard PIP threshold - use all factors)
-    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=50)
+    # Infer theta for test set using BATCHED method to avoid OOM
+    # Memory: unbatched transform allocates (n, p, d) tensor which can exceed GPU RAM
+    test_batch_size = model._compute_memory_efficient_batch_size(target_gb=0.5)
+    print(f"Using batched test inference with batch_size={test_batch_size}")
     
-    if args.verbose:
-        print(f"Predicted probabilities: min={y_test_proba.min():.4f}, max={y_test_proba.max():.4f}")
+    test_result = model.transform_batched(X_test, y_new=None, X_aux_new=X_aux_test, 
+                                          n_iter=50, batch_size=test_batch_size,
+                                          verbose=args.verbose)
+    E_theta_test = test_result['E_theta']
+
+    # Compute probabilities directly from E_theta (no redundant transform call)
+    y_test_proba = compute_proba_from_theta(model, E_theta_test, X_aux_test, verbose=args.verbose)
     
     print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")
     y_test_pred = (y_test_proba.ravel() > optimal_threshold).astype(int)
@@ -1025,7 +1097,7 @@ def main():
             'metrics': test_metrics,
             'predictions': y_test_pred,
             'probabilities': y_test_proba,
-            'E_theta': test_result['E_theta']
+            'E_theta': E_theta_test
         }, f)
     print(f"Test results saved to {test_results_path}")
 
