@@ -32,8 +32,6 @@ import random
 import json
 from datetime import datetime
 
-import torch
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -146,19 +144,6 @@ def main():
     print(f"  Aux features:   {X_aux_train.shape[1]}")
     print(f"  Label dist (train): {np.bincount(y_train)}")
     
-    # Convert to torch tensors for comp_methods interface
-    X_train_t = torch.from_numpy(X_train.astype(np.float32))
-    X_aux_train_t = torch.from_numpy(X_aux_train.astype(np.float32))
-    y_train_t = torch.from_numpy(y_train.astype(np.int64))
-    
-    X_test_t = torch.from_numpy(X_test.astype(np.float32))
-    X_aux_test_t = torch.from_numpy(X_aux_test.astype(np.float32))
-    y_test_t = torch.from_numpy(y_test.astype(np.int64))
-    
-    X_val_t = torch.from_numpy(X_val.astype(np.float32))
-    X_aux_val_t = torch.from_numpy(X_aux_val.astype(np.float32))
-    y_val_t = torch.from_numpy(y_val.astype(np.int64))
-    
     # =========================================================================
     # STEP 2: Train and Evaluate Baseline Methods
     # =========================================================================
@@ -178,11 +163,11 @@ def main():
         try:
             # Train
             print(f"\nTraining {alg}...")
-            model = train_alg(
+            model, nmf_obj = train_alg(
                 algorithm=alg,
-                x_data_train=X_train_t,
-                x_aux_data_train=X_aux_train_t,
-                y_data_train=y_train_t,
+                x_data_train=X_train,
+                x_aux_data_train=X_aux_train,
+                y_data_train=y_train,
                 save_path=str(output_dir),
                 latent_dim=args.latent_dim
             )
@@ -192,44 +177,31 @@ def main():
             eval_alg(
                 model=model,
                 algorithm=alg,
-                x_data_test=X_test_t,
-                x_aux_data_test=X_aux_test_t,
-                y_data_test=y_test_t,
+                x_data_test=X_test,
+                x_aux_data_test=X_aux_test,
+                y_data_test=y_test,
                 save_path=str(output_dir),
-                latent_dim=args.latent_dim
+                latent_dim=args.latent_dim,
+                nmf=nmf_obj
             )
             
             # Also evaluate on validation set
             print(f"\nEvaluating {alg} on validation set...")
-            from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-            from sklearn.decomposition import NMF
-            
-            X_val_np = X_val_t.numpy()
-            X_aux_val_np = X_aux_val_t.numpy()
-            y_val_np = y_val_t.numpy()
-            
-            if alg.startswith('m'):  # Matrix factorization methods
-                nmf = NMF(n_components=args.latent_dim)
-                X_latent = nmf.fit_transform(X_val_np)
-                X_val_combined = np.concatenate((X_latent, X_aux_val_np), axis=1)
-            else:
-                X_val_combined = np.concatenate((X_val_np, X_aux_val_np), axis=1)
-            
-            y_val_pred = model.predict(X_val_combined)
-            y_val_proba = model.predict_proba(X_val_combined)[:, 1]
-            
-            val_acc = accuracy_score(y_val_np, y_val_pred)
-            val_f1 = f1_score(y_val_np, y_val_pred, average='weighted')
-            val_auc = roc_auc_score(y_val_np, y_val_proba)
-            
-            print(f"  Val accuracy: {val_acc:.4f}")
-            print(f"  Val F1:       {val_f1:.4f}")
-            print(f"  Val AUC:      {val_auc:.4f}")
+            val_results = eval_alg(
+                model=model,
+                algorithm=alg,
+                x_data_test=X_val,
+                x_aux_data_test=X_aux_val,
+                y_data_test=y_val,
+                save_path=str(output_dir / f"{alg}_val"),
+                latent_dim=args.latent_dim,
+                nmf=nmf_obj
+            )
             
             all_results[alg] = {
-                'val_accuracy': val_acc,
-                'val_f1': val_f1,
-                'val_auc': val_auc,
+                'val_accuracy': val_results['test_accuracy'],
+                'val_f1': val_results['test_f1'],
+                'val_auc': val_results['test_roc_auc'],
                 'status': 'success'
             }
             

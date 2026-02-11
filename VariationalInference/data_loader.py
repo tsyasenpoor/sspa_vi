@@ -109,7 +109,7 @@ class DataLoader:
         # Detect data type from path
         self.is_emtab = self._detect_emtab_format()
         self.is_singscore = 'singscore' in str(self.data_path).lower() and not self.is_emtab
-        self.is_simulated = 'simulated' in str(self.data_path).lower() and not self.is_emtab
+        self.is_simulated = self._detect_simulated_format()
         self.feature_type = 'pathway' if self.is_singscore else 'gene'
 
         # Create cache directory
@@ -149,6 +149,42 @@ class DataLoader:
                 return False
 
         return True
+
+    def _detect_simulated_format(self) -> bool:
+        """
+        Detect if data_path is a simulated CSV dataset.
+
+        Detection heuristics (in order):
+        1. Path contains 'simulated' (original behaviour).
+        2. Path is a .csv or .csv.gz file that is NOT inside an EMTAB directory.
+        3. Path parent/ancestors contain 'scdesign' or 'simulation'.
+
+        Returns
+        -------
+        bool
+            True if simulated CSV format detected, False otherwise.
+        """
+        if self.is_emtab:
+            return False
+
+        path_lower = str(self.data_path).lower()
+
+        # Original heuristic
+        if 'simulated' in path_lower:
+            return True
+
+        # CSV/CSV.gz file (not h5ad, not a directory)
+        suffixes = ''.join(self.data_path.suffixes).lower()
+        is_csv = suffixes in ('.csv', '.csv.gz')
+        if is_csv and not self.data_path.is_dir():
+            return True
+
+        # Ancestor directory contains simulation-related keywords
+        sim_keywords = ('scdesign', 'simulation', 'sim_')
+        if any(kw in path_lower for kw in sim_keywords):
+            return True
+
+        return False
 
     def _get_cache_key(self) -> str:
         """Generate cache key based on data file."""
@@ -235,37 +271,55 @@ class DataLoader:
 
     def load_simulated_csv(self) -> pd.DataFrame:
         """
-        Load simulated data from CSV (simulated_gex_t2dm_groundtruth.csv format).
+        Load simulated data from CSV (.csv or .csv.gz).
         
         Expected format:
         - Rows: samples/cells
-        - Columns: genes (Ensembl IDs) + 't2dm' label column
-        - No preprocessing needed (already clean)
+        - Columns: gene expression columns (Ensembl IDs) + metadata columns
+        - Metadata columns are auto-detected as non-Ensembl, non-numeric-header columns.
         
         Returns
         -------
         pd.DataFrame
-            Raw expression DataFrame with label column.
+            Raw expression DataFrame (genes only). Metadata stored in self.sim_metadata.
         """
         self._log(f"Loading simulated CSV: {self.data_path}")
         
         # Load CSV
         df = pd.read_csv(self.data_path, index_col=0)
         
-        # Check for t2dm column
-        if 'covid' not in df.columns:
-            raise ValueError(f"Simulated CSV must contain 'covid' label column. Found: {list(df.columns)}")
+        # Auto-detect metadata vs gene columns.
+        # Gene columns start with 'ENSG' or 'ENSMUSG'; everything else is metadata.
+        gene_cols = [c for c in df.columns if c.startswith(('ENSG', 'ENSMUSG'))]
+        meta_cols = [c for c in df.columns if c not in gene_cols]
         
-        # Separate labels from expression data
-        self.label_data = df['covid'].copy()
-        self.raw_df = df.drop(columns=['covid'])
+        if not gene_cols:
+            raise ValueError(
+                f"No Ensembl gene columns detected in simulated CSV. "
+                f"Columns found: {list(df.columns[:10])}..."
+            )
+        
+        # Store full metadata (all non-gene columns) for label/aux extraction later
+        self.sim_metadata = df[meta_cols].copy() if meta_cols else pd.DataFrame(index=df.index)
+        
+        # For backward compatibility, also populate label_data with the first
+        # metadata column (often 'disease' or 'covid'). This will be overridden
+        # by get_matrices which reads the correct label_column from sim_metadata.
+        if meta_cols:
+            self.label_data = df[meta_cols[0]].copy()
+            self._log(f"  Metadata columns: {meta_cols}")
+        else:
+            self.label_data = None
+        
+        self.raw_df = df[gene_cols]
         
         # Store metadata
         self.gene_list = self.raw_df.columns.tolist()
         self.cell_ids = self.raw_df.index.tolist()
         
         self._log(f"  Shape: {len(self.cell_ids)} cells x {len(self.gene_list)} genes")
-        self._log(f"  Label distribution: {self.label_data.value_counts().to_dict()}")
+        if self.label_data is not None:
+            self._log(f"  Label ({meta_cols[0]}) distribution: {self.label_data.value_counts().to_dict()}")
         
         return self.raw_df
 
@@ -857,9 +911,15 @@ class DataLoader:
         if stratify_by is not None:
             # For simulated data, use pre-loaded labels
             if self.is_simulated:
-                if not hasattr(self, 'label_data') or self.label_data is None:
-                    raise ValueError("Simulated data not loaded. Call preprocess() first.")
-                stratify = self.label_data.loc[self.cell_ids].values
+                if hasattr(self, 'sim_metadata') and stratify_by in self.sim_metadata.columns:
+                    stratify = self.sim_metadata.loc[self.cell_ids, stratify_by].values
+                elif hasattr(self, 'label_data') and self.label_data is not None:
+                    stratify = self.label_data.loc[self.cell_ids].values
+                else:
+                    raise ValueError(
+                        f"Stratify column '{stratify_by}' not found in simulated metadata. "
+                        f"Available: {list(getattr(self, 'sim_metadata', pd.DataFrame()).columns)}"
+                    )
             # For EMTAB data, use responses_df
             elif self.is_emtab:
                 if self.responses_df is None:
@@ -944,7 +1004,15 @@ class DataLoader:
 
         # Get labels (handles simulated vs EMTAB vs h5ad)
         if self.is_simulated:
-            y = self.label_data.loc[cell_ids].values.astype(int)
+            if hasattr(self, 'sim_metadata') and label_column in self.sim_metadata.columns:
+                y = self.sim_metadata.loc[cell_ids, label_column].values.astype(int)
+            elif hasattr(self, 'label_data') and self.label_data is not None:
+                y = self.label_data.loc[cell_ids].values.astype(int)
+            else:
+                raise ValueError(
+                    f"Label column '{label_column}' not found in simulated metadata. "
+                    f"Available: {list(getattr(self, 'sim_metadata', pd.DataFrame()).columns)}"
+                )
         elif self.is_emtab:
             # For EMTAB, get labels from responses_df using cell indices
             cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
@@ -960,6 +1028,13 @@ class DataLoader:
             # Subset to requested cells
             cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
             X_aux = X_aux[cell_idx]
+        elif aux_columns and self.is_simulated and hasattr(self, 'sim_metadata'):
+            # Extract aux columns from simulated metadata
+            valid_aux = [c for c in aux_columns if c in self.sim_metadata.columns and c != 'None']
+            if valid_aux:
+                X_aux = self.sim_metadata.loc[cell_ids, valid_aux].values.astype(float)
+            else:
+                X_aux = np.zeros((len(cell_ids), 0))
         else:
             X_aux = np.zeros((len(cell_ids), 0))
 
