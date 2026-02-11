@@ -385,8 +385,11 @@ class SVIConfig:
     Early Stopping (HO-LL) Parameters
     ---------------------------------
     early_stopping_metric : str, default='elbo'
-        Metric to use for early stopping: 'elbo' or 'heldout_ll'.
-        When 'heldout_ll', stops when held-out log-likelihood hasn't improved.
+        Metric to use for early stopping: 'elbo', 'heldout_ll', or 'heldout_regression_ll'.
+        When 'heldout_ll', stops when combined held-out log-likelihood hasn't improved.
+        When 'heldout_regression_ll', stops when the regression (Bernoulli) component
+        of held-out log-likelihood hasn't improved. Use this when the Poisson component
+        dominates due to high gene dimensionality, causing premature convergence.
     heldout_ll_patience : int, default=10
         Number of epochs without HO-LL improvement before stopping.
     heldout_ll_ema_decay : float, default=0.9
@@ -475,7 +478,7 @@ class SVIConfig:
     rel_tol: float = 2e-4
 
     # Early stopping based on held-out log-likelihood
-    early_stopping_metric: str = 'elbo'  # 'elbo' or 'heldout_ll'
+    early_stopping_metric: str = 'elbo'  # 'elbo', 'heldout_ll', or 'heldout_regression_ll'
     heldout_ll_patience: int = 10  # epochs without improvement before stopping
     heldout_ll_ema_decay: float = 0.9  # EMA smoothing for HO-LL
     restore_best_heldout: bool = True  # restore to best HO-LL epoch
