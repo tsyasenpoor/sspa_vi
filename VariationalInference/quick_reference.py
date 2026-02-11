@@ -277,8 +277,9 @@ def parse_args() -> argparse.Namespace:
         '--early-stopping-metric',
         type=str,
         default='elbo',
-        choices=['elbo', 'heldout_ll'],
-        help='Metric for early stopping: elbo (training) or heldout_ll (validation)'
+        choices=['elbo', 'heldout_ll', 'heldout_regression_ll'],
+        help='Metric for early stopping: elbo (training), heldout_ll (combined validation), '
+             'or heldout_regression_ll (regression-only validation, useful when Poisson dominates)'
     )
     parser.add_argument(
         '--heldout-ll-patience',
