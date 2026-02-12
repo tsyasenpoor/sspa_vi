@@ -289,11 +289,23 @@ class SVICorrected:
 
     @staticmethod
     @jax.jit
+    def _stable_softplus(x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Numerically stable softplus: log(1 + exp(x)).
+
+        For large x (>20), log(1+exp(x)) ≈ x to avoid float32 overflow
+        (exp(88) already exceeds float32 max).
+        For small x (<-20), log(1+exp(x)) ≈ exp(x) ≈ 0.
+        """
+        return jnp.where(x > 20, x, jnp.log1p(jnp.exp(jnp.clip(x, -50, 20))))
+
+    @staticmethod
+    @jax.jit
     def _lambda_jj(zeta: jnp.ndarray) -> jnp.ndarray:
         """
         Jaakkola-Jordan auxiliary function: λ(ζ) = tanh(ζ/2) / (4ζ)
         For ζ→0: λ(0) = 1/8
-        
+
         Vectorized and numerically stable.
         JIT-compiled for performance.
         """
@@ -806,9 +818,21 @@ class SVICorrected:
             
             # Sum over outcomes: (batch, d)
             R_sum = R.sum(axis=1)
-            
-            b_theta_new = b_theta_new + self.regression_weight * R_sum
-            
+
+            # Cap regression contribution to b_theta to prevent it from
+            # overwhelming the Poisson reconstruction gradient.
+            # Without capping, regression_weight * R_sum can make b_theta
+            # negative (clipped to 1e-6 → E[theta] explodes) or enormous
+            # (E[theta] → 0), causing the count/regression objectives to
+            # see-saw rather than converge together.
+            regression_contrib = self.regression_weight * R_sum
+            regression_contrib = jnp.clip(
+                regression_contrib,
+                -0.9 * b_theta_new,       # Don't let b_theta drop below 10% of Poisson value
+                10.0 * jnp.maximum(b_theta_new, 0.1)  # Don't let b_theta jump by >10x
+            )
+            b_theta_new = b_theta_new + regression_contrib
+
             b_theta_new = jnp.maximum(b_theta_new, 1e-6)
             a_theta_new = jnp.maximum(a_theta_new, 1.001)
             
@@ -1274,7 +1298,7 @@ class SVICorrected:
 
         # JJ bound for all outcomes
         elbo_y = jnp.sum((y_expanded - 0.5) * E_A - lam * E_A_sq)
-        elbo_y += jnp.sum(lam * zeta**2 - 0.5 * zeta - jnp.log1p(jnp.exp(jnp.clip(zeta, -500, 500))))
+        elbo_y += jnp.sum(lam * zeta**2 - 0.5 * zeta - self._stable_softplus(zeta))
         elbo += scale * self.regression_weight * elbo_y
         
         # === Priors on local parameters ===
@@ -1375,6 +1399,58 @@ class SVICorrected:
                 elbo += jnp.where(sign > 0, 0.5 * self.p_aux * (1 + jnp.log(2 * jnp.pi)) + 0.5 * logdet, 0.0)
         
         return float(elbo)
+
+    def _diagnose_elbo(
+        self,
+        X_batch: jnp.ndarray,
+        y_batch: jnp.ndarray,
+        X_aux_batch: jnp.ndarray,
+        a_theta: jnp.ndarray,
+        b_theta: jnp.ndarray,
+        a_xi: jnp.ndarray,
+        b_xi: jnp.ndarray,
+        zeta: jnp.ndarray,
+        scale: float
+    ) -> str:
+        """Diagnose which ELBO component is non-finite. Returns a summary string."""
+        E_theta = a_theta / b_theta
+        E_log_theta = jsp.digamma(a_theta) - jnp.log(b_theta)
+
+        components = {}
+        # Poisson likelihood
+        log_rates = E_log_theta[:, jnp.newaxis, :] + self.E_log_beta_effective[jnp.newaxis, :, :]
+        log_sum_rates = logsumexp(log_rates, axis=2)
+        poisson_ll = float(jnp.sum(X_batch * log_sum_rates))
+        components['poisson_xlogλ'] = poisson_ll
+
+        rate_term = float(jnp.sum(E_theta.sum(axis=0) * self.E_beta_effective.sum(axis=0)))
+        components['poisson_rate'] = rate_term
+
+        # JJ bound
+        y_expanded = y_batch if y_batch.ndim > 1 else y_batch[:, jnp.newaxis]
+        lam = self._lambda_jj(zeta)
+        intercept_contrib = self._get_intercept_contrib(E_theta.shape[0])
+        aux_contrib = X_aux_batch @ self.E_gamma.T if self.p_aux > 0 else 0.0
+        E_A = E_theta @ self.E_v_effective.T + aux_contrib + intercept_contrib
+        E_v_sq = self.mu_v**2 + jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)
+        Var_theta = a_theta / (b_theta**2)
+        E_A_sq = E_A**2 + (Var_theta @ E_v_sq.T)
+        jj_linear = float(jnp.sum((y_expanded - 0.5) * E_A - lam * E_A_sq))
+        jj_aux = float(jnp.sum(lam * zeta**2 - 0.5 * zeta - self._stable_softplus(zeta)))
+        components['jj_linear'] = jj_linear
+        components['jj_aux'] = jj_aux
+
+        # Sigma_v entropy
+        for k in range(self.kappa):
+            sign, logdet = jnp.linalg.slogdet(self.Sigma_v[k])
+            components[f'Sigma_v[{k}]_sign'] = float(sign)
+            components[f'Sigma_v[{k}]_logdet'] = float(logdet)
+
+        # Report non-finite components
+        bad = {k: v for k, v in components.items() if not np.isfinite(v)}
+        if bad:
+            return f"non-finite components: {bad}"
+        return f"all components finite but sum diverges: {components}"
 
     def _checkpoint_params(self) -> Dict[str, Any]:
         """
@@ -1530,9 +1606,8 @@ class SVICorrected:
 
         # Binary cross-entropy: y*log(σ) + (1-y)*log(1-σ)
         # = y*logits - log(1 + exp(logits))
-        logits_clipped = jnp.clip(logits, -500, 500)
         loglik_labels = jnp.sum(
-            y_heldout * logits_clipped - jnp.log1p(jnp.exp(logits_clipped))
+            y_heldout * logits - self._stable_softplus(logits)
         )
 
         # Combine and normalize
@@ -1620,9 +1695,6 @@ class SVICorrected:
 
         n_batches = (n_heldout + batch_size - 1) // batch_size
 
-        # Precompute global expectations (shared across batches)
-        E_log_beta = jsp.digamma(self.a_beta) - jnp.log(self.b_beta)
-
         for batch_idx in range(n_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, n_heldout)
@@ -1650,7 +1722,8 @@ class SVICorrected:
 
             # === Poisson log-likelihood for counts (batched) ===
             # log_rates: (batch_n, p, d) - this is the memory bottleneck
-            log_rates = E_log_theta[:, jnp.newaxis, :] + E_log_beta[jnp.newaxis, :, :]
+            # Use E_log_beta_effective to be consistent with spike-slab masking
+            log_rates = E_log_theta[:, jnp.newaxis, :] + self.E_log_beta_effective[jnp.newaxis, :, :]
             log_sum_rates = logsumexp(log_rates, axis=2)  # (batch_n, p)
 
             batch_loglik_counts = jnp.sum(X_batch * log_sum_rates)
@@ -1670,9 +1743,8 @@ class SVICorrected:
             if self.use_intercept:
                 logits = logits + self.mu_intercept[jnp.newaxis, :]
 
-            logits_clipped = jnp.clip(logits, -500, 500)
             batch_loglik_labels = jnp.sum(
-                y_batch * logits_clipped - jnp.log1p(jnp.exp(logits_clipped))
+                y_batch * logits - self._stable_softplus(logits)
             )
 
             # Accumulate
@@ -1919,20 +1991,29 @@ class SVICorrected:
                         self.elbo_history_.append((iteration, elbo))
                         epoch_elbo = elbo
                         self.last_elbo_ = elbo  # Track for display
-                        
+
                         # EMA update: O(1)
                         if self.elbo_ema_ is None:
                             self.elbo_ema_ = elbo
                         else:
-                            self.elbo_ema_ = (self.ema_decay * self.elbo_ema_ + 
+                            self.elbo_ema_ = (self.ema_decay * self.elbo_ema_ +
                                               (1 - self.ema_decay) * elbo)
-                        
+
                         # Welford's online update: O(1)
                         self.elbo_welford_n_ += 1
                         delta = elbo - self.elbo_welford_mean_
                         self.elbo_welford_mean_ += delta / self.elbo_welford_n_
                         delta2 = elbo - self.elbo_welford_mean_
                         self.elbo_welford_M2_ += delta * delta2
+                    elif verbose and not hasattr(self, '_elbo_nan_warned'):
+                        self._elbo_nan_warned = True
+                        # Diagnose which component diverged
+                        diag = self._diagnose_elbo(
+                            X_batch, y_batch, X_aux_batch,
+                            a_theta, b_theta, a_xi, b_xi, zeta, scale
+                        )
+                        print(f"  [WARNING] ELBO non-finite ({elbo}) at iteration {iteration}. "
+                              f"Diagnostics: {diag}")
                 
                 iteration += 1
             
@@ -2171,13 +2252,13 @@ class SVICorrected:
         a_xi = jnp.full(n_new, self.alpha_xi + self.d * self.alpha_theta)
         b_xi = jnp.full(n_new, self.lambda_xi)
         
-        # Frozen global expectations
-        E_beta = self.a_beta / self.b_beta
-        E_log_beta = jsp.digamma(self.a_beta) - jnp.log(self.b_beta)
-        E_v = self.mu_v
+        # Frozen global expectations (use effective versions for spike-slab consistency)
+        E_beta = self.E_beta_effective
+        E_log_beta = self.E_log_beta_effective
+        E_v = self.E_v_effective
         E_v_sq = self.mu_v**2 + jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)
         E_gamma = self.mu_gamma
-        
+
         beta_col_sums = E_beta.sum(axis=0)
         
         # Accumulators for averaging
@@ -2226,13 +2307,19 @@ class SVICorrected:
             a_theta = self.alpha_theta + shape_contrib
             b_theta = E_xi[:, jnp.newaxis] + beta_col_sums[jnp.newaxis, :]
             
-            # Regression contribution
+            # Regression contribution (consistent with training: uses regression_weight + capping)
             C_minus_ell = (E_A[:, :, jnp.newaxis] - E_theta[:, jnp.newaxis, :] * E_v[jnp.newaxis, :, :])
             R = (-(y_new[:, :, jnp.newaxis] - 0.5) * E_v[jnp.newaxis, :, :] +
                   2 * lam[:, :, jnp.newaxis] * E_v[jnp.newaxis, :, :] * C_minus_ell +
                   2 * lam[:, :, jnp.newaxis] * E_v_sq[jnp.newaxis, :, :] * E_theta[:, jnp.newaxis, :])
-            
-            b_theta = b_theta + R.sum(axis=1)
+
+            regression_contrib = self.regression_weight * R.sum(axis=1)
+            regression_contrib = jnp.clip(
+                regression_contrib,
+                -0.9 * b_theta,
+                10.0 * jnp.maximum(b_theta, 0.1)
+            )
+            b_theta = b_theta + regression_contrib
             b_theta = jnp.maximum(b_theta, 1e-10)
 
             # Accumulate for averaging (Stability Fix)
