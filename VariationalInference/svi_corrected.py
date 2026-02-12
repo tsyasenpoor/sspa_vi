@@ -73,6 +73,7 @@ class SVICorrected:
         # Supervision
         regression_weight: float = 1.0,
         count_scale: Optional[float] = None,  # For compatibility with bayes_opt
+        v_learning_rate_mult: float = 1.0,  # Multiplier for v's SVI learning rate
         
         # Convergence tracking
         ema_decay: float = 0.95,
@@ -156,7 +157,8 @@ class SVICorrected:
         self.pi_v = pi_v
         
         self.regression_weight = regression_weight
-        
+        self.v_learning_rate_mult = v_learning_rate_mult
+
         # Convergence tracking (EMA + Welford)
         self.ema_decay = ema_decay
         self.convergence_tol = convergence_tol
@@ -819,18 +821,19 @@ class SVICorrected:
             # Sum over outcomes: (batch, d)
             R_sum = R.sum(axis=1)
 
-            # Cap regression contribution to b_theta to prevent it from
-            # overwhelming the Poisson reconstruction gradient.
-            # Without capping, regression_weight * R_sum can make b_theta
-            # negative (clipped to 1e-6 → E[theta] explodes) or enormous
-            # (E[theta] → 0), causing the count/regression objectives to
-            # see-saw rather than converge together.
+            # Soft-cap regression contribution to b_theta.
+            # Hard clipping (previous version) blocked ~99.9% of the regression
+            # signal when regression_weight was large (e.g. 10000) relative to
+            # b_theta (~1-5). Instead, use soft saturation: the contribution
+            # preserves direction but smoothly saturates, preventing b_theta
+            # from going negative while allowing meaningful regression influence.
             regression_contrib = self.regression_weight * R_sum
-            regression_contrib = jnp.clip(
-                regression_contrib,
-                -0.9 * b_theta_new,       # Don't let b_theta drop below 10% of Poisson value
-                10.0 * jnp.maximum(b_theta_new, 0.1)  # Don't let b_theta jump by >10x
-            )
+            b_ref = jnp.maximum(b_theta_new, 0.1)
+            # Allow regression to shift b_theta by up to ~b_ref in magnitude
+            # (soft limit), with smooth saturation beyond that.
+            # For |rc| << b_ref: passes through ~unchanged
+            # For |rc| >> b_ref: saturates at ~±b_ref
+            regression_contrib = regression_contrib * b_ref / (jnp.abs(regression_contrib) + b_ref)
             b_theta_new = b_theta_new + regression_contrib
 
             b_theta_new = jnp.maximum(b_theta_new, 1e-6)
@@ -1175,14 +1178,20 @@ class SVICorrected:
         self.a_eta, self.b_eta = self._natural_to_gamma(self.eta1_eta, self.eta2_eta)
         
         # v: clipped canonical update
+        # Scale gradient clip threshold by sqrt(d/50) so that the per-component
+        # clip threshold stays constant regardless of dimensionality.
+        # Without this, the L2 norm of the gradient scales as sqrt(d), causing
+        # over-clipping with many factors (e.g. d=1375 clips 5x more than d=50).
+        v_clip_threshold = 5.0 * jnp.sqrt(self.d / 50.0)
+        v_rho_t = rho_t * self.v_learning_rate_mult
         for k in range(self.kappa):
             mu_grad = mu_v_hat[k] - self.mu_v[k]
             mu_grad_norm = jnp.sqrt(jnp.sum(mu_grad**2))
-            mu_grad_scale = jnp.minimum(1.0, 5.0 / (mu_grad_norm + 1e-10))
+            mu_grad_scale = jnp.minimum(1.0, v_clip_threshold / (mu_grad_norm + 1e-10))
             mu_v_clip = self.mu_v[k] + mu_grad * mu_grad_scale
-            self.mu_v = self.mu_v.at[k].set(jnp.clip((1 - rho_t) * self.mu_v[k] + rho_t * mu_v_clip, -10, 10))
+            self.mu_v = self.mu_v.at[k].set(jnp.clip((1 - v_rho_t) * self.mu_v[k] + v_rho_t * mu_v_clip, -10, 10))
             
-            Sigma_new = (1 - rho_t) * self.Sigma_v[k] + rho_t * Sigma_v_hat[k]
+            Sigma_new = (1 - v_rho_t) * self.Sigma_v[k] + v_rho_t * Sigma_v_hat[k]
             Sigma_new = 0.5 * (Sigma_new + Sigma_new.T)
             eigvals = jnp.linalg.eigvalsh(Sigma_new)
             min_eigval = jnp.min(eigvals)
@@ -1190,7 +1199,7 @@ class SVICorrected:
             Sigma_new = jnp.where(min_eigval < 1e-4, Sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.d), Sigma_new)
             Sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, Sigma_new + 1e-3 * jnp.eye(self.d), Sigma_new)
             self.Sigma_v = self.Sigma_v.at[k].set(Sigma_new)
-        
+
         # gamma: clipped canonical update
         if self.p_aux > 0:
             for k in range(self.kappa):
@@ -2314,11 +2323,8 @@ class SVICorrected:
                   2 * lam[:, :, jnp.newaxis] * E_v_sq[jnp.newaxis, :, :] * E_theta[:, jnp.newaxis, :])
 
             regression_contrib = self.regression_weight * R.sum(axis=1)
-            regression_contrib = jnp.clip(
-                regression_contrib,
-                -0.9 * b_theta,
-                10.0 * jnp.maximum(b_theta, 0.1)
-            )
+            b_ref = jnp.maximum(b_theta, 0.1)
+            regression_contrib = regression_contrib * b_ref / (jnp.abs(regression_contrib) + b_ref)
             b_theta = b_theta + regression_contrib
             b_theta = jnp.maximum(b_theta, 1e-10)
 

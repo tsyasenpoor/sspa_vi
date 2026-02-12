@@ -242,6 +242,14 @@ def parse_args() -> argparse.Namespace:
         help='Weight for classification objective (higher=more focus on classification)'
     )
     parser.add_argument(
+        '--v-learning-rate-mult',
+        type=float,
+        default=1.0,
+        help='Multiplier for v (regression coefficient) SVI learning rate. '
+             'Increase (e.g. 3-10) for high-dimensional factor models (d>500) '
+             'where the default learning rate decays too fast for v to converge.'
+    )
+    parser.add_argument(
         '--elbo-freq',
         type=int,
         default=10,
@@ -801,6 +809,7 @@ def main():
         learning_rate_min=args.learning_rate_min,
         local_iterations=args.local_iterations,
         regression_weight=args.regression_weight,
+        v_learning_rate_mult=args.v_learning_rate_mult,
         alpha_theta=alpha_theta,
         alpha_beta=args.alpha_beta,
         alpha_xi=args.alpha_xi,

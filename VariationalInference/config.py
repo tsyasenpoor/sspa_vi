@@ -138,6 +138,7 @@ class VIConfig:
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
     regression_weight: float = 1.0
+    v_learning_rate_mult: float = 1.0
 
     # Training parameters
     max_iter: int = 200
@@ -208,6 +209,7 @@ class VIConfig:
             'spike_variance_v': self.spike_variance_v,
             'spike_value_beta': self.spike_value_beta,
             'regression_weight': self.regression_weight,
+            'v_learning_rate_mult': self.v_learning_rate_mult,
         }
 
     def training_params(self) -> Dict[str, Any]:
@@ -412,6 +414,7 @@ class SVIConfig:
     warmup_epochs: int = 5
     local_iterations: int = 5
     regression_weight: float = 1.0
+    v_learning_rate_mult: float = 1.0
 
     # Adaptive learning rate parameters
     lr_reduction_patience: int = 5
@@ -534,6 +537,7 @@ class SVIConfig:
             'warmup_epochs': self.warmup_epochs,
             'local_iterations': self.local_iterations,
             'regression_weight': self.regression_weight,
+            'v_learning_rate_mult': self.v_learning_rate_mult,
             'lr_reduction_patience': self.lr_reduction_patience,
             'lr_reduction_factor': self.lr_reduction_factor,
             'restore_best': self.restore_best,
