@@ -750,6 +750,12 @@ class CAVI:
         best_holl = -np.inf
         best_params = None
 
+        # Regression early stopping: stop if Reg degrades for too long
+        best_reg_ll = -np.inf
+        best_reg_params = None
+        best_reg_iter = 0
+        reg_patience = 10  # stop after this many consecutive checks of Reg degradation
+
         for t in range(max_iter):
 
             # 1. Compute φ and z_sums (sparse)
@@ -788,6 +794,12 @@ class CAVI:
                         best_holl = holl
                         best_params = self._checkpoint()
 
+                # Track best regression LL for early stopping
+                if reg_ll > best_reg_ll:
+                    best_reg_ll = reg_ll
+                    best_reg_params = self._checkpoint()
+                    best_reg_iter = t
+
                 # Loss = mean negative ELBO (tracks full objective including regression)
                 curr_loss = -elbo / self.n
                 loss_list.append(curr_loss)
@@ -805,6 +817,16 @@ class CAVI:
                           f"Pois={pois_ll:.4e}  Reg={reg_ll:.4e}  "
                           f"v={self.mu_v.ravel()[:3]}{holl_str}")
 
+                # Regression early stopping: if Reg has been degrading for
+                # reg_patience consecutive checks, stop and restore best.
+                checks_since_best = (t - best_reg_iter) // max(check_freq, 1)
+                if checks_since_best >= reg_patience and t >= 30:
+                    if verbose:
+                        print(f"Regression early stop at iter {t}: "
+                              f"Reg hasn't improved in {checks_since_best} checks "
+                              f"(best Reg={best_reg_ll:.4e} at iter {best_reg_iter})")
+                    break
+
                 # Convergence check on full ELBO (not just Poisson term)
                 if len(loss_list) >= 3 and t >= 30:
                     c1 = abs(pct_changes[-1]) < tol
@@ -820,9 +842,13 @@ class CAVI:
             if best_params is not None:
                 print(f"Best HO-LL: {best_holl:.4f}")
 
-        # Restore best if we have validation
+        # Restore best: prefer HO-LL checkpoint if available, else Reg checkpoint
         if best_params is not None:
             self._restore(best_params)
+        elif best_reg_params is not None:
+            if verbose:
+                print(f"Restoring best regression checkpoint (iter {best_reg_iter})")
+            self._restore(best_reg_params)
 
         return self
 
