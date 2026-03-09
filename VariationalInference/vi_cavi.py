@@ -38,9 +38,38 @@ References:
 import numpy as np
 import scipy.sparse as sp
 from scipy.special import digamma, gammaln
-from scipy.special import logsumexp as sp_logsumexp
 from typing import Tuple, Optional, Dict, Any, List
 import time
+
+
+def _logsumexp_rows(a):
+    """Fast row-wise logsumexp, avoids scipy dispatch overhead."""
+    a_max = a.max(axis=1, keepdims=True)
+    return a_max + np.log(np.exp(a - a_max).sum(axis=1, keepdims=True))
+
+
+def _scatter_add(indices, values, n_out):
+    """
+    Scatter-add: out[i] += values[idx == i] for each column.
+
+    ~10-20× faster than np.add.at by using np.bincount which is
+    implemented as a single C loop with no Python overhead.
+
+    Parameters
+    ----------
+    indices : (nnz,) int array — row or col indices
+    values : (nnz, K) float array
+    n_out : int — number of output rows
+
+    Returns
+    -------
+    out : (n_out, K) float array
+    """
+    K = values.shape[1]
+    out = np.empty((n_out, K))
+    for k in range(K):
+        out[:, k] = np.bincount(indices, weights=values[:, k], minlength=n_out)
+    return out
 
 
 class CAVI:
@@ -223,6 +252,9 @@ class CAVI:
         self._X_data = X_coo.data.astype(np.float64)
         self._nnz = len(self._X_data)
 
+        # Pre-compute digamma caches (avoid repeated recomputation)
+        self._refresh_log_caches()
+
         print(f"Initialized: n={self.n}, p={self.p}, K={K}, nnz={self._nnz}")
         print(f"  bp={bp:.4f}, dp={dp:.4f}")
         print(f"  E[theta] range: [{self.E_theta.min():.4f}, {self.E_theta.max():.4f}]")
@@ -301,6 +333,11 @@ class CAVI:
     def E_log_beta(self):
         return digamma(self.a_beta) - np.log(self.b_beta)
 
+    def _refresh_log_caches(self):
+        """Recompute cached digamma arrays after theta/beta updates."""
+        self._E_log_theta_cache = digamma(self.a_theta) - np.log(self.b_theta)
+        self._E_log_beta_cache = digamma(self.a_beta) - np.log(self.b_beta)
+
     @property
     def E_xi(self):
         return self.a_xi / self.b_xi
@@ -328,20 +365,17 @@ class CAVI:
             phi = np.random.dirichlet(np.ones(K), self._nnz)
         else:
             # φ_{ijk} ∝ exp(ψ(a^θ_{ik}) - log(b^θ_{ik}) + ψ(a^β_{jk}) - log(b^β_{jk}))
-            E_log_theta_nnz = self.E_log_theta[self._X_row]  # (nnz, K)
-            E_log_beta_nnz = self.E_log_beta[self._X_col]    # (nnz, K)
-            log_phi = E_log_theta_nnz + E_log_beta_nnz        # (nnz, K)
-            log_phi -= sp_logsumexp(log_phi, axis=1, keepdims=True)
+            log_phi = (self._E_log_theta_cache[self._X_row]
+                       + self._E_log_beta_cache[self._X_col])
+            log_phi -= _logsumexp_rows(log_phi)
             phi = np.exp(log_phi)
 
         # x_{ij} * φ_{ijk}
         Xphi = self._X_data[:, None] * phi  # (nnz, K)
 
-        # Accumulate
-        z_sum_beta = np.zeros((self.p, K))
-        z_sum_theta = np.zeros((self.n, K))
-        np.add.at(z_sum_beta, self._X_col, Xphi)
-        np.add.at(z_sum_theta, self._X_row, Xphi)
+        # Accumulate via bincount (10-20× faster than np.add.at)
+        z_sum_beta = _scatter_add(self._X_col, Xphi, self.p)
+        z_sum_theta = _scatter_add(self._X_row, Xphi, self.n)
 
         return z_sum_beta, z_sum_theta
 
@@ -517,9 +551,9 @@ class CAVI:
     def _compute_elbo(self, X_dense, y, X_aux):
         """Compute ELBO = E[log p] - E[log q]."""
         E_theta = self.E_theta
-        E_log_theta = self.E_log_theta
+        E_log_theta = self._E_log_theta_cache
         E_beta = self.E_beta
-        E_log_beta = self.E_log_beta
+        E_log_beta = self._E_log_beta_cache
         E_xi = self.E_xi
         E_eta = self.E_eta
         E_log_xi = digamma(self.a_xi) - np.log(self.b_xi)
@@ -532,7 +566,9 @@ class CAVI:
         E_log_theta_nnz = E_log_theta[self._X_row]
         E_log_beta_nnz = E_log_beta[self._X_col]
         log_rates = E_log_theta_nnz + E_log_beta_nnz  # (nnz, K)
-        log_sum_rates = sp_logsumexp(log_rates, axis=1)  # (nnz,)
+        log_rates_max = log_rates.max(axis=1)
+        log_sum_rates = log_rates_max + np.log(
+            np.exp(log_rates - log_rates_max[:, None]).sum(axis=1))  # (nnz,)
         poisson_ll = np.sum(self._X_data * log_sum_rates)
         poisson_ll -= np.sum(E_theta.sum(axis=0) * E_beta.sum(axis=0))
         poisson_ll -= np.sum(gammaln(self._X_data + 1))
@@ -623,13 +659,13 @@ class CAVI:
         a_xi_v = np.full(n_val, self.ap + self.K * self.a)
         b_xi_v = np.full(n_val, self.bp)
 
-        E_log_beta = self.E_log_beta
+        E_log_beta = self._E_log_beta_cache
         E_beta = self.E_beta
         beta_col_sums = E_beta.sum(axis=0)
 
         row = X_val_coo.row
         col = X_val_coo.col
-        data = X_val_coo.data.astype(np.float64)
+        data = X_val_coo.data if X_val_coo.data.dtype == np.float64 else X_val_coo.data.astype(np.float64)
 
         for _ in range(n_iter):
             E_log_theta_v = digamma(a_theta_v) - np.log(b_theta_v)
@@ -638,12 +674,10 @@ class CAVI:
 
             # φ sparse
             log_phi = E_log_theta_v[row] + E_log_beta[col]
-            log_phi -= sp_logsumexp(log_phi, axis=1, keepdims=True)
-            phi = np.exp(log_phi)
-            Xphi = data[:, None] * phi
+            log_phi -= _logsumexp_rows(log_phi)
+            Xphi = data[:, None] * np.exp(log_phi)
 
-            z_sum = np.zeros((n_val, self.K))
-            np.add.at(z_sum, row, Xphi)
+            z_sum = _scatter_add(row, Xphi, n_val)
 
             a_theta_v = self.a + z_sum
             b_theta_v = E_xi_v[:, None] + beta_col_sums[None, :]
@@ -653,7 +687,9 @@ class CAVI:
         E_log_theta_v = digamma(a_theta_v) - np.log(b_theta_v)
         E_theta_v = a_theta_v / b_theta_v
         log_rates = E_log_theta_v[row] + E_log_beta[col]
-        log_sum_rates = sp_logsumexp(log_rates, axis=1)
+        log_rates_max = log_rates.max(axis=1, keepdims=True)
+        log_sum_rates = (log_rates_max.ravel()
+                         + np.log(np.exp(log_rates - log_rates_max).sum(axis=1)))
 
         ll = np.sum(data * log_sum_rates)
         ll -= np.sum(E_theta_v.sum(axis=0) * E_beta.sum(axis=0))
@@ -730,6 +766,9 @@ class CAVI:
             # 4. Update θ, ξ (cell side — with full regression from start)
             self._update_theta(z_sum_theta, y, X_aux)
             self._update_xi()
+
+            # Refresh digamma caches after theta/beta changed
+            self._refresh_log_caches()
 
             # 5. Update v, γ
             self._update_v(y, X_aux, iteration=t)
@@ -831,7 +870,8 @@ class CAVI:
         E_beta = self.E_beta
         beta_col_sums = E_beta.sum(axis=0)
 
-        row, col, data = X_coo.row, X_coo.col, X_coo.data.astype(np.float64)
+        row, col = X_coo.row, X_coo.col
+        data = X_coo.data if X_coo.data.dtype == np.float64 else X_coo.data.astype(np.float64)
 
         for _ in range(n_iter):
             E_log_theta = digamma(a_theta) - np.log(b_theta)
@@ -839,11 +879,9 @@ class CAVI:
             E_xi = a_xi / b_xi
 
             log_phi = E_log_theta[row] + E_log_beta[col]
-            log_phi -= sp_logsumexp(log_phi, axis=1, keepdims=True)
-            phi = np.exp(log_phi)
-            Xphi = data[:, None] * phi
-            z_sum = np.zeros((n_new, self.K))
-            np.add.at(z_sum, row, Xphi)
+            log_phi -= _logsumexp_rows(log_phi)
+            Xphi = data[:, None] * np.exp(log_phi)
+            z_sum = _scatter_add(row, Xphi, n_new)
 
             a_theta = self.a + z_sum
             b_theta = E_xi[:, None] + beta_col_sums[None, :]
@@ -872,7 +910,8 @@ class CAVI:
 
         E_log_beta = self.E_log_beta
         beta_col_sums = self.E_beta.sum(axis=0)
-        row, col, data = X_coo.row, X_coo.col, X_coo.data.astype(np.float64)
+        row, col = X_coo.row, X_coo.col
+        data = X_coo.data if X_coo.data.dtype == np.float64 else X_coo.data.astype(np.float64)
 
         for _ in range(n_iter):
             E_log_theta = digamma(a_theta) - np.log(b_theta)
@@ -880,10 +919,9 @@ class CAVI:
             E_xi = a_xi / b_xi
 
             log_phi = E_log_theta[row] + E_log_beta[col]
-            log_phi -= sp_logsumexp(log_phi, axis=1, keepdims=True)
+            log_phi -= _logsumexp_rows(log_phi)
             Xphi = data[:, None] * np.exp(log_phi)
-            z_sum = np.zeros((n_new, self.K))
-            np.add.at(z_sum, row, Xphi)
+            z_sum = _scatter_add(row, Xphi, n_new)
 
             a_theta = self.a + z_sum
             b_theta = E_xi[:, None] + beta_col_sums[None, :]
