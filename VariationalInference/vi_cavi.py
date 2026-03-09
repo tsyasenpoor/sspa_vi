@@ -461,7 +461,8 @@ class CAVI:
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        self.mu_v = np.clip(mean_prec / precision, -10, 10)
+        mu_v_new = np.clip(mean_prec / precision, -10, 10)
+        self.mu_v = 0.5 * self.mu_v + 0.5 * mu_v_new  # damp to prevent oscillation
         self.sigma_v_diag = 1.0 / precision
 
     def _update_gamma(self, y, X_aux):
@@ -485,7 +486,8 @@ class CAVI:
             mean_prec = X_aux.T @ residual
 
             self.Sigma_gamma[k] = np.linalg.inv(prec)
-            self.mu_gamma[k] = self.Sigma_gamma[k] @ mean_prec
+            mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
+            self.mu_gamma[k] = 0.5 * self.mu_gamma[k] + 0.5 * mu_gamma_new
 
     # =================================================================
     # ELBO
