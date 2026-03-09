@@ -25,7 +25,7 @@ Key differences from previous vi_cavi.py:
 3. First iteration uses random Dirichlet φ (scHPF symmetry breaking)
 4. No damping — pure coordinate ascent
 5. No diversity noise, no annealing, no warmup phases
-6. Simple v_warmup: skip v/γ/ζ updates for first N iterations
+6. All parameters (θ, v, γ, ζ) learned jointly from iteration 0
 7. No spike-and-slab
 
 References:
@@ -461,7 +461,8 @@ class CAVI:
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        self.mu_v = np.clip(mean_prec / precision, -10, 10)
+        mu_v_new = np.clip(mean_prec / precision, -10, 10)
+        self.mu_v = 0.5 * self.mu_v + 0.5 * mu_v_new  # damp to prevent oscillation
         self.sigma_v_diag = 1.0 / precision
 
     def _update_gamma(self, y, X_aux):
@@ -485,7 +486,8 @@ class CAVI:
             mean_prec = X_aux.T @ residual
 
             self.Sigma_gamma[k] = np.linalg.inv(prec)
-            self.mu_gamma[k] = self.Sigma_gamma[k] @ mean_prec
+            mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
+            self.mu_gamma[k] = 0.5 * self.mu_gamma[k] + 0.5 * mu_gamma_new
 
     # =================================================================
     # ELBO
@@ -656,7 +658,7 @@ class CAVI:
         max_iter : int
         check_freq : int
         tol : float — convergence if |pct_change| < tol twice in a row
-        v_warmup : int — iterations before turning on regression
+        v_warmup : int — deprecated, kept for CLI compatibility (ignored)
         verbose : bool
         """
         t0 = time.time()
@@ -690,7 +692,6 @@ class CAVI:
         best_params = None
 
         for t in range(max_iter):
-            in_warmup = (t < v_warmup)
 
             # 1. Compute φ and z_sums (sparse)
             random_phi = (t == 0)  # scHPF: random Dirichlet on first iter
@@ -700,28 +701,16 @@ class CAVI:
             self._update_beta(z_sum_beta)
             self._update_eta()
 
-            # 3. Update ζ (JJ bound tightening — only after warmup)
-            if not in_warmup:
-                self._update_zeta(X_aux)
+            # 3. Update ζ (JJ bound tightening)
+            self._update_zeta(X_aux)
 
-            # 4. Update θ, ξ (cell side)
-            if in_warmup:
-                effective_rw = 0.0
-            else:
-                ramp_iters = 50  # ramp over 50 iterations after warmup
-                frac = min(1.0, (t - v_warmup) / ramp_iters)
-                effective_rw = self.regression_weight * frac
-
-            old_rw = self.regression_weight
-            self.regression_weight = effective_rw
+            # 4. Update θ, ξ (cell side — with full regression from start)
             self._update_theta(z_sum_theta, y, X_aux)
-            self.regression_weight = old_rw
             self._update_xi()
 
-            # 5. Update v, γ (only after warmup)
-            if not in_warmup:
-                self._update_v(y, X_aux)
-                self._update_gamma(y, X_aux)
+            # 5. Update v, γ
+            self._update_v(y, X_aux)
+            self._update_gamma(y, X_aux)
 
             # 6. Check convergence
             if t % check_freq == 0:
@@ -749,14 +738,13 @@ class CAVI:
                     pct_changes.append(100.0)
 
                 if verbose:
-                    phase = "WU" if in_warmup else "FT"
                     holl_str = f"  HO-LL={holl:.2f}" if holl is not None else ""
-                    print(f"Iter {t:4d} [{phase}]: ELBO={elbo:.4e}  "
+                    print(f"Iter {t:4d}: ELBO={elbo:.4e}  "
                           f"Pois={pois_ll:.4e}  Reg={reg_ll:.4e}  "
                           f"v={self.mu_v.ravel()[:3]}{holl_str}")
 
                 # Convergence check (scHPF style)
-                if len(loss_list) >= 3 and t >= max(30, v_warmup + 10):
+                if len(loss_list) >= 3 and t >= 30:
                     c1 = abs(pct_changes[-1]) < tol
                     c2 = abs(pct_changes[-2]) < tol
                     if c1 and c2:
