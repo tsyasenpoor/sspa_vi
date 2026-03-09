@@ -461,7 +461,7 @@ class CAVI:
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        self.mu_v = np.clip(mean_prec / precision, -10, 10)
+        self.mu_v = np.clip(mean_prec / precision, -3*self.sigma_v, 3*self.sigma_v)
         self.sigma_v_diag = 1.0 / precision
 
     def _update_gamma(self, y, X_aux):
@@ -706,13 +706,20 @@ class CAVI:
 
             # 4. Update θ, ξ (cell side)
             if in_warmup:
-                # During warmup: no regression correction
-                old_rw = self.regression_weight
-                self.regression_weight = 0.0
-                self._update_theta(z_sum_theta, y, X_aux)
-                self.regression_weight = old_rw
+                effective_rw = 0.0
             else:
-                self._update_theta(z_sum_theta, y, X_aux)
+                ramp_iters = 50  # ramp over 50 iterations after warmup
+                frac = min(1.0, (t - v_warmup) / ramp_iters)
+                effective_rw = self.regression_weight * frac
+
+            old_rw = self.regression_weight
+            self.regression_weight = effective_rw
+            self._update_theta(z_sum_theta, y, X_aux)
+            if not in_warmup and effective_rw > 0:
+                self._update_zeta(X_aux)
+                self._update_v(y, X_aux)
+                self._update_gamma(y, X_aux)
+            self.regression_weight = old_rw
             self._update_xi()
 
             # 5. Update v, γ (only after warmup)

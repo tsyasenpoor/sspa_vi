@@ -146,13 +146,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--pathway-min-genes',
         type=int,
-        default=0,
+        default=1,
         help='Minimum genes per pathway (for filtering)'
     )
     parser.add_argument(
         '--pathway-max-genes',
         type=int,
-        default=200000,
+        default=2000,
         help='Maximum genes per pathway (for filtering)'
     )
     parser.add_argument(
