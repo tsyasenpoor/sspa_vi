@@ -431,7 +431,7 @@ class CAVI:
         )
         return R.sum(axis=1)  # (n, K)
 
-    def _update_v(self, y, X_aux):
+    def _update_v(self, y, X_aux, iteration=0):
         """
         v posterior (diagonal Gaussian, JJ bound).
 
@@ -461,17 +461,26 @@ class CAVI:
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        mu_v_new = np.clip(mean_prec / precision, -10, 10)
-        self.mu_v = 0.5 * self.mu_v + 0.5 * mu_v_new  # damp to prevent oscillation
+        # Clip v: scale with sqrt(K) to prevent logit explosion in masked mode
+        v_clip = min(10.0, 50.0 / np.sqrt(self.K))
+        mu_v_new = np.clip(mean_prec / precision, -v_clip, v_clip)
+
+        # Adaptive damping: conservative early (keep 95% old), relaxing over
+        # iterations toward 50/50.  alpha = weight on NEW value.
+        alpha = min(0.5, 0.05 + 0.45 * (iteration / max(200, iteration)))
+        self.mu_v = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
         self.sigma_v_diag = 1.0 / precision
 
-    def _update_gamma(self, y, X_aux):
+    def _update_gamma(self, y, X_aux, iteration=0):
         """γ posterior (Gaussian, JJ bound)."""
         if self.p_aux == 0:
             return
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
         E_theta = self.E_theta
+
+        # Same adaptive damping schedule as v
+        alpha = min(0.5, 0.05 + 0.45 * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
             prec_prior = np.eye(self.p_aux) / (self.sigma_gamma ** 2)
@@ -487,7 +496,7 @@ class CAVI:
 
             self.Sigma_gamma[k] = np.linalg.inv(prec)
             mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
-            self.mu_gamma[k] = 0.5 * self.mu_gamma[k] + 0.5 * mu_gamma_new
+            self.mu_gamma[k] = (1.0 - alpha) * self.mu_gamma[k] + alpha * mu_gamma_new
 
     # =================================================================
     # ELBO
@@ -709,8 +718,8 @@ class CAVI:
             self._update_xi()
 
             # 5. Update v, γ
-            self._update_v(y, X_aux)
-            self._update_gamma(y, X_aux)
+            self._update_v(y, X_aux, iteration=t)
+            self._update_gamma(y, X_aux, iteration=t)
 
             # 6. Check convergence
             if t % check_freq == 0:
@@ -726,8 +735,8 @@ class CAVI:
                         best_holl = holl
                         best_params = self._checkpoint()
 
-                # Loss = mean negative Poisson LL on training (scHPF)
-                curr_loss = -pois_ll / self.n
+                # Loss = mean negative ELBO (tracks full objective including regression)
+                curr_loss = -elbo / self.n
                 loss_list.append(curr_loss)
 
                 if len(loss_list) >= 2:
@@ -743,7 +752,7 @@ class CAVI:
                           f"Pois={pois_ll:.4e}  Reg={reg_ll:.4e}  "
                           f"v={self.mu_v.ravel()[:3]}{holl_str}")
 
-                # Convergence check (scHPF style)
+                # Convergence check on full ELBO (not just Poisson term)
                 if len(loss_list) >= 3 and t >= 30:
                     c1 = abs(pct_changes[-1]) < tol
                     c2 = abs(pct_changes[-2]) < tol
