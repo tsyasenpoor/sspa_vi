@@ -45,8 +45,8 @@ def parse_args():
                         help='Path to gene annotation CSV for protein-coding filter')
     parser.add_argument('--label-column', type=str, default='IBD',
                         help='Column name for classification labels')
-    parser.add_argument('--aux-columns', type=str, nargs='+', default=['sex_female'],
-                        help='Column names for auxiliary features')
+    parser.add_argument('--aux-columns', type=str, nargs='*', default=[],
+                        help='Column names for auxiliary features (omit for pure expression baselines)')
     parser.add_argument('--output-dir', '-o', type=str, default='./results/baselines',
                         help='Directory to save results')
     parser.add_argument('--latent-dim', type=int, default=100,

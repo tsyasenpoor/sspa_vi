@@ -551,12 +551,188 @@ def get_emtab_search_space() -> Dict[str, Dict[str, Any]]:
     }
 
 
+def get_pbmc_search_space() -> Dict[str, Dict[str, Any]]:
+    """
+    Search space for scdesign3 PBMC simulated data (10k cells, 2k genes).
+
+    Dataset characteristics:
+    - 10,000 cells, 2,000 genes
+    - 92% sparse count matrix
+    - Multi-outcome: severity (balanced 50/50), outcome (imbalanced 93/7)
+    - Auxiliary features: sex, comorbidity
+    - Masked mode: 1395 REACTOME pathways → 1395 factors
+    - Unmasked mode: ~50 factors
+
+    Key insight: massive Poisson/regression scale imbalance.  The Poisson LL
+    is O(N*P) ~ 1.8e7 while regression LL is O(N*kappa) ~ 2e4.  The auto-
+    balance must be uncapped (or capped at P=2000) to allow sufficient
+    regression weight.  Previous sqrt(P)=44.7 cap caused chronic regression
+    divergence.
+
+    Hyperparameter priorities (ordered by impact on regression convergence):
+    1. max_regression_weight / regression_weight — determines if regression
+       can compete with Poisson in the theta update
+    2. sigma_v — too large allows v drift; too small suppresses signal
+    3. alpha_beta — high values over-sparsify gene programs, degrading theta
+       as a regression feature
+    4. use_intercept — critical for imbalanced outcome (93/7)
+    5. alpha_theta — controls theta sparsity (moderate is fine)
+    """
+    return {
+        # =====================================================================
+        # LEARNING RATE (stable for 10k cells)
+        # =====================================================================
+        'learning_rate': {
+            'type': 'float',
+            'low': 0.005,
+            'high': 0.1,
+            'log': True,
+            'description': 'Initial LR (conservative for large d)'
+        },
+        'learning_rate_decay': {
+            'type': 'float',
+            'low': 0.5,
+            'high': 0.8,
+            'log': False,
+            'description': 'Robbins-Monro decay exponent'
+        },
+        'learning_rate_delay': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 10.0,
+            'log': False,
+            'description': 'Delay before decay (tau in (tau+t)^{-kappa})'
+        },
+        'learning_rate_min': {
+            'type': 'float',
+            'low': 1e-4,
+            'high': 1e-2,
+            'log': True,
+            'description': 'Minimum LR floor'
+        },
+        'batch_size': {
+            'type': 'int',
+            'low': 128,
+            'high': 512,
+            'step': 64,
+            'description': 'Mini-batch size'
+        },
+
+        # =====================================================================
+        # GAMMA PRIOR SHAPES — alpha_beta critical for regression
+        # =====================================================================
+        'alpha_theta': {
+            'type': 'float',
+            'low': 1.5,
+            'high': 5.0,
+            'log': False,
+            'description': 'Sample factor sparsity (moderate range)'
+        },
+        'alpha_beta': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 5.0,
+            'log': False,
+            'description': 'Gene loading sparsity (LOWER than default — '
+                           'high values over-sparsify and degrade regression)'
+        },
+
+        # =====================================================================
+        # HIERARCHICAL SHRINKAGE
+        # =====================================================================
+        'alpha_xi': {
+            'type': 'float',
+            'low': 1.5,
+            'high': 6.0,
+            'log': False,
+            'description': 'Sample depth heterogeneity'
+        },
+        'alpha_eta': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 5.0,
+            'log': False,
+            'description': 'Gene scale heterogeneity'
+        },
+        'lambda_xi': {
+            'type': 'float',
+            'low': 1.0,
+            'high': 15.0,
+            'log': True,
+            'description': 'Prior mean for sample depth'
+        },
+        'lambda_eta': {
+            'type': 'float',
+            'low': 0.5,
+            'high': 5.0,
+            'log': True,
+            'description': 'Prior mean for gene scaling'
+        },
+
+        # =====================================================================
+        # REGRESSION — highest impact on regression convergence
+        # =====================================================================
+        'sigma_v': {
+            'type': 'float',
+            'low': 0.1,
+            'high': 1.0,
+            'log': True,
+            'description': 'Disease effect regularization (TIGHTER than 2.0 — '
+                           'prevents v drift with large d)'
+        },
+        'sigma_gamma': {
+            'type': 'float',
+            'low': 0.2,
+            'high': 2.0,
+            'log': True,
+            'description': 'Auxiliary covariate regularization'
+        },
+        'regression_weight': {
+            'type': 'float',
+            'low': 50.0,
+            'high': 2000.0,
+            'log': True,
+            'description': 'Regression vs Poisson tradeoff '
+                           '(high values needed due to P/kappa scale difference)'
+        },
+
+        # =====================================================================
+        # SPIKE-AND-SLAB (for unmasked mode)
+        # =====================================================================
+        'pi_v': {
+            'type': 'float',
+            'low': 0.3,
+            'high': 0.95,
+            'log': False,
+            'description': 'Disease coefficient inclusion probability'
+        },
+
+        # =====================================================================
+        # CONVERGENCE
+        # =====================================================================
+        'local_iterations': {
+            'type': 'int',
+            'low': 5,
+            'high': 25,
+            'step': 5,
+            'description': 'Local CAVI iterations per mini-batch'
+        },
+        'ema_decay': {
+            'type': 'float',
+            'low': 0.85,
+            'high': 0.95,
+            'log': False,
+            'description': 'EMA smoothing for ELBO tracking'
+        },
+    }
+
+
 def get_search_space_for_data(data_type: str) -> Dict[str, Dict[str, Any]]:
     """
     Get appropriate search space based on data type.
 
     Args:
-        data_type: One of 'default', 'simulation', 'emtab', 'large'
+        data_type: One of 'default', 'simulation', 'emtab', 'pbmc', 'large'
 
     Returns:
         Search space dictionary
@@ -565,6 +741,8 @@ def get_search_space_for_data(data_type: str) -> Dict[str, Dict[str, Any]]:
         return get_simulation_search_space()
     elif data_type == 'emtab':
         return get_emtab_search_space()
+    elif data_type == 'pbmc':
+        return get_pbmc_search_space()
     elif data_type == 'large':
         # Large dataset space (conservative learning rate)
         space = get_default_search_space()
@@ -705,7 +883,7 @@ class SVIObjective:
     def __init__(
         self,
         data_path: str,
-        label_column: str,
+        label_column,  # str or List[str]
         aux_columns: Optional[List[str]] = None,
         gene_annotation_path: Optional[str] = None,
         cache_dir: Optional[str] = None,
@@ -734,7 +912,7 @@ class SVIObjective:
 
         Args:
             data_path: Path to h5ad file or EMTAB directory (auto-detected)
-            label_column: Column name for binary labels (in adata.obs or responses.csv.gz)
+            label_column: Column name(s) for binary labels. str or list of str.
             aux_columns: List of auxiliary feature column names
             gene_annotation_path: Path to gene annotation CSV (optional)
             cache_dir: Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)
@@ -928,7 +1106,12 @@ class SVIObjective:
         # Stratified subsampling using train_test_split
         # We keep the "train" part which has subsample_frac of the data
         # Convert JAX array to numpy for sklearn compatibility
-        y_flat = np.array(self._y_train).ravel()
+        # For multi-label y (n, kappa), stratify on first label column only
+        y_np = np.array(self._y_train)
+        if y_np.ndim == 2:
+            y_flat = y_np[:, 0]  # stratify on first outcome
+        else:
+            y_flat = y_np.ravel()
 
         try:
             # Use stratified split - keep only the selected subset
@@ -950,9 +1133,13 @@ class SVIObjective:
                 X_aux_sub = None
 
             if self.verbose:
-                # Log class distribution in subsample
-                pos_ratio = float(np.array(y_sub).sum()) / len(y_sub)
-                orig_pos_ratio = y_flat.sum() / len(y_flat)
+                # Log class distribution in subsample (first label only for multi-label)
+                y_sub_np = np.array(y_sub)
+                if y_sub_np.ndim == 2:
+                    pos_ratio = float(y_sub_np[:, 0].sum()) / y_sub_np.shape[0]
+                else:
+                    pos_ratio = float(y_sub_np.sum()) / len(y_sub_np)
+                orig_pos_ratio = float(y_flat.sum()) / len(y_flat)
                 logger.debug(
                     f"Trial {trial_number}: Subsampled {len(selected_indices)}/{n_train} samples "
                     f"(pos ratio: {orig_pos_ratio:.3f} -> {pos_ratio:.3f})"
@@ -1065,6 +1252,12 @@ class SVIObjective:
                 adaptive_regression_weight=params.get('adaptive_regression_weight', False),
                 regression_weight_warmup_epochs=params.get('regression_weight_warmup_epochs', 100),
                 regression_weight_schedule=params.get('regression_weight_schedule', 'linear'),
+                # Auto-balance regression weight
+                auto_balance_regression=params.get('auto_balance_regression', False),
+                regression_balance_target=params.get('regression_balance_target', 1.0),
+                max_regression_weight=params.get('max_regression_weight', None),
+                # LR schedule
+                lr_schedule_unit=params.get('lr_schedule_unit', 'epoch'),
             )
 
             # Train model on subsampled data with held-out validation tracking
@@ -1088,12 +1281,37 @@ class SVIObjective:
             )
 
             # Compute validation metrics (convert JAX arrays to numpy for sklearn)
-            y_val_np = np.array(self._y_val).ravel()
-            y_val_proba_np = np.array(y_val_proba).ravel()
-            val_auc = roc_auc_score(y_val_np, y_val_proba_np)
-            y_val_pred = (y_val_proba_np > 0.5).astype(int)
-            metrics = compute_metrics(y_val_np, y_val_pred, y_val_proba_np)
-            val_accuracy = metrics.get('accuracy', 0)
+            y_val_np = np.array(self._y_val)
+            y_val_proba_np = np.array(y_val_proba)
+
+            # Multi-label: evaluate per-label, average AUC
+            if y_val_np.ndim == 2 and y_val_np.shape[1] > 1:
+                kappa = y_val_np.shape[1]
+                aucs = []
+                accs = []
+                for k in range(kappa):
+                    try:
+                        aucs.append(roc_auc_score(y_val_np[:, k], y_val_proba_np[:, k]))
+                    except ValueError:
+                        aucs.append(0.5)  # single-class in fold
+                    pred_k = (y_val_proba_np[:, k] > 0.5).astype(int)
+                    accs.append(float(np.mean(pred_k == y_val_np[:, k])))
+                val_auc = float(np.mean(aucs))
+                val_accuracy = float(np.mean(accs))
+                # Store per-label metrics
+                label_names = self.label_column if isinstance(self.label_column, list) else [self.label_column]
+                for k in range(kappa):
+                    lname = label_names[k] if k < len(label_names) else f'label_{k}'
+                    trial.set_user_attr(f'val_auc_{lname}', aucs[k])
+                    trial.set_user_attr(f'val_accuracy_{lname}', accs[k])
+                metrics = {}  # skip single-label compute_metrics
+            else:
+                y_val_np = y_val_np.ravel()
+                y_val_proba_np = y_val_proba_np.ravel()
+                val_auc = roc_auc_score(y_val_np, y_val_proba_np)
+                y_val_pred = (y_val_proba_np > 0.5).astype(int)
+                metrics = compute_metrics(y_val_np, y_val_pred, y_val_proba_np)
+                val_accuracy = metrics.get('accuracy', 0)
 
             # Log trial result
             if self.verbose:
@@ -1554,8 +1772,10 @@ Examples:
     )
     parser.add_argument(
         '--label-column', '-l',
+        nargs='+',
         required=True,
-        help='Column name for binary labels (e.g., t2dm for h5ad, IBD for EMTAB)'
+        help='Column name(s) for binary labels. '
+             'Multiple columns enable multi-outcome inference (e.g., --label-column severity outcome).'
     )
     parser.add_argument(
         '--aux-columns', '-a',
@@ -1626,11 +1846,12 @@ Examples:
     )
     parser.add_argument(
         '--data-type',
-        choices=['default', 'simulation', 'emtab', 'large'],
+        choices=['default', 'simulation', 'emtab', 'pbmc', 'large'],
         default='default',
         help='Data type for search space selection: '
              'simulation (scdesign3 ~1k cells, 500 genes), '
              'emtab (~10k cells, 10k genes), '
+             'pbmc (scdesign3 PBMC 10k cells, 2k genes), '
              'large (>50k cells), '
              'default (generic). Default: auto-detect or default.'
     )
@@ -1659,14 +1880,14 @@ Examples:
     parser.add_argument(
         '--min-pathway-genes',
         type=int,
-        default=30,
-        help='Minimum number of genes for a pathway to be included (default: 30)'
+        default=0,
+        help='Minimum number of genes for a pathway to be included (default: 0 = no filter)'
     )
     parser.add_argument(
         '--max-pathway-genes',
         type=int,
-        default=200,
-        help='Maximum number of genes for a pathway to be included (default: 200)'
+        default=200000,
+        help='Maximum number of genes for a pathway to be included (default: 200000 = no filter)'
     )
     parser.add_argument(
         '--pathway-prefix',
@@ -1760,6 +1981,10 @@ def main():
     """Main entry point for the Bayesian optimization script."""
     args = parse_args()
 
+    # Normalize label_column: nargs='+' always yields list; unwrap for single-label
+    if isinstance(args.label_column, list) and len(args.label_column) == 1:
+        args.label_column = args.label_column[0]
+
     # Set up logging level
     if args.quiet:
         logging.getLogger().setLevel(logging.WARNING)
@@ -1817,10 +2042,19 @@ def main():
         data_gene_list = temp_data['gene_list']
         logger.info(f"Data contains {len(data_gene_list)} genes")
 
+        # Auto-detect gene ID format (same logic as quick_reference.py)
+        n_ensg = sum(1 for g in data_gene_list if g.startswith('ENSG'))
+        genes_are_ensembl = n_ensg > len(data_gene_list) * 0.5
+        convert_flag = genes_are_ensembl
+        logger.info(f"Gene ID format: {'Ensembl' if genes_are_ensembl else 'Symbol'} "
+                     f"({n_ensg}/{len(data_gene_list)} ENSG prefix) → convert_to_ensembl={convert_flag}")
+
         # Load pathways, filtering to genes in the data
         logger.info(f"Loading pathways from {args.gmt_file}...")
         pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
             gmt_path=args.gmt_file,
+            convert_to_ensembl=convert_flag,
+            species='human',
             gene_filter=data_gene_list,
             min_genes=args.min_pathway_genes,
             max_genes=args.max_pathway_genes,

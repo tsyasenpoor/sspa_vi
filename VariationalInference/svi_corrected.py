@@ -110,6 +110,14 @@ class SVICorrected:
         # Memory optimization
         target_memory_gb: float = 0.5,  # Target memory per batch for transform/heldout operations
 
+        # LR schedule unit
+        lr_schedule_unit: str = 'epoch',  # 'epoch' or 'iteration'
+
+        # Auto-balanced regression weight
+        auto_balance_regression: bool = False,
+        regression_balance_target: float = 1.0,  # Target ratio of regression/Poisson in θ update
+        max_regression_weight: Optional[float] = None,  # Cap for auto-balance (default: sqrt(P) at fit time)
+
         # Pathway mode: 'unmasked', 'masked', 'pathway_init', or 'combined'
         mode: str = 'unmasked',
         pathway_mask: Optional[np.ndarray] = None,  # (n_pathways, n_genes) binary matrix
@@ -216,8 +224,19 @@ class SVICorrected:
         """
         Robbins-Monro schedule: ρ_t = lr * (τ + t)^{-κ}
         Satisfies: Σ ρ_t = ∞, Σ ρ_t² < ∞
+
+        When lr_schedule_unit='epoch', t is divided by n_batches so the
+        schedule evolves per epoch rather than per mini-batch.  This avoids
+        premature decay when n_batches is large (e.g. 40 batches/epoch
+        would otherwise exhaust the schedule in ~12 epochs).
         """
-        rho = self.learning_rate * (self.learning_rate_delay + t) ** (-self.learning_rate_decay)
+        if (self.lr_schedule_unit == 'epoch'
+                and hasattr(self, 'n_batches_')
+                and self.n_batches_ > 0):
+            effective_t = t / self.n_batches_
+        else:
+            effective_t = t
+        rho = self.learning_rate * (self.learning_rate_delay + effective_t) ** (-self.learning_rate_decay)
         return max(rho, self.learning_rate_min)
 
     def _get_effective_regression_weight(self, epoch: int, max_epochs: int) -> float:
@@ -347,14 +366,14 @@ class SVICorrected:
     
     @staticmethod
     @jax.jit
-    def _gaussian_to_natural(mu: jnp.ndarray, Sigma: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def _gaussian_to_natural(mu: jnp.ndarray, sigma: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         N(μ, Σ) → natural parameters (η₁, η₂) = (Σ⁻¹μ, -½Σ⁻¹)
         JIT-compiled for performance.
         """
-        Sigma_inv = jnp.linalg.inv(Sigma + 1e-6 * jnp.eye(Sigma.shape[0]))
-        eta1 = Sigma_inv @ mu
-        eta2 = -0.5 * Sigma_inv
+        sigma_inv = jnp.linalg.inv(sigma + 1e-6 * jnp.eye(sigma.shape[0]))
+        eta1 = sigma_inv @ mu
+        eta2 = -0.5 * sigma_inv
         return eta1, eta2
     
     @staticmethod
@@ -368,18 +387,18 @@ class SVICorrected:
         """
         # Add regularization for numerical stability
         eta2_reg = eta2 - 1e-6 * jnp.eye(eta2.shape[0])
-        Sigma = -0.5 * jnp.linalg.inv(eta2_reg)
+        sigma = -0.5 * jnp.linalg.inv(eta2_reg)
         # Ensure symmetry and positive definiteness
-        Sigma = 0.5 * (Sigma + Sigma.T)
-        eigvals = jnp.linalg.eigvalsh(Sigma)
+        sigma = 0.5 * (sigma + sigma.T)
+        eigvals = jnp.linalg.eigvalsh(sigma)
         min_eigval = jnp.min(eigvals)
-        Sigma = jnp.where(
+        sigma = jnp.where(
             min_eigval < 1e-6,
-            Sigma + (1e-6 - min_eigval + 1e-8) * jnp.eye(Sigma.shape[0]),
-            Sigma
+            sigma + (1e-6 - min_eigval + 1e-8) * jnp.eye(sigma.shape[0]),
+            sigma
         )
-        mu = Sigma @ eta1
-        return mu, Sigma
+        mu = sigma @ eta1
+        return mu, sigma
     
     # =========================================================================
     # INITIALIZATION
@@ -558,15 +577,15 @@ class SVICorrected:
         v_init_scale = 0.5
         key_v1, key_v2 = random.split(key2, 2)
         self.mu_v = v_init_scale * random.normal(key_v1, (self.kappa, self.d))
-        self.Sigma_v = jnp.array([jnp.eye(self.d) * self.sigma_v**2 for _ in range(self.kappa)])
+        self.sigma_v = jnp.array([jnp.eye(self.d) * self.sigma_v**2 for _ in range(self.kappa)])
         
         # γ: Auxiliary coefficients, N(μ_γ, Σ_γ)
         if self.p_aux > 0:
             self.mu_gamma = jnp.zeros((self.kappa, self.p_aux))
-            self.Sigma_gamma = jnp.array([jnp.eye(self.p_aux) * self.sigma_gamma**2 for _ in range(self.kappa)])
+            self.sigma_gamma = jnp.array([jnp.eye(self.p_aux) * self.sigma_gamma**2 for _ in range(self.kappa)])
         else:
             self.mu_gamma = jnp.zeros((self.kappa, 0))
-            self.Sigma_gamma = jnp.zeros((self.kappa, 0, 0))
+            self.sigma_gamma = jnp.zeros((self.kappa, 0, 0))
 
         # Intercept/bias term: b ~ N(μ_b, σ_b²)
         # Adds learnable intercept to logit: A = θ @ v + aux @ γ + b
@@ -610,14 +629,14 @@ class SVICorrected:
         self.eta1_v = []
         self.eta2_v = []
         for k in range(self.kappa):
-            e1, e2 = self._gaussian_to_natural(self.mu_v[k], self.Sigma_v[k])
+            e1, e2 = self._gaussian_to_natural(self.mu_v[k], self.sigma_v[k])
             self.eta1_v.append(e1)
             self.eta2_v.append(e2)
         # gamma: Gaussian
         self.eta1_gamma = []
         self.eta2_gamma = []
         for k in range(self.kappa):
-            e1, e2 = self._gaussian_to_natural(self.mu_gamma[k], self.Sigma_gamma[k])
+            e1, e2 = self._gaussian_to_natural(self.mu_gamma[k], self.sigma_gamma[k])
             self.eta1_gamma.append(e1)
             self.eta2_gamma.append(e2)
     
@@ -627,10 +646,10 @@ class SVICorrected:
         self.a_eta, self.b_eta = self._natural_to_gamma(self.eta1_eta, self.eta2_eta)
         for k in range(self.kappa):
             self.mu_v = self.mu_v.at[k].set(self._natural_to_gaussian(self.eta1_v[k], self.eta2_v[k])[0])
-            self.Sigma_v = self.Sigma_v.at[k].set(self._natural_to_gaussian(self.eta1_v[k], self.eta2_v[k])[1])
+            self.sigma_v = self.sigma_v.at[k].set(self._natural_to_gaussian(self.eta1_v[k], self.eta2_v[k])[1])
             if self.p_aux > 0:
                 self.mu_gamma = self.mu_gamma.at[k].set(self._natural_to_gaussian(self.eta1_gamma[k], self.eta2_gamma[k])[0])
-                self.Sigma_gamma = self.Sigma_gamma.at[k].set(self._natural_to_gaussian(self.eta1_gamma[k], self.eta2_gamma[k])[1])
+                self.sigma_gamma = self.sigma_gamma.at[k].set(self._natural_to_gaussian(self.eta1_gamma[k], self.eta2_gamma[k])[1])
     
     def _compute_expectations(self):
         """Compute expected sufficient statistics from current parameters."""
@@ -701,7 +720,7 @@ class SVICorrected:
         # Use |μ_v| / σ_v as evidence (signal-to-noise ratio for factor importance)
 
         # Signal-to-noise ratio for each factor
-        v_snr = jnp.abs(self.mu_v) / (jnp.sqrt(jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)) + 1e-10)
+        v_snr = jnp.abs(self.mu_v) / (jnp.sqrt(jnp.diagonal(self.sigma_v, axis1=1, axis2=2)) + 1e-10)
 
         # Use a soft threshold: log(1 + SNR) to compress range
         log_lik_ratio_v = jnp.log1p(v_snr)
@@ -793,7 +812,7 @@ class SVICorrected:
             )  # Result: (batch, kappa, d)
             
             # E[v²_kℓ] for all outcomes: (kappa, d)
-            E_v_sq = self.mu_v**2 + jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)  # (kappa, d)
+            E_v_sq = self.mu_v**2 + jnp.diagonal(self.sigma_v, axis1=1, axis2=2)  # (kappa, d)
             
             # Expand y_batch to (batch, kappa)
             y_expanded = y_batch if y_batch.ndim > 1 else y_batch[:, jnp.newaxis]
@@ -977,9 +996,9 @@ class SVICorrected:
         mean_contrib = term1 - term2
 
         # Convert to mean and variance
-        Sigma_v_hat = jnp.zeros((self.kappa, self.d, self.d))
+        sigma_v_hat = jnp.zeros((self.kappa, self.d, self.d))
         for k in range(self.kappa):
-            Sigma_v_hat = Sigma_v_hat.at[k].set(jnp.diag(1.0 / precision[k]))
+            sigma_v_hat = sigma_v_hat.at[k].set(jnp.diag(1.0 / precision[k]))
 
         mu_v_hat = mean_contrib / precision
 
@@ -987,7 +1006,7 @@ class SVICorrected:
         # The -15 boundary was causing v's to get stuck at extremes
         mu_v_hat = jnp.clip(mu_v_hat, -5, 5)
 
-        return mu_v_hat, Sigma_v_hat
+        return mu_v_hat, sigma_v_hat
     
     def _compute_intermediate_gamma(
         self,
@@ -1011,7 +1030,7 @@ class SVICorrected:
         lam = self._lambda_jj(zeta)  # (batch, kappa)
         
         mu_gamma_hat = jnp.zeros((self.kappa, self.p_aux))
-        Sigma_gamma_hat = jnp.zeros((self.kappa, self.p_aux, self.p_aux))
+        sigma_gamma_hat = jnp.zeros((self.kappa, self.p_aux, self.p_aux))
         
         # Loop over outcomes (could be vectorized further but might be memory-intensive)
         for k in range(self.kappa):
@@ -1025,13 +1044,13 @@ class SVICorrected:
             theta_v = E_theta @ self.E_v_effective[k]  # (batch,)
             mean_contrib = scale * X_aux_batch.T @ (y_expanded[:, k] - 0.5 - 2 * lam[:, k] * theta_v)
             
-            Sigma_gamma_hat_k = jnp.linalg.inv(prec_hat)
-            mu_gamma_hat_k = Sigma_gamma_hat_k @ mean_contrib
+            sigma_gamma_hat_k = jnp.linalg.inv(prec_hat)
+            mu_gamma_hat_k = sigma_gamma_hat_k @ mean_contrib
             
             mu_gamma_hat = mu_gamma_hat.at[k].set(mu_gamma_hat_k)
-            Sigma_gamma_hat = Sigma_gamma_hat.at[k].set(Sigma_gamma_hat_k)
+            sigma_gamma_hat = sigma_gamma_hat.at[k].set(sigma_gamma_hat_k)
         
-        return mu_gamma_hat, Sigma_gamma_hat
+        return mu_gamma_hat, sigma_gamma_hat
 
     def _compute_intermediate_intercept(
         self,
@@ -1097,8 +1116,8 @@ class SVICorrected:
         rho_t: float,
         a_beta_hat: jnp.ndarray, b_beta_hat: jnp.ndarray,
         a_eta_hat: jnp.ndarray, b_eta_hat: jnp.ndarray,
-        mu_v_hat: jnp.ndarray, Sigma_v_hat: jnp.ndarray,
-        mu_gamma_hat: jnp.ndarray, Sigma_gamma_hat: jnp.ndarray,
+        mu_v_hat: jnp.ndarray, sigma_v_hat: jnp.ndarray,
+        mu_gamma_hat: jnp.ndarray, sigma_gamma_hat: jnp.ndarray,
         mu_intercept_hat: Optional[jnp.ndarray] = None
     ):
         """SVI update with gradient clipping and bounds.
@@ -1160,14 +1179,14 @@ class SVICorrected:
             mu_v_clip = self.mu_v[k] + mu_grad * mu_grad_scale
             self.mu_v = self.mu_v.at[k].set(jnp.clip((1 - rho_t) * self.mu_v[k] + rho_t * mu_v_clip, -10, 10))
             
-            Sigma_new = (1 - rho_t) * self.Sigma_v[k] + rho_t * Sigma_v_hat[k]
-            Sigma_new = 0.5 * (Sigma_new + Sigma_new.T)
-            eigvals = jnp.linalg.eigvalsh(Sigma_new)
+            sigma_new = (1 - rho_t) * self.sigma_v[k] + rho_t * sigma_v_hat[k]
+            sigma_new = 0.5 * (sigma_new + sigma_new.T)
+            eigvals = jnp.linalg.eigvalsh(sigma_new)
             min_eigval = jnp.min(eigvals)
             max_eigval = jnp.max(eigvals)
-            Sigma_new = jnp.where(min_eigval < 1e-4, Sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.d), Sigma_new)
-            Sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, Sigma_new + 1e-3 * jnp.eye(self.d), Sigma_new)
-            self.Sigma_v = self.Sigma_v.at[k].set(Sigma_new)
+            sigma_new = jnp.where(min_eigval < 1e-4, sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.d), sigma_new)
+            sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, sigma_new + 1e-3 * jnp.eye(self.d), sigma_new)
+            self.sigma_v = self.sigma_v.at[k].set(sigma_new)
         
         # gamma: clipped canonical update
         if self.p_aux > 0:
@@ -1178,14 +1197,14 @@ class SVICorrected:
                 mu_gamma_clip = self.mu_gamma[k] + mu_grad * mu_grad_scale
                 self.mu_gamma = self.mu_gamma.at[k].set(jnp.clip((1 - rho_t) * self.mu_gamma[k] + rho_t * mu_gamma_clip, -10, 10))
                 
-                Sigma_new = (1 - rho_t) * self.Sigma_gamma[k] + rho_t * Sigma_gamma_hat[k]
-                Sigma_new = 0.5 * (Sigma_new + Sigma_new.T)
-                eigvals = jnp.linalg.eigvalsh(Sigma_new)
+                sigma_new = (1 - rho_t) * self.sigma_gamma[k] + rho_t * sigma_gamma_hat[k]
+                sigma_new = 0.5 * (sigma_new + sigma_new.T)
+                eigvals = jnp.linalg.eigvalsh(sigma_new)
                 min_eigval = jnp.min(eigvals)
                 max_eigval = jnp.max(eigvals)
-                Sigma_new = jnp.where(min_eigval < 1e-4, Sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.p_aux), Sigma_new)
-                Sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, Sigma_new + 1e-3 * jnp.eye(self.p_aux), Sigma_new)
-                self.Sigma_gamma = self.Sigma_gamma.at[k].set(Sigma_new)
+                sigma_new = jnp.where(min_eigval < 1e-4, sigma_new + (1e-4 - min_eigval + 1e-6) * jnp.eye(self.p_aux), sigma_new)
+                sigma_new = jnp.where(max_eigval / (min_eigval + 1e-8) > 1e6, sigma_new + 1e-3 * jnp.eye(self.p_aux), sigma_new)
+                self.sigma_gamma = self.sigma_gamma.at[k].set(sigma_new)
 
         # Intercept: simple SVI update
         if self.use_intercept and mu_intercept_hat is not None:
@@ -1283,7 +1302,7 @@ class SVICorrected:
         intercept_contrib = self._get_intercept_contrib(E_theta.shape[0])
 
         E_A = E_theta @ self.E_v_effective.T + aux_contrib + intercept_contrib  # (batch, kappa)
-        E_v_sq = self.mu_v**2 + jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)  # (kappa, d)
+        E_v_sq = self.mu_v**2 + jnp.diagonal(self.sigma_v, axis1=1, axis2=2)  # (kappa, d)
         Var_theta = a_theta / (b_theta**2)  # (batch, d)
         E_A_sq = E_A**2 + (Var_theta @ E_v_sq.T)  # (batch, kappa)
 
@@ -1329,7 +1348,7 @@ class SVICorrected:
         for k in range(self.kappa):
             elbo_v -= 0.5 * self.d * jnp.log(2 * jnp.pi * self.sigma_v**2)
             elbo_v -= 0.5 / self.sigma_v**2 * (
-                jnp.sum(self.mu_v[k]**2) + jnp.trace(self.Sigma_v[k])
+                jnp.sum(self.mu_v[k]**2) + jnp.trace(self.sigma_v[k])
             )
         elbo += elbo_v
         
@@ -1340,7 +1359,7 @@ class SVICorrected:
             for k in range(self.kappa):
                 elbo_gamma -= 0.5 * self.p_aux * jnp.log(2 * jnp.pi * self.sigma_gamma**2)
                 elbo_gamma -= 0.5 / self.sigma_gamma**2 * (
-                    jnp.sum(self.mu_gamma[k]**2) + jnp.trace(self.Sigma_gamma[k])
+                    jnp.sum(self.mu_gamma[k]**2) + jnp.trace(self.sigma_gamma[k])
                 )
         elbo += elbo_gamma
 
@@ -1380,13 +1399,13 @@ class SVICorrected:
         # H[q(v)] - Multivariate Gaussian entropy: H[N(μ,Σ)] = d/2*(1+log(2π)) + 1/2*log|Σ|
         # Using slogdet for numerical stability (returns sign and log of determinant)
         for k in range(self.kappa):
-            sign, logdet = jnp.linalg.slogdet(self.Sigma_v[k])
+            sign, logdet = jnp.linalg.slogdet(self.sigma_v[k])
             elbo += jnp.where(sign > 0, 0.5 * self.d * (1 + jnp.log(2 * jnp.pi)) + 0.5 * logdet, 0.0)
         
         # H[q(γ)] - Multivariate Gaussian entropy
         if self.p_aux > 0:
             for k in range(self.kappa):
-                sign, logdet = jnp.linalg.slogdet(self.Sigma_gamma[k])
+                sign, logdet = jnp.linalg.slogdet(self.sigma_gamma[k])
                 elbo += jnp.where(sign > 0, 0.5 * self.p_aux * (1 + jnp.log(2 * jnp.pi)) + 0.5 * logdet, 0.0)
         
         # Return components separately for tracking
@@ -1415,10 +1434,10 @@ class SVICorrected:
             'b_eta': np.array(self.b_eta),
             # v (regression coefficients for factors)
             'mu_v': np.array(self.mu_v),
-            'Sigma_v': np.array(self.Sigma_v),
+            'sigma_v': np.array(self.sigma_v),
             # gamma (regression coefficients for auxiliary)
             'mu_gamma': np.array(self.mu_gamma),
-            'Sigma_gamma': np.array(self.Sigma_gamma),
+            'sigma_gamma': np.array(self.sigma_gamma),
         }
 
         # Intercept if used
@@ -1452,11 +1471,11 @@ class SVICorrected:
 
         # Restore v parameters
         self.mu_v = jnp.array(checkpoint['mu_v'])
-        self.Sigma_v = jnp.array(checkpoint['Sigma_v'])
+        self.sigma_v = jnp.array(checkpoint['sigma_v'])
 
         # Restore gamma parameters
         self.mu_gamma = jnp.array(checkpoint['mu_gamma'])
-        self.Sigma_gamma = jnp.array(checkpoint['Sigma_gamma'])
+        self.sigma_gamma = jnp.array(checkpoint['sigma_gamma'])
 
         # Restore intercept if used
         if self.use_intercept and 'mu_intercept' in checkpoint:
@@ -1883,10 +1902,10 @@ class SVICorrected:
                     X_batch, E_theta, E_log_theta, scale
                 )
                 a_eta_hat, b_eta_hat = self._compute_intermediate_eta(E_theta, scale)
-                mu_v_hat, Sigma_v_hat = self._compute_intermediate_v(
+                mu_v_hat, sigma_v_hat = self._compute_intermediate_v(
                     y_batch, X_aux_batch, E_theta, a_theta, b_theta, zeta, scale
                 )
-                mu_gamma_hat, Sigma_gamma_hat = self._compute_intermediate_gamma(
+                mu_gamma_hat, sigma_gamma_hat = self._compute_intermediate_gamma(
                     y_batch, X_aux_batch, E_theta, zeta, scale
                 )
 
@@ -1917,8 +1936,8 @@ class SVICorrected:
                     rho_t,
                     a_beta_hat, b_beta_hat,
                     a_eta_hat, b_eta_hat,
-                    mu_v_hat, Sigma_v_hat,
-                    mu_gamma_hat, Sigma_gamma_hat,
+                    mu_v_hat, sigma_v_hat,
+                    mu_gamma_hat, sigma_gamma_hat,
                     mu_intercept_hat
                 )
 
@@ -2260,7 +2279,7 @@ class SVICorrected:
         E_beta = self.a_beta / self.b_beta
         E_log_beta = jsp.digamma(self.a_beta) - jnp.log(self.b_beta)
         E_v = self.mu_v
-        E_v_sq = self.mu_v**2 + jnp.diagonal(self.Sigma_v, axis1=1, axis2=2)
+        E_v_sq = self.mu_v**2 + jnp.diagonal(self.sigma_v, axis1=1, axis2=2)
         E_gamma = self.mu_gamma
         
         beta_col_sums = E_beta.sum(axis=0)

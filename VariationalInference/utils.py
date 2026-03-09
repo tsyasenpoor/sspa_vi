@@ -336,10 +336,10 @@ def save_results(
                 'rho_beta': model.rho_beta,
                 # Classification weights
                 'mu_v': model.mu_v,
-                'Sigma_v_diag': np.array([np.diag(model.Sigma_v[k]) for k in range(model.kappa)]),  # Only diagonal
+                'sigma_v_diag': np.array(model.sigma_v_diag),  # Already diagonal (kappa, d)
                 'rho_v': model.rho_v,
                 'mu_gamma': model.mu_gamma,
-                'Sigma_gamma': model.Sigma_gamma,
+                'Sigma_gamma': np.array(model.Sigma_gamma),  # Posterior covariance
                 # Dimensions
                 'n': model.n,
                 'p': model.p,

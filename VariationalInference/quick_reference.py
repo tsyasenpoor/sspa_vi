@@ -159,6 +159,15 @@ def parse_args() -> argparse.Namespace:
         help='Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)'
     )
 
+    # Inference method selection
+    parser.add_argument(
+        '--method',
+        type=str,
+        default='svi',
+        choices=['vi', 'svi'],
+        help='Inference method: svi (stochastic variational inference) or vi (coordinate ascent VI)'
+    )
+
     # Mode selection
     parser.add_argument(
         '--mode',
@@ -250,27 +259,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help='Weight for classification objective (higher=more focus on classification)'
-    )
-    parser.add_argument(
-        '--auto-balance-regression',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Automatically balance Poisson and regression contributions to theta updates. '
-             'Computes scale ratio each epoch and adjusts regression_weight dynamically.'
-    )
-    parser.add_argument(
-        '--regression-balance-target',
-        type=float,
-        default=1.0,
-        help='Target ratio of regression vs Poisson contribution in theta update '
-             '(only used with --auto-balance-regression true). 1.0 = equal influence.'
-    )
-    parser.add_argument(
-        '--max-regression-weight',
-        type=float,
-        default=None,
-        help='Maximum regression weight for auto-balance (default: sqrt(P)). '
-             'Caps the auto-balance to prevent b_theta overflow from large weights.'
     )
     parser.add_argument(
         '--elbo-freq',
@@ -478,6 +466,101 @@ def parse_args() -> argparse.Namespace:
         help='Schedule for regression weight warmup'
     )
 
+    # VI (CAVI) specific training options
+    parser.add_argument(
+        '--max-iter',
+        type=int,
+        default=200,
+        help='[VI only] Maximum iterations for coordinate ascent VI'
+    )
+    parser.add_argument(
+        '--tol',
+        type=float,
+        default=10.0,
+        help='[VI only] Absolute ELBO change tolerance'
+    )
+    parser.add_argument(
+        '--rel-tol',
+        type=float,
+        default=2e-4,
+        help='[VI only] Relative ELBO change tolerance for convergence'
+    )
+    parser.add_argument(
+        '--min-iter',
+        type=int,
+        default=50,
+        help='[VI only] Minimum iterations before convergence check'
+    )
+    parser.add_argument(
+        '--patience',
+        type=int,
+        default=5,
+        help='[VI only] Number of iterations below rel_tol to trigger convergence'
+    )
+    parser.add_argument(
+        '--theta-damping',
+        type=float,
+        default=0.8,
+        help='[VI only] Damping factor for theta updates'
+    )
+    parser.add_argument(
+        '--beta-damping',
+        type=float,
+        default=0.8,
+        help='[VI only] Damping factor for beta updates'
+    )
+    parser.add_argument(
+        '--v-damping',
+        type=float,
+        default=0.1,
+        help='[VI only] Damping factor for v updates'
+    )
+    parser.add_argument(
+        '--gamma-damping',
+        type=float,
+        default=0.1,
+        help='[VI only] Damping factor for gamma updates'
+    )
+    parser.add_argument(
+        '--xi-damping',
+        type=float,
+        default=0.9,
+        help='[VI only] Damping factor for xi updates'
+    )
+    parser.add_argument(
+        '--eta-damping',
+        type=float,
+        default=0.9,
+        help='[VI only] Damping factor for eta updates'
+    )
+    parser.add_argument(
+        '--adaptive-damping',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        help='[VI only] Enable adaptive damping (increase damping when ELBO drops)'
+    )
+    parser.add_argument(
+        '--v-warmup',
+        type=int,
+        default=50,
+        help='[VI only] Number of pure-Poisson warmup iterations before '
+             'engaging regression (v/gamma) updates. Lets factors differentiate first.'
+    )
+    parser.add_argument(
+        '--v-anneal',
+        type=int,
+        default=50,
+        help='[VI only] Number of iterations to linearly anneal regression_weight '
+             'from 0 to target after warmup. Prevents v oscillation.'
+    )
+    parser.add_argument(
+        '--v-update-freq',
+        type=int,
+        default=5,
+        help='[VI only] Update v/gamma every N iterations after warmup. '
+             'Lets theta equilibrate between v updates, preventing oscillation.'
+    )
+
     # Memory optimization
     parser.add_argument(
         '--target-memory-gb',
@@ -627,7 +710,12 @@ def main():
     # =========================================================================
     # STEP 2: Import Modules
     # =========================================================================
-    from VariationalInference.svi_corrected import SVI
+    if args.method == 'vi':
+        from VariationalInference.vi_cavi import CAVI as ModelClass
+        print("[METHOD] Using Coordinate Ascent VI (full-batch)")
+    else:
+        from VariationalInference.svi_corrected import SVI as ModelClass
+        print("[METHOD] Using Stochastic Variational Inference")
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
         compute_metrics, save_results, print_model_summary, load_pathways
@@ -823,16 +911,21 @@ def main():
     print(f"  sigma_gamma:  {args.sigma_gamma:.4f}")
     print(f"  pi_v:         {args.pi_v:.4f}")
     print(f"  pi_beta:      {args.pi_beta:.4f}")
-    print(f"  count_scale:  {args.count_scale if args.count_scale else 'auto'}")
-    print(f"  lr_schedule:  {args.lr_schedule_unit}")
-    print(f"  auto_balance: {args.auto_balance_regression}"
-          + (f" (target={args.regression_balance_target}, max_w={args.max_regression_weight or 'sqrt(P)'})" if args.auto_balance_regression else ""))
+    if args.method == 'svi':
+        print(f"  count_scale:  {args.count_scale if args.count_scale else 'auto'}")
+        print(f"  lr_schedule:  {args.lr_schedule_unit}")
+        print(f"  auto_balance: {getattr(args, 'auto_balance_regression', False)}"
+              + (f" (target={getattr(args, 'regression_balance_target', 'N/A')}, max_w={getattr(args, 'max_regression_weight', None) or 'sqrt(P)'})" if getattr(args, 'auto_balance_regression', False) else ""))
+    else:
+        print(f"  method:       vi (coordinate ascent)")
+        print(f"  max_iter:     {args.max_iter}")
+        print(f"  rel_tol:      {args.rel_tol}")
 
     # =========================================================================
-    # STEP 4: Train SVI Model
+    # STEP 4: Train Model
     # =========================================================================
     print("\n" + "=" * 80)
-    print("Training SVI Model")
+    print(f"Training {args.method.upper()} Model")
     print("=" * 80)
     
     print(f"\nModel Configuration:")
@@ -849,20 +942,10 @@ def main():
         print(f"  n_pathway_factors: {n_pathway_factors}")
         print(f"  n_drgps:          {args.n_drgps}")
 
-    # Create SVI model
-    model = SVI(
-        n_factors=n_factors,  # Use n_factors (may be overridden by pathway count)
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        learning_rate_decay=args.learning_rate_decay,
-        learning_rate_delay=args.learning_rate_delay,
-        learning_rate_min=args.learning_rate_min,
-        lr_schedule_unit=args.lr_schedule_unit,
-        local_iterations=args.local_iterations,
+    # Common model kwargs (shared by SVI and VI)
+    common_kwargs = dict(
+        n_factors=n_factors,
         regression_weight=args.regression_weight,
-        auto_balance_regression=args.auto_balance_regression,
-        regression_balance_target=args.regression_balance_target,
-        max_regression_weight=args.max_regression_weight,
         alpha_theta=alpha_theta,
         alpha_beta=args.alpha_beta,
         alpha_xi=args.alpha_xi,
@@ -873,53 +956,91 @@ def main():
         sigma_gamma=args.sigma_gamma,
         pi_v=args.pi_v,
         pi_beta=args.pi_beta,
-        count_scale=args.count_scale,
         random_state=args.seed,
         use_spike_slab=args.use_spike_slab,
-        ema_decay=args.ema_decay,
-        convergence_tol=args.convergence_tol,
-        convergence_window=args.convergence_window,
-        # Early stopping settings
-        early_stopping_metric=args.early_stopping_metric,
-        heldout_ll_patience=args.heldout_ll_patience,
-        heldout_ll_ema_decay=args.heldout_ll_ema_decay,
-        restore_best_heldout=args.restore_best_heldout,
-        min_epochs_before_stopping=args.min_epochs_before_stopping,
-        regression_ll_patience=args.regression_ll_patience,
-        # Pathway mode settings
+        # Pathway mode
         mode=args.mode,
         pathway_mask=pathway_mask,
         pathway_names=pathway_names,
-        n_pathway_factors=n_pathway_factors,  # For combined mode boundary
-        # V-collapse mitigation options
-        use_intercept=args.use_intercept,
-        sigma_intercept=args.sigma_intercept,
-        two_step_training=args.two_step_training,
-        two_step_phase1_ratio=args.two_step_phase1_ratio,
-        two_step_freeze_beta=args.two_step_freeze_beta,
-        two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
-        adaptive_regression_weight=args.adaptive_regression_weight,
-        regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
-        regression_weight_schedule=args.regression_weight_schedule,
-        # Memory optimization
-        target_memory_gb=args.target_memory_gb
+        n_pathway_factors=n_pathway_factors,
     )
 
-    # Train model with held-out validation data for convergence tracking
-    model.fit(
+    if args.method == 'svi':
+        # SVI-specific kwargs (includes V-collapse mitigation, which VI doesn't use)
+        common_kwargs.update(
+            use_intercept=args.use_intercept,
+            sigma_intercept=args.sigma_intercept,
+            two_step_training=args.two_step_training,
+            two_step_phase1_ratio=args.two_step_phase1_ratio,
+            two_step_freeze_beta=args.two_step_freeze_beta,
+            two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
+            adaptive_regression_weight=args.adaptive_regression_weight,
+            regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
+            regression_weight_schedule=args.regression_weight_schedule,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            learning_rate_decay=args.learning_rate_decay,
+            learning_rate_delay=args.learning_rate_delay,
+            learning_rate_min=args.learning_rate_min,
+            lr_schedule_unit=args.lr_schedule_unit,
+            local_iterations=args.local_iterations,
+            auto_balance_regression=args.auto_balance_regression,
+            regression_balance_target=args.regression_balance_target,
+            max_regression_weight=args.max_regression_weight,
+            count_scale=args.count_scale,
+            ema_decay=args.ema_decay,
+            convergence_tol=args.convergence_tol,
+            convergence_window=args.convergence_window,
+            early_stopping_metric=args.early_stopping_metric,
+            heldout_ll_patience=args.heldout_ll_patience,
+            heldout_ll_ema_decay=args.heldout_ll_ema_decay,
+            restore_best_heldout=args.restore_best_heldout,
+            min_epochs_before_stopping=args.min_epochs_before_stopping,
+            regression_ll_patience=args.regression_ll_patience,
+            target_memory_gb=args.target_memory_gb,
+        )
+
+    # Create model
+    model = ModelClass(**common_kwargs)
+
+    # Common fit kwargs
+    fit_kwargs = dict(
         X=X_train,
         y=y_train,
         X_aux=X_aux_train,
-        max_epochs=args.max_epochs,
         elbo_freq=args.elbo_freq,
         verbose=True,
         early_stopping=args.early_stopping,
-        # Held-out data for Blei-style convergence tracking
         X_heldout=X_val,
         y_heldout=y_val,
         X_aux_heldout=X_aux_val,
-        heldout_freq=5  # Compute held-out LL every 5 epochs
+        heldout_freq=5,
     )
+
+    if args.method == 'svi':
+        fit_kwargs['max_epochs'] = args.max_epochs
+    else:
+        # VI-specific fit kwargs
+        fit_kwargs.update(
+            max_iter=args.max_iter,
+            tol=args.tol,
+            rel_tol=args.rel_tol,
+            min_iter=args.min_iter,
+            patience=args.patience,
+            theta_damping=args.theta_damping,
+            beta_damping=args.beta_damping,
+            v_damping=args.v_damping,
+            gamma_damping=args.gamma_damping,
+            xi_damping=args.xi_damping,
+            eta_damping=args.eta_damping,
+            adaptive_damping=args.adaptive_damping,
+            v_warmup=args.v_warmup,
+            v_anneal=args.v_anneal,
+            debug=args.debug,
+        )
+
+    # Train model
+    model.fit(**fit_kwargs)
 
     print("\nTraining complete!")
     print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
@@ -966,9 +1087,9 @@ def main():
         'E_beta': np.array(model.E_beta),
         'E_log_beta': np.array(model.E_log_beta),
         'mu_v': np.array(model.mu_v),
-        'Sigma_v': np.array(model.Sigma_v),
+        'sigma_v_diag': np.array(model.sigma_v_diag) if args.method == 'vi' else np.array(model.sigma_v),
         'mu_gamma': np.array(model.mu_gamma),
-        'Sigma_gamma': np.array(model.Sigma_gamma),
+        'sigma_gamma': np.array(model.sigma_gamma),
         'n': model.n,
         'p': model.p,
         'kappa': model.kappa,

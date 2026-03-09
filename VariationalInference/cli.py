@@ -188,6 +188,15 @@ def create_parser() -> argparse.ArgumentParser:
         help='Early stopping patience'
     )
 
+    # Inference method selection
+    train_parser.add_argument(
+        '--method',
+        type=str,
+        default='svi',
+        choices=['vi', 'svi'],
+        help='Inference method: vi (coordinate ascent, full-batch) or svi (stochastic, mini-batch)'
+    )
+
     # SVI-specific parameters (only used when --method svi)
     train_parser.add_argument(
         '--batch-size',
@@ -512,9 +521,14 @@ def cmd_train(args: argparse.Namespace) -> int:
     import cProfile
     import pstats
     import io
-    from .svi import SVI
     from .data_loader import DataLoader
     from .utils import save_results, compute_metrics, print_model_summary
+
+    method = getattr(args, 'method', 'svi').lower()
+    if method == 'vi':
+        from .vi_cavi import CAVI as ModelClass
+    else:
+        from .svi_corrected import SVICorrected as ModelClass
 
     # Initialize profiler if requested
     profiler = None
@@ -523,8 +537,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         profiler.enable()
         print("\n[PROFILER] Profiling enabled - measuring function execution times...")
 
+    method_label = 'COORDINATE ASCENT VI' if method == 'vi' else 'STOCHASTIC VI'
     print("=" * 60)
-    print("STOCHASTIC VARIATIONAL INFERENCE TRAINING")
+    print(f"{method_label} TRAINING")
     print("=" * 60)
 
     # Print configuration
@@ -574,17 +589,12 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     # Create and train model
     print("\n" + "-" * 40)
-    print("Training SVI model...")
+    print(f"Training {method.upper()} model...")
     print("-" * 40)
 
-    model = SVI(
+    # Build common model kwargs
+    model_kwargs = dict(
         n_factors=args.n_factors,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        learning_rate_decay=args.learning_rate_decay,
-        learning_rate_delay=args.learning_rate_delay,
-        learning_rate_min=args.learning_rate_min,
-        local_iterations=args.local_iterations,
         regression_weight=args.regression_weight,
         alpha_theta=args.alpha_theta,
         alpha_beta=args.alpha_beta,
@@ -592,39 +602,62 @@ def cmd_train(args: argparse.Namespace) -> int:
         pi_v=args.pi_v,
         pi_beta=args.pi_beta,
         random_state=args.seed,
-        # Early stopping settings
-        early_stopping_metric=getattr(args, 'early_stopping_metric', 'elbo'),
-        heldout_ll_patience=getattr(args, 'heldout_ll_patience', 10),
-        regression_ll_patience=getattr(args, 'regression_ll_patience', 10),
-        min_epochs_before_stopping=getattr(args, 'min_epochs_before_stopping', 20),
-        # V-collapse mitigation options
-        use_intercept=args.use_intercept,
-        sigma_intercept=args.sigma_intercept,
-        two_step_training=args.two_step_training,
-        two_step_phase1_ratio=args.two_step_phase1_ratio,
-        two_step_freeze_beta=args.two_step_freeze_beta,
-        two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
-        adaptive_regression_weight=args.adaptive_regression_weight,
-        regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
-        regression_weight_schedule=args.regression_weight_schedule,
-        # Memory optimization
-        target_memory_gb=args.target_memory_gb
     )
 
-    model.fit(
-        X=X_train,
-        y=y_train,
-        X_aux=X_aux_train,
-        max_epochs=args.max_epochs,
-        elbo_freq=10,
-        verbose=args.verbose,
-        early_stopping=getattr(args, 'early_stopping', False),
-        # Held-out data for Blei-style convergence tracking
-        X_heldout=X_val,
-        y_heldout=y_val,
-        X_aux_heldout=X_aux_val,
-        heldout_freq=5
-    )
+    if method == 'svi':
+        # SVI-specific kwargs (includes V-collapse mitigation, which VI doesn't use)
+        model_kwargs.update(
+            use_intercept=args.use_intercept,
+            sigma_intercept=args.sigma_intercept,
+            two_step_training=args.two_step_training,
+            two_step_phase1_ratio=args.two_step_phase1_ratio,
+            two_step_freeze_beta=args.two_step_freeze_beta,
+            two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
+            adaptive_regression_weight=args.adaptive_regression_weight,
+            regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
+            regression_weight_schedule=args.regression_weight_schedule,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            learning_rate_decay=args.learning_rate_decay,
+            learning_rate_delay=args.learning_rate_delay,
+            learning_rate_min=args.learning_rate_min,
+            local_iterations=args.local_iterations,
+            early_stopping_metric=getattr(args, 'early_stopping_metric', 'elbo'),
+            heldout_ll_patience=getattr(args, 'heldout_ll_patience', 10),
+            regression_ll_patience=getattr(args, 'regression_ll_patience', 10),
+            min_epochs_before_stopping=getattr(args, 'min_epochs_before_stopping', 20),
+            target_memory_gb=args.target_memory_gb,
+        )
+
+    model = ModelClass(**model_kwargs)
+
+    # Build fit kwargs
+    if method == 'svi':
+        fit_kwargs = dict(
+            X=X_train, y=y_train, X_aux=X_aux_train,
+            max_epochs=args.max_epochs,
+            elbo_freq=10,
+            verbose=args.verbose,
+            early_stopping=getattr(args, 'early_stopping', False),
+            X_heldout=X_val, y_heldout=y_val, X_aux_heldout=X_aux_val,
+            heldout_freq=5,
+        )
+    else:
+        fit_kwargs = dict(
+            X=X_train, y=y_train, X_aux=X_aux_train,
+            max_iter=getattr(args, 'max_iter', 200),
+            tol=getattr(args, 'tol', 10.0),
+            rel_tol=getattr(args, 'rel_tol', 2e-4),
+            elbo_freq=10,
+            min_iter=getattr(args, 'min_iter', 50),
+            patience=getattr(args, 'patience', 5),
+            verbose=args.verbose,
+            X_heldout=X_val, y_heldout=y_val, X_aux_heldout=X_aux_val,
+            heldout_freq=5,
+            early_stopping=getattr(args, 'early_stopping', False),
+        )
+
+    model.fit(**fit_kwargs)
 
     # Evaluate on validation set
     print("\n" + "-" * 40)

@@ -317,3 +317,13 @@ VariationalInference/notebooks/convergence_analysis.ipynb
 BRAY_FileTransfer/ENS_biomaRt_humanGRCh38_genebiotypes_Jan102024.csv
 BRAY_FileTransfer/Covid19/control_adata.h5ad
 jobs_sh/sim_comb.sh
+VariationalInference/notebooks/pathways.ipynb
+BRAY_FileTransfer/Covid19/covid19_filtered_fullgenes_clean.h5ad
+VariationalInference/ISMB_2026__Supervised_Poisson_Factorization_for_Identifying_Gene_Program_Environment_Interactions (6).pdf
+jobs_sh/sim_spectra.sh
+jobs_sh/sim_schpf.sh
+jobs_sh/sim_schpf_baselines.sh
+jobs_sh/sim_baseline.sh
+jobs_sh/pbmc_comb.sh
+VariationalInference/scdesign3/t.ipynb
+VariationalInference/scdesign3/tst.py
