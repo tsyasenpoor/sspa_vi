@@ -44,9 +44,7 @@ For more information:
 For CLI usage:
     python -m VariationalInference.cli train --help
 """
-import os 
-os.environ['XLA_FLAGS'] = '--xla_gpu_enable_triton_gemm=false'
-
+import os
 import sys
 from pathlib import Path
 
@@ -61,46 +59,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from typing import Optional, List
-from scipy.special import expit
 from sklearn.metrics import precision_recall_curve
-
-
-def compute_proba_from_theta(model, E_theta, X_aux=None, verbose=False):
-    """
-    Compute class probabilities directly from E_theta.
-    
-    This avoids redundant transform calls when E_theta is already available
-    from a previous transform_batched() call.
-    
-    Parameters
-    ----------
-    model : trained SVI model
-    E_theta : (n, d) expected theta values from transform_batched
-    X_aux : (n, p_aux) auxiliary covariates, or None
-    verbose : print debug info
-    
-    Returns
-    -------
-    proba : (n,) predicted probabilities
-    """
-    # Compute logits: E_theta @ mu_v.T
-    logits = E_theta @ np.array(model.mu_v).T
-    
-    # Add auxiliary covariate contribution if present
-    if model.p_aux > 0 and model.mu_gamma is not None and X_aux is not None:
-        logits = logits + X_aux @ np.array(model.mu_gamma).T
-    
-    # Add intercept if enabled
-    if hasattr(model, 'use_intercept') and model.use_intercept:
-        logits = logits + np.array(model.mu_intercept)[np.newaxis, :]
-    
-    # Apply sigmoid to get probabilities
-    proba = expit(logits).squeeze()
-    
-    if verbose:
-        print(f"Predicted probabilities: min={proba.min():.4f}, max={proba.max():.4f}")
-    
-    return proba
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,40 +172,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--max-epochs',
         type=int,
-        default=100,
+        default=500,
         help='Maximum epochs for SVI'
-    )
-    parser.add_argument(
-        '--learning-rate',
-        type=float,
-        default=0.01,
-        help='Initial learning rate for SVI'
     )
     parser.add_argument(
         '--learning-rate-decay',
         type=float,
         default=0.75,
-        help='Learning rate decay exponent (kappa) for SVI'
+        help='Learning rate decay exponent (kappa) for SVI Robbins-Monro schedule'
     )
     parser.add_argument(
         '--learning-rate-delay',
         type=float,
         default=1.0,
-        help='Learning rate delay (tau) for SVI'
-    )
-    parser.add_argument(
-        '--learning-rate-min',
-        type=float,
-        default=1e-4,
-        help='Minimum learning rate for SVI to prevent stagnation'
-    )
-    parser.add_argument(
-        '--lr-schedule-unit',
-        type=str,
-        default='epoch',
-        choices=['epoch', 'iteration'],
-        help='Learning rate schedule unit: epoch (recommended) or iteration (legacy Robbins-Monro). '
-             'Epoch-based prevents premature LR decay when n_batches is large.'
+        help='Learning rate delay (tau) for SVI Robbins-Monro schedule'
     )
     parser.add_argument(
         '--local-iterations',
@@ -261,117 +200,30 @@ def parse_args() -> argparse.Namespace:
         help='Weight for classification objective (higher=more focus on classification)'
     )
     parser.add_argument(
-        '--elbo-freq',
+        '--check-freq',
         type=int,
-        default=1,
-        help='Compute ELBO every N iterations'
+        default=5,
+        help='Check convergence / compute held-out LL every N iterations/epochs'
     )
     
-    # Convergence options
+    # Hyperparameter options (scHPF priors — defaults work well, rarely need tuning)
     parser.add_argument(
-        '--ema-decay',
+        '--a',
         type=float,
-        default=0.95,
-        help='EMA smoothing factor for ELBO tracking (lower=faster response, default: 0.95)'
+        default=0.3,
+        help='Gamma shape prior for theta (cell loadings). scHPF default 0.3.'
     )
     parser.add_argument(
-        '--convergence-tol',
+        '--c',
         type=float,
-        default=1e-4,
-        help='Relative change threshold for convergence (default: 1e-4)'
-    )
-    parser.add_argument(
-        '--convergence-window',
-        type=int,
-        default=10,
-        help='Number of consecutive epochs below tol to trigger convergence (default: 10)'
-    )
-    parser.add_argument(
-        '--early-stopping',
-        action='store_true',
-        default=False,
-        help='Enable early stopping when ELBO converges (recommended for stability)'
-    )
-    parser.add_argument(
-        '--early-stopping-metric',
-        type=str,
-        default='elbo',
-        choices=['elbo', 'heldout_ll'],
-        help='Metric for early stopping: elbo (training) or heldout_ll (validation)'
-    )
-    parser.add_argument(
-        '--heldout-ll-patience',
-        type=int,
-        default=10,
-        help='Epochs without HO-LL improvement before stopping (only for heldout_ll metric)'
-    )
-    parser.add_argument(
-        '--heldout-ll-ema-decay',
-        type=float,
-        default=0.9,
-        help='EMA smoothing for HO-LL tracking (lower=faster response)'
-    )
-    parser.add_argument(
-        '--restore-best-heldout',
-        action='store_true',
-        default=True,
-        help='Restore parameters to best HO-LL epoch on early stop'
-    )
-    parser.add_argument(
-        '--min-epochs-before-stopping',
-        type=int,
-        default=20,
-        help='Minimum epochs before early stopping can trigger'
-    )
-    parser.add_argument(
-        '--regression-ll-patience',
-        type=int,
-        default=10,
-        help='Epochs without regression LL improvement before stopping (only for regression_ll metric)'
-    )
-
-    # Hyperparameter options (Priors & Regularization)
-    parser.add_argument(
-        '--alpha-theta',
-        type=float,
-        default=None,
-        help='Gamma prior shape for theta (gene programs). None=auto (1.0 for N<200, 0.5 else)'
-    )
-    parser.add_argument(
-        '--alpha-beta',
-        type=float,
-        default=2.0,
-        help='Gamma prior shape for beta (gene-program loadings)'
-    )
-    parser.add_argument(
-        '--alpha-xi',
-        type=float,
-        default=2.0,
-        help='Gamma prior shape for xi (auxiliary precision)'
-    )
-    parser.add_argument(
-        '--alpha-eta',
-        type=float,
-        default=2.0,
-        help='Gamma prior shape for eta (gene-specific precision)'
-    )
-    parser.add_argument(
-        '--lambda-xi',
-        type=float,
-        default=2.0,
-        help='Gamma prior rate for xi'
-    )
-    parser.add_argument(
-        '--lambda-eta',
-        type=float,
-        default=2.0,
-        help='Gamma prior rate for eta'
+        default=0.3,
+        help='Gamma shape prior for beta (gene loadings). scHPF default 0.3.'
     )
     parser.add_argument(
         '--sigma-v',
         type=float,
-        default=None,
-        help='Gaussian prior std for v (classification weights). None=auto (1.0 for N<200, 2.0 else)'
+        default=1.0,
+        help='Gaussian prior std for v (classification weights).'
     )
     parser.add_argument(
         '--sigma-gamma',
@@ -380,195 +232,30 @@ def parse_args() -> argparse.Namespace:
         help='Gaussian prior std for gamma (auxiliary effects)'
     )
     parser.add_argument(
-        '--pi-v',
-        type=float,
-        default=0.5,
-        help='Spike-and-slab prior probability for v (0=all spike, 1=all slab)'
-    )
-    parser.add_argument(
-        '--pi-beta',
-        type=float,
-        default=0.5,
-        help='Spike-and-slab prior probability for beta'
-    )
-    parser.add_argument(
-        '--use-spike-slab',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Use spike-and-slab priors (default: False). Set to True for sparse priors.'
-    )
-    parser.add_argument(
-        '--count-scale',
-        type=float,
-        default=None,
-        help='Count scaling factor for Poisson likelihood. None=auto (median library size)'
-    )
-
-    # V-collapse mitigation options
-    # Option 1: Intercept term
-    parser.add_argument(
-        '--use-intercept',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Add learnable intercept term to logit (helps with v-collapse)'
-    )
-    parser.add_argument(
-        '--sigma-intercept',
-        type=float,
-        default=1.0,
-        help='Gaussian prior std for intercept term'
-    )
-
-    # Option 2: Two-step training
-    parser.add_argument(
-        '--two-step-training',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Use two-step training: learn gene programs first, then regression'
-    )
-    parser.add_argument(
-        '--two-step-phase1-ratio',
-        type=float,
-        default=0.3,
-        help='Fraction of epochs for phase 1 (reconstruction only)'
-    )
-    parser.add_argument(
-        '--two-step-freeze-beta',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=True,
-        help='Freeze beta during phase 2 (default: True)'
-    )
-    parser.add_argument(
-        '--two-step-phase2-beta-lr-mult',
-        type=float,
-        default=0.1,
-        help='Learning rate multiplier for beta in phase 2 (if not frozen)'
-    )
-
-    # Option 3: Adaptive regression weight
-    parser.add_argument(
-        '--adaptive-regression-weight',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Gradually warm up regression_weight during training'
-    )
-    parser.add_argument(
-        '--regression-weight-warmup-epochs',
+        '--heldout-patience',
         type=int,
-        default=100,
-        help='Number of epochs to warm up regression weight'
-    )
-    parser.add_argument(
-        '--regression-weight-schedule',
-        type=str,
-        default='linear',
-        choices=['linear', 'cosine', 'exponential'],
-        help='Schedule for regression weight warmup'
+        default=50,
+        help='[SVI] Epochs without HO-LL improvement before stopping'
     )
 
     # VI (CAVI) specific training options
     parser.add_argument(
         '--max-iter',
         type=int,
-        default=200,
+        default=600,
         help='[VI only] Maximum iterations for coordinate ascent VI'
     )
     parser.add_argument(
         '--tol',
         type=float,
-        default=10.0,
-        help='[VI only] Absolute ELBO change tolerance'
-    )
-    parser.add_argument(
-        '--rel-tol',
-        type=float,
-        default=2e-4,
-        help='[VI only] Relative ELBO change tolerance for convergence'
-    )
-    parser.add_argument(
-        '--min-iter',
-        type=int,
-        default=50,
-        help='[VI only] Minimum iterations before convergence check'
-    )
-    parser.add_argument(
-        '--patience',
-        type=int,
-        default=5,
-        help='[VI only] Number of iterations below rel_tol to trigger convergence'
-    )
-    parser.add_argument(
-        '--theta-damping',
-        type=float,
-        default=0.8,
-        help='[VI only] Damping factor for theta updates'
-    )
-    parser.add_argument(
-        '--beta-damping',
-        type=float,
-        default=0.8,
-        help='[VI only] Damping factor for beta updates'
-    )
-    parser.add_argument(
-        '--v-damping',
-        type=float,
-        default=0.1,
-        help='[VI only] Damping factor for v updates'
-    )
-    parser.add_argument(
-        '--gamma-damping',
-        type=float,
-        default=0.1,
-        help='[VI only] Damping factor for gamma updates'
-    )
-    parser.add_argument(
-        '--xi-damping',
-        type=float,
-        default=0.9,
-        help='[VI only] Damping factor for xi updates'
-    )
-    parser.add_argument(
-        '--eta-damping',
-        type=float,
-        default=0.9,
-        help='[VI only] Damping factor for eta updates'
-    )
-    parser.add_argument(
-        '--adaptive-damping',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=True,
-        help='[VI only] Enable adaptive damping (increase damping when ELBO drops)'
+        default=0.001,
+        help='[VI only] Convergence tolerance (percent change in loss)'
     )
     parser.add_argument(
         '--v-warmup',
         type=int,
         default=50,
-        help='[VI only] Number of pure-Poisson warmup iterations before '
-             'engaging regression (v/gamma) updates. Lets factors differentiate first.'
-    )
-    parser.add_argument(
-        '--v-anneal',
-        type=int,
-        default=50,
-        help='[VI only] Number of iterations to linearly anneal regression_weight '
-             'from 0 to target after warmup. Prevents v oscillation.'
-    )
-    parser.add_argument(
-        '--v-update-freq',
-        type=int,
-        default=5,
-        help='[VI only] Update v/gamma every N iterations after warmup. '
-             'Lets theta equilibrate between v updates, preventing oscillation.'
-    )
-
-    # Memory optimization
-    parser.add_argument(
-        '--target-memory-gb',
-        type=float,
-        default=0.5,
-        help='Target GPU memory per batch in GB for transform/heldout operations. '
-             'Lower values reduce memory usage but increase computation time. '
-             'For large datasets (10k+ cells × 10k+ genes × 1k factors), use 0.5-1.0 GB.'
+        help='Iterations/epochs before regression (v/gamma) updates begin'
     )
 
     # Normalization options
@@ -687,11 +374,14 @@ def main():
     print("=" * 80)
     print(f"\nConfiguration:")
     print(f"  Data:         {args.data}")
+    print(f"  Method:       {args.method}")
     print(f"  Mode:         {args.mode}")
     print(f"  n_factors:    {args.n_factors}" + (" (may be overridden by pathway count)" if args.mode != 'unmasked' else ""))
-    print(f"  batch_size:   {args.batch_size}")
-    print(f"  max_epochs:   {args.max_epochs}")
-    print(f"  learning_rate:{args.learning_rate}")
+    if args.method == 'svi':
+        print(f"  batch_size:   {args.batch_size}")
+        print(f"  max_epochs:   {args.max_epochs}")
+    else:
+        print(f"  max_iter:     {args.max_iter}")
     # Normalise label_column to list internally
     label_columns = args.label_column if isinstance(args.label_column, list) else [args.label_column]
     n_outcomes = len(label_columns)
@@ -712,10 +402,10 @@ def main():
     # =========================================================================
     if args.method == 'vi':
         from VariationalInference.vi_cavi import CAVI as ModelClass
-        print("[METHOD] Using Coordinate Ascent VI (full-batch)")
+        print("[METHOD] Using CAVI (coordinate ascent, full-batch)")
     else:
         from VariationalInference.svi_corrected import SVI as ModelClass
-        print("[METHOD] Using Stochastic Variational Inference")
+        print("[METHOD] Using SVI (stochastic, mini-batch)")
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
         compute_metrics, save_results, print_model_summary, load_pathways
@@ -885,41 +575,24 @@ def main():
         print(f"\n[UNMASKED MODE] Using {n_factors} latent factors (no pathway constraint)")
 
     # =========================================================================
-    # STEP 3.5: Set Hyperparameters
+    # STEP 3.5: Hyperparameters (scHPF defaults — rarely need tuning)
     # =========================================================================
-    n_train = X_train.shape[0]
-    
-    # Auto-configure hyperparameters if not provided
-    if args.alpha_theta is None:
-        alpha_theta = 1.0 if n_train < 200 else 0.5
-    else:
-        alpha_theta = args.alpha_theta
-    
-    if args.sigma_v is None:
-        sigma_v = 1.0 if n_train < 200 else 2.0
-    else:
-        sigma_v = args.sigma_v
-    
-    print(f"\nModel Hyperparameters:")
-    print(f"  alpha_theta:  {alpha_theta:.4f}")
-    print(f"  alpha_beta:   {args.alpha_beta:.4f}")
-    print(f"  alpha_xi:     {args.alpha_xi:.4f}")
-    print(f"  alpha_eta:    {args.alpha_eta:.4f}")
-    print(f"  lambda_xi:    {args.lambda_xi:.4f}")
-    print(f"  lambda_eta:   {args.lambda_eta:.4f}")
-    print(f"  sigma_v:      {sigma_v:.4f}")
-    print(f"  sigma_gamma:  {args.sigma_gamma:.4f}")
-    print(f"  pi_v:         {args.pi_v:.4f}")
-    print(f"  pi_beta:      {args.pi_beta:.4f}")
+    sigma_v = args.sigma_v
+
+    print(f"\nModel Hyperparameters (scHPF):")
+    print(f"  a (theta shape): {args.a:.4f}")
+    print(f"  c (beta shape):  {args.c:.4f}")
+    print(f"  ap, cp:          1.0, 1.0 (fixed)")
+    print(f"  bp, dp:          empirical (computed from data)")
+    print(f"  sigma_v:         {sigma_v:.4f}")
+    print(f"  sigma_gamma:     {args.sigma_gamma:.4f}")
+    print(f"  regression_wt:   {args.regression_weight:.4f}")
     if args.method == 'svi':
-        print(f"  count_scale:  {args.count_scale if args.count_scale else 'auto'}")
-        print(f"  lr_schedule:  {args.lr_schedule_unit}")
-        print(f"  auto_balance: {getattr(args, 'auto_balance_regression', False)}"
-              + (f" (target={getattr(args, 'regression_balance_target', 'N/A')}, max_w={getattr(args, 'max_regression_weight', None) or 'sqrt(P)'})" if getattr(args, 'auto_balance_regression', False) else ""))
+        print(f"  lr_decay (kappa):{args.learning_rate_decay:.4f}")
+        print(f"  lr_delay (tau):  {args.learning_rate_delay:.4f}")
     else:
-        print(f"  method:       vi (coordinate ascent)")
-        print(f"  max_iter:     {args.max_iter}")
-        print(f"  rel_tol:      {args.rel_tol}")
+        print(f"  max_iter:        {args.max_iter}")
+        print(f"  tol:             {args.tol}")
 
     # =========================================================================
     # STEP 4: Train Model
@@ -942,23 +615,17 @@ def main():
         print(f"  n_pathway_factors: {n_pathway_factors}")
         print(f"  n_drgps:          {args.n_drgps}")
 
-    # Common model kwargs (shared by SVI and VI)
+    # Common model kwargs (shared by CAVI and SVI)
     common_kwargs = dict(
         n_factors=n_factors,
-        regression_weight=args.regression_weight,
-        alpha_theta=alpha_theta,
-        alpha_beta=args.alpha_beta,
-        alpha_xi=args.alpha_xi,
-        lambda_xi=args.lambda_xi,
-        alpha_eta=args.alpha_eta,
-        lambda_eta=args.lambda_eta,
+        a=args.a,
+        ap=1.0,
+        c=args.c,
+        cp=1.0,
         sigma_v=sigma_v,
         sigma_gamma=args.sigma_gamma,
-        pi_v=args.pi_v,
-        pi_beta=args.pi_beta,
+        regression_weight=args.regression_weight,
         random_state=args.seed,
-        use_spike_slab=args.use_spike_slab,
-        # Pathway mode
         mode=args.mode,
         pathway_mask=pathway_mask,
         pathway_names=pathway_names,
@@ -966,86 +633,55 @@ def main():
     )
 
     if args.method == 'svi':
-        # SVI-specific kwargs (includes V-collapse mitigation, which VI doesn't use)
         common_kwargs.update(
-            use_intercept=args.use_intercept,
-            sigma_intercept=args.sigma_intercept,
-            two_step_training=args.two_step_training,
-            two_step_phase1_ratio=args.two_step_phase1_ratio,
-            two_step_freeze_beta=args.two_step_freeze_beta,
-            two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
-            adaptive_regression_weight=args.adaptive_regression_weight,
-            regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
-            regression_weight_schedule=args.regression_weight_schedule,
             batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            learning_rate_decay=args.learning_rate_decay,
             learning_rate_delay=args.learning_rate_delay,
-            learning_rate_min=args.learning_rate_min,
-            lr_schedule_unit=args.lr_schedule_unit,
+            learning_rate_decay=args.learning_rate_decay,
             local_iterations=args.local_iterations,
-            auto_balance_regression=args.auto_balance_regression,
-            regression_balance_target=args.regression_balance_target,
-            max_regression_weight=args.max_regression_weight,
-            count_scale=args.count_scale,
-            ema_decay=args.ema_decay,
-            convergence_tol=args.convergence_tol,
-            convergence_window=args.convergence_window,
-            early_stopping_metric=args.early_stopping_metric,
-            heldout_ll_patience=args.heldout_ll_patience,
-            heldout_ll_ema_decay=args.heldout_ll_ema_decay,
-            restore_best_heldout=args.restore_best_heldout,
-            min_epochs_before_stopping=args.min_epochs_before_stopping,
-            regression_ll_patience=args.regression_ll_patience,
-            target_memory_gb=args.target_memory_gb,
         )
 
     # Create model
     model = ModelClass(**common_kwargs)
 
-    # Common fit kwargs
-    fit_kwargs = dict(
-        X=X_train,
-        y=y_train,
-        X_aux=X_aux_train,
-        elbo_freq=args.elbo_freq,
-        verbose=True,
-        early_stopping=args.early_stopping,
-        X_heldout=X_val,
-        y_heldout=y_val,
-        X_aux_heldout=X_aux_val,
-        heldout_freq=5,
-    )
-
+    # Build fit kwargs
     if args.method == 'svi':
-        fit_kwargs['max_epochs'] = args.max_epochs
-    else:
-        # VI-specific fit kwargs
-        fit_kwargs.update(
-            max_iter=args.max_iter,
-            tol=args.tol,
-            rel_tol=args.rel_tol,
-            min_iter=args.min_iter,
-            patience=args.patience,
-            theta_damping=args.theta_damping,
-            beta_damping=args.beta_damping,
-            v_damping=args.v_damping,
-            gamma_damping=args.gamma_damping,
-            xi_damping=args.xi_damping,
-            eta_damping=args.eta_damping,
-            adaptive_damping=args.adaptive_damping,
+        fit_kwargs = dict(
+            X_train=X_train,
+            y_train=y_train,
+            X_aux_train=X_aux_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_aux_val=X_aux_val,
+            max_epochs=args.max_epochs,
+            check_freq=args.check_freq,
             v_warmup=args.v_warmup,
-            v_anneal=args.v_anneal,
-            debug=args.debug,
+            verbose=True,
+            heldout_patience=args.heldout_patience,
+        )
+    else:
+        fit_kwargs = dict(
+            X_train=X_train,
+            y_train=y_train,
+            X_aux_train=X_aux_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_aux_val=X_aux_val,
+            max_iter=args.max_iter,
+            check_freq=args.check_freq,
+            tol=args.tol,
+            v_warmup=args.v_warmup,
+            verbose=True,
         )
 
     # Train model
     model.fit(**fit_kwargs)
 
     print("\nTraining complete!")
-    print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
-    print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
-    print(f"  Time:       {model.training_time_:.2f}s")
+    if hasattr(model, 'elbo_history_') and model.elbo_history_:
+        print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
+        print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
+    if hasattr(model, 'holl_history_') and model.holl_history_:
+        print(f"  Best HO-LL: {model.holl_history_[-1][1]:.4f}")
 
     # =========================================================================
     # DEBUG: v Parameter Diagnostics
@@ -1080,30 +716,24 @@ def main():
     # =========================================================================
     print("\n[CHECKPOINT] Saving model parameters immediately after training...")
     checkpoint_params = {
-        'n_factors': model.d,
-        'alpha_theta': float(model.alpha_theta),
-        'alpha_beta': float(model.alpha_beta),
+        'n_factors': model.K,
+        'a': float(model.a),
+        'c': float(model.c),
         'sigma_v': float(model.sigma_v),
         'E_beta': np.array(model.E_beta),
         'E_log_beta': np.array(model.E_log_beta),
         'mu_v': np.array(model.mu_v),
-        'sigma_v_diag': np.array(model.sigma_v_diag) if args.method == 'vi' else np.array(model.sigma_v),
+        'sigma_v_diag': np.array(model.sigma_v_diag),
         'mu_gamma': np.array(model.mu_gamma),
-        'sigma_gamma': np.array(model.sigma_gamma),
         'n': model.n,
         'p': model.p,
-        'kappa': model.kappa,
         'p_aux': model.p_aux,
-        'elbo_history': model.elbo_history_,
-        'training_time': model.training_time_,
     }
-    if hasattr(model, 'rho_v'):
-        checkpoint_params['rho_v'] = np.array(model.rho_v)
-    if hasattr(model, 'rho_beta'):
-        checkpoint_params['rho_beta'] = np.array(model.rho_beta)
-    if hasattr(model, 'use_intercept') and model.use_intercept:
-        checkpoint_params['mu_intercept'] = np.array(model.mu_intercept)
-    
+    if hasattr(model, 'elbo_history_'):
+        checkpoint_params['elbo_history'] = model.elbo_history_
+    if hasattr(model, 'holl_history_'):
+        checkpoint_params['holl_history'] = model.holl_history_
+
     checkpoint_path = output_dir / 'model_checkpoint.npz'
     np.savez_compressed(checkpoint_path, **checkpoint_params)
     print(f"[CHECKPOINT] Saved to {checkpoint_path}")
@@ -1116,24 +746,9 @@ def main():
     print("Training Set Evaluation")
     print("=" * 80)
 
-    # Use the stored training parameters from the final epoch
-    # These are the actual θ values that were used during training
-    # E_theta_train = model.train_a_theta_ / model.train_b_theta_
-    print("Using stored training set θ from final epoch")
-
-    # Determine appropriate batch size for memory efficiency
-    # Target ~500MB per batch for the (n_batch, p, d) tensor
-    auto_batch_size = model._compute_memory_efficient_batch_size(target_gb=0.5)
-    print(f"Using batched processing with batch_size={auto_batch_size} for memory efficiency")
-
-    # Compute E_theta via transform_batched (ONCE)
-    train_result = model.transform_batched(X_train, y_new=None, X_aux_new=X_aux_train,
-                                           n_iter=50, batch_size=auto_batch_size,
-                                           verbose=args.verbose)
-    E_theta_train = train_result['E_theta']
-    
-    # Compute probabilities directly from E_theta (no redundant transform call)
-    y_train_proba = compute_proba_from_theta(model, E_theta_train, X_aux_train, verbose=args.verbose)
+    # Predict on training set
+    y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=20)
+    E_theta_train = model.transform(X_train)['E_theta']
 
     # Ensure y and proba are 2D for uniform κ-outcome handling
     _y_train_2d = y_train if y_train.ndim == 2 else y_train[:, np.newaxis]
@@ -1205,14 +820,9 @@ def main():
     print("Validation Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for validation set (BATCHED to avoid OOM)
-    val_result = model.transform_batched(X_val, y_new=None, X_aux_new=X_aux_val,
-                                         n_iter=50, batch_size=auto_batch_size,
-                                         verbose=args.verbose)
-    E_theta_val = val_result['E_theta']
-
-    # Compute probabilities directly from E_theta (no redundant transform call)
-    y_val_proba = compute_proba_from_theta(model, E_theta_val, X_aux_val, verbose=args.verbose)
+    # Predict on validation set
+    y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=20)
+    E_theta_val = model.transform(X_val)['E_theta']
     
     # Ensure 2D for uniform κ-outcome handling
     _y_val_2d = y_val if y_val.ndim == 2 else y_val[:, np.newaxis]
@@ -1266,18 +876,9 @@ def main():
     print("Test Set Evaluation")
     print("=" * 80)
 
-    # Infer theta for test set using BATCHED method to avoid OOM
-    # Memory: unbatched transform allocates (n, p, d) tensor which can exceed GPU RAM
-    test_batch_size = model._compute_memory_efficient_batch_size(target_gb=0.5)
-    print(f"Using batched test inference with batch_size={test_batch_size}")
-    
-    test_result = model.transform_batched(X_test, y_new=None, X_aux_new=X_aux_test, 
-                                          n_iter=50, batch_size=test_batch_size,
-                                          verbose=args.verbose)
-    E_theta_test = test_result['E_theta']
-
-    # Compute probabilities directly from E_theta (no redundant transform call)
-    y_test_proba = compute_proba_from_theta(model, E_theta_test, X_aux_test, verbose=args.verbose)
+    # Predict on test set
+    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=20)
+    E_theta_test = model.transform(X_test)['E_theta']
 
     # Ensure 2D for uniform κ-outcome handling
     _y_test_2d = y_test if y_test.ndim == 2 else y_test[:, np.newaxis]
@@ -1304,20 +905,6 @@ def main():
     test_metrics = test_metrics_all[label_columns[0]]
     y_test_pred = (_proba_test_2d[:, 0] > optimal_threshold).astype(int)
 
-    # Report factor summary (soft sparsity via rho_v, no hard threshold)
-    if hasattr(model, 'get_sparse_factors') and model.use_spike_slab:
-        # Use median PIP as adaptive threshold for reporting
-        rho_v_median = float(np.median(np.array(model.rho_v)))
-        sparse_info = model.get_sparse_factors(pip_threshold=rho_v_median)
-        n_active = len(sparse_info['active_factors'])
-        print(f"\nActive DRGPs (PIP > {rho_v_median:.2f} median): {n_active} / {model.d}")
-        if n_active < 10:
-            for i in range(n_active):
-                f_idx = sparse_info['active_factors'][i][1]
-                v_val = sparse_info['v_values'][i]
-                direction = sparse_info['direction'][i]
-                print(f"  Factor {f_idx}: v={v_val:.4f} ({direction})")
-    
     # Save test results immediately
     test_results_path = output_dir / 'test_results.pkl'
     with open(test_results_path, 'wb') as f:

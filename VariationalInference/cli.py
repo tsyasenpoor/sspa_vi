@@ -124,68 +124,56 @@ def create_parser() -> argparse.ArgumentParser:
         help='Path to gene annotation CSV for protein-coding filter'
     )
 
-    # Model hyperparameters
+    # Model hyperparameters (scHPF priors — defaults work well, rarely need tuning)
     train_parser.add_argument(
-        '--alpha-theta',
+        '--a',
         type=float,
-        default=2.0,
-        help='Prior shape for theta'
+        default=0.3,
+        help='Gamma shape prior for theta (cell loadings). scHPF default 0.3.'
     )
     train_parser.add_argument(
-        '--alpha-beta',
+        '--c',
         type=float,
-        default=2.0,
-        help='Prior shape for beta'
+        default=0.3,
+        help='Gamma shape prior for beta (gene loadings). scHPF default 0.3.'
     )
     train_parser.add_argument(
         '--sigma-v',
         type=float,
-        default=0.2,
-        help='Prior std for classification weights'
+        default=1.0,
+        help='Gaussian prior std for v (classification weights).'
     )
     train_parser.add_argument(
-        '--pi-v',
+        '--sigma-gamma',
         type=float,
-        default=0.9,
-        help='Prior probability of v being active. Values 0.9-1.0 favor classification.'
-    )
-    train_parser.add_argument(
-        '--pi-beta',
-        type=float,
-        default=0.05,
-        help='Prior probability of beta being active'
+        default=1.0,
+        help='Gaussian prior std for gamma (auxiliary effects)'
     )
 
     # Training parameters
     train_parser.add_argument(
         '--max-iter',
         type=int,
-        default=200,
-        help='Maximum training iterations'
+        default=600,
+        help='[VI] Maximum CAVI iterations'
     )
     train_parser.add_argument(
         '--tol',
         type=float,
-        default=10.0,
-        help='Absolute ELBO tolerance for convergence'
+        default=0.001,
+        help='[VI] Convergence tolerance (percent change in loss)'
     )
     train_parser.add_argument(
-        '--rel-tol',
-        type=float,
-        default=2e-4,
-        help='Relative ELBO tolerance for convergence'
-    )
-    train_parser.add_argument(
-        '--min-iter',
+        '--v-warmup',
         type=int,
         default=50,
-        help='Minimum iterations before checking convergence'
+        help='Iterations/epochs before regression (v/gamma) updates begin'
     )
     train_parser.add_argument(
-        '--patience',
+        '--check-freq',
         type=int,
         default=5,
-        help='Early stopping patience'
+        help='Check convergence / compute held-out LL every N iterations/epochs'
     )
 
     # Inference method selection
@@ -207,50 +195,32 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         '--max-epochs',
         type=int,
-        default=100,
+        default=500,
         help='Maximum epochs for SVI (only used with --method svi)'
-    )
-    train_parser.add_argument(
-        '--min-epochs',
-        type=int,
-        default=10,
-        help='Minimum epochs before convergence check for SVI'
-    )
-    train_parser.add_argument(
-        '--learning-rate',
-        type=float,
-        default=0.01,
-        help='Initial learning rate for SVI'
     )
     train_parser.add_argument(
         '--learning-rate-decay',
         type=float,
         default=0.75,
-        help='Learning rate decay exponent (kappa) for SVI'
+        help='Learning rate decay exponent (kappa) for SVI Robbins-Monro schedule'
     )
     train_parser.add_argument(
         '--learning-rate-delay',
         type=float,
         default=1.0,
-        help='Learning rate delay (tau) for SVI'
-    )
-    train_parser.add_argument(
-        '--learning-rate-min',
-        type=float,
-        default=1e-4,
-        help='Minimum learning rate for SVI to prevent stagnation'
-    )
-    train_parser.add_argument(
-        '--warmup-epochs',
-        type=int,
-        default=5,
-        help='Number of epochs for learning rate warmup in SVI'
+        help='Learning rate delay (tau) for SVI Robbins-Monro schedule'
     )
     train_parser.add_argument(
         '--local-iterations',
         type=int,
-        default=5,
+        default=10,
         help='Number of local parameter iterations per batch for SVI'
+    )
+    train_parser.add_argument(
+        '--heldout-patience',
+        type=int,
+        default=50,
+        help='[SVI] Epochs without HO-LL improvement before stopping'
     )
     
     train_parser.add_argument(
@@ -260,137 +230,6 @@ def create_parser() -> argparse.ArgumentParser:
         help='Weight for classification objective (higher=more focus on classification). Values above 5.0 may cause instability.'
     )
     
-    # Early stopping and convergence
-    train_parser.add_argument(
-        '--early-stopping',
-        action='store_true',
-        default=False,
-        help='Enable early stopping when convergence criterion is met'
-    )
-    train_parser.add_argument(
-        '--early-stopping-metric',
-        type=str,
-        default='elbo',
-        choices=['elbo', 'heldout_ll', 'regression_ll'],
-        help='Metric for early stopping: elbo (training), heldout_ll (validation), or regression_ll (regression component)'
-    )
-    train_parser.add_argument(
-        '--heldout-ll-patience',
-        type=int,
-        default=10,
-        help='Epochs without HO-LL improvement before stopping (only for heldout_ll metric)'
-    )
-    train_parser.add_argument(
-        '--regression-ll-patience',
-        type=int,
-        default=10,
-        help='Epochs without regression LL improvement before stopping (only for regression_ll metric)'
-    )
-    train_parser.add_argument(
-        '--min-epochs-before-stopping',
-        type=int,
-        default=20,
-        help='Minimum epochs before early stopping can trigger'
-    )
-
-    # Learning rate reduction
-    train_parser.add_argument(
-        '--lr-reduction-patience',
-        type=int,
-        default=5,
-        help='Epochs of ELBO degradation before reducing learning rate (SVI adaptive LR)'
-    )
-    train_parser.add_argument(
-        '--lr-reduction-factor',
-        type=float,
-        default=0.5,
-        help='Factor to reduce learning rate by when ELBO degrades (default: 0.5 = halve)'
-    )
-    train_parser.add_argument(
-        '--no-restore-best',
-        action='store_true',
-        help='Do not restore best parameters when learning rate is reduced or at end of training'
-    )
-    train_parser.add_argument(
-        '--count-scale',
-        type=float,
-        default=1.0,
-        help='Scaling factor for count data (divide counts by this value). Use values > 1 (e.g., 100, 1000) with large raw counts for numerical stability.'
-    )
-    train_parser.add_argument(
-        '--normalize',
-        type=str,
-        choices=['none', 'size_factor'],
-        default='none',
-        help='Normalization method: none (raw counts), size_factor (library size normalization). Applied BEFORE count_scale.'
-    )
-
-    # V-collapse mitigation options
-    train_parser.add_argument(
-        '--use-intercept',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Add learnable intercept term to logit (helps with v-collapse)'
-    )
-    train_parser.add_argument(
-        '--sigma-intercept',
-        type=float,
-        default=1.0,
-        help='Gaussian prior std for intercept term'
-    )
-    train_parser.add_argument(
-        '--two-step-training',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Use two-step training: learn gene programs first, then regression'
-    )
-    train_parser.add_argument(
-        '--two-step-phase1-ratio',
-        type=float,
-        default=0.3,
-        help='Fraction of epochs for phase 1 (reconstruction only)'
-    )
-    train_parser.add_argument(
-        '--two-step-freeze-beta',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=True,
-        help='Freeze beta during phase 2 (default: True)'
-    )
-    train_parser.add_argument(
-        '--two-step-phase2-beta-lr-mult',
-        type=float,
-        default=0.1,
-        help='Learning rate multiplier for beta in phase 2 (if not frozen)'
-    )
-    train_parser.add_argument(
-        '--adaptive-regression-weight',
-        type=lambda x: x.lower() in ('true', '1', 'yes'),
-        default=False,
-        help='Gradually warm up regression_weight during training'
-    )
-    train_parser.add_argument(
-        '--regression-weight-warmup-epochs',
-        type=int,
-        default=100,
-        help='Number of epochs to warm up regression weight'
-    )
-    train_parser.add_argument(
-        '--regression-weight-schedule',
-        type=str,
-        default='linear',
-        choices=['linear', 'cosine', 'exponential'],
-        help='Schedule for regression weight warmup'
-    )
-
-    # Memory optimization
-    train_parser.add_argument(
-        '--target-memory-gb',
-        type=float,
-        default=0.5,
-        help='Target GPU memory per batch in GB for transform/heldout operations. '
-             'Lower values reduce memory usage but increase computation time. '
-             'Default 0.5 GB works well for most GPUs.'
-    )
 
     # Output options
     train_parser.add_argument(
@@ -528,7 +367,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     if method == 'vi':
         from .vi_cavi import CAVI as ModelClass
     else:
-        from .svi_corrected import SVICorrected as ModelClass
+        from .svi_corrected import SVI as ModelClass
 
     # Initialize profiler if requested
     profiler = None
@@ -544,10 +383,13 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     # Print configuration
     print(f"\nData: {args.data}")
+    print(f"Method: {method}")
     print(f"n_factors: {args.n_factors}")
-    print(f"batch_size: {args.batch_size}")
-    print(f"max_epochs: {args.max_epochs}")
-    print(f"learning_rate: {args.learning_rate}")
+    if method == 'svi':
+        print(f"batch_size: {args.batch_size}")
+        print(f"max_epochs: {args.max_epochs}")
+    else:
+        print(f"max_iter: {args.max_iter}")
     print(f"label_column: {args.label_column}")
     print(f"aux_columns: {args.aux_columns}")
     print(f"random_state: {args.seed if args.seed else 'None (random)'}")
@@ -595,38 +437,22 @@ def cmd_train(args: argparse.Namespace) -> int:
     # Build common model kwargs
     model_kwargs = dict(
         n_factors=args.n_factors,
-        regression_weight=args.regression_weight,
-        alpha_theta=args.alpha_theta,
-        alpha_beta=args.alpha_beta,
+        a=args.a,
+        ap=1.0,
+        c=args.c,
+        cp=1.0,
         sigma_v=args.sigma_v,
-        pi_v=args.pi_v,
-        pi_beta=args.pi_beta,
+        sigma_gamma=args.sigma_gamma,
+        regression_weight=args.regression_weight,
         random_state=args.seed,
     )
 
     if method == 'svi':
-        # SVI-specific kwargs (includes V-collapse mitigation, which VI doesn't use)
         model_kwargs.update(
-            use_intercept=args.use_intercept,
-            sigma_intercept=args.sigma_intercept,
-            two_step_training=args.two_step_training,
-            two_step_phase1_ratio=args.two_step_phase1_ratio,
-            two_step_freeze_beta=args.two_step_freeze_beta,
-            two_step_phase2_beta_lr_mult=args.two_step_phase2_beta_lr_mult,
-            adaptive_regression_weight=args.adaptive_regression_weight,
-            regression_weight_warmup_epochs=args.regression_weight_warmup_epochs,
-            regression_weight_schedule=args.regression_weight_schedule,
             batch_size=args.batch_size,
-            learning_rate=args.learning_rate,
-            learning_rate_decay=args.learning_rate_decay,
             learning_rate_delay=args.learning_rate_delay,
-            learning_rate_min=args.learning_rate_min,
+            learning_rate_decay=args.learning_rate_decay,
             local_iterations=args.local_iterations,
-            early_stopping_metric=getattr(args, 'early_stopping_metric', 'elbo'),
-            heldout_ll_patience=getattr(args, 'heldout_ll_patience', 10),
-            regression_ll_patience=getattr(args, 'regression_ll_patience', 10),
-            min_epochs_before_stopping=getattr(args, 'min_epochs_before_stopping', 20),
-            target_memory_gb=args.target_memory_gb,
         )
 
     model = ModelClass(**model_kwargs)
@@ -634,27 +460,31 @@ def cmd_train(args: argparse.Namespace) -> int:
     # Build fit kwargs
     if method == 'svi':
         fit_kwargs = dict(
-            X=X_train, y=y_train, X_aux=X_aux_train,
+            X_train=X_train,
+            y_train=y_train,
+            X_aux_train=X_aux_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_aux_val=X_aux_val,
             max_epochs=args.max_epochs,
-            elbo_freq=10,
+            check_freq=args.check_freq,
+            v_warmup=args.v_warmup,
             verbose=args.verbose,
-            early_stopping=getattr(args, 'early_stopping', False),
-            X_heldout=X_val, y_heldout=y_val, X_aux_heldout=X_aux_val,
-            heldout_freq=5,
+            heldout_patience=args.heldout_patience,
         )
     else:
         fit_kwargs = dict(
-            X=X_train, y=y_train, X_aux=X_aux_train,
-            max_iter=getattr(args, 'max_iter', 200),
-            tol=getattr(args, 'tol', 10.0),
-            rel_tol=getattr(args, 'rel_tol', 2e-4),
-            elbo_freq=10,
-            min_iter=getattr(args, 'min_iter', 50),
-            patience=getattr(args, 'patience', 5),
+            X_train=X_train,
+            y_train=y_train,
+            X_aux_train=X_aux_train,
+            X_val=X_val,
+            y_val=y_val,
+            X_aux_val=X_aux_val,
+            max_iter=args.max_iter,
+            check_freq=args.check_freq,
+            tol=args.tol,
+            v_warmup=args.v_warmup,
             verbose=args.verbose,
-            X_heldout=X_val, y_heldout=y_val, X_aux_heldout=X_aux_val,
-            heldout_freq=5,
-            early_stopping=getattr(args, 'early_stopping', False),
         )
 
     model.fit(**fit_kwargs)
@@ -664,7 +494,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     print("Evaluating on validation set...")
     print("-" * 40)
 
-    y_val_proba = model.predict_proba(X_val, X_aux_val)
+    y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=20)
     y_val_pred = (y_val_proba.ravel() > 0.5).astype(int)
 
     val_metrics = compute_metrics(y_val, y_val_pred, y_val_proba.ravel())
@@ -679,7 +509,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     print("Evaluating on test set...")
     print("-" * 40)
 
-    y_test_proba = model.predict_proba(X_test, X_aux_test)
+    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=20)
     y_test_pred = (y_test_proba.ravel() > 0.5).astype(int)
 
     test_metrics = compute_metrics(y_test, y_test_pred, y_test_proba.ravel())
@@ -798,7 +628,7 @@ def cmd_predict(args: argparse.Namespace) -> int:
         X_aux = np.zeros((X.shape[0], 0))
 
     print("Making predictions...")
-    proba = model.predict_proba(X, X_aux, verbose=args.verbose)
+    proba = model.predict_proba(X, X_aux, n_iter=20)
 
     # Save predictions
     results_df = pd.DataFrame({

@@ -323,27 +323,22 @@ def save_results(
             # Save only essential parameters (memory-efficient)
             essential_params = {
                 # Hyperparameters
-                'n_factors': model.d,
-                'alpha_theta': model.alpha_theta,
-                'alpha_beta': model.alpha_beta,
+                'n_factors': model.K,
+                'a': model.a,
+                'c': model.c,
                 'sigma_v': model.sigma_v,
                 'sigma_gamma': model.sigma_gamma,
-                'pi_v': model.pi_v,
-                'pi_beta': model.pi_beta,
                 # Global parameters (needed for inference)
                 'E_beta': model.E_beta,
                 'E_log_beta': model.E_log_beta,
-                'rho_beta': model.rho_beta,
                 # Classification weights
                 'mu_v': model.mu_v,
-                'sigma_v_diag': np.array(model.sigma_v_diag),  # Already diagonal (kappa, d)
-                'rho_v': model.rho_v,
+                'sigma_v_diag': np.array(model.sigma_v_diag),
                 'mu_gamma': model.mu_gamma,
-                'Sigma_gamma': np.array(model.Sigma_gamma),  # Posterior covariance
+                'Sigma_gamma': np.array(model.Sigma_gamma),
                 # Dimensions
                 'n': model.n,
                 'p': model.p,
-                'kappa': model.kappa,
                 'p_aux': model.p_aux,
             }
 
@@ -367,7 +362,7 @@ def save_results(
     if program_names is not None:
         prog_labels = program_names
     else:
-        prog_labels = [f"GP{k+1}" for k in range(model.d)]
+        prog_labels = [f"GP{k+1}" for k in range(model.K)]
     
     program_label = f"{feature_type}_program" if feature_type == 'pathway' else "gene_program"
     beta_df = pd.DataFrame(
@@ -377,9 +372,10 @@ def save_results(
     )
 
     # Add classification weights if available
-    if hasattr(model, 'E_v'):
-        for k in range(model.kappa):
-            beta_df.insert(0, f'v_weight_class{k}', model.E_v[k])
+    if hasattr(model, 'mu_v'):
+        n_outcomes = model.mu_v.shape[0]
+        for k in range(n_outcomes):
+            beta_df.insert(0, f'v_weight_class{k}', model.mu_v[k])
 
     beta_path = output_dir / f'{prefix}_{feature_type}_programs{ext}'
     beta_df.to_csv(beta_path, compression=compression)
@@ -401,13 +397,11 @@ def save_results(
     # Save summary
     summary = {
         'hyperparameters': {
-            'n_factors': model.d,
-            'alpha_theta': model.alpha_theta,
-            'alpha_beta': model.alpha_beta,
+            'n_factors': model.K,
+            'a': model.a,
+            'c': model.c,
             'sigma_v': model.sigma_v,
             'sigma_gamma': model.sigma_gamma,
-            'pi_v': model.pi_v,
-            'pi_beta': model.pi_beta,
         },
         'data_shapes': {
             f'n_{feature_type}s': len(gene_list),
@@ -420,47 +414,22 @@ def save_results(
         'program_names': program_names,  # Pathway names if using pathway modes
         'n_pathway_factors': getattr(model, 'n_pathway_factors', None),  # For combined mode
         'training': {
-            'training_time': getattr(model, 'training_time_', None),
             'final_elbo': model.elbo_history_[-1][1] if hasattr(model, 'elbo_history_') and model.elbo_history_ else None,
             'n_iterations': model.elbo_history_[-1][0] if hasattr(model, 'elbo_history_') and model.elbo_history_ else None,
-            # === NEW: EMA and convergence diagnostics for paper ===
-            'final_elbo_ema': getattr(model, 'elbo_ema_', None),
-            'elbo_welford_mean': getattr(model, 'elbo_welford_mean_', None),
-            'elbo_welford_std': (
-                np.sqrt(model.elbo_welford_M2_ / (model.elbo_welford_n_ - 1)) 
-                if hasattr(model, 'elbo_welford_n_') and model.elbo_welford_n_ > 1 
-                else None
-            ),
+            'final_holl': model.holl_history_[-1][1] if hasattr(model, 'holl_history_') and model.holl_history_ else None,
         },
         'classification': {
             'optimal_threshold': optimal_threshold,
         }
     }
 
-    # === Raw ELBO history (mini-batch, scaled) ===
+    # === ELBO history ===
     if hasattr(model, 'elbo_history_'):
         summary['elbo_history'] = model.elbo_history_
-    
-    # === ELBO component histories ===
-    if hasattr(model, 'poisson_ll_history_'):
-        summary['poisson_ll_history'] = model.poisson_ll_history_
-    if hasattr(model, 'regression_ll_history_'):
-        summary['regression_ll_history'] = model.regression_ll_history_
-    
-    # === NEW: Convergence history with EMA trajectory ===
-    # Format: [(epoch, ema, welford_mean, welford_std, rel_change), ...]
-    if hasattr(model, 'convergence_history_') and model.convergence_history_:
-        summary['convergence_history'] = model.convergence_history_
 
-    # === NEW: Held-out log-likelihood history (Blei-style convergence) ===
-    # Format: [(epoch, total_ll, counts_ll, regression_ll), ...]
-    if hasattr(model, 'heldout_loglik_history_') and model.heldout_loglik_history_:
-        summary['heldout_loglik_history'] = model.heldout_loglik_history_
-        # Also store final held-out LL components in training section for quick access
-        last_entry = model.heldout_loglik_history_[-1]
-        summary['training']['final_heldout_loglik'] = last_entry[1]
-        summary['training']['final_heldout_loglik_counts'] = last_entry[2]
-        summary['training']['final_heldout_loglik_regression'] = last_entry[3]
+    # === Held-out LL history ===
+    if hasattr(model, 'holl_history_'):
+        summary['holl_history'] = model.holl_history_
 
     # Convert JAX/NumPy types to JSON-serializable Python types
     def convert_to_json_serializable(obj):
@@ -497,23 +466,21 @@ def save_results(
     saved_files['summary'] = summary_path
     print(f"Saved summary to {summary_path}")
     
-    # Save ELBO component histories to CSV for easy plotting
+    # Save ELBO history to CSV for easy plotting
     if hasattr(model, 'elbo_history_') and model.elbo_history_:
-        # Combine all components into one dataframe
         elbo_df = pd.DataFrame(model.elbo_history_, columns=['iteration', 'elbo'])
-        
-        if hasattr(model, 'poisson_ll_history_') and model.poisson_ll_history_:
-            poisson_df = pd.DataFrame(model.poisson_ll_history_, columns=['iteration', 'poisson_ll'])
-            elbo_df = elbo_df.merge(poisson_df, on='iteration', how='left')
-        
-        if hasattr(model, 'regression_ll_history_') and model.regression_ll_history_:
-            regression_df = pd.DataFrame(model.regression_ll_history_, columns=['iteration', 'regression_ll'])
-            elbo_df = elbo_df.merge(regression_df, on='iteration', how='left')
-        
-        elbo_history_path = output_dir / f'{prefix}_elbo_components{ext}'
+        elbo_history_path = output_dir / f'{prefix}_elbo_history{ext}'
         elbo_df.to_csv(elbo_history_path, index=False, compression=compression)
-        saved_files['elbo_components'] = elbo_history_path
-        print(f"Saved ELBO component history to {elbo_history_path}")
+        saved_files['elbo_history'] = elbo_history_path
+        print(f"Saved ELBO history to {elbo_history_path}")
+
+    # Save held-out LL history
+    if hasattr(model, 'holl_history_') and model.holl_history_:
+        holl_df = pd.DataFrame(model.holl_history_, columns=['iteration', 'heldout_ll'])
+        holl_history_path = output_dir / f'{prefix}_holl_history{ext}'
+        holl_df.to_csv(holl_history_path, index=False, compression=compression)
+        saved_files['holl_history'] = holl_history_path
+        print(f"Saved held-out LL history to {holl_history_path}")
 
     return saved_files
 
@@ -552,135 +519,40 @@ def get_top_genes_per_program(
     """
     results = {}
 
-    for k in range(model.d):
+    for k in range(model.K):
         program_name = f"GP{k+1}"
 
         # Get gene loadings for this program
-        # Use the full posterior mean E_beta which already incorporates spike-and-slab
-        # E_beta = rho_beta * E_beta_slab + (1 - rho_beta) * spike_value
         loadings = model.E_beta[:, k].copy()
 
-        # Apply soft weighting by rho_beta instead of hard threshold
-        # This preserves relative ranking while downweighting low-probability genes
-        if hasattr(model, 'rho_beta'):
-            # Use rho_beta as a soft weight rather than binary mask
-            # This ensures genes with high E_beta but low rho are still visible
-            # but ranked lower than genes with both high E_beta and high rho
-            loadings = loadings * model.rho_beta[:, k]
-
-        # Get top genes
+        # Get top genes by E[beta] loading
         top_indices = np.argsort(loadings)[::-1][:n_top]
-        # Report the original E_beta values (not the weighted ones) for interpretability
-        # along with the rho values for transparency
-        if hasattr(model, 'rho_beta'):
-            top_genes = [(gene_list[i], float(model.E_beta[i, k]), float(model.rho_beta[i, k]))
-                        for i in top_indices]
-        else:
-            top_genes = [(gene_list[i], float(loadings[i])) for i in top_indices]
+        top_genes = [(gene_list[i], float(loadings[i])) for i in top_indices]
 
         results[program_name] = top_genes
 
     return results
 
 
-def compute_adaptive_threshold(prior_prob: float, factor: float = 2.0) -> float:
+def get_active_programs(model: Any) -> Dict[str, Any]:
     """
-    Compute an adaptive threshold for spike-and-slab based on prior probability.
-
-    For spike-and-slab priors, using threshold=0.5 is inappropriate when the prior
-    is far from 0.5. Instead, use a threshold that considers when the posterior
-    has "moved away" from the prior.
+    Get summary of factor activity (all factors active — no spike-and-slab).
 
     Parameters
     ----------
-    prior_prob : float
-        Prior probability of being in the slab (e.g., pi_beta or pi_v).
-    factor : float, default=2.0
-        How much larger than the prior the posterior should be to be considered active.
-        E.g., factor=2.0 means active if rho > 2 * prior_prob.
-
-    Returns
-    -------
-    float
-        Adaptive threshold value.
-    """
-    # Threshold at factor * prior, but cap at 0.5 to avoid being too lenient
-    return min(prior_prob * factor, 0.5)
-
-
-def get_active_programs(
-    model: Any,
-    threshold: float = None,
-    use_adaptive: bool = True
-) -> Dict[str, Any]:
-    """
-    Get summary of active genes and factors based on spike-and-slab.
-
-    Parameters
-    ----------
-    model : VI
-        Trained model with rho_beta and rho_v attributes.
-    threshold : float, optional
-        Threshold for considering an indicator active. If None and use_adaptive=True,
-        an adaptive threshold based on the prior will be computed.
-    use_adaptive : bool, default=True
-        Whether to use adaptive thresholding based on the model's prior probabilities.
+    model : CAVI or SVI
+        Trained model.
 
     Returns
     -------
     dict
         Summary statistics about active components.
     """
-    results = {}
-
-    if hasattr(model, 'rho_beta'):
-        # Determine threshold for beta
-        if threshold is not None:
-            beta_threshold = threshold
-        elif use_adaptive and hasattr(model, 'pi_beta'):
-            beta_threshold = compute_adaptive_threshold(model.pi_beta)
-        else:
-            beta_threshold = 0.5
-
-        active_beta = model.rho_beta > beta_threshold
-        results['beta'] = {
-            'n_active': int(active_beta.sum()),
-            'n_total': model.rho_beta.size,
-            'sparsity': float(1 - active_beta.mean()),
-            'active_per_program': [int(active_beta[:, k].sum()) for k in range(model.d)],
-            'threshold_used': float(beta_threshold),
-            'prior_prob': float(model.pi_beta) if hasattr(model, 'pi_beta') else None,
-            'rho_stats': {
-                'min': float(model.rho_beta.min()),
-                'max': float(model.rho_beta.max()),
-                'mean': float(model.rho_beta.mean())
-            }
-        }
-
-    if hasattr(model, 'rho_v'):
-        # Determine threshold for v
-        if threshold is not None:
-            v_threshold = threshold
-        elif use_adaptive and hasattr(model, 'pi_v'):
-            v_threshold = compute_adaptive_threshold(model.pi_v)
-        else:
-            v_threshold = 0.5
-
-        active_v = model.rho_v > v_threshold
-        results['v'] = {
-            'n_active': int(active_v.sum()),
-            'n_total': model.rho_v.size,
-            'sparsity': float(1 - active_v.mean()),
-            'active_per_class': [int(active_v[k].sum()) for k in range(model.kappa)],
-            'threshold_used': float(v_threshold),
-            'prior_prob': float(model.pi_v) if hasattr(model, 'pi_v') else None,
-            'rho_stats': {
-                'min': float(model.rho_v.min()),
-                'max': float(model.rho_v.max()),
-                'mean': float(model.rho_v.mean())
-            }
-        }
-
+    results = {
+        'n_factors': model.K,
+        'E_beta_range': (float(model.E_beta.min()), float(model.E_beta.max())),
+        'mu_v_range': (float(model.mu_v.min()), float(model.mu_v.max())),
+    }
     return results
 
 
@@ -699,13 +571,12 @@ def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> No
     print("MODEL SUMMARY")
     print("=" * 60)
 
-    print(f"\nHyperparameters:")
-    print(f"  n_factors: {model.d}")
-    print(f"  alpha_theta: {model.alpha_theta}")
-    print(f"  alpha_beta: {model.alpha_beta}")
+    print(f"\nHyperparameters (scHPF):")
+    print(f"  n_factors (K): {model.K}")
+    print(f"  a: {model.a}")
+    print(f"  c: {model.c}")
     print(f"  sigma_v: {model.sigma_v}")
-    print(f"  pi_v: {model.pi_v}")
-    print(f"  pi_beta: {model.pi_beta}")
+    print(f"  sigma_gamma: {model.sigma_gamma}")
 
     if hasattr(model, 'seed_used_'):
         print(f"  random_state: {model.seed_used_} {'(random)' if model.seed_used_ is None else ''}")
@@ -715,53 +586,28 @@ def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> No
     print(f"    range: [{model.E_beta.min():.4f}, {model.E_beta.max():.4f}]")
     print(f"    mean: {model.E_beta.mean():.4f}")
 
-    if hasattr(model, 'E_v'):
-        print(f"  E[v] shape: {model.E_v.shape}")
-        print(f"    range: [{model.E_v.min():.4f}, {model.E_v.max():.4f}]")
+    print(f"  mu_v shape: {model.mu_v.shape}")
+    print(f"    range: [{model.mu_v.min():.4f}, {model.mu_v.max():.4f}]")
 
     if hasattr(model, 'E_theta'):
         print(f"  E[theta] shape: {model.E_theta.shape}")
         print(f"    range: [{model.E_theta.min():.4f}, {model.E_theta.max():.4f}]")
-
-    # Sparsity info with adaptive threshold
-    active_info = get_active_programs(model, use_adaptive=True)
-    if active_info:
-        print(f"\nSparsity (adaptive threshold):")
-        if 'beta' in active_info:
-            beta_info = active_info['beta']
-            print(f"  Beta (threshold={beta_info['threshold_used']:.4f}, prior={beta_info['prior_prob']}):")
-            print(f"    Sparsity: {beta_info['sparsity']*100:.1f}%")
-            print(f"    Active: {beta_info['n_active']}/{beta_info['n_total']}")
-            print(f"    rho_beta: min={beta_info['rho_stats']['min']:.4f}, "
-                  f"max={beta_info['rho_stats']['max']:.4f}, mean={beta_info['rho_stats']['mean']:.4f}")
-        if 'v' in active_info:
-            v_info = active_info['v']
-            print(f"  V (threshold={v_info['threshold_used']:.4f}, prior={v_info['prior_prob']}):")
-            print(f"    Sparsity: {v_info['sparsity']*100:.1f}%")
-            print(f"    Active: {v_info['n_active']}/{v_info['n_total']}")
-            print(f"    rho_v: min={v_info['rho_stats']['min']:.4f}, "
-                  f"max={v_info['rho_stats']['max']:.4f}, mean={v_info['rho_stats']['mean']:.4f}")
 
     # Training info
     if hasattr(model, 'elbo_history_') and model.elbo_history_:
         print(f"\nTraining:")
         print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
         print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
-        if hasattr(model, 'training_time_'):
-            print(f"  Time: {model.training_time_:.2f}s")
+    if hasattr(model, 'holl_history_') and model.holl_history_:
+        print(f"  Best HO-LL: {max(h for _, h in model.holl_history_):.4f}")
 
     # Top genes per program
     if gene_list is not None:
         top_genes = get_top_genes_per_program(model, gene_list, n_top=5)
-        most_influential = np.argmax(np.abs(model.E_v[0])) if hasattr(model, 'E_v') else 0
+        most_influential = np.argmax(np.abs(model.mu_v[0])) if model.mu_v.size > 0 else 0
         print(f"\nTop 5 genes in most influential program (GP{most_influential + 1}):")
-        for item in top_genes[f'GP{most_influential + 1}']:
-            if len(item) == 3:
-                gene, loading, rho = item
-                print(f"    {gene}: {loading:.4f} (rho={rho:.4f})")
-            else:
-                gene, loading = item
-                print(f"    {gene}: {loading:.4f}")
+        for gene, loading in top_genes[f'GP{most_influential + 1}']:
+            print(f"    {gene}: {loading:.4f}")
 
     print("=" * 60)
 
