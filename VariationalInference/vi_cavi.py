@@ -461,7 +461,7 @@ class CAVI:
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        self.mu_v = np.clip(mean_prec / precision, -3*self.sigma_v, 3*self.sigma_v)
+        self.mu_v = np.clip(mean_prec / precision, -10, 10)
         self.sigma_v_diag = 1.0 / precision
 
     def _update_gamma(self, y, X_aux):
@@ -715,10 +715,6 @@ class CAVI:
             old_rw = self.regression_weight
             self.regression_weight = effective_rw
             self._update_theta(z_sum_theta, y, X_aux)
-            if not in_warmup and effective_rw > 0:
-                self._update_zeta(X_aux)
-                self._update_v(y, X_aux)
-                self._update_gamma(y, X_aux)
             self.regression_weight = old_rw
             self._update_xi()
 
