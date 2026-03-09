@@ -243,12 +243,48 @@ def create_parser() -> argparse.ArgumentParser:
         default=5,
         help='Number of local parameter iterations per batch for SVI'
     )
+    
     train_parser.add_argument(
         '--regression-weight',
         type=float,
         default=1.0,
         help='Weight for classification objective (higher=more focus on classification). Values above 5.0 may cause instability.'
     )
+    
+    # Early stopping and convergence
+    train_parser.add_argument(
+        '--early-stopping',
+        action='store_true',
+        default=False,
+        help='Enable early stopping when convergence criterion is met'
+    )
+    train_parser.add_argument(
+        '--early-stopping-metric',
+        type=str,
+        default='elbo',
+        choices=['elbo', 'heldout_ll', 'regression_ll'],
+        help='Metric for early stopping: elbo (training), heldout_ll (validation), or regression_ll (regression component)'
+    )
+    train_parser.add_argument(
+        '--heldout-ll-patience',
+        type=int,
+        default=10,
+        help='Epochs without HO-LL improvement before stopping (only for heldout_ll metric)'
+    )
+    train_parser.add_argument(
+        '--regression-ll-patience',
+        type=int,
+        default=10,
+        help='Epochs without regression LL improvement before stopping (only for regression_ll metric)'
+    )
+    train_parser.add_argument(
+        '--min-epochs-before-stopping',
+        type=int,
+        default=20,
+        help='Minimum epochs before early stopping can trigger'
+    )
+
+    # Learning rate reduction
     train_parser.add_argument(
         '--lr-reduction-patience',
         type=int,
@@ -556,6 +592,11 @@ def cmd_train(args: argparse.Namespace) -> int:
         pi_v=args.pi_v,
         pi_beta=args.pi_beta,
         random_state=args.seed,
+        # Early stopping settings
+        early_stopping_metric=getattr(args, 'early_stopping_metric', 'elbo'),
+        heldout_ll_patience=getattr(args, 'heldout_ll_patience', 10),
+        regression_ll_patience=getattr(args, 'regression_ll_patience', 10),
+        min_epochs_before_stopping=getattr(args, 'min_epochs_before_stopping', 20),
         # V-collapse mitigation options
         use_intercept=args.use_intercept,
         sigma_intercept=args.sigma_intercept,
@@ -577,6 +618,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         max_epochs=args.max_epochs,
         elbo_freq=10,
         verbose=args.verbose,
+        early_stopping=getattr(args, 'early_stopping', False),
         # Held-out data for Blei-style convergence tracking
         X_heldout=X_val,
         y_heldout=y_val,

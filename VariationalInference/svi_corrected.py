@@ -79,12 +79,13 @@ class SVICorrected:
         convergence_tol: float = 1e-4,
         convergence_window: int = 10,
 
-        # Early stopping based on held-out log-likelihood
-        early_stopping_metric: str = 'elbo',  # 'elbo' or 'heldout_ll'
+        # Early stopping based on held-out log-likelihood or regression LL
+        early_stopping_metric: str = 'elbo',  # 'elbo', 'heldout_ll', or 'regression_ll'
         heldout_ll_patience: int = 10,  # epochs without improvement before stopping
         heldout_ll_ema_decay: float = 0.9,  # EMA smoothing for HO-LL
         restore_best_heldout: bool = True,  # restore to best HO-LL epoch
         min_epochs_before_stopping: int = 20,  # minimum epochs before early stopping kicks in
+        regression_ll_patience: int = 10,  # epochs without improvement in regression LL before stopping
 
         # V-collapse mitigation options
         # Option 1: Bias/intercept term
@@ -169,6 +170,7 @@ class SVICorrected:
         self.heldout_ll_ema_decay = heldout_ll_ema_decay
         self.restore_best_heldout = restore_best_heldout
         self.min_epochs_before_stopping = min_epochs_before_stopping
+        self.regression_ll_patience = regression_ll_patience
 
         # V-collapse mitigation options
         # Option 1: Bias/intercept
@@ -1214,7 +1216,7 @@ class SVICorrected:
         b_xi: jnp.ndarray,
         zeta: jnp.ndarray,
         scale: float
-    ) -> float:
+    ) -> Tuple[float, float, float]:
         """
         Compute ELBO for mini-batch, scaled to full dataset.
         
@@ -1230,6 +1232,19 @@ class SVICorrected:
         - Poisson: P(x|λ) = λ^x exp(-λ) / Γ(x+1)
         - Gamma: p(x|a,b) = b^a x^(a-1) exp(-bx) / Γ(a)
         - Gaussian: p(x|μ,Σ) = (2π)^(-d/2) |Σ|^(-1/2) exp(-1/2 (x-μ)'Σ^(-1)(x-μ))
+        
+        Returns
+        -------
+        elbo_total : float
+            Total ELBO (poisson + regression + priors + entropy)
+        poisson_ll : float
+            Poisson log-likelihood component only (scaled, unweighted)
+        regression_ll : float
+            Regression log-likelihood component only (scaled, **unweighted** —
+            i.e. ``scale * elbo_y``; the regression_weight is already folded
+            into ``elbo_total`` but kept out of this return value so that
+            epoch-to-epoch comparisons remain valid when auto-balance
+            changes the weight)
         """
         batch_size = X_batch.shape[0]
         elbo = 0.0
@@ -1374,7 +1389,15 @@ class SVICorrected:
                 sign, logdet = jnp.linalg.slogdet(self.Sigma_gamma[k])
                 elbo += jnp.where(sign > 0, 0.5 * self.p_aux * (1 + jnp.log(2 * jnp.pi)) + 0.5 * logdet, 0.0)
         
-        return float(elbo)
+        # Return components separately for tracking
+        # NOTE: regression_ll is UNWEIGHTED (scale * elbo_y) so that the
+        # epoch-to-epoch metric is independent of auto-balance w_reg changes.
+        # The weighted contribution is already folded into ``elbo``.
+        poisson_ll = float(scale * elbo_x)
+        regression_ll = float(scale * elbo_y)   # raw, not multiplied by w_reg
+        
+        return float(elbo), poisson_ll, regression_ll
+
 
     def _checkpoint_params(self) -> Dict[str, Any]:
         """
@@ -1685,7 +1708,7 @@ class SVICorrected:
         y: np.ndarray,
         X_aux: np.ndarray,
         max_epochs: int = 100,
-        elbo_freq: int = 10,
+        elbo_freq: int = 1,
         verbose: bool = True,
         early_stopping: bool = False,
         X_heldout: Optional[np.ndarray] = None,
@@ -1747,6 +1770,8 @@ class SVICorrected:
         n_batches = max(1, (self.n + self.batch_size - 1) // self.batch_size)
         iteration = 0
         self.elbo_history_ = []
+        self.poisson_ll_history_ = []  # Track Poisson component
+        self.regression_ll_history_ = []  # Track regression component
         
         # EMA + Welford initialization (O(1) memory)
         self.elbo_ema_ = None           # Exponential moving average
@@ -1756,6 +1781,8 @@ class SVICorrected:
         self.elbo_welford_M2_ = 0.0     # Welford sum of squared deviations
         self.convergence_history_ = []  # (epoch, ema, mean, std, rel_change)
         self.last_elbo_ = None          # Track last computed ELBO for display
+        self.last_poisson_ll_ = None    # Track last Poisson LL
+        self.last_regression_ll_ = None # Track last regression LL
         consecutive_converged = 0
 
         # Held-out log-likelihood tracking (Blei-style)
@@ -1768,6 +1795,13 @@ class SVICorrected:
         self.best_epoch_ = 0  # Epoch with best HO-LL
         heldout_ll_no_improve = 0  # Counter for epochs without improvement
         self.best_params_ = None  # Checkpoint of best model parameters
+        
+        # Regression LL based early stopping tracking
+        self.regression_ll_ema_ = None  # EMA of regression LL
+        self.best_regression_ll_ = -np.inf  # Best regression LL seen
+        self.best_regression_epoch_ = 0  # Epoch with best regression LL
+        regression_ll_no_improve = 0  # Counter for epochs without improvement
+        self.best_regression_params_ = None  # Checkpoint of best regression model
 
         # Storage for final training set local parameters
         self.train_a_theta_ = None
@@ -1816,6 +1850,7 @@ class SVICorrected:
             epoch_b_xi = jnp.zeros(self.n)
             
             epoch_elbo = 0.0
+            elbo_computed_this_epoch = False  # Track if ELBO computed in any batch this epoch
             
             for batch_idx in range(n_batches):
                 start = batch_idx * self.batch_size
@@ -1892,15 +1927,21 @@ class SVICorrected:
                     self._update_spike_slab(E_theta, self.E_beta, a_theta, b_theta)
 
                 # Compute ELBO periodically
+                elbo_computed_this_iter = False
                 if iteration % elbo_freq == 0:
-                    elbo = self._compute_elbo(
+                    elbo, poisson_ll, regression_ll = self._compute_elbo(
                         X_batch, y_batch, X_aux_batch,
                         a_theta, b_theta, a_xi, b_xi, zeta, scale
                     )
                     if np.isfinite(elbo):
                         self.elbo_history_.append((iteration, elbo))
+                        self.poisson_ll_history_.append((iteration, poisson_ll))
+                        self.regression_ll_history_.append((iteration, regression_ll))
                         epoch_elbo = elbo
                         self.last_elbo_ = elbo  # Track for display
+                        self.last_poisson_ll_ = poisson_ll
+                        self.last_regression_ll_ = regression_ll
+                        elbo_computed_this_iter = True  # Flag for printing
                         
                         # EMA update: O(1)
                         if self.elbo_ema_ is None:
@@ -1909,12 +1950,22 @@ class SVICorrected:
                             self.elbo_ema_ = (self.ema_decay * self.elbo_ema_ + 
                                               (1 - self.ema_decay) * elbo)
                         
+                        # EMA update for regression LL
+                        if self.regression_ll_ema_ is None:
+                            self.regression_ll_ema_ = regression_ll
+                        else:
+                            self.regression_ll_ema_ = (self.ema_decay * self.regression_ll_ema_ +
+                                                      (1 - self.ema_decay) * regression_ll)
+                        
                         # Welford's online update: O(1)
                         self.elbo_welford_n_ += 1
                         delta = elbo - self.elbo_welford_mean_
                         self.elbo_welford_mean_ += delta / self.elbo_welford_n_
                         delta2 = elbo - self.elbo_welford_mean_
                         self.elbo_welford_M2_ += delta * delta2
+                        
+                        # Set epoch flag for printing
+                        elbo_computed_this_epoch = True
                 
                 iteration += 1
             
@@ -1975,12 +2026,31 @@ class SVICorrected:
                             self.best_params_ = self._checkpoint_params()
                     else:
                         heldout_ll_no_improve += 1
+            
+            # Track regression LL for early stopping
+            regression_ll_improved = False
+            if self.last_regression_ll_ is not None and epoch >= self.min_epochs_before_stopping:
+                if self.regression_ll_ema_ > self.best_regression_ll_:
+                    self.best_regression_ll_ = self.regression_ll_ema_
+                    self.best_regression_epoch_ = epoch
+                    regression_ll_improved = True
+                    regression_ll_no_improve = 0
+                    # Checkpoint parameters for potential restoration
+                    self.best_regression_params_ = self._checkpoint_params()
+                else:
+                    regression_ll_no_improve += 1
 
-            if verbose and epoch % 5 == 0:
+            # Print diagnostics every epoch (even when ELBO non-finite)
+            if verbose and (epoch % 10 == 0 or epoch < 5 or elbo_computed_this_epoch):
                 beta_diversity = np.std(np.array(self.E_beta), axis=1).mean()
                 ema_str = f"{self.elbo_ema_:.2e}" if self.elbo_ema_ is not None else "N/A"
                 rel_str = f"{rel_change:.2e}" if rel_change != np.inf else "N/A"
                 elbo_str = f"{self.last_elbo_:.2e}" if self.last_elbo_ is not None else "N/A"
+                
+                # ELBO component breakdown - PROMINENTLY displayed
+                poisson_str = f"{self.last_poisson_ll_:.2e}" if self.last_poisson_ll_ is not None else "N/A"
+                regression_str = f"{self.last_regression_ll_:.2e}" if self.last_regression_ll_ is not None else "N/A"
+                
                 # Enhanced HO-LL status display
                 if heldout_ll is not None:
                     if epoch < self.min_epochs_before_stopping:
@@ -1997,12 +2067,19 @@ class SVICorrected:
                       f"Δrel = {rel_str}, ρ_t = {rho_t:.4f}, "
                       f"v = {np.array(self.mu_v).ravel()[:3]}, β_div = {beta_diversity:.3f}{heldout_str}")
             
-            # Early stopping check - supports both ELBO and HO-LL based stopping
+            # Early stopping check - supports ELBO, HO-LL, and regression_ll based stopping
             should_stop = False
             stop_reason = ""
 
             if early_stopping and epoch >= self.min_epochs_before_stopping:
-                if self.early_stopping_metric == 'heldout_ll' and use_heldout:
+                if self.early_stopping_metric == 'regression_ll':
+                    # Regression LL based early stopping: keep going for patience epochs after best, then restore
+                    if regression_ll_no_improve >= self.regression_ll_patience:
+                        should_stop = True
+                        stop_reason = (f"Regression LL hasn't improved for {self.regression_ll_patience} epochs. "
+                                       f"Best RegLL = {self.best_regression_ll_:.4e} at epoch {self.best_regression_epoch_}. "
+                                       f"Restoring to best checkpoint.")
+                elif self.early_stopping_metric == 'heldout_ll' and use_heldout:
                     # HO-LL based early stopping: stop when HO-LL hasn't improved
                     if heldout_ll_no_improve >= self.heldout_ll_patience:
                         should_stop = True
@@ -2032,11 +2109,59 @@ class SVICorrected:
         
         self.training_time_ = time.time() - start_time
 
-        # Restore best model if using HO-LL based early stopping
+        # Restore best model based on early stopping metric
         self.restored_to_best_ = False
-        if (self.restore_best_heldout and use_heldout and
-            self.best_params_ is not None and
-            self.early_stopping_metric == 'heldout_ll'):
+        
+        if self.early_stopping_metric == 'regression_ll' and self.best_regression_params_ is not None:
+            # Always restore to best regression LL checkpoint
+            final_epoch = epoch
+            if final_epoch > self.best_regression_epoch_:
+                if verbose:
+                    print(f"\n*** Restoring parameters from best regression LL epoch {self.best_regression_epoch_} "
+                          f"(RegLL = {self.best_regression_ll_:.4e}) ***")
+                self._restore_params(self.best_regression_params_)
+                self.restored_to_best_ = True
+                
+                # Recompute local parameters with restored globals
+                if verbose:
+                    print("*** Recomputing local parameters with restored globals ***")
+                
+                # Run full pass over training data with restored parameters
+                perm = np.arange(self.n)
+                epoch_a_theta = jnp.zeros((self.n, self.d))
+                epoch_b_theta = jnp.zeros((self.n, self.d))
+                epoch_a_xi = jnp.zeros(self.n)
+                epoch_b_xi = jnp.zeros(self.n)
+                
+                for batch_idx in range(n_batches):
+                    start = batch_idx * self.batch_size
+                    end = min(start + self.batch_size, self.n)
+                    idx = perm[start:end]
+                    
+                    X_batch = X[idx]
+                    y_batch = y[idx]
+                    X_aux_batch = X_aux[idx]
+                    
+                    # Optimize local parameters only (globals frozen)
+                    a_theta, b_theta, a_xi, b_xi, zeta = self._update_local_parameters(
+                        X_batch, y_batch, X_aux_batch
+                    )
+                    
+                    # Store final parameters
+                    epoch_a_theta = epoch_a_theta.at[idx].set(a_theta)
+                    epoch_b_theta = epoch_b_theta.at[idx].set(b_theta)
+                    epoch_a_xi = epoch_a_xi.at[idx].set(a_xi)
+                    epoch_b_xi = epoch_b_xi.at[idx].set(b_xi)
+                
+                # Update stored training parameters
+                self.train_a_theta_ = epoch_a_theta
+                self.train_b_theta_ = epoch_b_theta
+                self.train_a_xi_ = epoch_a_xi
+                self.train_b_xi_ = epoch_b_xi
+                
+        elif (self.restore_best_heldout and use_heldout and
+              self.best_params_ is not None and
+              self.early_stopping_metric == 'heldout_ll'):
             # Check if current epoch is significantly past the best
             final_epoch = epoch
             if final_epoch > self.best_epoch_:

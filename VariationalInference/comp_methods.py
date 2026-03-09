@@ -132,14 +132,18 @@ def eval_alg(
         X_test = np.concatenate((X_gex, X_aux), axis=1)
 
     y_pred = model.predict(X_test)
-    y_pred_proba = model.predict_proba(X_test)[:, 1]
+    y_pred_proba_full = model.predict_proba(X_test)
+    n_classes = y_pred_proba_full.shape[1]
 
     test_accuracy = accuracy_score(y_true, y_pred)
     test_precision = precision_score(y_true, y_pred, average="weighted")
     test_recall = recall_score(y_true, y_pred, average="weighted")
     test_f1 = f1_score(y_true, y_pred, average="weighted")
     test_confusion_matrix = confusion_matrix(y_true, y_pred)
-    test_roc_auc = roc_auc_score(y_true, y_pred_proba)
+    if n_classes == 2:
+        test_roc_auc = roc_auc_score(y_true, y_pred_proba_full[:, 1])
+    else:
+        test_roc_auc = roc_auc_score(y_true, y_pred_proba_full, multi_class='ovr', average='weighted')
 
     print(f"  accuracy:  {test_accuracy:.4f}")
     print(f"  precision: {test_precision:.4f}")

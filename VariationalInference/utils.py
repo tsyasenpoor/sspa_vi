@@ -262,7 +262,7 @@ def save_results(
     compress: bool = True,
     save_full_model: bool = False,
     feature_type: str = 'gene',
-    optimal_threshold: float = 0.5,
+    optimal_threshold: Union[float, Dict[str, float]] = 0.5,
     program_names: Optional[List[str]] = None,
     mode: str = 'unmasked'
 ) -> Dict[str, Path]:
@@ -350,6 +350,10 @@ def save_results(
             # Optional: include training history
             if hasattr(model, 'elbo_history_'):
                 essential_params['elbo_history'] = model.elbo_history_
+            if hasattr(model, 'poisson_ll_history_'):
+                essential_params['poisson_ll_history'] = model.poisson_ll_history_
+            if hasattr(model, 'regression_ll_history_'):
+                essential_params['regression_ll_history'] = model.regression_ll_history_
             if hasattr(model, 'training_time_'):
                 essential_params['training_time'] = model.training_time_
 
@@ -437,6 +441,12 @@ def save_results(
     if hasattr(model, 'elbo_history_'):
         summary['elbo_history'] = model.elbo_history_
     
+    # === ELBO component histories ===
+    if hasattr(model, 'poisson_ll_history_'):
+        summary['poisson_ll_history'] = model.poisson_ll_history_
+    if hasattr(model, 'regression_ll_history_'):
+        summary['regression_ll_history'] = model.regression_ll_history_
+    
     # === NEW: Convergence history with EMA trajectory ===
     # Format: [(epoch, ema, welford_mean, welford_std, rel_change), ...]
     if hasattr(model, 'convergence_history_') and model.convergence_history_:
@@ -483,6 +493,24 @@ def save_results(
 
     saved_files['summary'] = summary_path
     print(f"Saved summary to {summary_path}")
+    
+    # Save ELBO component histories to CSV for easy plotting
+    if hasattr(model, 'elbo_history_') and model.elbo_history_:
+        # Combine all components into one dataframe
+        elbo_df = pd.DataFrame(model.elbo_history_, columns=['iteration', 'elbo'])
+        
+        if hasattr(model, 'poisson_ll_history_') and model.poisson_ll_history_:
+            poisson_df = pd.DataFrame(model.poisson_ll_history_, columns=['iteration', 'poisson_ll'])
+            elbo_df = elbo_df.merge(poisson_df, on='iteration', how='left')
+        
+        if hasattr(model, 'regression_ll_history_') and model.regression_ll_history_:
+            regression_df = pd.DataFrame(model.regression_ll_history_, columns=['iteration', 'regression_ll'])
+            elbo_df = elbo_df.merge(regression_df, on='iteration', how='left')
+        
+        elbo_history_path = output_dir / f'{prefix}_elbo_components{ext}'
+        elbo_df.to_csv(elbo_history_path, index=False, compression=compression)
+        saved_files['elbo_components'] = elbo_history_path
+        print(f"Saved ELBO component history to {elbo_history_path}")
 
     return saved_files
 
@@ -946,6 +974,14 @@ def load_pathways(
     }
     print(f"  After size filter [{min_genes}, {max_genes}]: {len(pathways_sized)} pathways")
     pathways = pathways_sized
+    
+    if len(pathways) == 0:
+        raise ValueError(
+            f"Zero pathways remain after filtering (min_genes={min_genes}, "
+            f"max_genes={max_genes}). Likely cause: gene ID mismatch between "
+            f"expression data (gene_filter) and pathway GMT file. Check whether "
+            f"convert_to_ensembl should be True or False."
+        )
     
     # Collect only genes that appear in remaining pathways
     genes_in_pathways = set()

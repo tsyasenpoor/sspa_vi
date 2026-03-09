@@ -269,7 +269,7 @@ class DataLoader:
 
         return self.raw_df
 
-    def load_simulated_csv(self) -> pd.DataFrame:
+    def load_simulated_csv(self, metadata_hints: Optional[List[str]] = None) -> pd.DataFrame:
         """
         Load simulated data from CSV (.csv or .csv.gz).
         
@@ -278,24 +278,46 @@ class DataLoader:
         - Columns: gene expression columns (Ensembl IDs) + metadata columns
         - Metadata columns are auto-detected as non-Ensembl, non-numeric-header columns.
         
+        Parameters
+        ----------
+        metadata_hints : list of str, optional
+            Column names known to be metadata (e.g. label_column, aux_columns).
+            These are forced into metadata even if they have numeric dtype.
+        
         Returns
         -------
         pd.DataFrame
             Raw expression DataFrame (genes only). Metadata stored in self.sim_metadata.
         """
         self._log(f"Loading simulated CSV: {self.data_path}")
+        hints = set(metadata_hints or [])
         
         # Load CSV
         df = pd.read_csv(self.data_path, index_col=0)
         
         # Auto-detect metadata vs gene columns.
-        # Gene columns start with 'ENSG' or 'ENSMUSG'; everything else is metadata.
+        # Primary: gene columns start with 'ENSG' or 'ENSMUSG'.
+        # Fallback: if no Ensembl IDs present (e.g. simulated data with gene symbols),
+        # treat numeric-dtype columns as genes and object/categorical columns as metadata.
+        # In both cases, columns in metadata_hints are always treated as metadata.
         gene_cols = [c for c in df.columns if c.startswith(('ENSG', 'ENSMUSG'))]
-        meta_cols = [c for c in df.columns if c not in gene_cols]
+        if gene_cols:
+            meta_cols = [c for c in df.columns if c not in gene_cols]
+        else:
+            self._log("  No Ensembl IDs detected — falling back to dtype-based gene/metadata split")
+            meta_cols = [c for c in df.columns if df[c].dtype == object or str(df[c].dtype).startswith('category')]
+            gene_cols = [c for c in df.columns if c not in meta_cols]
+        
+        # Force hint columns into metadata even if they were detected as genes
+        hint_in_genes = [c for c in hints if c in df.columns and c not in meta_cols]
+        if hint_in_genes:
+            self._log(f"  Forcing metadata_hints into metadata: {hint_in_genes}")
+            meta_cols = list(dict.fromkeys(meta_cols + hint_in_genes))  # preserve order, no dups
+            gene_cols = [c for c in gene_cols if c not in hints]
         
         if not gene_cols:
             raise ValueError(
-                f"No Ensembl gene columns detected in simulated CSV. "
+                f"No gene columns detected in simulated CSV (tried Ensembl prefix and dtype fallback). "
                 f"Columns found: {list(df.columns[:10])}..."
             )
         
@@ -609,7 +631,8 @@ class DataLoader:
         min_cells_expressing: float = 0.02,
         normalize: bool = False,
         normalize_target_sum: float = 1e4,
-        normalize_method: str = 'library_size'
+        normalize_method: str = 'library_size',
+        metadata_hints: Optional[List[str]] = None
     ) -> pd.DataFrame:
         """
         Run full preprocessing pipeline.
@@ -644,7 +667,7 @@ class DataLoader:
         # SIMULATED DATA: Load directly from CSV, no preprocessing
         if self.is_simulated:
             self._log("Detected simulated data - loading CSV directly (no preprocessing)")
-            self.load_simulated_csv()
+            self.load_simulated_csv(metadata_hints=metadata_hints)
             self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} genes")
             return self.raw_df
 
@@ -964,10 +987,39 @@ class DataLoader:
 
         return splits
 
+    def _get_label_vector(self, cell_ids: List[str], label_column: str) -> np.ndarray:
+        """Return 1-D integer label vector for a single column.
+
+        Handles simulated / EMTAB / h5ad data sources uniformly.
+        """
+        if self.is_simulated:
+            if hasattr(self, 'sim_metadata') and label_column in self.sim_metadata.columns:
+                raw_y = self.sim_metadata.loc[cell_ids, label_column].values
+            elif hasattr(self, 'label_data') and self.label_data is not None:
+                raw_y = self.label_data.loc[cell_ids].values
+            else:
+                raise ValueError(
+                    f"Label column '{label_column}' not found in simulated metadata. "
+                    f"Available: {list(getattr(self, 'sim_metadata', pd.DataFrame()).columns)}"
+                )
+            try:
+                return raw_y.astype(int)
+            except (ValueError, TypeError):
+                codes, uniques = pd.factorize(raw_y, sort=True)
+                self._log(f"  Label encoding '{label_column}': {dict(enumerate(uniques))}")
+                return codes.astype(int)
+        elif self.is_emtab:
+            cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
+            return self.responses_df[label_column].values[cell_idx].astype(int)
+        else:
+            if self.adata is None:
+                self.load_adata()
+            return self.adata.obs.loc[cell_ids, label_column].values.astype(int)
+
     def get_matrices(
         self,
         cell_ids: List[str],
-        label_column: str,
+        label_column,
         aux_columns: Optional[List[str]] = None,
         return_sparse: bool = True
     ) -> Tuple[Union[np.ndarray, sp.csr_matrix], np.ndarray, np.ndarray]:
@@ -978,8 +1030,9 @@ class DataLoader:
         ----------
         cell_ids : list of str
             List of cell IDs to include.
-        label_column : str
-            Column name for labels.
+        label_column : str or list of str
+            Column name(s) for labels. If a list with κ>1 entries,
+            returns y as (n_cells, κ) for multi-outcome inference.
         aux_columns : list of str, optional
             Column names for auxiliary features.
         return_sparse : bool, default=True
@@ -992,7 +1045,7 @@ class DataLoader:
         X_aux : np.ndarray
             Auxiliary feature matrix (n_cells, n_aux).
         y : np.ndarray
-            Label array (n_cells,).
+            Label array (n_cells,) for single label, (n_cells, κ) for multi-label.
         """
         if self.raw_df is None:
             raise ValueError("Must preprocess data first")
@@ -1002,25 +1055,21 @@ class DataLoader:
         if return_sparse:
             X = sp.csr_matrix(X)
 
-        # Get labels (handles simulated vs EMTAB vs h5ad)
-        if self.is_simulated:
-            if hasattr(self, 'sim_metadata') and label_column in self.sim_metadata.columns:
-                y = self.sim_metadata.loc[cell_ids, label_column].values.astype(int)
-            elif hasattr(self, 'label_data') and self.label_data is not None:
-                y = self.label_data.loc[cell_ids].values.astype(int)
-            else:
-                raise ValueError(
-                    f"Label column '{label_column}' not found in simulated metadata. "
-                    f"Available: {list(getattr(self, 'sim_metadata', pd.DataFrame()).columns)}"
-                )
-        elif self.is_emtab:
-            # For EMTAB, get labels from responses_df using cell indices
-            cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
-            y = self.responses_df[label_column].values[cell_idx].astype(int)
+        # --- Normalise label_column to list for uniform handling ---
+        if isinstance(label_column, str):
+            label_columns = [label_column]
         else:
-            if self.adata is None:
-                self.load_adata()
-            y = self.adata.obs.loc[cell_ids, label_column].values.astype(int)
+            label_columns = list(label_column)
+
+        y_parts = []
+        for lcol in label_columns:
+            y_single = self._get_label_vector(cell_ids, lcol)
+            y_parts.append(y_single)
+
+        if len(y_parts) == 1:
+            y = y_parts[0]  # (n,) – backward compatible
+        else:
+            y = np.column_stack(y_parts)  # (n, κ)
 
         # Get auxiliary features
         if aux_columns and not self.is_simulated:
@@ -1050,7 +1099,7 @@ class DataLoader:
 
     def load_and_preprocess(
         self,
-        label_column: str = 't2dm',
+        label_column = 't2dm',
         aux_columns: Optional[List[str]] = None,
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
@@ -1114,6 +1163,17 @@ class DataLoader:
         Gene expression data (X matrices) are returned as sparse matrices by default
         for memory efficiency, as scRNA-seq data is typically very sparse.
         """
+        # Build metadata hints from label + aux columns so simulated CSV
+        # correctly classifies numeric metadata columns (e.g. severity, outcome)
+        # label_column may be str or list of str
+        if isinstance(label_column, list):
+            _label_cols = label_column
+        else:
+            _label_cols = [label_column] if label_column else []
+        _metadata_hints = list(_label_cols)
+        if aux_columns:
+            _metadata_hints.extend(aux_columns)
+        
         # Preprocess
         self.preprocess(
             layer=layer,
@@ -1122,14 +1182,16 @@ class DataLoader:
             min_cells_expressing=min_cells_expressing,
             normalize=normalize,
             normalize_target_sum=normalize_target_sum,
-            normalize_method=normalize_method
+            normalize_method=normalize_method,
+            metadata_hints=_metadata_hints
         )
 
-        # Split
+        # Split – stratify on the first label column when multiple are given
+        _stratify_col = stratify_by or (_label_cols[0] if _label_cols else None)
         splits = self.split_data(
             train_ratio=train_ratio,
             val_ratio=val_ratio,
-            stratify_by=stratify_by or label_column,
+            stratify_by=_stratify_col,
             random_state=random_state
         )
 

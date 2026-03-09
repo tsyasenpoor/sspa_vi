@@ -128,8 +128,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--label-column',
         type=str,
-        default='t2dm',
-        help='Column name in adata.obs for classification labels'
+        nargs='+',
+        default=['t2dm'],
+        help='Column name(s) in adata.obs for classification labels. '
+             'Multiple columns enable multi-outcome inference (e.g., --label-column severity outcome).'
     )
     parser.add_argument(
         '--aux-columns',
@@ -230,6 +232,14 @@ def parse_args() -> argparse.Namespace:
         help='Minimum learning rate for SVI to prevent stagnation'
     )
     parser.add_argument(
+        '--lr-schedule-unit',
+        type=str,
+        default='epoch',
+        choices=['epoch', 'iteration'],
+        help='Learning rate schedule unit: epoch (recommended) or iteration (legacy Robbins-Monro). '
+             'Epoch-based prevents premature LR decay when n_batches is large.'
+    )
+    parser.add_argument(
         '--local-iterations',
         type=int,
         default=10,
@@ -242,9 +252,30 @@ def parse_args() -> argparse.Namespace:
         help='Weight for classification objective (higher=more focus on classification)'
     )
     parser.add_argument(
+        '--auto-balance-regression',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=False,
+        help='Automatically balance Poisson and regression contributions to theta updates. '
+             'Computes scale ratio each epoch and adjusts regression_weight dynamically.'
+    )
+    parser.add_argument(
+        '--regression-balance-target',
+        type=float,
+        default=1.0,
+        help='Target ratio of regression vs Poisson contribution in theta update '
+             '(only used with --auto-balance-regression true). 1.0 = equal influence.'
+    )
+    parser.add_argument(
+        '--max-regression-weight',
+        type=float,
+        default=None,
+        help='Maximum regression weight for auto-balance (default: sqrt(P)). '
+             'Caps the auto-balance to prevent b_theta overflow from large weights.'
+    )
+    parser.add_argument(
         '--elbo-freq',
         type=int,
-        default=10,
+        default=1,
         help='Compute ELBO every N iterations'
     )
     
@@ -277,8 +308,8 @@ def parse_args() -> argparse.Namespace:
         '--early-stopping-metric',
         type=str,
         default='elbo',
-        choices=['elbo', 'heldout_ll'],
-        help='Metric for early stopping: elbo (training) or heldout_ll (validation)'
+        choices=['elbo', 'heldout_ll', 'regression_ll'],
+        help='Metric for early stopping: elbo (training), heldout_ll (validation), or regression_ll (regression component)'
     )
     parser.add_argument(
         '--heldout-ll-patience',
@@ -303,6 +334,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help='Minimum epochs before early stopping can trigger'
+    )
+    parser.add_argument(
+        '--regression-ll-patience',
+        type=int,
+        default=10,
+        help='Epochs without regression LL improvement before stopping (only for regression_ll metric)'
     )
 
     # Hyperparameter options (Priors & Regularization)
@@ -572,7 +609,11 @@ def main():
     print(f"  batch_size:   {args.batch_size}")
     print(f"  max_epochs:   {args.max_epochs}")
     print(f"  learning_rate:{args.learning_rate}")
-    print(f"  label_column: {args.label_column}")
+    # Normalise label_column to list internally
+    label_columns = args.label_column if isinstance(args.label_column, list) else [args.label_column]
+    n_outcomes = len(label_columns)
+
+    print(f"  label_column: {label_columns}")
     print(f"  aux_columns:  {args.aux_columns}")
     seed_display = args.seed if args.seed else f"auto ({getattr(args, '_auto_seed', 'unknown')})"
     print(f"  random_seed:  {seed_display}")
@@ -608,11 +649,11 @@ def main():
     )
 
     data = loader.load_and_preprocess(
-        label_column=args.label_column,
+        label_column=label_columns,
         aux_columns=args.aux_columns,
         train_ratio=0.7,
         val_ratio=0.15,
-        stratify_by=args.label_column,
+        stratify_by=label_columns[0],
         min_cells_expressing=0.02,
         layer=args.layer,
         convert_to_ensembl=True,
@@ -636,7 +677,12 @@ def main():
     print(f"  Validation:     {len(splits['val'])}")
     print(f"  Test:           {len(splits['test'])}")
     print(f"  Aux features:   {X_aux_train.shape[1]}")
-    print(f"  Label dist:     {np.bincount(y_train)}")
+    if y_train.ndim == 1:
+        print(f"  Label ({label_columns[0]}) distribution: {dict(zip(*np.unique(y_train, return_counts=True)))}")
+    else:
+        for k, lc in enumerate(label_columns):
+            print(f"  Label ({lc}) distribution: {dict(zip(*np.unique(y_train[:, k], return_counts=True)))}")
+
 
     # =========================================================================
     # STEP 3.25: Load Pathways (for masked/pathway_init modes)
@@ -650,11 +696,21 @@ def main():
         print(f"Loading Pathways for {args.mode.upper()} Mode")
         print("=" * 80)
         
+        # Auto-detect gene ID format: if most genes start with 'ENSG', expression
+        # data uses Ensembl IDs so GMT symbols need conversion; otherwise the
+        # expression data already uses symbols and no conversion is needed.
+        n_ensg = sum(1 for g in gene_list if g.startswith('ENSG'))
+        genes_are_ensembl = n_ensg > len(gene_list) * 0.5
+        convert_flag = genes_are_ensembl
+        print(f"  Gene ID format: {'Ensembl' if genes_are_ensembl else 'Symbol'} "
+              f"({n_ensg}/{len(gene_list)} ENSG prefix)")
+        print(f"  convert_to_ensembl = {convert_flag}")
+
         # Load pathways from GMT file, filtering to genes in our expression data
         # Uses caching to avoid repeated Ensembl conversion (cache_dir from args)
         pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
             gmt_path=args.pathway_file,
-            convert_to_ensembl=True,
+            convert_to_ensembl=convert_flag,
             species='human',
             gene_filter=gene_list,  # Only include genes in our expression data
             min_genes=args.pathway_min_genes,
@@ -768,6 +824,9 @@ def main():
     print(f"  pi_v:         {args.pi_v:.4f}")
     print(f"  pi_beta:      {args.pi_beta:.4f}")
     print(f"  count_scale:  {args.count_scale if args.count_scale else 'auto'}")
+    print(f"  lr_schedule:  {args.lr_schedule_unit}")
+    print(f"  auto_balance: {args.auto_balance_regression}"
+          + (f" (target={args.regression_balance_target}, max_w={args.max_regression_weight or 'sqrt(P)'})" if args.auto_balance_regression else ""))
 
     # =========================================================================
     # STEP 4: Train SVI Model
@@ -798,8 +857,12 @@ def main():
         learning_rate_decay=args.learning_rate_decay,
         learning_rate_delay=args.learning_rate_delay,
         learning_rate_min=args.learning_rate_min,
+        lr_schedule_unit=args.lr_schedule_unit,
         local_iterations=args.local_iterations,
         regression_weight=args.regression_weight,
+        auto_balance_regression=args.auto_balance_regression,
+        regression_balance_target=args.regression_balance_target,
+        max_regression_weight=args.max_regression_weight,
         alpha_theta=alpha_theta,
         alpha_beta=args.alpha_beta,
         alpha_xi=args.alpha_xi,
@@ -822,6 +885,7 @@ def main():
         heldout_ll_ema_decay=args.heldout_ll_ema_decay,
         restore_best_heldout=args.restore_best_heldout,
         min_epochs_before_stopping=args.min_epochs_before_stopping,
+        regression_ll_patience=args.regression_ll_patience,
         # Pathway mode settings
         mode=args.mode,
         pathway_mask=pathway_mask,
@@ -950,49 +1014,64 @@ def main():
     # Compute probabilities directly from E_theta (no redundant transform call)
     y_train_proba = compute_proba_from_theta(model, E_theta_train, X_aux_train, verbose=args.verbose)
 
+    # Ensure y and proba are 2D for uniform κ-outcome handling
+    _y_train_2d = y_train if y_train.ndim == 2 else y_train[:, np.newaxis]
+    _proba_train_2d = y_train_proba if y_train_proba.ndim == 2 else y_train_proba[:, np.newaxis]
+
     # DEBUG: Compute logits and correlation with labels
     train_logits = E_theta_train @ np.array(model.mu_v).T
     if model.p_aux > 0 and model.mu_gamma is not None:
         train_logits = train_logits + X_aux_train @ model.mu_gamma.T
-    train_logits = train_logits.flatten()
+    if train_logits.ndim == 1:
+        train_logits = train_logits[:, np.newaxis]
 
     print(f"\nDEBUG: Training Logit Analysis")
-    print(f"  Logits range: [{train_logits.min():.4f}, {train_logits.max():.4f}]")
-    print(f"  Logits std:   {train_logits.std():.4f}")
-    logit_label_corr = np.corrcoef(train_logits, y_train.flatten())[0, 1]
-    print(f"  Logit-label correlation: {logit_label_corr:.4f}")
-    if logit_label_corr < 0:
-        print(f"  WARNING: Negative correlation! Model predictions are INVERTED!")
-    if np.abs(logit_label_corr) < 0.1:
-        print(f"  WARNING: Weak correlation! Model is not discriminating!")
+    for k in range(n_outcomes):
+        col_logits = train_logits[:, k]
+        col_y = _y_train_2d[:, k]
+        lname = label_columns[k]
+        print(f"  [{lname}] Logits range: [{col_logits.min():.4f}, {col_logits.max():.4f}]")
+        print(f"  [{lname}] Logits std:   {col_logits.std():.4f}")
+        logit_label_corr = np.corrcoef(col_logits, col_y)[0, 1]
+        print(f"  [{lname}] Logit-label correlation: {logit_label_corr:.4f}")
+        if logit_label_corr < 0:
+            print(f"  [{lname}] WARNING: Negative correlation! Model predictions are INVERTED!")
+        if np.abs(logit_label_corr) < 0.1:
+            print(f"  [{lname}] WARNING: Weak correlation! Model is not discriminating!")
+        logits_c0 = col_logits[col_y == 0]
+        logits_c1 = col_logits[col_y == 1]
+        print(f"  [{lname}] Class 0 logits: mean={logits_c0.mean():.4f}, std={logits_c0.std():.4f}")
+        print(f"  [{lname}] Class 1 logits: mean={logits_c1.mean():.4f}, std={logits_c1.std():.4f}")
+        if logits_c1.mean() < logits_c0.mean():
+            print(f"  [{lname}] WARNING: Class 1 has LOWER logits than Class 0!")
 
-    # Show logit distribution by class
-    y_flat = y_train.flatten()
-    logits_class0 = train_logits[y_flat == 0]
-    logits_class1 = train_logits[y_flat == 1]
-    print(f"  Class 0 logits: mean={logits_class0.mean():.4f}, std={logits_class0.std():.4f}")
-    print(f"  Class 1 logits: mean={logits_class1.mean():.4f}, std={logits_class1.std():.4f}")
-    if logits_class1.mean() < logits_class0.mean():
-        print(f"  WARNING: Class 1 has LOWER logits than Class 0 - model learned wrong direction!")
+    # Per-outcome metrics
+    train_metrics_all = {}
+    for k in range(n_outcomes):
+        lname = label_columns[k]
+        y_pred_k = (_proba_train_2d[:, k] > 0.5).astype(int)
+        metrics_k = compute_metrics(_y_train_2d[:, k], y_pred_k, _proba_train_2d[:, k])
+        train_metrics_all[lname] = metrics_k
+        print(f"\nTraining Results [{lname}]:")
+        print(f"  Accuracy:  {metrics_k['accuracy']:.4f}")
+        if 'auc' in metrics_k:
+            print(f"  AUC:       {metrics_k['auc']:.4f}")
+        print(f"  F1:        {metrics_k['f1']:.4f}")
+        print(f"  Precision: {metrics_k['precision']:.4f}")
+        print(f"  Recall:    {metrics_k['recall']:.4f}")
 
-    y_train_pred = (y_train_proba.ravel() > 0.5).astype(int)
-
-    train_metrics = compute_metrics(y_train, y_train_pred, y_train_proba.ravel())
-    print(f"\nTraining Results:")
-    print(f"  Accuracy:  {train_metrics['accuracy']:.4f}")
-    if 'auc' in train_metrics:
-        print(f"  AUC:       {train_metrics['auc']:.4f}")
-    print(f"  F1:        {train_metrics['f1']:.4f}")
-    print(f"  Precision: {train_metrics['precision']:.4f}")
-    print(f"  Recall:    {train_metrics['recall']:.4f}")
+    # Backward-compatible single-outcome aliases
+    train_metrics = train_metrics_all[label_columns[0]]
+    y_train_pred = (_proba_train_2d[:, 0] > 0.5).astype(int)
     
     # Save training results immediately
     train_results_path = output_dir / 'training_results.pkl'
     with open(train_results_path, 'wb') as f:
         pickle.dump({
-            'metrics': train_metrics,
-            'predictions': y_train_pred,
-            'probabilities': y_train_proba,
+            'label_columns': label_columns,
+            'metrics': train_metrics_all,
+            'predictions': {lc: (_proba_train_2d[:, k] > 0.5).astype(int) for k, lc in enumerate(label_columns)},
+            'probabilities': {lc: _proba_train_2d[:, k] for k, lc in enumerate(label_columns)},
             'logits': train_logits,
             'E_theta': E_theta_train
         }, f)
@@ -1014,32 +1093,47 @@ def main():
     # Compute probabilities directly from E_theta (no redundant transform call)
     y_val_proba = compute_proba_from_theta(model, E_theta_val, X_aux_val, verbose=args.verbose)
     
-    # Find optimal threshold on validation set
-    precision_curve, recall_curve, thresholds_curve = precision_recall_curve(y_val, y_val_proba.ravel())
-    f1_curve = 2 * precision_curve * recall_curve / (precision_curve + recall_curve + 1e-8)
-    optimal_idx = np.argmax(f1_curve[:-1])  # Last element is threshold=1.0
-    optimal_threshold = thresholds_curve[optimal_idx] if len(thresholds_curve) > 0 else 0.5
-    print(f"Optimal threshold (validation F1): {optimal_threshold:.4f}")
-    
-    y_val_pred = (y_val_proba.ravel() > optimal_threshold).astype(int)
+    # Ensure 2D for uniform κ-outcome handling
+    _y_val_2d = y_val if y_val.ndim == 2 else y_val[:, np.newaxis]
+    _proba_val_2d = y_val_proba if y_val_proba.ndim == 2 else y_val_proba[:, np.newaxis]
 
-    val_metrics = compute_metrics(y_val, y_val_pred, y_val_proba.ravel())
-    print(f"\nValidation Results:")
-    print(f"  Accuracy:  {val_metrics['accuracy']:.4f}")
-    if 'auc' in val_metrics:
-        print(f"  AUC:       {val_metrics['auc']:.4f}")
-    print(f"  F1:        {val_metrics['f1']:.4f}")
-    print(f"  Precision: {val_metrics['precision']:.4f}")
-    print(f"  Recall:    {val_metrics['recall']:.4f}")
+    # Find optimal threshold on validation set (per outcome)
+    optimal_thresholds = {}
+    val_metrics_all = {}
+    for k in range(n_outcomes):
+        lname = label_columns[k]
+        prec_k, rec_k, thr_k = precision_recall_curve(_y_val_2d[:, k], _proba_val_2d[:, k])
+        f1_k = 2 * prec_k * rec_k / (prec_k + rec_k + 1e-8)
+        opt_idx = np.argmax(f1_k[:-1])
+        opt_thr = thr_k[opt_idx] if len(thr_k) > 0 else 0.5
+        optimal_thresholds[lname] = opt_thr
+        print(f"Optimal threshold [{lname}] (validation F1): {opt_thr:.4f}")
+
+        y_val_pred_k = (_proba_val_2d[:, k] > opt_thr).astype(int)
+        metrics_k = compute_metrics(_y_val_2d[:, k], y_val_pred_k, _proba_val_2d[:, k])
+        val_metrics_all[lname] = metrics_k
+        print(f"\nValidation Results [{lname}]:")
+        print(f"  Accuracy:  {metrics_k['accuracy']:.4f}")
+        if 'auc' in metrics_k:
+            print(f"  AUC:       {metrics_k['auc']:.4f}")
+        print(f"  F1:        {metrics_k['f1']:.4f}")
+        print(f"  Precision: {metrics_k['precision']:.4f}")
+        print(f"  Recall:    {metrics_k['recall']:.4f}")
+
+    # Backward-compatible aliases (first outcome)
+    optimal_threshold = optimal_thresholds[label_columns[0]]
+    val_metrics = val_metrics_all[label_columns[0]]
+    y_val_pred = (_proba_val_2d[:, 0] > optimal_threshold).astype(int)
     
     # Save validation results immediately
     val_results_path = output_dir / 'validation_results.pkl'
     with open(val_results_path, 'wb') as f:
         pickle.dump({
-            'metrics': val_metrics,
-            'predictions': y_val_pred,
-            'probabilities': y_val_proba,
-            'optimal_threshold': optimal_threshold,
+            'label_columns': label_columns,
+            'metrics': val_metrics_all,
+            'predictions': {lc: (_proba_val_2d[:, k] > optimal_thresholds[lc]).astype(int) for k, lc in enumerate(label_columns)},
+            'probabilities': {lc: _proba_val_2d[:, k] for k, lc in enumerate(label_columns)},
+            'optimal_thresholds': optimal_thresholds,
             'E_theta': E_theta_val
         }, f)
     print(f"Validation results saved to {val_results_path}")
@@ -1063,9 +1157,31 @@ def main():
 
     # Compute probabilities directly from E_theta (no redundant transform call)
     y_test_proba = compute_proba_from_theta(model, E_theta_test, X_aux_test, verbose=args.verbose)
-    
-    print(f"Using optimal threshold from validation: {optimal_threshold:.4f}")
-    y_test_pred = (y_test_proba.ravel() > optimal_threshold).astype(int)
+
+    # Ensure 2D for uniform κ-outcome handling
+    _y_test_2d = y_test if y_test.ndim == 2 else y_test[:, np.newaxis]
+    _proba_test_2d = y_test_proba if y_test_proba.ndim == 2 else y_test_proba[:, np.newaxis]
+
+    # Per-outcome test metrics using per-outcome optimal thresholds from validation
+    test_metrics_all = {}
+    for k in range(n_outcomes):
+        lname = label_columns[k]
+        thr_k = optimal_thresholds[lname]
+        print(f"Using optimal threshold [{lname}] from validation: {thr_k:.4f}")
+        y_test_pred_k = (_proba_test_2d[:, k] > thr_k).astype(int)
+        metrics_k = compute_metrics(_y_test_2d[:, k], y_test_pred_k, _proba_test_2d[:, k])
+        test_metrics_all[lname] = metrics_k
+        print(f"\nTest Results [{lname}]:")
+        print(f"  Accuracy:  {metrics_k['accuracy']:.4f}")
+        if 'auc' in metrics_k:
+            print(f"  AUC:       {metrics_k['auc']:.4f}")
+        print(f"  F1:        {metrics_k['f1']:.4f}")
+        print(f"  Precision: {metrics_k['precision']:.4f}")
+        print(f"  Recall:    {metrics_k['recall']:.4f}")
+
+    # Backward-compatible aliases
+    test_metrics = test_metrics_all[label_columns[0]]
+    y_test_pred = (_proba_test_2d[:, 0] > optimal_threshold).astype(int)
 
     # Report factor summary (soft sparsity via rho_v, no hard threshold)
     if hasattr(model, 'get_sparse_factors') and model.use_spike_slab:
@@ -1080,23 +1196,16 @@ def main():
                 v_val = sparse_info['v_values'][i]
                 direction = sparse_info['direction'][i]
                 print(f"  Factor {f_idx}: v={v_val:.4f} ({direction})")
-
-    test_metrics = compute_metrics(y_test, y_test_pred, y_test_proba.ravel())
-    print(f"\nTest Results:")
-    print(f"  Accuracy:  {test_metrics['accuracy']:.4f}")
-    if 'auc' in test_metrics:
-        print(f"  AUC:       {test_metrics['auc']:.4f}")
-    print(f"  F1:        {test_metrics['f1']:.4f}")
-    print(f"  Precision: {test_metrics['precision']:.4f}")
-    print(f"  Recall:    {test_metrics['recall']:.4f}")
     
     # Save test results immediately
     test_results_path = output_dir / 'test_results.pkl'
     with open(test_results_path, 'wb') as f:
         pickle.dump({
-            'metrics': test_metrics,
-            'predictions': y_test_pred,
-            'probabilities': y_test_proba,
+            'label_columns': label_columns,
+            'metrics': test_metrics_all,
+            'predictions': {lc: (_proba_test_2d[:, k] > optimal_thresholds[lc]).astype(int) for k, lc in enumerate(label_columns)},
+            'probabilities': {lc: _proba_test_2d[:, k] for k, lc in enumerate(label_columns)},
+            'optimal_thresholds': optimal_thresholds,
             'E_theta': E_theta_test
         }, f)
     print(f"Test results saved to {test_results_path}")
@@ -1117,7 +1226,7 @@ def main():
         splits=splits,
         prefix=prefix,
         compress=True,
-        optimal_threshold=optimal_threshold,
+        optimal_threshold=optimal_thresholds,
         program_names=pathway_names,  # Use pathway names if in masked/pathway_init mode
         mode=args.mode
     )
@@ -1151,29 +1260,25 @@ def main():
     # theta_test_df.to_csv(output_dir / f'{prefix}_theta_test.csv.gz', compression='gzip')
     # print(f"Saved test theta to {output_dir / f'{prefix}_theta_test.csv.gz'}")
 
-    # Predictions
-    train_pred_df = pd.DataFrame({
-        'cell_id': splits['train'],
-        'true_label': y_train,
-        'pred_prob': y_train_proba.ravel(),
-        'pred_label': y_train_pred
-    })
+    # Predictions (per-outcome columns)
+    def _build_pred_df(cell_ids, y_2d, proba_2d, thresholds_dict):
+        d = {'cell_id': cell_ids}
+        for k, lc in enumerate(label_columns):
+            thr = thresholds_dict.get(lc, 0.5)
+            d[f'true_{lc}'] = y_2d[:, k]
+            d[f'prob_{lc}'] = proba_2d[:, k]
+            d[f'pred_{lc}'] = (proba_2d[:, k] > thr).astype(int)
+        return pd.DataFrame(d)
+
+    # Training: threshold = 0.5 (no validation-tuned threshold for training)
+    train_thresholds = {lc: 0.5 for lc in label_columns}
+    train_pred_df = _build_pred_df(splits['train'], _y_train_2d, _proba_train_2d, train_thresholds)
     train_pred_df.to_csv(output_dir / f'{prefix}_train_predictions.csv.gz', compression='gzip', index=False)
 
-    val_pred_df = pd.DataFrame({
-        'cell_id': splits['val'],
-        'true_label': y_val,
-        'pred_prob': y_val_proba.ravel(),
-        'pred_label': y_val_pred
-    })
+    val_pred_df = _build_pred_df(splits['val'], _y_val_2d, _proba_val_2d, optimal_thresholds)
     val_pred_df.to_csv(output_dir / f'{prefix}_val_predictions.csv.gz', compression='gzip', index=False)
 
-    test_pred_df = pd.DataFrame({
-        'cell_id': splits['test'],
-        'true_label': y_test,
-        'pred_prob': y_test_proba.ravel(),
-        'pred_label': y_test_pred
-    })
+    test_pred_df = _build_pred_df(splits['test'], _y_test_2d, _proba_test_2d, optimal_thresholds)
     test_pred_df.to_csv(output_dir / f'{prefix}_test_predictions.csv.gz', compression='gzip', index=False)
     print(f"Saved predictions to {output_dir}")
 
