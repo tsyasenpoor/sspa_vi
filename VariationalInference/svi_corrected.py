@@ -310,11 +310,23 @@ class SVICorrected:
 
     @staticmethod
     @jax.jit
+    def _stable_softplus(x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Numerically stable softplus: log(1 + exp(x)).
+
+        For large x (>20), log(1+exp(x)) ≈ x to avoid float32 overflow
+        (exp(88) already exceeds float32 max).
+        For small x (<-20), log(1+exp(x)) ≈ exp(x) ≈ 0.
+        """
+        return jnp.where(x > 20, x, jnp.log1p(jnp.exp(jnp.clip(x, -50, 20))))
+
+    @staticmethod
+    @jax.jit
     def _lambda_jj(zeta: jnp.ndarray) -> jnp.ndarray:
         """
         Jaakkola-Jordan auxiliary function: λ(ζ) = tanh(ζ/2) / (4ζ)
         For ζ→0: λ(0) = 1/8
-        
+
         Vectorized and numerically stable.
         JIT-compiled for performance.
         """
@@ -827,9 +839,21 @@ class SVICorrected:
             
             # Sum over outcomes: (batch, d)
             R_sum = R.sum(axis=1)
-            
-            b_theta_new = b_theta_new + self.regression_weight * R_sum
-            
+
+            # Cap regression contribution to b_theta to prevent it from
+            # overwhelming the Poisson reconstruction gradient.
+            # Without capping, regression_weight * R_sum can make b_theta
+            # negative (clipped to 1e-6 → E[theta] explodes) or enormous
+            # (E[theta] → 0), causing the count/regression objectives to
+            # see-saw rather than converge together.
+            regression_contrib = self.regression_weight * R_sum
+            regression_contrib = jnp.clip(
+                regression_contrib,
+                -0.9 * b_theta_new,       # Don't let b_theta drop below 10% of Poisson value
+                10.0 * jnp.maximum(b_theta_new, 0.1)  # Don't let b_theta jump by >10x
+            )
+            b_theta_new = b_theta_new + regression_contrib
+
             b_theta_new = jnp.maximum(b_theta_new, 1e-6)
             a_theta_new = jnp.maximum(a_theta_new, 1.001)
             
@@ -1308,7 +1332,7 @@ class SVICorrected:
 
         # JJ bound for all outcomes
         elbo_y = jnp.sum((y_expanded - 0.5) * E_A - lam * E_A_sq)
-        elbo_y += jnp.sum(lam * zeta**2 - 0.5 * zeta - jnp.log1p(jnp.exp(jnp.clip(zeta, -500, 500))))
+        elbo_y += jnp.sum(lam * zeta**2 - 0.5 * zeta - self._stable_softplus(zeta))
         elbo += scale * self.regression_weight * elbo_y
         
         # === Priors on local parameters ===
@@ -1517,7 +1541,10 @@ class SVICorrected:
 
         Returns
         -------
-        float : Average held-out log-likelihood per sample
+        dict : Dictionary with keys:
+            'total': Average total held-out log-likelihood per sample
+            'counts': Average Poisson (count) component per sample
+            'regression': Average weighted Bernoulli (regression) component per sample
         """
         # Convert to JAX arrays (input normalization - single conversion)
         if sp.issparse(X_heldout):
@@ -1569,14 +1596,20 @@ class SVICorrected:
 
         # Binary cross-entropy: y*log(σ) + (1-y)*log(1-σ)
         # = y*logits - log(1 + exp(logits))
-        logits_clipped = jnp.clip(logits, -500, 500)
         loglik_labels = jnp.sum(
-            y_heldout * logits_clipped - jnp.log1p(jnp.exp(logits_clipped))
+            y_heldout * logits - self._stable_softplus(logits)
         )
 
         # Combine and normalize
-        total_loglik = float(loglik_counts) + self.regression_weight * float(loglik_labels)
-        return total_loglik / n_heldout
+        loglik_counts_val = float(loglik_counts)
+        loglik_labels_val = float(loglik_labels)
+        weighted_labels = self.regression_weight * loglik_labels_val
+        total_loglik = loglik_counts_val + weighted_labels
+        return {
+            'total': total_loglik / n_heldout,
+            'counts': loglik_counts_val / n_heldout,
+            'regression': weighted_labels / n_heldout,
+        }
 
     def compute_heldout_loglik_batched(
         self,
@@ -1608,7 +1641,10 @@ class SVICorrected:
 
         Returns
         -------
-        float : Average held-out log-likelihood per sample
+        dict : Dictionary with keys:
+            'total': Average total held-out log-likelihood per sample
+            'counts': Average Poisson (count) component per sample
+            'regression': Average weighted Bernoulli (regression) component per sample
         """
         # Convert sparse to dense numpy if needed (keep on CPU until batching)
         if sp.issparse(X_heldout):
@@ -1649,9 +1685,6 @@ class SVICorrected:
 
         n_batches = (n_heldout + batch_size - 1) // batch_size
 
-        # Precompute global expectations (shared across batches)
-        E_log_beta = jsp.digamma(self.a_beta) - jnp.log(self.b_beta)
-
         for batch_idx in range(n_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, n_heldout)
@@ -1679,7 +1712,8 @@ class SVICorrected:
 
             # === Poisson log-likelihood for counts (batched) ===
             # log_rates: (batch_n, p, d) - this is the memory bottleneck
-            log_rates = E_log_theta[:, jnp.newaxis, :] + E_log_beta[jnp.newaxis, :, :]
+            # Use E_log_beta_effective to be consistent with spike-slab masking
+            log_rates = E_log_theta[:, jnp.newaxis, :] + self.E_log_beta_effective[jnp.newaxis, :, :]
             log_sum_rates = logsumexp(log_rates, axis=2)  # (batch_n, p)
 
             batch_loglik_counts = jnp.sum(X_batch * log_sum_rates)
@@ -1699,9 +1733,8 @@ class SVICorrected:
             if self.use_intercept:
                 logits = logits + self.mu_intercept[jnp.newaxis, :]
 
-            logits_clipped = jnp.clip(logits, -500, 500)
             batch_loglik_labels = jnp.sum(
-                y_batch * logits_clipped - jnp.log1p(jnp.exp(logits_clipped))
+                y_batch * logits - self._stable_softplus(logits)
             )
 
             # Accumulate
@@ -1714,8 +1747,13 @@ class SVICorrected:
             del X_batch, y_batch, X_aux_batch, result
 
         # Combine and normalize
-        total_loglik = total_loglik_counts + self.regression_weight * total_loglik_labels
-        return total_loglik / total_samples
+        weighted_labels = self.regression_weight * total_loglik_labels
+        total_loglik = total_loglik_counts + weighted_labels
+        return {
+            'total': total_loglik / total_samples,
+            'counts': total_loglik_counts / total_samples,
+            'regression': weighted_labels / total_samples,
+        }
 
     # =========================================================================
     # MAIN FITTING LOOP
@@ -1746,7 +1784,7 @@ class SVICorrected:
         - elbo_welford_mean_: Running mean (Welford)
         - elbo_welford_var_: Running variance (Welford)
         - convergence_history_: List of (epoch, ema, mean, std, rel_change)
-        - heldout_loglik_history_: List of (epoch, heldout_ll) if held-out data provided
+        - heldout_loglik_history_: List of (epoch, total_ll, counts_ll, regression_ll) if held-out data provided
 
         Parameters
         ----------
@@ -1806,7 +1844,7 @@ class SVICorrected:
 
         # Held-out log-likelihood tracking (Blei-style)
         use_heldout = X_heldout is not None and y_heldout is not None
-        self.heldout_loglik_history_ = []  # (epoch, heldout_ll)
+        self.heldout_loglik_history_ = []  # (epoch, total_ll, counts_ll, regression_ll)
 
         # HO-LL based early stopping tracking
         self.heldout_ll_ema_ = None  # EMA of held-out log-likelihood
@@ -1966,7 +2004,7 @@ class SVICorrected:
                         if self.elbo_ema_ is None:
                             self.elbo_ema_ = elbo
                         else:
-                            self.elbo_ema_ = (self.ema_decay * self.elbo_ema_ + 
+                            self.elbo_ema_ = (self.ema_decay * self.elbo_ema_ +
                                               (1 - self.ema_decay) * elbo)
                         
                         # EMA update for regression LL
@@ -2015,28 +2053,43 @@ class SVICorrected:
             # Compute held-out log-likelihood (Blei-style convergence tracking)
             # Uses memory-efficient batched version to avoid OOM on large datasets
             heldout_ll = None
+            heldout_counts_ll = None
+            heldout_regression_ll = None
             heldout_ll_improved = False
             if use_heldout and epoch % heldout_freq == 0:
-                heldout_ll = self.compute_heldout_loglik_batched(
+                heldout_result = self.compute_heldout_loglik_batched(
                     X_heldout, y_heldout, X_aux_heldout, n_iter=20
                 )
-                self.heldout_loglik_history_.append((epoch, heldout_ll))
+                heldout_ll = heldout_result['total']
+                heldout_counts_ll = heldout_result['counts']
+                heldout_regression_ll = heldout_result['regression']
 
-                # Update HO-LL EMA
+                # Store all components for analysis
+                self.heldout_loglik_history_.append((
+                    epoch, heldout_ll, heldout_counts_ll, heldout_regression_ll
+                ))
+
+                # Determine which metric drives early stopping
+                if self.early_stopping_metric == 'heldout_regression_ll':
+                    heldout_tracking_ll = heldout_regression_ll
+                else:
+                    heldout_tracking_ll = heldout_ll
+
+                # Update HO-LL EMA (tracks whichever metric is used for stopping)
                 if self.heldout_ll_ema_ is None:
-                    self.heldout_ll_ema_ = heldout_ll
+                    self.heldout_ll_ema_ = heldout_tracking_ll
                 else:
                     self.heldout_ll_ema_ = (
                         self.heldout_ll_ema_decay * self.heldout_ll_ema_ +
-                        (1 - self.heldout_ll_ema_decay) * heldout_ll
+                        (1 - self.heldout_ll_ema_decay) * heldout_tracking_ll
                     )
 
                 # Only start tracking best HO-LL and counting patience AFTER warmup
                 # This prevents the model from stopping at epoch 0 before learning
                 if epoch >= self.min_epochs_before_stopping:
-                    # Check for improvement (higher HO-LL is better)
-                    if heldout_ll > self.best_heldout_ll_:
-                        self.best_heldout_ll_ = heldout_ll
+                    # Check for improvement (higher is better)
+                    if heldout_tracking_ll > self.best_heldout_ll_:
+                        self.best_heldout_ll_ = heldout_tracking_ll
                         self.best_epoch_ = epoch
                         heldout_ll_improved = True
                         heldout_ll_no_improve = 0
@@ -2072,13 +2125,16 @@ class SVICorrected:
                 
                 # Enhanced HO-LL status display
                 if heldout_ll is not None:
+                    components_str = f"counts={heldout_counts_ll:.2f}, regr={heldout_regression_ll:.2f}"
                     if epoch < self.min_epochs_before_stopping:
                         # Warmup phase - not yet tracking best or counting patience
-                        heldout_str = f", HO-LL = {heldout_ll:.2f} [warmup until epoch {self.min_epochs_before_stopping}]"
+                        heldout_str = (f", HO-LL = {heldout_ll:.2f} ({components_str}) "
+                                       f"[warmup until epoch {self.min_epochs_before_stopping}]")
                     else:
                         improve_marker = "↑" if heldout_ll_improved else "↓"
-                        heldout_str = (f", HO-LL = {heldout_ll:.2f} {improve_marker} "
-                                       f"(best={self.best_heldout_ll_:.2f}@{self.best_epoch_}, "
+                        tracking_label = "regr" if self.early_stopping_metric == 'heldout_regression_ll' else "total"
+                        heldout_str = (f", HO-LL = {heldout_ll:.2f} ({components_str}) {improve_marker} "
+                                       f"(best {tracking_label}={self.best_heldout_ll_:.2f}@{self.best_epoch_}, "
                                        f"patience={heldout_ll_no_improve}/{self.heldout_ll_patience})")
                 else:
                     heldout_str = ""
@@ -2102,8 +2158,9 @@ class SVICorrected:
                     # HO-LL based early stopping: stop when HO-LL hasn't improved
                     if heldout_ll_no_improve >= self.heldout_ll_patience:
                         should_stop = True
-                        stop_reason = (f"HO-LL hasn't improved for {self.heldout_ll_patience} checks. "
-                                       f"Best HO-LL = {self.best_heldout_ll_:.4f} at epoch {self.best_epoch_}")
+                        metric_name = "Regression HO-LL" if self.early_stopping_metric == 'heldout_regression_ll' else "HO-LL"
+                        stop_reason = (f"{metric_name} hasn't improved for {self.heldout_ll_patience} checks. "
+                                       f"Best = {self.best_heldout_ll_:.4f} at epoch {self.best_epoch_}")
                 elif self.early_stopping_metric == 'elbo':
                     # ELBO based early stopping (original behavior)
                     if rel_change < self.convergence_tol:
@@ -2208,9 +2265,12 @@ class SVICorrected:
 
             # Report held-out LL summary if available
             if len(self.heldout_loglik_history_) > 0:
-                final_heldout_ll = self.heldout_loglik_history_[-1][1]
-                print(f"Final Held-out LL: {final_heldout_ll:.4f} (per sample)")
-                print(f"Best Held-out LL: {self.best_heldout_ll_:.4f} at epoch {self.best_epoch_}")
+                last_entry = self.heldout_loglik_history_[-1]
+                final_total, final_counts, final_regr = last_entry[1], last_entry[2], last_entry[3]
+                print(f"Final Held-out LL: total={final_total:.4f}, counts={final_counts:.4f}, "
+                      f"regression={final_regr:.4f} (per sample)")
+                tracking_label = "Regression" if self.early_stopping_metric == 'heldout_regression_ll' else "Total"
+                print(f"Best {tracking_label} Held-out LL: {self.best_heldout_ll_:.4f} at epoch {self.best_epoch_}")
                 if self.restored_to_best_:
                     print(f"Model restored to best epoch {self.best_epoch_}")
 
@@ -2281,7 +2341,7 @@ class SVICorrected:
         E_v = self.mu_v
         E_v_sq = self.mu_v**2 + jnp.diagonal(self.sigma_v, axis1=1, axis2=2)
         E_gamma = self.mu_gamma
-        
+
         beta_col_sums = E_beta.sum(axis=0)
         
         # Accumulators for averaging
@@ -2330,13 +2390,19 @@ class SVICorrected:
             a_theta = self.alpha_theta + shape_contrib
             b_theta = E_xi[:, jnp.newaxis] + beta_col_sums[jnp.newaxis, :]
             
-            # Regression contribution
+            # Regression contribution (consistent with training: uses regression_weight + capping)
             C_minus_ell = (E_A[:, :, jnp.newaxis] - E_theta[:, jnp.newaxis, :] * E_v[jnp.newaxis, :, :])
             R = (-(y_new[:, :, jnp.newaxis] - 0.5) * E_v[jnp.newaxis, :, :] +
                   2 * lam[:, :, jnp.newaxis] * E_v[jnp.newaxis, :, :] * C_minus_ell +
                   2 * lam[:, :, jnp.newaxis] * E_v_sq[jnp.newaxis, :, :] * E_theta[:, jnp.newaxis, :])
-            
-            b_theta = b_theta + R.sum(axis=1)
+
+            regression_contrib = self.regression_weight * R.sum(axis=1)
+            regression_contrib = jnp.clip(
+                regression_contrib,
+                -0.9 * b_theta,
+                10.0 * jnp.maximum(b_theta, 0.1)
+            )
+            b_theta = b_theta + regression_contrib
             b_theta = jnp.maximum(b_theta, 1e-10)
 
             # Accumulate for averaging (Stability Fix)

@@ -453,11 +453,14 @@ def save_results(
         summary['convergence_history'] = model.convergence_history_
 
     # === NEW: Held-out log-likelihood history (Blei-style convergence) ===
-    # Format: [(epoch, heldout_ll), ...]
+    # Format: [(epoch, total_ll, counts_ll, regression_ll), ...]
     if hasattr(model, 'heldout_loglik_history_') and model.heldout_loglik_history_:
         summary['heldout_loglik_history'] = model.heldout_loglik_history_
-        # Also store final held-out LL in training section for quick access
-        summary['training']['final_heldout_loglik'] = model.heldout_loglik_history_[-1][1]
+        # Also store final held-out LL components in training section for quick access
+        last_entry = model.heldout_loglik_history_[-1]
+        summary['training']['final_heldout_loglik'] = last_entry[1]
+        summary['training']['final_heldout_loglik_counts'] = last_entry[2]
+        summary['training']['final_heldout_loglik_regression'] = last_entry[3]
 
     # Convert JAX/NumPy types to JSON-serializable Python types
     def convert_to_json_serializable(obj):
