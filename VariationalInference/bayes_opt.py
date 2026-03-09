@@ -863,6 +863,13 @@ def parse_args(argv=None):
         help='Only tune these params (use defaults for others)'
     )
 
+    # Fixed params (JSON string)
+    parser.add_argument(
+        '--fixed-params', type=str, default=None,
+        help='JSON string of params to fix (not tuned). '
+             'E.g. \'{"n_factors": 500, "batch_size": 224}\''
+    )
+
     # Training limits for each trial
     parser.add_argument('--max-iter', type=int, default=200,
                         help='Max iterations per VI trial')
@@ -905,6 +912,15 @@ def main(argv=None):
         optuna.logging.DEBUG if args.verbose else optuna.logging.WARNING
     )
 
+    # Parse fixed params JSON
+    fixed_params = {}
+    if args.fixed_params:
+        try:
+            fixed_params = json.loads(args.fixed_params)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid --fixed-params JSON: {e}")
+            return 1
+
     optimizer = HyperparameterOptimizer(
         method=args.method,
         data_path=args.data,
@@ -917,6 +933,7 @@ def main(argv=None):
         n_pathway_factors=args.n_pathway_factors,
         n_trials=args.n_trials,
         params_to_tune=args.params_to_tune,
+        fixed_params=fixed_params,
         max_iter=args.max_iter,
         max_epochs=args.max_epochs,
         subsample_ratio=args.subsample_ratio,
