@@ -194,9 +194,10 @@ class CAVI:
         # --- Apply pathway mask if needed ---
         self._init_beta_mask()
 
-        # --- v: N(0, sigma_v^2) prior → init small random ---
+        # --- v: N(0, sigma_v^2/K) prior → init small random ---
+        # K-scaled prior so total logit θ·v has variance ~ sigma_v^2
         self.mu_v = np.random.randn(self.kappa, K) * 0.01
-        self.sigma_v_diag = np.full((self.kappa, K), self.sigma_v ** 2)
+        self.sigma_v_diag = np.full((self.kappa, K), (self.sigma_v ** 2) / K)
 
         # --- γ: N(0, sigma_gamma^2) ---
         if self.p_aux > 0:
@@ -435,8 +436,11 @@ class CAVI:
         """
         v posterior (diagonal Gaussian, JJ bound).
 
-        precision_{kℓ} = 1/σ²_v + 2 Σ_i λ(ζ_{ik}) E[θ²_{iℓ}]
+        precision_{kℓ} = 1/σ²_eff + 2 Σ_i λ(ζ_{ik}) E[θ²_{iℓ}]
         mean*prec_{kℓ} = Σ_i [(y_{ik}-0.5) - 2λ(ζ_{ik})C^{(-ℓ)}_{ik}] E[θ_{iℓ}]
+
+        σ²_eff = σ²_v / K  so the prior on the total logit θ·v stays O(σ²_v)
+        regardless of the number of factors K.
         """
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
@@ -453,21 +457,28 @@ class CAVI:
         # C^{(-ℓ)}: (n, kappa, K)
         C_minus = theta_v[:, :, None] - E_theta[:, None, :] * E_v[None, :, :]
 
+        # K-scaled prior: each v_kl has prior variance sigma_v^2 / K
+        # so the logit sum Σ_l θ_l v_l has total prior variance ~ sigma_v^2
+        sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
+
         # Precision: (kappa, K)
-        precision = 1.0 / (self.sigma_v ** 2) + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
+        precision = 1.0 / sigma_v_eff_sq + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
 
         # Mean*precision: (kappa, K)
         term1 = np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        # Clip v: scale with sqrt(K) to prevent logit explosion in masked mode
-        v_clip = min(10.0, 50.0 / np.sqrt(self.K))
+        # Clip v per-element: bound so max logit contribution per factor is
+        # bounded.  For K=50 this is ~1.41, for K=348 this is ~0.54.
+        v_clip = min(5.0, 10.0 / np.sqrt(self.K))
         mu_v_new = np.clip(mean_prec / precision, -v_clip, v_clip)
 
-        # Adaptive damping: conservative early (keep 95% old), relaxing over
-        # iterations toward 50/50.  alpha = weight on NEW value.
-        alpha = min(0.5, 0.05 + 0.45 * (iteration / max(200, iteration)))
+        # Adaptive damping: starts at alpha=0.05 (conservative), ramps toward
+        # alpha_max over ~200 iterations.  Cap at 0.15 to prevent the
+        # sign-flipping limit cycle seen with 0.5.
+        alpha_max = 0.15
+        alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
         self.mu_v = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
         self.sigma_v_diag = 1.0 / precision
 
@@ -480,7 +491,8 @@ class CAVI:
         E_theta = self.E_theta
 
         # Same adaptive damping schedule as v
-        alpha = min(0.5, 0.05 + 0.45 * (iteration / max(200, iteration)))
+        alpha_max = 0.15
+        alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
             prec_prior = np.eye(self.p_aux) / (self.sigma_gamma ** 2)
@@ -563,9 +575,11 @@ class CAVI:
                        + self.cp * np.log(self.dp) - self.dp * E_eta)
         elbo -= self.p * gammaln(self.cp)
 
-        # === Prior: p(v) ===
-        elbo -= 0.5 * np.sum(self.mu_v ** 2 + self.sigma_v_diag) / (self.sigma_v ** 2)
-        elbo -= 0.5 * self.kappa * self.K * np.log(2 * np.pi * self.sigma_v ** 2)
+        # === Prior: p(v) with K-scaled variance ===
+        # Each v_kl ~ N(0, sigma_v^2 / K) so total logit variance stays O(sigma_v^2)
+        sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
+        elbo -= 0.5 * np.sum(self.mu_v ** 2 + self.sigma_v_diag) / sigma_v_eff_sq
+        elbo -= 0.5 * self.kappa * self.K * np.log(2 * np.pi * sigma_v_eff_sq)
 
         # === Entropy: -E[log q] ===
         # q(θ) Gamma entropy
