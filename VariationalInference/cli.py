@@ -141,7 +141,21 @@ def create_parser() -> argparse.ArgumentParser:
         '--sigma-v',
         type=float,
         default=1.0,
-        help='Gaussian prior std for v (classification weights).'
+        help='Gaussian prior std for v (classification weights). Used when --v-prior=normal.'
+    )
+    train_parser.add_argument(
+        '--b-v',
+        type=float,
+        default=1.0,
+        help='Laplace prior scale for v (classification weights). Used when --v-prior=laplace. '
+             'Smaller b_v = stronger sparsity.'
+    )
+    train_parser.add_argument(
+        '--v-prior',
+        type=str,
+        default='normal',
+        choices=['normal', 'laplace'],
+        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)."
     )
     train_parser.add_argument(
         '--sigma-gamma',
@@ -442,6 +456,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         c=args.c,
         cp=1.0,
         sigma_v=args.sigma_v,
+        b_v=args.b_v,
+        v_prior=args.v_prior,
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
         random_state=args.seed,

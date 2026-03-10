@@ -43,6 +43,8 @@ class SVI:
         c: float = 0.3,
         cp: float = 1.0,
         sigma_v: float = 1.0,
+        b_v: float = 1.0,
+        v_prior: str = 'normal',
         sigma_gamma: float = 1.0,
         regression_weight: float = 1.0,
         # SVI-specific
@@ -64,6 +66,10 @@ class SVI:
         self.c = c
         self.cp = cp
         self.sigma_v = sigma_v
+        self.b_v = b_v
+        self.v_prior = v_prior.lower()
+        if self.v_prior not in ('normal', 'laplace'):
+            raise ValueError(f"v_prior must be 'normal' or 'laplace', got '{v_prior}'")
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
 
@@ -144,7 +150,11 @@ class SVI:
 
         # Regression params: v, γ
         self.mu_v = np.random.randn(self.n_outcomes, K) * 0.01
-        self.sigma_v_diag = np.full((self.n_outcomes, K), self.sigma_v ** 2)
+        if self.v_prior == 'normal':
+            self.sigma_v_diag = np.full((self.n_outcomes, K), self.sigma_v ** 2)
+        else:
+            # Laplace: init from Laplace variance = 2*b_v^2
+            self.sigma_v_diag = np.full((self.n_outcomes, K), 2.0 * self.b_v ** 2)
 
         if self.p_aux > 0:
             self.mu_gamma = np.zeros((self.n_outcomes, self.p_aux))
@@ -349,14 +359,25 @@ class SVI:
 
         C_minus = theta_v[:, :, None] - E_theta[:, None, :] * self.mu_v[None, :, :]
 
-        precision = 1.0 / (self.sigma_v ** 2) + \
+        if self.v_prior == 'normal':
+            prior_precision = 1.0 / (self.sigma_v ** 2)
+        else:
+            # Laplace (Bayesian Lasso): adaptive precision from E_q[1/s_{kl}]
+            E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
+            omega = np.sqrt(np.maximum(E_v_sq, 1e-12))
+            prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
+
+        precision = prior_precision + \
                     2 * scale * np.einsum('ik,id->kd', lam, E_theta_sq)
 
         term1 = scale * np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
         term2 = 2 * scale * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        mu_v_hat = np.clip(mean_prec / precision, -10, 10)
+        if self.v_prior == 'normal':
+            mu_v_hat = np.clip(mean_prec / precision, -10, 10)
+        else:
+            mu_v_hat = mean_prec / precision  # No clip for Laplace
         sigma_v_hat = 1.0 / precision
 
         return mu_v_hat, sigma_v_hat
