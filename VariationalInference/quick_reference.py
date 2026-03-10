@@ -231,6 +231,95 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help='Gaussian prior std for gamma (auxiliary effects)'
     )
+
+    # Bayesian optimization parameter names (override --a, --c when provided)
+    parser.add_argument(
+        '--alpha-theta',
+        type=float,
+        default=None,
+        help='Gamma shape prior for theta (=a in scHPF). Overrides --a if set.'
+    )
+    parser.add_argument(
+        '--alpha-beta',
+        type=float,
+        default=None,
+        help='Gamma shape prior for beta (=c in scHPF). Overrides --c if set.'
+    )
+    parser.add_argument(
+        '--alpha-xi',
+        type=float,
+        default=None,
+        help='Gamma shape prior for xi (=ap in scHPF). Default 1.0.'
+    )
+    parser.add_argument(
+        '--alpha-eta',
+        type=float,
+        default=None,
+        help='Gamma shape prior for eta (=cp in scHPF). Default 1.0.'
+    )
+    parser.add_argument(
+        '--lambda-xi',
+        type=float,
+        default=None,
+        help='Rate multiplier for xi prior. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--lambda-eta',
+        type=float,
+        default=None,
+        help='Rate multiplier for eta prior. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--pi-v',
+        type=float,
+        default=None,
+        help='Spike-and-slab mixture weight for v. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--pi-beta',
+        type=float,
+        default=None,
+        help='Spike-and-slab mixture weight for beta. Stored but not yet used by CAVI/SVI.'
+    )
+
+    # Damping parameters (VI coordinate ascent)
+    parser.add_argument(
+        '--theta-damping',
+        type=float,
+        default=None,
+        help='Damping for theta updates. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--beta-damping',
+        type=float,
+        default=None,
+        help='Damping for beta updates. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--v-damping',
+        type=float,
+        default=None,
+        help='Damping for v updates. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--gamma-damping',
+        type=float,
+        default=None,
+        help='Damping for gamma updates. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--xi-damping',
+        type=float,
+        default=None,
+        help='Damping for xi updates. Stored but not yet used by CAVI/SVI.'
+    )
+    parser.add_argument(
+        '--eta-damping',
+        type=float,
+        default=None,
+        help='Damping for eta updates. Stored but not yet used by CAVI/SVI.'
+    )
+
     parser.add_argument(
         '--heldout-patience',
         type=int,
@@ -616,12 +705,19 @@ def main():
         print(f"  n_drgps:          {args.n_drgps}")
 
     # Common model kwargs (shared by CAVI and SVI)
+    # Bayes opt names override scHPF names when provided:
+    #   alpha_theta -> a,  alpha_beta -> c,  alpha_xi -> ap,  alpha_eta -> cp
+    a_val = args.alpha_theta if args.alpha_theta is not None else args.a
+    c_val = args.alpha_beta if args.alpha_beta is not None else args.c
+    ap_val = args.alpha_xi if args.alpha_xi is not None else 1.0
+    cp_val = args.alpha_eta if args.alpha_eta is not None else 1.0
+
     common_kwargs = dict(
         n_factors=n_factors,
-        a=args.a,
-        ap=1.0,
-        c=args.c,
-        cp=1.0,
+        a=a_val,
+        ap=ap_val,
+        c=c_val,
+        cp=cp_val,
         sigma_v=sigma_v,
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
