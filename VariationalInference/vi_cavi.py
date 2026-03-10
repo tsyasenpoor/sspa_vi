@@ -644,7 +644,18 @@ class CAVI:
     # =================================================================
 
     def compute_heldout_ll(self, X_val, y_val=None, X_aux_val=None, n_iter=20):
-        """Mean negative Poisson log-likelihood on held-out data."""
+        """
+        Held-out log-likelihood on validation data.
+
+        Returns
+        -------
+        total_ll : float
+            Mean total LL per sample (Poisson + weighted regression if labels provided).
+        poisson_ll : float
+            Mean Poisson LL per sample.
+        regression_ll : float or None
+            Mean regression LL per sample (before weighting), or None if no labels.
+        """
         if sp.issparse(X_val):
             X_val_coo = X_val.tocoo()
         else:
@@ -691,11 +702,43 @@ class CAVI:
         log_sum_rates = (log_rates_max.ravel()
                          + np.log(np.exp(log_rates - log_rates_max).sum(axis=1)))
 
-        ll = np.sum(data * log_sum_rates)
-        ll -= np.sum(E_theta_v.sum(axis=0) * E_beta.sum(axis=0))
-        ll -= np.sum(gammaln(data + 1))
+        poisson_ll = np.sum(data * log_sum_rates)
+        poisson_ll -= np.sum(E_theta_v.sum(axis=0) * E_beta.sum(axis=0))
+        poisson_ll -= np.sum(gammaln(data + 1))
+        poisson_ll_per_sample = poisson_ll / n_val
 
-        return ll / n_val
+        # Regression LL on validation data (if labels provided)
+        regression_ll_per_sample = None
+        if y_val is not None:
+            y_v = np.asarray(y_val, dtype=np.float64)
+            if y_v.ndim == 1:
+                y_v = y_v[:, None]
+            if X_aux_val is None:
+                X_aux_v = np.zeros((n_val, self.p_aux if self.p_aux > 0 else 0))
+            else:
+                X_aux_v = np.asarray(X_aux_val, dtype=np.float64)
+
+            E_A = E_theta_v @ self.mu_v.T
+            if self.p_aux > 0:
+                E_A = E_A + X_aux_v @ self.mu_gamma.T
+
+            E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
+            Var_theta_v = a_theta_v / (b_theta_v ** 2)
+            E_A_sq = E_A ** 2 + Var_theta_v @ E_v_sq.T
+
+            zeta_val = np.sqrt(np.maximum(E_A_sq, 1e-8))
+            lam = self._lambda_jj(zeta_val)
+
+            reg_ll = np.sum((y_v - 0.5) * E_A - lam * E_A_sq)
+            reg_ll += np.sum(lam * zeta_val ** 2 - 0.5 * zeta_val
+                             + np.log(1 / (1 + np.exp(-zeta_val))))
+            regression_ll_per_sample = float(reg_ll / n_val)
+
+        total_ll = poisson_ll_per_sample
+        if regression_ll_per_sample is not None:
+            total_ll += self.regression_weight * regression_ll_per_sample
+
+        return float(total_ll), float(poisson_ll_per_sample), regression_ll_per_sample
 
     # =================================================================
     # fit()
@@ -756,6 +799,12 @@ class CAVI:
         best_reg_iter = 0
         reg_patience = 10  # stop after this many consecutive checks of Reg degradation
 
+        # HO-LL regression early stopping
+        best_holl_reg = -np.inf
+        best_holl_reg_iter = 0
+        best_holl_reg_params = None
+        holl_reg_patience = 10
+
         for t in range(max_iter):
 
             # 1. Compute φ and z_sums (sparse)
@@ -785,16 +834,26 @@ class CAVI:
                 elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux)
                 self.elbo_history_.append((t, elbo))
 
-                # Held-out LL
+                # Held-out LL (with breakdown)
                 holl = None
+                holl_pois = None
+                holl_reg = None
                 if X_val is not None:
-                    holl = self.compute_heldout_ll(X_val)
-                    self.holl_history_.append((t, holl))
+                    holl, holl_pois, holl_reg = self.compute_heldout_ll(
+                        X_val, y_val=y_val, X_aux_val=X_aux_val)
+                    self.holl_history_.append((t, holl, holl_pois,
+                                              holl_reg if holl_reg is not None else 0.0))
                     if holl > best_holl:
                         best_holl = holl
                         best_params = self._checkpoint()
 
-                # Track best regression LL for early stopping
+                    # Track best HO-LL regression for early stopping
+                    if holl_reg is not None and holl_reg > best_holl_reg:
+                        best_holl_reg = holl_reg
+                        best_holl_reg_iter = t
+                        best_holl_reg_params = self._checkpoint()
+
+                # Track best training regression LL for early stopping
                 if reg_ll > best_reg_ll:
                     best_reg_ll = reg_ll
                     best_reg_params = self._checkpoint()
@@ -812,12 +871,29 @@ class CAVI:
                     pct_changes.append(100.0)
 
                 if verbose:
-                    holl_str = f"  HO-LL={holl:.2f}" if holl is not None else ""
+                    if holl is not None:
+                        holl_parts = [f"  HO-LL={holl:.2f}"]
+                        holl_parts.append(f"  HO-Pois={holl_pois:.2f}")
+                        if holl_reg is not None:
+                            holl_parts.append(f"  HO-Reg={holl_reg:.4e}")
+                        holl_str = "".join(holl_parts)
+                    else:
+                        holl_str = ""
                     print(f"Iter {t:4d}: ELBO={elbo:.4e}  "
                           f"Pois={pois_ll:.4e}  Reg={reg_ll:.4e}  "
                           f"v={self.mu_v.ravel()[:3]}{holl_str}")
 
-                # Regression early stopping: if Reg has been degrading for
+                # HO-LL regression early stopping (preferred when validation available)
+                if X_val is not None and holl_reg is not None:
+                    holl_reg_checks_since_best = (t - best_holl_reg_iter) // max(check_freq, 1)
+                    if holl_reg_checks_since_best >= holl_reg_patience and t >= 30:
+                        if verbose:
+                            print(f"HO-LL Reg early stop at iter {t}: "
+                                  f"HO-Reg hasn't improved in {holl_reg_checks_since_best} checks "
+                                  f"(best HO-Reg={best_holl_reg:.4e} at iter {best_holl_reg_iter})")
+                        break
+
+                # Regression early stopping (training): if Reg has been degrading for
                 # reg_patience consecutive checks, stop and restore best.
                 checks_since_best = (t - best_reg_iter) // max(check_freq, 1)
                 if checks_since_best >= reg_patience and t >= 30:
@@ -842,8 +918,15 @@ class CAVI:
             if best_params is not None:
                 print(f"Best HO-LL: {best_holl:.4f}")
 
-        # Restore best: prefer HO-LL checkpoint if available, else Reg checkpoint
-        if best_params is not None:
+        # Restore best: prefer HO-LL reg checkpoint > HO-LL total > training Reg
+        if best_holl_reg_params is not None:
+            if verbose:
+                print(f"Restoring best HO-LL regression checkpoint (iter {best_holl_reg_iter}, "
+                      f"HO-Reg={best_holl_reg:.4e})")
+            self._restore(best_holl_reg_params)
+        elif best_params is not None:
+            if verbose:
+                print(f"Restoring best HO-LL checkpoint (HO-LL={best_holl:.4f})")
             self._restore(best_params)
         elif best_reg_params is not None:
             if verbose:

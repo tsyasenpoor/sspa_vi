@@ -474,9 +474,15 @@ def save_results(
         saved_files['elbo_history'] = elbo_history_path
         print(f"Saved ELBO history to {elbo_history_path}")
 
-    # Save held-out LL history
+    # Save held-out LL history (with breakdown if available)
     if hasattr(model, 'holl_history_') and model.holl_history_:
-        holl_df = pd.DataFrame(model.holl_history_, columns=['iteration', 'heldout_ll'])
+        # Support both old format (iter, holl) and new format (iter, holl, pois, reg)
+        first = model.holl_history_[0]
+        if len(first) == 4:
+            columns = ['iteration', 'heldout_ll', 'heldout_pois_ll', 'heldout_reg_ll']
+        else:
+            columns = ['iteration', 'heldout_ll']
+        holl_df = pd.DataFrame(model.holl_history_, columns=columns)
         holl_history_path = output_dir / f'{prefix}_holl_history{ext}'
         holl_df.to_csv(holl_history_path, index=False, compression=compression)
         saved_files['holl_history'] = holl_history_path
@@ -599,7 +605,7 @@ def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> No
         print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
         print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
     if hasattr(model, 'holl_history_') and model.holl_history_:
-        print(f"  Best HO-LL: {max(h for _, h in model.holl_history_):.4f}")
+        print(f"  Best HO-LL: {max(entry[1] for entry in model.holl_history_):.4f}")
 
     # Top genes per program
     if gene_list is not None:
