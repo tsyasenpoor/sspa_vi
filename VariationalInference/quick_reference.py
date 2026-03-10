@@ -777,7 +777,7 @@ def main():
         print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
         print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
     if hasattr(model, 'holl_history_') and model.holl_history_:
-        print(f"  Best HO-LL: {model.holl_history_[-1][1]:.4f}")
+        print(f"  Best HO-LL: {max(entry[1] for entry in model.holl_history_):.4f}")
 
     # =========================================================================
     # DEBUG: v Parameter Diagnostics
