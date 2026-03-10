@@ -51,7 +51,10 @@ import numpy as np
 import optuna
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, f1_score,
+    precision_score, recall_score, average_precision_score,
+)
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -81,9 +84,13 @@ SHARED_SEARCH_SPACE = {
     'lambda_eta': ('float', 0.5, 3.0),
     'sigma_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
+    'regression_weight': ('log_float', 0.1, 500.0),
+}
+
+# --- Spike-and-slab params (SVI only; vi_cavi has no spike-and-slab) ---
+SPIKE_SLAB_SEARCH_SPACE = {
     'pi_v': ('float', 0.3, 0.99),
     'pi_beta': ('float', 0.01, 0.20),
-    'regression_weight': ('log_float', 0.1, 500.0),
 }
 
 # --- VI-specific search space ---
@@ -166,7 +173,9 @@ def build_search_space(method: str, dataset_preset: Optional[str] = None) -> Dic
 
     if method == 'vi':
         space.update(VI_SEARCH_SPACE)
+        # vi_cavi has no spike-and-slab — skip pi_v, pi_beta
     else:
+        space.update(SPIKE_SLAB_SEARCH_SPACE)
         space.update(SVI_SEARCH_SPACE)
 
     if dataset_preset and dataset_preset in DATASET_PRESETS:
@@ -231,6 +240,7 @@ class TrialObjective:
         max_epochs: int = 100,
         random_state: Optional[int] = None,
         subsample_ratio: Optional[float] = None,
+        label_names: Optional[List[str]] = None,
     ):
         self.method = method
         self.X_train = X_train
@@ -250,6 +260,7 @@ class TrialObjective:
         self.max_epochs = max_epochs
         self.random_state = random_state
         self.subsample_ratio = subsample_ratio
+        self.label_names = label_names
 
     def _subsample(self):
         """Return (optionally subsampled) training data."""
@@ -312,8 +323,42 @@ class TrialObjective:
 
         return config_cls(**config_kwargs)
 
+    @staticmethod
+    def _compute_label_metrics(y_true, y_proba, label_name=None):
+        """Compute all classification metrics for a single binary label.
+
+        Returns a dict with keys: auc, accuracy, f1, precision, recall,
+        average_precision.  Keys are prefixed with *label_name* when given.
+        """
+        y_true = np.asarray(y_true).ravel()
+        y_proba = np.asarray(y_proba).ravel()
+        y_pred = (y_proba > 0.5).astype(int)
+        prefix = f"{label_name}_" if label_name else ""
+
+        metrics = {}
+        # AUC / average-precision (need both classes)
+        if len(np.unique(y_true)) >= 2:
+            metrics[f'{prefix}auc'] = float(roc_auc_score(y_true, y_proba))
+            metrics[f'{prefix}average_precision'] = float(
+                average_precision_score(y_true, y_proba)
+            )
+        else:
+            metrics[f'{prefix}auc'] = 0.5
+            metrics[f'{prefix}average_precision'] = float('nan')
+
+        metrics[f'{prefix}accuracy'] = float(accuracy_score(y_true, y_pred))
+        metrics[f'{prefix}f1'] = float(f1_score(y_true, y_pred, zero_division=0))
+        metrics[f'{prefix}precision'] = float(precision_score(y_true, y_pred, zero_division=0))
+        metrics[f'{prefix}recall'] = float(recall_score(y_true, y_pred, zero_division=0))
+        return metrics
+
     def __call__(self, trial: optuna.Trial) -> float:
-        """Run a single trial: train model, return validation AUC."""
+        """Run a single trial: train model, return validation AUC.
+
+        For multi-label setups the objective is the *macro-average* AUC
+        across all label columns.  Per-label metrics are stored as trial
+        user attributes so they appear in the results CSV.
+        """
         try:
             params = self._sample_hyperparams(trial)
             config = self._build_config(params)
@@ -352,8 +397,6 @@ class TrialObjective:
 
             # Filter to only params accepted by the specific fit() method
             if self.method == 'vi':
-                # CAVI.fit() accepts: X_train, y_train, X_aux_train, X_val, y_val, X_aux_val,
-                #                     max_iter, check_freq, tol, v_warmup, verbose
                 vi_fit_params = {
                     'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
                     'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
@@ -362,33 +405,64 @@ class TrialObjective:
 
             model.fit(**fit_kwargs)
 
-            # Evaluate on validation set
+            # ---- Evaluate on held-out validation set ----
             y_val_proba = model.predict_proba(
                 self.X_val, self.X_aux_val, n_iter=15
             )
-            y_val_proba = np.asarray(y_val_proba).ravel()
+            y_val_proba = np.asarray(y_val_proba)
+            y_val = np.asarray(self.y_val)
 
-            # Compute AUC (primary metric)
-            y_val_flat = np.asarray(self.y_val).ravel()
-            if len(np.unique(y_val_flat)) < 2:
-                logger.warning("Validation set has only one class — returning 0.5")
-                return 0.5
+            # Determine number of labels (κ)
+            if y_val.ndim == 1:
+                n_labels = 1
+                y_val = y_val[:, None]          # (n, 1)
+                y_val_proba = y_val_proba.reshape(-1, 1)
+            else:
+                n_labels = y_val.shape[1]
+                if y_val_proba.ndim == 1:
+                    y_val_proba = y_val_proba.reshape(-1, 1)
 
-            auc = roc_auc_score(y_val_flat, y_val_proba)
+            # Build label names for logging
+            label_names = self.label_names if self.label_names is not None else [
+                f'label{k}' for k in range(n_labels)
+            ]
 
-            # Log additional metrics
-            y_val_pred = (y_val_proba > 0.5).astype(int)
-            acc = accuracy_score(y_val_flat, y_val_pred)
-            f1 = f1_score(y_val_flat, y_val_pred, zero_division=0)
-            trial.set_user_attr('val_accuracy', float(acc))
-            trial.set_user_attr('val_f1', float(f1))
-            trial.set_user_attr('val_auc', float(auc))
+            # Per-label metrics
+            aucs = []
+            all_metrics = {}
+            for k in range(n_labels):
+                lname = label_names[k] if n_labels > 1 else None
+                m = self._compute_label_metrics(
+                    y_val[:, k], y_val_proba[:, k], label_name=lname
+                )
+                all_metrics.update(m)
+                auc_key = f'{lname}_auc' if lname else 'auc'
+                aucs.append(m[auc_key])
+
+            # Macro-average AUC as primary objective
+            mean_auc = float(np.mean(aucs))
+
+            # When single-label, keep backward-compatible attr names
+            if n_labels == 1:
+                trial.set_user_attr('val_auc', all_metrics['auc'])
+                trial.set_user_attr('val_accuracy', all_metrics['accuracy'])
+                trial.set_user_attr('val_f1', all_metrics['f1'])
+                trial.set_user_attr('val_precision', all_metrics['precision'])
+                trial.set_user_attr('val_recall', all_metrics['recall'])
+                trial.set_user_attr('val_average_precision', all_metrics['average_precision'])
+            else:
+                # Store per-label + macro averages
+                for key, val in all_metrics.items():
+                    trial.set_user_attr(f'val_{key}', val)
+                trial.set_user_attr('val_mean_auc', mean_auc)
 
             logger.info(
-                f"Trial {trial.number}: AUC={auc:.4f}, Acc={acc:.4f}, "
-                f"F1={f1:.4f}, n_factors={params.get('n_factors', '?')}"
+                f"Trial {trial.number}: "
+                + (f"AUC={mean_auc:.4f} (macro)" if n_labels > 1 else f"AUC={mean_auc:.4f}")
+                + f", Acc={all_metrics.get('accuracy', all_metrics.get(f'{label_names[0]}_accuracy', 0)):.4f}"
+                + f", n_factors={params.get('n_factors', '?')}"
             )
-            return auc
+            return mean_auc
 
         except Exception as e:
             logger.error(f"Trial {trial.number} failed: {e}")
@@ -610,6 +684,7 @@ class HyperparameterOptimizer:
             max_epochs=self.max_epochs,
             random_state=self.random_state,
             subsample_ratio=self.subsample_ratio,
+            label_names=self.label_column,
         )
 
         # Create Optuna study
@@ -646,17 +721,34 @@ class HyperparameterOptimizer:
     def _report_results(self, study: optuna.Study, elapsed: float):
         """Print a summary of the optimization results."""
         best = study.best_trial
+        attrs = best.user_attrs
+        n_labels = len(self.label_column)
 
         print("\n" + "=" * 70)
         print(f"  {self.method.upper()} BAYESIAN OPTIMIZATION COMPLETE")
         print("=" * 70)
         print(f"  Trials:        {len(study.trials)}")
         print(f"  Best trial:    #{best.number}")
-        print(f"  Best AUC:      {best.value:.4f}")
-        if 'val_accuracy' in best.user_attrs:
-            print(f"  Best Accuracy: {best.user_attrs['val_accuracy']:.4f}")
-        if 'val_f1' in best.user_attrs:
-            print(f"  Best F1:       {best.user_attrs['val_f1']:.4f}")
+        print(f"  Best AUC:      {best.value:.4f}"
+              + (" (macro-avg)" if n_labels > 1 else ""))
+
+        # Validation metrics
+        if n_labels == 1:
+            for metric in ('accuracy', 'f1', 'precision', 'recall', 'average_precision'):
+                key = f'val_{metric}'
+                if key in attrs:
+                    print(f"  {metric.replace('_', ' ').title():18s} {attrs[key]:.4f}")
+        else:
+            # Per-label metrics
+            for lname in self.label_column:
+                print(f"\n  --- {lname} ---")
+                for metric in ('auc', 'accuracy', 'f1', 'precision', 'recall', 'average_precision'):
+                    key = f'val_{lname}_{metric}'
+                    if key in attrs:
+                        print(f"    {metric.replace('_', ' ').title():18s} {attrs[key]:.4f}")
+            if 'val_mean_auc' in attrs:
+                print(f"\n  Macro-avg AUC:   {attrs['val_mean_auc']:.4f}")
+
         print(f"  Time elapsed:  {elapsed:.1f}s ({elapsed/60:.1f}min)")
         print()
         print("  Best hyperparameters:")
@@ -679,8 +771,9 @@ class HyperparameterOptimizer:
             'n_trials': len(study.trials),
             'best_trial': best.number,
             'best_auc': best.value,
-            'best_accuracy': best.user_attrs.get('val_accuracy'),
-            'best_f1': best.user_attrs.get('val_f1'),
+            'best_val_metrics': {
+                k: v for k, v in best.user_attrs.items() if k.startswith('val_')
+            },
             'best_params': best.params,
             'fixed_params': self.fixed_params,
             'data_path': str(self.data_path),
@@ -791,22 +884,48 @@ class HyperparameterOptimizer:
         model.fit(**fit_kwargs)
 
         y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=20)
-        y_test_proba = np.asarray(y_test_proba).ravel()
-        y_test_flat = np.asarray(y_test).ravel()
+        y_test_proba = np.asarray(y_test_proba)
+        y_test_arr = np.asarray(y_test)
 
-        test_auc = roc_auc_score(y_test_flat, y_test_proba)
-        y_test_pred = (y_test_proba > 0.5).astype(int)
-        test_acc = accuracy_score(y_test_flat, y_test_pred)
-        test_f1 = f1_score(y_test_flat, y_test_pred, zero_division=0)
+        # Multi-label handling
+        if y_test_arr.ndim == 1:
+            n_labels = 1
+            y_test_arr = y_test_arr[:, None]
+            y_test_proba = y_test_proba.reshape(-1, 1)
+        else:
+            n_labels = y_test_arr.shape[1]
+            if y_test_proba.ndim == 1:
+                y_test_proba = y_test_proba.reshape(-1, 1)
 
-        metrics = {'auc': test_auc, 'accuracy': test_acc, 'f1': test_f1}
+        label_names = self.label_column
+        metrics = {}
+        aucs = []
 
         print("\n" + "=" * 50)
         print("  TEST SET EVALUATION (best hyperparameters)")
         print("=" * 50)
-        print(f"  AUC:      {test_auc:.4f}")
-        print(f"  Accuracy: {test_acc:.4f}")
-        print(f"  F1:       {test_f1:.4f}")
+
+        for k in range(n_labels):
+            lname = label_names[k] if n_labels > 1 else None
+            m = TrialObjective._compute_label_metrics(
+                y_test_arr[:, k], y_test_proba[:, k], label_name=lname
+            )
+            metrics.update(m)
+            auc_key = f'{lname}_auc' if lname else 'auc'
+            aucs.append(m[auc_key])
+
+            header = f"  --- {lname} ---" if lname else ""
+            if header:
+                print(header)
+            prefix = f"{lname}_" if lname else ""
+            for metric in ('auc', 'accuracy', 'f1', 'precision', 'recall', 'average_precision'):
+                print(f"  {metric.replace('_', ' ').title():18s} {m[f'{prefix}{metric}']:.4f}")
+
+        if n_labels > 1:
+            mean_auc = float(np.mean(aucs))
+            metrics['mean_auc'] = mean_auc
+            print(f"\n  Macro-avg AUC:   {mean_auc:.4f}")
+
         print("=" * 50)
 
         # Save model
