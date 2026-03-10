@@ -327,6 +327,8 @@ def save_results(
                 'a': model.a,
                 'c': model.c,
                 'sigma_v': model.sigma_v,
+                'b_v': model.b_v,
+                'v_prior': model.v_prior,
                 'sigma_gamma': model.sigma_gamma,
                 # Global parameters (needed for inference)
                 'E_beta': model.E_beta,
@@ -401,6 +403,8 @@ def save_results(
             'a': model.a,
             'c': model.c,
             'sigma_v': model.sigma_v,
+            'b_v': model.b_v,
+            'v_prior': model.v_prior,
             'sigma_gamma': model.sigma_gamma,
         },
         'data_shapes': {
@@ -581,7 +585,11 @@ def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> No
     print(f"  n_factors (K): {model.K}")
     print(f"  a: {model.a}")
     print(f"  c: {model.c}")
-    print(f"  sigma_v: {model.sigma_v}")
+    print(f"  v_prior: {model.v_prior}")
+    if model.v_prior == 'normal':
+        print(f"  sigma_v: {model.sigma_v}")
+    else:
+        print(f"  b_v: {model.b_v}")
     print(f"  sigma_gamma: {model.sigma_gamma}")
 
     if hasattr(model, 'seed_used_'):

@@ -223,7 +223,21 @@ def parse_args() -> argparse.Namespace:
         '--sigma-v',
         type=float,
         default=1.0,
-        help='Gaussian prior std for v (classification weights).'
+        help='Gaussian prior std for v (classification weights). Used when --v-prior=normal.'
+    )
+    parser.add_argument(
+        '--b-v',
+        type=float,
+        default=1.0,
+        help='Laplace prior scale for v (classification weights). Used when --v-prior=laplace. '
+             'Smaller b_v = stronger sparsity.'
+    )
+    parser.add_argument(
+        '--v-prior',
+        type=str,
+        default='normal',
+        choices=['normal', 'laplace'],
+        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)."
     )
     parser.add_argument(
         '--sigma-gamma',
@@ -673,7 +687,11 @@ def main():
     print(f"  c (beta shape):  {args.c:.4f}")
     print(f"  ap, cp:          1.0, 1.0 (fixed)")
     print(f"  bp, dp:          empirical (computed from data)")
-    print(f"  sigma_v:         {sigma_v:.4f}")
+    print(f"  v_prior:         {args.v_prior}")
+    if args.v_prior == 'normal':
+        print(f"  sigma_v:         {sigma_v:.4f}")
+    else:
+        print(f"  b_v:             {args.b_v:.4f}")
     print(f"  sigma_gamma:     {args.sigma_gamma:.4f}")
     print(f"  regression_wt:   {args.regression_weight:.4f}")
     if args.method == 'svi':
@@ -719,6 +737,8 @@ def main():
         c=c_val,
         cp=cp_val,
         sigma_v=sigma_v,
+        b_v=args.b_v,
+        v_prior=args.v_prior,
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
         random_state=args.seed,
@@ -816,6 +836,8 @@ def main():
         'a': float(model.a),
         'c': float(model.c),
         'sigma_v': float(model.sigma_v),
+        'b_v': float(model.b_v),
+        'v_prior': model.v_prior,
         'E_beta': np.array(model.E_beta),
         'E_log_beta': np.array(model.E_log_beta),
         'mu_v': np.array(model.mu_v),

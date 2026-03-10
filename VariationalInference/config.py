@@ -58,7 +58,12 @@ class VIConfig:
     lambda_eta : float, default=1.5
         Prior rate for gene scaling.
     sigma_v : float, default=0.2
-        Prior std for classification weights.
+        Prior std for classification weights (used when v_prior='normal').
+    b_v : float, default=1.0
+        Laplace prior scale for classification weights (used when v_prior='laplace').
+        Smaller b_v = stronger sparsity. Var[v] = 2*b_v^2.
+    v_prior : str, default='normal'
+        Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso).
     sigma_gamma : float, default=0.5
         Prior std for auxiliary feature effects.
     pi_v : float, default=0.9
@@ -132,6 +137,8 @@ class VIConfig:
     lambda_xi: float = 1.5
     lambda_eta: float = 1.5
     sigma_v: float = 0.2
+    b_v: float = 1.0
+    v_prior: str = 'normal'
     sigma_gamma: float = 0.5
     pi_v: float = 0.9
     pi_beta: float = 0.05
@@ -201,6 +208,8 @@ class VIConfig:
             'lambda_xi': self.lambda_xi,
             'lambda_eta': self.lambda_eta,
             'sigma_v': self.sigma_v,
+            'b_v': self.b_v,
+            'v_prior': self.v_prior,
             'sigma_gamma': self.sigma_gamma,
             'random_state': self.random_state,
             'pi_v': self.pi_v,
@@ -363,6 +372,8 @@ class SVIConfig:
     alpha_theta, alpha_beta, alpha_xi, alpha_eta : float, default=2.0
     lambda_xi, lambda_eta : float, default=1.5
     sigma_v : float, default=0.2
+    b_v : float, default=1.0
+    v_prior : str, default='normal'
     sigma_gamma : float, default=0.5
     pi_v : float, default=0.9
     pi_beta : float, default=0.05
@@ -463,6 +474,8 @@ class SVIConfig:
     lambda_xi: float = 1.5
     lambda_eta: float = 1.5
     sigma_v: float = 0.2
+    b_v: float = 1.0
+    v_prior: str = 'normal'
     sigma_gamma: float = 0.5
     pi_v: float = 0.9
     pi_beta: float = 0.05
@@ -549,6 +562,8 @@ class SVIConfig:
             'lambda_xi': self.lambda_xi,
             'lambda_eta': self.lambda_eta,
             'sigma_v': self.sigma_v,
+            'b_v': self.b_v,
+            'v_prior': self.v_prior,
             'sigma_gamma': self.sigma_gamma,
             'random_state': self.random_state,
             'pi_v': self.pi_v,

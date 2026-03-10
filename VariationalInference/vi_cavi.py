@@ -89,7 +89,12 @@ class CAVI:
     cp : float
         Gamma shape prior for η (gene capacity). Default 1.0.
     sigma_v : float
-        Gaussian prior std for v (regression weights).
+        Gaussian prior std for v (regression weights). Used when v_prior='normal'.
+    b_v : float
+        Laplace prior scale for v (regression weights). Used when v_prior='laplace'.
+        Smaller b_v = stronger sparsity. Var[v] = 2*b_v^2.
+    v_prior : str
+        Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso).
     sigma_gamma : float
         Gaussian prior std for γ (auxiliary covariate weights).
     regression_weight : float
@@ -106,6 +111,8 @@ class CAVI:
         c: float = 0.3,
         cp: float = 1.0,
         sigma_v: float = 1.0,
+        b_v: float = 1.0,
+        v_prior: str = 'normal',
         sigma_gamma: float = 1.0,
         regression_weight: float = 1.0,
         random_state: Optional[int] = None,
@@ -122,6 +129,10 @@ class CAVI:
         self.c = c
         self.cp = cp
         self.sigma_v = sigma_v
+        self.b_v = b_v
+        self.v_prior = v_prior.lower()
+        if self.v_prior not in ('normal', 'laplace'):
+            raise ValueError(f"v_prior must be 'normal' or 'laplace', got '{v_prior}'")
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
 
@@ -223,10 +234,14 @@ class CAVI:
         # --- Apply pathway mask if needed ---
         self._init_beta_mask()
 
-        # --- v: N(0, sigma_v^2/K) prior → init small random ---
-        # K-scaled prior so total logit θ·v has variance ~ sigma_v^2
+        # --- v: init small random ---
         self.mu_v = np.random.randn(self.kappa, K) * 0.01
-        self.sigma_v_diag = np.full((self.kappa, K), (self.sigma_v ** 2) / K)
+        if self.v_prior == 'normal':
+            # N(0, sigma_v^2/K) prior — K-scaled so total logit θ·v has variance ~ sigma_v^2
+            self.sigma_v_diag = np.full((self.kappa, K), (self.sigma_v ** 2) / K)
+        else:
+            # Laplace (Bayesian Lasso): init sigma_v_diag from Laplace variance = 2*b_v^2
+            self.sigma_v_diag = np.full((self.kappa, K), 2.0 * self.b_v ** 2)
 
         # --- γ: N(0, sigma_gamma^2) ---
         if self.p_aux > 0:
@@ -470,11 +485,14 @@ class CAVI:
         """
         v posterior (diagonal Gaussian, JJ bound).
 
-        precision_{kℓ} = 1/σ²_eff + 2 Σ_i λ(ζ_{ik}) E[θ²_{iℓ}]
-        mean*prec_{kℓ} = Σ_i [(y_{ik}-0.5) - 2λ(ζ_{ik})C^{(-ℓ)}_{ik}] E[θ_{iℓ}]
+        For v_prior='normal':
+            precision_{kℓ} = 1/σ²_eff + 2 Σ_i λ(ζ_{ik}) E[θ²_{iℓ}]
+            σ²_eff = σ²_v / K
 
-        σ²_eff = σ²_v / K  so the prior on the total logit θ·v stays O(σ²_v)
-        regardless of the number of factors K.
+        For v_prior='laplace' (Bayesian Lasso):
+            precision_{kℓ} = E_q[1/s_{kℓ}] + 2 Σ_i λ(ζ_{ik}) E[θ²_{iℓ}]
+            where E_q[1/s_{kℓ}] is computed from the inverse Gaussian
+            variational posterior on the scale mixture variable s_{kℓ}.
         """
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
@@ -491,29 +509,42 @@ class CAVI:
         # C^{(-ℓ)}: (n, kappa, K)
         C_minus = theta_v[:, :, None] - E_theta[:, None, :] * E_v[None, :, :]
 
-        # K-scaled prior: each v_kl has prior variance sigma_v^2 / K
-        # so the logit sum Σ_l θ_l v_l has total prior variance ~ sigma_v^2
-        sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
+        if self.v_prior == 'normal':
+            # K-scaled prior: each v_kl has prior variance sigma_v^2 / K
+            sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
+            prior_precision = 1.0 / sigma_v_eff_sq
+        else:
+            # Laplace (Bayesian Lasso): adaptive precision from E_q[1/s_{kl}]
+            # ω_{kl} = sqrt(E_q[v_{kl}^2]) = sqrt(mu_v^2 + sigma_v_diag)
+            E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
+            omega = np.sqrt(np.maximum(E_v_sq, 1e-12))
+            # E_q[s^{-1}] = 1/(b_v * ω) + 1/ω^2
+            prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
         # Precision: (kappa, K)
-        precision = 1.0 / sigma_v_eff_sq + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
+        precision = prior_precision + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
 
         # Mean*precision: (kappa, K)
         term1 = np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
-        # Clip v per-element: bound so max logit contribution per factor is
-        # bounded.  For K=50 this is ~1.41, for K=348 this is ~0.54.
-        v_clip = min(5.0, 10.0 / np.sqrt(self.K))
-        mu_v_new = np.clip(mean_prec / precision, -v_clip, v_clip)
+        if self.v_prior == 'normal':
+            # Clip v per-element: bound so max logit contribution per factor is
+            # bounded.  For K=50 this is ~1.41, for K=348 this is ~0.54.
+            v_clip = min(5.0, 10.0 / np.sqrt(self.K))
+            mu_v_new = np.clip(mean_prec / precision, -v_clip, v_clip)
 
-        # Adaptive damping: starts at alpha=0.05 (conservative), ramps toward
-        # alpha_max over ~200 iterations.  Cap at 0.15 to prevent the
-        # sign-flipping limit cycle seen with 0.5.
-        alpha_max = 0.15
-        alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
-        self.mu_v = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+            # Adaptive damping: starts at alpha=0.05 (conservative), ramps toward
+            # alpha_max over ~200 iterations.
+            alpha_max = 0.15
+            alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
+            self.mu_v = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+        else:
+            # Laplace: no clip needed — adaptive E[1/s] acts as automatic shrinkage
+            mu_v_new = mean_prec / precision
+            self.mu_v = mu_v_new
+
         self.sigma_v_diag = 1.0 / precision
 
     def _update_gamma(self, y, X_aux, iteration=0):
@@ -611,11 +642,34 @@ class CAVI:
                        + self.cp * np.log(self.dp) - self.dp * E_eta)
         elbo -= self.p * gammaln(self.cp)
 
-        # === Prior: p(v) with K-scaled variance ===
-        # Each v_kl ~ N(0, sigma_v^2 / K) so total logit variance stays O(sigma_v^2)
-        sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
-        elbo -= 0.5 * np.sum(self.mu_v ** 2 + self.sigma_v_diag) / sigma_v_eff_sq
-        elbo -= 0.5 * self.kappa * self.K * np.log(2 * np.pi * sigma_v_eff_sq)
+        # === Prior: p(v) ===
+        if self.v_prior == 'normal':
+            # K-scaled Gaussian: each v_kl ~ N(0, sigma_v^2 / K)
+            sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
+            elbo -= 0.5 * np.sum(self.mu_v ** 2 + self.sigma_v_diag) / sigma_v_eff_sq
+            elbo -= 0.5 * self.kappa * self.K * np.log(2 * np.pi * sigma_v_eff_sq)
+        else:
+            # Laplace (Bayesian Lasso): augmented model with s_{kl}
+            E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
+            omega = np.sqrt(np.maximum(E_v_sq, 1e-12))
+            E_inv_s = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
+
+            # E_q[log p(v|s)] = -0.5*log(2π) - 0.5*E_q[log s] - 0.5*E_q[v^2]*E_q[1/s]
+            # Approximate E_q[log s] ≈ log(mu_s) for the inverse Gaussian
+            mu_s = self.b_v / omega  # mu_s = b_v * sqrt(1/E[v^2])... = b_v / omega
+            E_log_s = np.log(np.maximum(mu_s, 1e-12))  # approximation
+            elbo += np.sum(-0.5 * np.log(2 * np.pi) - 0.5 * E_log_s
+                           - 0.5 * E_v_sq * E_inv_s)
+
+            # E_q[log p(s)] = log(1/(2*b_v^2)) - E_q[s]/(2*b_v^2)
+            # E_q[s] = mu_s for inverse Gaussian
+            rate_s = 1.0 / (2.0 * self.b_v ** 2)
+            elbo += np.sum(np.log(rate_s) - mu_s * rate_s)
+
+            # H[q(s)] = 0.5*log(2πe * mu_s^3 / lambda_s)
+            lambda_s = 1.0 / (self.b_v ** 2)
+            elbo += 0.5 * np.sum(np.log(2 * np.pi * np.e * mu_s ** 3
+                                        / np.maximum(lambda_s, 1e-12)))
 
         # === Entropy: -E[log q] ===
         # q(θ) Gamma entropy

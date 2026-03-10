@@ -83,6 +83,7 @@ SHARED_SEARCH_SPACE = {
     'lambda_xi': ('float', 0.5, 3.0),
     'lambda_eta': ('float', 0.5, 3.0),
     'sigma_v': ('log_float', 0.05, 2.0),
+    'b_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
     'regression_weight': ('log_float', 0.1, 500.0),
 }
@@ -152,7 +153,8 @@ def _suggest_param(trial: optuna.Trial, name: str, spec: tuple):
         raise ValueError(f"Unknown param type: {ptype}")
 
 
-def build_search_space(method: str, dataset_preset: Optional[str] = None) -> Dict[str, tuple]:
+def build_search_space(method: str, dataset_preset: Optional[str] = None,
+                       v_prior: str = 'normal') -> Dict[str, tuple]:
     """
     Build the full search space for a given method and optional dataset preset.
 
@@ -163,6 +165,9 @@ def build_search_space(method: str, dataset_preset: Optional[str] = None) -> Dic
     dataset_preset : str, optional
         One of 'pbmc', 'simulation', 'emtab'. Overrides defaults for
         dataset-specific ranges.
+    v_prior : str, default='normal'
+        Prior for v: 'normal' or 'laplace'. When 'laplace', tunes b_v
+        instead of sigma_v.
 
     Returns
     -------
@@ -170,6 +175,12 @@ def build_search_space(method: str, dataset_preset: Optional[str] = None) -> Dic
         Mapping param_name -> (type, *args) for _suggest_param.
     """
     space = dict(SHARED_SEARCH_SPACE)
+
+    # Only include the relevant v prior parameter
+    if v_prior == 'laplace':
+        space.pop('sigma_v', None)
+    else:
+        space.pop('b_v', None)
 
     if method == 'vi':
         space.update(VI_SEARCH_SPACE)
@@ -547,6 +558,7 @@ class HyperparameterOptimizer:
         random_state: Optional[int] = None,
         output_dir: str = './bayes_opt_results',
         study_name: Optional[str] = None,
+        v_prior: str = 'normal',
     ):
         self.method = method.lower()
         assert self.method in ('vi', 'svi'), f"method must be 'vi' or 'svi', got '{method}'"
@@ -575,6 +587,7 @@ class HyperparameterOptimizer:
         self.val_ratio = val_ratio
         self.random_state = random_state
         self.output_dir = Path(output_dir)
+        self.v_prior = v_prior.lower()
         self.study_name = study_name or f'{self.method}_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
 
         # Will be populated by load_data / load_pathways
@@ -661,7 +674,11 @@ class HyperparameterOptimizer:
         self.load_pathways()
 
         # Build search space
-        self.search_space = build_search_space(self.method, self.dataset_preset)
+        self.search_space = build_search_space(self.method, self.dataset_preset, self.v_prior)
+
+        # Always pass v_prior as a fixed param so the model knows which prior to use
+        if 'v_prior' not in self.fixed_params:
+            self.fixed_params['v_prior'] = self.v_prior
 
         # Filter search space if params_to_tune is set
         if self.params_to_tune:
@@ -1040,6 +1057,12 @@ def parse_args(argv=None):
     parser.add_argument('--output-dir', default='./bayes_opt_results', help='Output directory')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
 
+    # Prior for v
+    parser.add_argument(
+        '--v-prior', default='normal', choices=['normal', 'laplace'],
+        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)"
+    )
+
     # Evaluation
     parser.add_argument('--evaluate-best', action='store_true',
                         help='Re-train best params and evaluate on test set')
@@ -1105,6 +1128,7 @@ def main(argv=None):
         val_ratio=args.val_ratio,
         random_state=args.seed,
         output_dir=args.output_dir,
+        v_prior=args.v_prior,
     )
 
     study = optimizer.run()
