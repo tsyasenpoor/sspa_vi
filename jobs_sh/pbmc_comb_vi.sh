@@ -6,9 +6,9 @@
 
 for exp in exp0_easy exp1_medium exp2_hard exp3_intersectional; do
     for mode in masked unmasked; do
-        cat > pbmc_vi_${mode}_${exp}.sh << EOF
+        cat > pbmc_svi_${mode}_${exp}.sh << EOF
 #!/bin/bash
-#SBATCH --job-name=vi_${mode}_${exp}
+#SBATCH --job-name=svi_${mode}_${exp}
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=general
 #SBATCH --qos=general
@@ -16,8 +16,8 @@ for exp in exp0_easy exp1_medium exp2_hard exp3_intersectional; do
 #SBATCH --mem=100G
 #SBATCH --gres=gpu:1
 #SBATCH --mail-user=tsyasenpoor@uconn.edu
-#SBATCH -o pbmc_vi_${mode}_${exp}_%j.out
-#SBATCH -e pbmc_vi_${mode}_${exp}_%j.err
+#SBATCH -o pbmc_svi_${mode}_${exp}_%j.out
+#SBATCH -e pbmc_svi_${mode}_${exp}_%j.err
 
 echo "Job started on: \$(hostname)"
 echo "Job started at: \$(date)"
@@ -29,12 +29,12 @@ conda activate jax_gpu
 echo "Python version: \$(python --version)"
 
 python -u /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/quick_reference.py \\
-    --method vi \\
+    --method svi \\
     --data /labs/Aguiar/SSPA_BRAY/scdesign3_PBMC_10kcells_2kgenes/${exp}/${exp}.csv.gz \\
-    --label-column severity outcome \\
+    --label-column severity \\
     --aux-columns sex comorbidity \\
     --mode ${mode} \\
-    --output-dir ./results/pbmc_vi/${mode}/${exp} \\
+    --output-dir ./results/pbmc_svi/${mode}/${exp} \\
     --n-factors 50 \\
     --use-spike-slab true \\
     --alpha-theta 3.214354 \\
@@ -66,6 +66,6 @@ python -u /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/quick_reference.py \\
 echo "Job finished at: \$(date)"
 EOF
 
-        sbatch pbmc_vi_${mode}_${exp}.sh
+        sbatch pbmc_svi_${mode}_${exp}.sh
     done
 done

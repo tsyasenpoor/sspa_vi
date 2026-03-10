@@ -45,7 +45,7 @@ import time
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import optuna
@@ -109,7 +109,7 @@ SVI_SEARCH_SPACE = {
 # --- Dataset-specific presets ---
 DATASET_PRESETS = {
     'pbmc': {
-        'n_factors': ('int', 500, 2000, 150),
+        'n_factors': ('int', 20, 500, 5),
         'regression_weight': ('log_float', 10.0, 500.0),
         'alpha_theta': ('float', 1.5, 4.0),
         'alpha_beta': ('float', 1.5, 4.0),
@@ -350,6 +350,16 @@ class TrialObjective:
                 'X_aux_val': self.X_aux_val,
             })
 
+            # Filter to only params accepted by the specific fit() method
+            if self.method == 'vi':
+                # CAVI.fit() accepts: X_train, y_train, X_aux_train, X_val, y_val, X_aux_val,
+                #                     max_iter, check_freq, tol, v_warmup, verbose
+                vi_fit_params = {
+                    'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
+                    'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
+                }
+                fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
+
             model.fit(**fit_kwargs)
 
             # Evaluate on validation set
@@ -441,7 +451,7 @@ class HyperparameterOptimizer:
         self,
         method: str = 'svi',
         data_path: str = None,
-        label_column: str = 't2dm',
+        label_column: Union[str, List[str]] = None,
         aux_columns: Optional[List[str]] = None,
         gene_annotation_path: Optional[str] = None,
         dataset_preset: Optional[str] = None,
@@ -464,7 +474,13 @@ class HyperparameterOptimizer:
         assert self.method in ('vi', 'svi'), f"method must be 'vi' or 'svi', got '{method}'"
 
         self.data_path = data_path
-        self.label_column = label_column
+        # Normalise label_column to list for consistent handling
+        if label_column is None:
+            self.label_column = ['t2dm']
+        elif isinstance(label_column, str):
+            self.label_column = [label_column]
+        else:
+            self.label_column = list(label_column)
         self.aux_columns = aux_columns
         self.gene_annotation_path = gene_annotation_path
         self.dataset_preset = dataset_preset
@@ -497,12 +513,14 @@ class HyperparameterOptimizer:
             gene_annotation_path=self.gene_annotation_path,
             verbose=True,
         )
+        # Use first label column for stratification in multi-label case
+        stratify_col = self.label_column[0] if isinstance(self.label_column, list) else self.label_column
         self.data = loader.load_and_preprocess(
             label_column=self.label_column,
             aux_columns=self.aux_columns,
             train_ratio=self.train_ratio,
             val_ratio=self.val_ratio,
-            stratify_by=self.label_column,
+            stratify_by=stratify_col,
             random_state=self.random_state,
         )
         X_train, X_aux_train, y_train = self.data['train']
@@ -761,6 +779,14 @@ class HyperparameterOptimizer:
             'verbose': True,
         })
 
+        # Filter to only params accepted by the specific fit() method
+        if self.method == 'vi':
+            vi_fit_params = {
+                'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
+                'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
+            }
+            fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
+
         logger.info("Re-training with best hyperparameters on full training data...")
         model.fit(**fit_kwargs)
 
@@ -830,7 +856,11 @@ def parse_args(argv=None):
 
     # Data
     parser.add_argument('--data', required=True, help='Path to data (h5ad or directory)')
-    parser.add_argument('--label-column', default='t2dm', help='Label column')
+    parser.add_argument(
+        '--label-column', nargs='+', default=['t2dm'],
+        help='Label column(s). Multiple columns enable multi-outcome inference '
+             '(e.g., --label-column severity outcome).'
+    )
     parser.add_argument('--aux-columns', nargs='+', default=None, help='Auxiliary feature columns')
     parser.add_argument('--gene-annotation', default=None, help='Gene annotation CSV path')
 
@@ -862,6 +892,12 @@ def parse_args(argv=None):
         '--params-to-tune', nargs='+', default=None,
         help='Only tune these params (use defaults for others)'
     )
+    parser.add_argument(
+        '--fixed-params', nargs='+', default=None,
+        metavar='KEY=VALUE',
+        help='Fix specific params at given values (not tuned). '
+             'Format: key=value pairs, e.g. --fixed-params n_factors=50 regression_weight=100'
+    )
 
     # Training limits for each trial
     parser.add_argument('--max-iter', type=int, default=200,
@@ -891,6 +927,27 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def _parse_fixed_params(raw: list) -> dict:
+    """Parse ['key=value', ...] into {key: auto-typed-value}."""
+    out = {}
+    if not raw:
+        return out
+    for item in raw:
+        if '=' not in item:
+            raise ValueError(f"--fixed-params entries must be KEY=VALUE, got '{item}'")
+        k, v = item.split('=', 1)
+        # Auto-cast to int / float when possible
+        try:
+            v = int(v)
+        except ValueError:
+            try:
+                v = float(v)
+            except ValueError:
+                pass  # keep as str
+        out[k] = v
+    return out
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -917,6 +974,7 @@ def main(argv=None):
         n_pathway_factors=args.n_pathway_factors,
         n_trials=args.n_trials,
         params_to_tune=args.params_to_tune,
+        fixed_params=_parse_fixed_params(args.fixed_params),
         max_iter=args.max_iter,
         max_epochs=args.max_epochs,
         subsample_ratio=args.subsample_ratio,

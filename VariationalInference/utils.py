@@ -807,6 +807,9 @@ def load_pathways(
         gene_filter_set = set(gene_filter)
         all_genes = all_genes & gene_filter_set
         
+        # Store original pathway sizes before gene filtering (for adaptive thresholding)
+        original_pathway_sizes = {name: len(genes) for name, genes in pathways.items()}
+        
         # Update pathways to only include filtered genes
         pathways_filtered = {}
         for pathway_name, genes in pathways.items():
@@ -815,8 +818,40 @@ def load_pathways(
                 pathways_filtered[pathway_name] = filtered
         pathways = pathways_filtered
         print(f"  After gene filter: {len(all_genes)} genes, {len(pathways)} pathways")
+        
+        # Adaptive filtering: different thresholds based on original pathway size
+        # - Small pathways (<500 genes): keep if at least 2 genes in dataset
+        # - Large pathways (>=500 genes): keep if at least half of genes in dataset
+        SMALL_PATHWAY_THRESHOLD = 100
+        MIN_GENES_SMALL = 5
+        
+        pathways_adaptive = {}
+        n_dropped_small = 0
+        n_dropped_large = 0
+        for name, genes in pathways.items():
+            orig_size = original_pathway_sizes.get(name, len(genes))
+            n_overlap = len(genes)
+            
+            if orig_size < SMALL_PATHWAY_THRESHOLD:
+                # Small pathway: require at least 2 genes
+                if n_overlap >= MIN_GENES_SMALL:
+                    pathways_adaptive[name] = genes
+                else:
+                    n_dropped_small += 1
+            else:
+                # Large pathway: require at least half of genes in dataset
+                required = orig_size
+                if n_overlap >= required:
+                    pathways_adaptive[name] = genes
+                else:
+                    n_dropped_large += 1
+        
+        print(f"  After adaptive filter (small<{SMALL_PATHWAY_THRESHOLD}: ≥{MIN_GENES_SMALL}; "
+              f"large: ≥50%): {len(pathways_adaptive)} pathways "
+              f"(dropped {n_dropped_small} small, {n_dropped_large} large)")
+        pathways = pathways_adaptive
     
-    # Filter pathways by size
+    # Filter pathways by size (after gene filter overlap)
     pathways_sized = {
         name: genes for name, genes in pathways.items()
         if min_genes <= len(genes) <= max_genes
