@@ -459,6 +459,10 @@ class TrialObjective:
             logger.info(
                 f"Trial {trial.number}: "
                 + (f"AUC={mean_auc:.4f} (macro)" if n_labels > 1 else f"AUC={mean_auc:.4f}")
+                + (", " + ", ".join(
+                    f"{label_names[k]}={aucs[k]:.4f}"
+                    for k in range(n_labels)
+                ) if n_labels > 1 else "")
                 + f", Acc={all_metrics.get('accuracy', all_metrics.get(f'{label_names[0]}_accuracy', 0)):.4f}"
                 + f", n_factors={params.get('n_factors', '?')}"
             )
