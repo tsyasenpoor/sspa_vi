@@ -416,12 +416,17 @@ class CAVI:
         """
         θ shape and rate (scHPF Eq 7, cell side + JJ regression).
 
-        The JJ bound introduces a quadratic penalty -λ E[v²] θ² in the ELBO.
-        Since Gamma can't represent quadratic terms, we solve for b_theta via
-        the fixed-point equation b² - b_base·b - c·a_theta = 0, yielding:
-            b = (b_base + sqrt(b_base² + 4·c·a_theta)) / 2
-        which is always positive and eliminates the instability from
-        linearizing E[θ²] ≈ E[θ]·E[θ] at the current iterate.
+        Uses inner iteration over (θ, ζ) to maintain a tight JJ bound.
+        The JJ auxiliary ζ must satisfy ζ = sqrt(E[A²]) for the bound to be
+        tight. When θ changes significantly in one step, ζ becomes stale and
+        the quadratic regularization λ(ζ)E[v²]θ² vanishes (since λ→0 as ζ→∞),
+        creating a runaway feedback loop. The inner loop re-tightens ζ after
+        each θ update, preventing this.
+
+        Within each inner step we solve the quadratic:
+            b² - b_base·b - c_quad·a_theta = 0
+            b = (b_base + sqrt(b_base² + 4·c_quad·a_theta)) / 2
+        which is always positive.
         """
         # a^θ_{ik} = a + Σ_j x_{ij} φ_{ijk}
         self.a_theta = self.a + z_sum_theta
@@ -431,17 +436,34 @@ class CAVI:
         b_poisson = self.E_xi[:, None] + beta_sum[None, :]
 
         if self.regression_weight > 0:
-            R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
-            b_base = b_poisson + self.regression_weight * R_linear
-            # c = regression_weight * R_quad_coeff  (coefficient of E[θ])
-            c_quad = self.regression_weight * R_quad_coeff  # (n, K), always >= 0
+            n_inner = 5
+            self._theta_inner_iters = 0
+            for inner in range(n_inner):
+                R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
+                b_base = b_poisson + self.regression_weight * R_linear
+                c_quad = self.regression_weight * R_quad_coeff  # (n, K), always >= 0
 
-            # Solve quadratic: b² - b_base·b - c_quad·a_theta = 0
-            # b = (b_base + sqrt(b_base² + 4·c_quad·a_theta)) / 2
-            discriminant = b_base ** 2 + 4.0 * c_quad * self.a_theta
-            self.b_theta = (b_base + np.sqrt(discriminant)) / 2.0
+                # Solve quadratic: b² - b_base·b - c_quad·a_theta = 0
+                discriminant = b_base ** 2 + 4.0 * c_quad * self.a_theta
+                b_theta_new = (b_base + np.sqrt(discriminant)) / 2.0
+
+                # Check convergence (skip on first iteration)
+                if inner > 0:
+                    rel_change = np.abs(b_theta_new - self.b_theta).max() / (
+                        np.abs(self.b_theta).max() + 1e-10)
+                    self.b_theta = b_theta_new
+                    self._theta_inner_iters = inner + 1
+                    if rel_change < 1e-3:
+                        break
+                else:
+                    self.b_theta = b_theta_new
+                    self._theta_inner_iters = 1
+
+                # Re-tighten ζ for updated θ
+                self._update_zeta(X_aux)
         else:
             self.b_theta = b_poisson
+            self._theta_inner_iters = 0
 
     def _update_xi(self):
         """ξ rate (scHPF): b^ξ_i = b' + Σ_k E[θ_{ik}]."""
@@ -912,10 +934,16 @@ class CAVI:
             self._update_xi()
             if diag:
                 E_th = self.E_theta
+                inner_info = f" inner={self._theta_inner_iters}" if self._theta_inner_iters > 0 else ""
                 print(f"  [diag t={t}] after θ,ξ: "
                       f"E[θ]=[{E_th.min():.4e},{E_th.max():.4e}] mean={E_th.mean():.4e} "
                       f"b_θ=[{self.b_theta.min():.4e},{self.b_theta.max():.4e}] "
-                      f"a_θ=[{self.a_theta.min():.4e},{self.a_theta.max():.4e}]")
+                      f"a_θ=[{self.a_theta.min():.4e},{self.a_theta.max():.4e}]{inner_info}")
+                if self._theta_inner_iters > 0:
+                    print(f"  [diag t={t}] post-θ ζ: "
+                          f"ζ=[{self.zeta.min():.4e},{self.zeta.max():.4e}] "
+                          f"λ(ζ)=[{self._lambda_jj(self.zeta).min():.4e},"
+                          f"{self._lambda_jj(self.zeta).max():.4e}]")
 
             # Refresh digamma caches after theta/beta changed
             self._refresh_log_caches()
