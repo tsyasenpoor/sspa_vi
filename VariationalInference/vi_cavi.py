@@ -413,21 +413,35 @@ class CAVI:
         self.b_eta = self.dp + self.E_beta.sum(axis=1)
 
     def _update_theta(self, z_sum_theta, y, X_aux):
-        """θ shape and rate (scHPF Eq 7, cell side + JJ regression)."""
+        """
+        θ shape and rate (scHPF Eq 7, cell side + JJ regression).
+
+        The JJ bound introduces a quadratic penalty -λ E[v²] θ² in the ELBO.
+        Since Gamma can't represent quadratic terms, we solve for b_theta via
+        the fixed-point equation b² - b_base·b - c·a_theta = 0, yielding:
+            b = (b_base + sqrt(b_base² + 4·c·a_theta)) / 2
+        which is always positive and eliminates the instability from
+        linearizing E[θ²] ≈ E[θ]·E[θ] at the current iterate.
+        """
         # a^θ_{ik} = a + Σ_j x_{ij} φ_{ijk}
         self.a_theta = self.a + z_sum_theta
 
-        # b^θ_{ik} = E[ξ_i] + Σ_j E[β_{jk}]
+        # b_base = E[ξ_i] + Σ_j E[β_{jk}] + regression_weight * R_linear
         beta_sum = self.E_beta.sum(axis=0)  # (K,)
-        b_theta_new = self.E_xi[:, None] + beta_sum[None, :]
+        b_poisson = self.E_xi[:, None] + beta_sum[None, :]
 
-        # JJ regression correction (if active)
         if self.regression_weight > 0:
-            R = self._regression_rate_correction(y, X_aux)
-            b_theta_new = b_theta_new + self.regression_weight * R
+            R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
+            b_base = b_poisson + self.regression_weight * R_linear
+            # c = regression_weight * R_quad_coeff  (coefficient of E[θ])
+            c_quad = self.regression_weight * R_quad_coeff  # (n, K), always >= 0
 
-        # Floor to prevent negative rates
-        self.b_theta = np.maximum(b_theta_new, 1e-6)
+            # Solve quadratic: b² - b_base·b - c_quad·a_theta = 0
+            # b = (b_base + sqrt(b_base² + 4·c_quad·a_theta)) / 2
+            discriminant = b_base ** 2 + 4.0 * c_quad * self.a_theta
+            self.b_theta = (b_base + np.sqrt(discriminant)) / 2.0
+        else:
+            self.b_theta = b_poisson
 
     def _update_xi(self):
         """ξ rate (scHPF): b^ξ_i = b' + Σ_k E[θ_{ik}]."""
@@ -447,15 +461,20 @@ class CAVI:
         E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T  # (n, kappa)
         self.zeta = np.sqrt(np.maximum(E_A_sq, 1e-8))
 
-    def _regression_rate_correction(self, y, X_aux):
+    def _regression_rate_parts(self, y, X_aux):
         """
-        Compute the JJ regression correction to θ rate.
+        Compute the JJ regression correction to θ rate, split into linear
+        and quadratic parts.
 
-        R_{iℓ} = Σ_k [ -(y_{ik} - 0.5) v_{kℓ}
-                       + 2λ(ζ_{ik}) v_{kℓ} C^{(-ℓ)}_{ik}
-                       + 2λ(ζ_{ik}) E[v²_{kℓ}] E[θ_{iℓ}] ]
+        The full correction is R = R_linear + R_quad_coeff * E[θ], where:
+          R_linear_{iℓ} = Σ_k [-(y_{ik} - 0.5) v_{kℓ}
+                                + 2λ(ζ_{ik}) v_{kℓ} C^{(-ℓ)}_{ik}]
+          R_quad_coeff_{iℓ} = Σ_k [2λ(ζ_{ik}) E[v²_{kℓ}]]
 
-        Returns: (n, K) array.
+        Returns
+        -------
+        R_linear : (n, K) — terms not depending on E[θ_{iℓ}]
+        R_quad_coeff : (n, K) — coefficient of E[θ_{iℓ}], always >= 0
         """
         y_exp = y if y.ndim > 1 else y[:, None]  # (n, kappa)
         lam = self._lambda_jj(self.zeta)           # (n, kappa)
@@ -469,17 +488,20 @@ class CAVI:
             theta_v = theta_v + X_aux @ self.mu_gamma.T
 
         # C^{(-ℓ)}_{ik} = A_{ik} - θ_{iℓ} v_{kℓ}
-        # We need (n, kappa, K) tensor
         full_lp = theta_v[:, :, None]  # (n, kappa, 1)
         C_minus = full_lp - E_theta[:, None, :] * E_v[None, :, :]  # (n, kappa, K)
 
-        # R: (n, kappa, K)
-        R = (
+        # Linear part: (n, kappa, K) → sum over kappa → (n, K)
+        R_linear = (
             -(y_exp[:, :, None] - 0.5) * E_v[None, :, :]
             + 2 * lam[:, :, None] * E_v[None, :, :] * C_minus
-            + 2 * lam[:, :, None] * E_v_sq[None, :, :] * E_theta[:, None, :]
-        )
-        return R.sum(axis=1)  # (n, K)
+        ).sum(axis=1)
+
+        # Quadratic coefficient: (n, kappa, K) → sum over kappa → (n, K)
+        # This is always >= 0 since λ >= 0 and E[v²] >= 0
+        R_quad_coeff = (2 * lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
+
+        return R_linear, R_quad_coeff
 
     def _update_v(self, y, X_aux, iteration=0):
         """
@@ -529,6 +551,8 @@ class CAVI:
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
+        sigma_v_diag_new = 1.0 / precision
+
         if self.v_prior == 'normal':
             # Clip v per-element: bound so max logit contribution per factor is
             # bounded.  For K=50 this is ~1.41, for K=348 this is ~0.54.
@@ -540,12 +564,13 @@ class CAVI:
             alpha_max = 0.15
             alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
             self.mu_v = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+            # Damp sigma_v_diag consistently with mu_v to keep q(v) coherent
+            self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
         else:
             # Laplace: no clip needed — adaptive E[1/s] acts as automatic shrinkage
             mu_v_new = mean_prec / precision
             self.mu_v = mu_v_new
-
-        self.sigma_v_diag = 1.0 / precision
+            self.sigma_v_diag = sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
         """γ posterior (Gaussian, JJ bound)."""
@@ -860,6 +885,7 @@ class CAVI:
         holl_reg_patience = 10
 
         for t in range(max_iter):
+            diag = verbose and (t % check_freq == 0)
 
             # 1. Compute φ and z_sums (sparse)
             random_phi = (t == 0)  # scHPF: random Dirichlet on first iter
@@ -868,13 +894,28 @@ class CAVI:
             # 2. Update β, η (gene side first — scHPF order)
             self._update_beta(z_sum_beta)
             self._update_eta()
+            if diag:
+                print(f"  [diag t={t}] after β,η: "
+                      f"E[β]=[{self.E_beta.min():.4e},{self.E_beta.max():.4e}] "
+                      f"E[η]=[{self.E_eta.min():.4e},{self.E_eta.max():.4e}]")
 
             # 3. Update ζ (JJ bound tightening)
             self._update_zeta(X_aux)
+            if diag:
+                print(f"  [diag t={t}] after ζ:   "
+                      f"ζ=[{self.zeta.min():.4e},{self.zeta.max():.4e}] "
+                      f"λ(ζ)=[{self._lambda_jj(self.zeta).min():.4e},"
+                      f"{self._lambda_jj(self.zeta).max():.4e}]")
 
             # 4. Update θ, ξ (cell side — with full regression from start)
             self._update_theta(z_sum_theta, y, X_aux)
             self._update_xi()
+            if diag:
+                E_th = self.E_theta
+                print(f"  [diag t={t}] after θ,ξ: "
+                      f"E[θ]=[{E_th.min():.4e},{E_th.max():.4e}] mean={E_th.mean():.4e} "
+                      f"b_θ=[{self.b_theta.min():.4e},{self.b_theta.max():.4e}] "
+                      f"a_θ=[{self.a_theta.min():.4e},{self.a_theta.max():.4e}]")
 
             # Refresh digamma caches after theta/beta changed
             self._refresh_log_caches()
@@ -882,11 +923,28 @@ class CAVI:
             # 5. Update v, γ
             self._update_v(y, X_aux, iteration=t)
             self._update_gamma(y, X_aux, iteration=t)
+            if diag:
+                print(f"  [diag t={t}] after v,γ: "
+                      f"μ_v=[{self.mu_v.min():.4e},{self.mu_v.max():.4e}] "
+                      f"σ²_v=[{self.sigma_v_diag.min():.4e},{self.sigma_v_diag.max():.4e}] "
+                      f"μ_γ=[{self.mu_gamma.min():.4e},{self.mu_gamma.max():.4e}]"
+                      if self.p_aux > 0 else
+                      f"  [diag t={t}] after v:   "
+                      f"μ_v=[{self.mu_v.min():.4e},{self.mu_v.max():.4e}] "
+                      f"σ²_v=[{self.sigma_v_diag.min():.4e},{self.sigma_v_diag.max():.4e}]")
 
             # 6. Check convergence
             if t % check_freq == 0:
                 elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux)
                 self.elbo_history_.append((t, elbo))
+
+                # ELBO monotonicity check
+                if diag and len(self.elbo_history_) >= 2:
+                    prev_elbo = self.elbo_history_[-2][1]
+                    delta = elbo - prev_elbo
+                    if delta < -1.0:  # allow tiny numerical noise
+                        print(f"  [WARN t={t}] ELBO DECREASED by {delta:.4e} "
+                              f"({prev_elbo:.4e} → {elbo:.4e})")
 
                 # Held-out LL (with breakdown)
                 holl = None
@@ -939,21 +997,21 @@ class CAVI:
 
                 # HO-LL regression early stopping (preferred when validation available)
                 if X_val is not None and holl_reg is not None:
-                    holl_reg_checks_since_best = (t - best_holl_reg_iter) // max(check_freq, 1)
-                    if holl_reg_checks_since_best >= holl_reg_patience and t >= 30:
+                    iters_since_best = t - best_holl_reg_iter
+                    if iters_since_best >= holl_reg_patience and t >= 30:
                         if verbose:
                             print(f"HO-LL Reg early stop at iter {t}: "
-                                  f"HO-Reg hasn't improved in {holl_reg_checks_since_best} checks "
+                                  f"HO-Reg hasn't improved in {iters_since_best} iters "
                                   f"(best HO-Reg={best_holl_reg:.4e} at iter {best_holl_reg_iter})")
                         break
 
                 # Regression early stopping (training): if Reg has been degrading for
-                # reg_patience consecutive checks, stop and restore best.
-                checks_since_best = (t - best_reg_iter) // max(check_freq, 1)
-                if checks_since_best >= reg_patience and t >= 30:
+                # reg_patience consecutive iters, stop and restore best.
+                iters_since_best = t - best_reg_iter
+                if iters_since_best >= reg_patience and t >= 30:
                     if verbose:
                         print(f"Regression early stop at iter {t}: "
-                              f"Reg hasn't improved in {checks_since_best} checks "
+                              f"Reg hasn't improved in {iters_since_best} iters "
                               f"(best Reg={best_reg_ll:.4e} at iter {best_reg_iter})")
                     break
 
