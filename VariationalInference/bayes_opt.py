@@ -1082,6 +1082,7 @@ def _parse_fixed_params(raw: list) -> dict:
         if '=' not in item:
             raise ValueError(f"--fixed-params entries must be KEY=VALUE, got '{item}'")
         k, v = item.split('=', 1)
+        k = k.replace('-', '_')  # normalise CLI-style hyphens to underscores
         # Auto-cast to int / float when possible
         try:
             v = int(v)

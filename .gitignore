@@ -381,3 +381,7 @@ results/pbmc_bayes_opt/unmasked/exp3_intersectional/best_config_vi_20260309_1621
 results/pbmc_bayes_opt/unmasked/exp3_intersectional/best_params_vi_20260309_162128.json
 jobs_sh/pbmc_comb_vi.sh
 jobs_sh/pbmc_comb_vi.sh
+jobs_sh/submit_pbmc_vi.sh
+submit_pbmc_vi.sh
+jobs_sh/submit_pbmc_vi_seeds.sh
+jobs_sh/submit_pbmc_bayes_opt_laplace.sh
