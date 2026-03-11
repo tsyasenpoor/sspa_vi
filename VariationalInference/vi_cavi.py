@@ -471,14 +471,7 @@ class CAVI:
         self.b_xi = self.bp + self.E_theta.sum(axis=1)
 
     def _update_zeta(self, X_aux):
-        """JJ auxiliary: ζ_{ik} = min(sqrt(E[A²_{ik}]), ζ_cap).
-
-        Capping ζ prevents λ_JJ(ζ) from vanishing at large logits.
-        The JJ bound is valid for ANY ζ, so capping produces a looser
-        but still valid lower bound with curvature ≥ λ_JJ(ζ_cap) > 0.
-        Using raw λ_JJ everywhere (from the capped ζ) keeps all updates
-        and the ELBO on a single consistent objective.
-        """
+        """JJ auxiliary: ζ_{ik} = sqrt(E[A²_{ik}])."""
         E_theta = self.E_theta
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
         Var_theta = self.a_theta / (self.b_theta ** 2)  # (n, K)
@@ -488,10 +481,7 @@ class CAVI:
             E_A = E_A + X_aux @ self.mu_gamma.T
 
         E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T  # (n, kappa)
-        zeta_raw = np.sqrt(np.maximum(E_A_sq, 1e-8))
-        # Cap ζ to keep λ_JJ ≥ λ_JJ(ζ_cap) ≈ 0.06 (prevents curvature
-        # from vanishing while staying consistent — no Bohning hybrid).
-        self.zeta = np.minimum(zeta_raw, 4.0)
+        self.zeta = np.sqrt(np.maximum(E_A_sq, 1e-8))
 
     def _regression_rate_parts(self, y, X_aux):
         """
@@ -509,7 +499,7 @@ class CAVI:
         R_quad_coeff : (n, K) — coefficient of E[θ_{iℓ}], always >= 0
         """
         y_exp = y if y.ndim > 1 else y[:, None]  # (n, kappa)
-        lam = self._lambda_jj(self.zeta)              # (n, kappa)
+        lam = self._lambda_jj(self.zeta)           # (n, kappa)
         E_theta = self.E_theta                      # (n, K)
         E_v = self.mu_v                             # (kappa, K)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
@@ -530,7 +520,14 @@ class CAVI:
         ).sum(axis=1)
 
         # Quadratic coefficient: (n, kappa, K) → sum over kappa → (n, K)
-        R_quad_coeff = (2 * lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
+        # Floor λ at 1/8 (Bohning bound) for the quadratic term.
+        # The JJ curvature λ(ζ) → 0 as ζ → ∞, which removes the braking
+        # force on θ and causes runaway divergence.  The Bohning bound
+        # guarantees curvature ≥ 1/8 for the logistic, so the quadratic
+        # regularizer always scales as regression_weight * E[v²] / 4,
+        # keeping θ bounded.
+        lam_quad = np.maximum(lam, 0.125)  # 1/8 = Bohning curvature
+        R_quad_coeff = (2 * lam_quad[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
 
         return R_linear, R_quad_coeff
 
@@ -662,16 +659,26 @@ class CAVI:
         elbo += poisson_ll
 
         # === JJ Bernoulli likelihood ===
+        # Split -λ·E[A²] into diagonal and cross terms to match the θ update,
+        # which uses Bohning-floored λ (max(λ,1/8)) for the diagonal
+        # E[θ²]·E[v²] terms and raw λ for the cross terms.
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
+        lam_quad = np.maximum(lam, 0.125)  # Bohning floor (same as θ update)
         E_A = E_theta @ self.mu_v.T
         if self.p_aux > 0:
             E_A = E_A + X_aux @ self.mu_gamma.T
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
-        Var_theta = self.a_theta / (self.b_theta ** 2)
-        E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T
+        E_theta_sq = E_theta ** 2 + self.a_theta / (self.b_theta ** 2)
 
-        regression_ll = np.sum((y_exp - 0.5) * E_A - lam * E_A_sq)
+        # Diagonal: Σ_ℓ E[θ²_ℓ]·E[v²_ℓ] — uses floored λ (Bohning)
+        diag = E_theta_sq @ E_v_sq.T  # (n, kappa)
+        # Cross: E[A²] - diag — uses raw λ
+        E_A_sq = E_A ** 2 + (self.a_theta / (self.b_theta ** 2)) @ E_v_sq.T
+        cross = E_A_sq - diag
+
+        regression_ll = np.sum((y_exp - 0.5) * E_A
+                               - lam_quad * diag - lam * cross)
         regression_ll += np.sum(lam * self.zeta ** 2 - 0.5 * self.zeta
                                 + np.log(1 / (1 + np.exp(-self.zeta))))
         elbo += self.regression_weight * regression_ll
