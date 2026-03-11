@@ -520,8 +520,14 @@ class CAVI:
         ).sum(axis=1)
 
         # Quadratic coefficient: (n, kappa, K) → sum over kappa → (n, K)
-        # This is always >= 0 since λ >= 0 and E[v²] >= 0
-        R_quad_coeff = (2 * lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
+        # Floor λ at 1/8 (Bohning bound) for the quadratic term.
+        # The JJ curvature λ(ζ) → 0 as ζ → ∞, which removes the braking
+        # force on θ and causes runaway divergence.  The Bohning bound
+        # guarantees curvature ≥ 1/8 for the logistic, so the quadratic
+        # regularizer always scales as regression_weight * E[v²] / 4,
+        # keeping θ bounded.
+        lam_quad = np.maximum(lam, 0.125)  # 1/8 = Bohning curvature
+        R_quad_coeff = (2 * lam_quad[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
 
         return R_linear, R_quad_coeff
 
