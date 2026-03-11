@@ -997,21 +997,21 @@ class CAVI:
 
                 # HO-LL regression early stopping (preferred when validation available)
                 if X_val is not None and holl_reg is not None:
-                    holl_reg_checks_since_best = (t - best_holl_reg_iter) // max(check_freq, 1)
-                    if holl_reg_checks_since_best >= holl_reg_patience and t >= 30:
+                    iters_since_best = t - best_holl_reg_iter
+                    if iters_since_best >= holl_reg_patience and t >= 30:
                         if verbose:
                             print(f"HO-LL Reg early stop at iter {t}: "
-                                  f"HO-Reg hasn't improved in {holl_reg_checks_since_best} checks "
+                                  f"HO-Reg hasn't improved in {iters_since_best} iters "
                                   f"(best HO-Reg={best_holl_reg:.4e} at iter {best_holl_reg_iter})")
                         break
 
                 # Regression early stopping (training): if Reg has been degrading for
-                # reg_patience consecutive checks, stop and restore best.
-                checks_since_best = (t - best_reg_iter) // max(check_freq, 1)
-                if checks_since_best >= reg_patience and t >= 30:
+                # reg_patience consecutive iters, stop and restore best.
+                iters_since_best = t - best_reg_iter
+                if iters_since_best >= reg_patience and t >= 30:
                     if verbose:
                         print(f"Regression early stop at iter {t}: "
-                              f"Reg hasn't improved in {checks_since_best} checks "
+                              f"Reg hasn't improved in {iters_since_best} iters "
                               f"(best Reg={best_reg_ll:.4e} at iter {best_reg_iter})")
                     break
 
