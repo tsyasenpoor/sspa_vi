@@ -180,6 +180,21 @@ class CAVI:
         safe = np.maximum(np.abs(zeta), 1e-8)
         return np.tanh(safe / 2.0) / (4.0 * safe)
 
+    @staticmethod
+    def _lambda_effective(zeta):
+        """Bohning-floored JJ curvature: max(λ_JJ(ζ), 1/8).
+
+        The JJ curvature λ(ζ) → 0 as ζ → ∞, which removes the quadratic
+        regularizer on θ and causes runaway divergence.  The Bohning bound
+        guarantees curvature ≥ 1/8 for the logistic function.  Using this
+        floored curvature *consistently* in all updates and in the ELBO
+        ensures we optimize a single coherent objective — a valid (though
+        slightly looser) lower bound on the log-likelihood.
+        """
+        safe = np.maximum(np.abs(zeta), 1e-8)
+        lam_jj = np.tanh(safe / 2.0) / (4.0 * safe)
+        return np.maximum(lam_jj, 0.125)
+
     # =================================================================
     # Initialization (scHPF pattern)
     # =================================================================
@@ -499,7 +514,7 @@ class CAVI:
         R_quad_coeff : (n, K) — coefficient of E[θ_{iℓ}], always >= 0
         """
         y_exp = y if y.ndim > 1 else y[:, None]  # (n, kappa)
-        lam = self._lambda_jj(self.zeta)           # (n, kappa)
+        lam = self._lambda_effective(self.zeta)     # (n, kappa) — Bohning-floored
         E_theta = self.E_theta                      # (n, K)
         E_v = self.mu_v                             # (kappa, K)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
@@ -514,20 +529,14 @@ class CAVI:
         C_minus = full_lp - E_theta[:, None, :] * E_v[None, :, :]  # (n, kappa, K)
 
         # Linear part: (n, kappa, K) → sum over kappa → (n, K)
+        # Both terms from ∂/∂E[θ] of [-λ·E[A²]] use the same floored λ.
         R_linear = (
             -(y_exp[:, :, None] - 0.5) * E_v[None, :, :]
             + 2 * lam[:, :, None] * E_v[None, :, :] * C_minus
         ).sum(axis=1)
 
         # Quadratic coefficient: (n, kappa, K) → sum over kappa → (n, K)
-        # Floor λ at 1/8 (Bohning bound) for the quadratic term.
-        # The JJ curvature λ(ζ) → 0 as ζ → ∞, which removes the braking
-        # force on θ and causes runaway divergence.  The Bohning bound
-        # guarantees curvature ≥ 1/8 for the logistic, so the quadratic
-        # regularizer always scales as regression_weight * E[v²] / 4,
-        # keeping θ bounded.
-        lam_quad = np.maximum(lam, 0.125)  # 1/8 = Bohning curvature
-        R_quad_coeff = (2 * lam_quad[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
+        R_quad_coeff = (2 * lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
 
         return R_linear, R_quad_coeff
 
@@ -545,7 +554,7 @@ class CAVI:
             variational posterior on the scale mixture variable s_{kℓ}.
         """
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_jj(self.zeta)
+        lam = self._lambda_effective(self.zeta)  # Bohning-floored
         E_theta = self.E_theta
         Var_theta = self.a_theta / (self.b_theta ** 2)
         E_theta_sq = E_theta ** 2 + Var_theta
@@ -605,7 +614,7 @@ class CAVI:
         if self.p_aux == 0:
             return
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_jj(self.zeta)
+        lam = self._lambda_effective(self.zeta)  # Bohning-floored
         E_theta = self.E_theta
 
         # Same adaptive damping schedule as v
@@ -658,9 +667,9 @@ class CAVI:
         poisson_ll -= np.sum(gammaln(self._X_data + 1))
         elbo += poisson_ll
 
-        # === JJ Bernoulli likelihood ===
+        # === JJ Bernoulli likelihood (Bohning-floored for consistency) ===
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_jj(self.zeta)
+        lam = self._lambda_effective(self.zeta)  # same floored λ as updates
         E_A = E_theta @ self.mu_v.T
         if self.p_aux > 0:
             E_A = E_A + X_aux @ self.mu_gamma.T
@@ -957,6 +966,11 @@ class CAVI:
             # 5. Update v, γ
             self._update_v(y, X_aux, iteration=t)
             self._update_gamma(y, X_aux, iteration=t)
+
+            # 5b. Re-tighten ζ after v/γ changed, so ELBO is evaluated at
+            # the optimal ζ for the current (θ, v, γ).
+            self._update_zeta(X_aux)
+
             if diag:
                 print(f"  [diag t={t}] after v,γ: "
                       f"μ_v=[{self.mu_v.min():.4e},{self.mu_v.max():.4e}] "
