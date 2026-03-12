@@ -572,9 +572,12 @@ class CAVI:
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
         # Precision: (kappa, K)
-        precision = prior_precision + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
+        # Use Bohning-floored λ for precision (diagonal E[θ²]·E[v²] terms),
+        # matching the θ update's quadratic coefficient and the ELBO's diagonal.
+        lam_quad = np.maximum(lam, 0.125)
+        precision = prior_precision + 2 * np.einsum('ik,id->kd', lam_quad, E_theta_sq)
 
-        # Mean*precision: (kappa, K)
+        # Mean*precision: (kappa, K) — uses raw λ for cross terms (C_minus)
         term1 = np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
@@ -606,6 +609,7 @@ class CAVI:
             return
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
+        lam_quad = np.maximum(lam, 0.125)  # Bohning floor for precision
         E_theta = self.E_theta
 
         # Same adaptive damping schedule as v
@@ -614,12 +618,12 @@ class CAVI:
 
         for k in range(self.kappa):
             prec_prior = np.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            # Precision: 1/σ² I + 2 Σ_i λ(ζ_{ik}) x^aux_i x^aux_i^T
-            weighted_X = X_aux * (2 * lam[:, k])[:, None]
+            # Precision: 1/σ² I + 2 Σ_i λ_quad(ζ_{ik}) x^aux_i x^aux_i^T
+            weighted_X = X_aux * (2 * lam_quad[:, k])[:, None]
             prec_lik = weighted_X.T @ X_aux
             prec = prec_prior + prec_lik
 
-            # Residual: y - 0.5 - 2λ(ζ) θ·v
+            # Residual: y - 0.5 - 2λ_raw(ζ) θ·v — raw λ for cross terms
             theta_v_k = E_theta @ self.mu_v[k]
             residual = (y_exp[:, k] - 0.5) - 2 * lam[:, k] * theta_v_k
             mean_prec = X_aux.T @ residual
