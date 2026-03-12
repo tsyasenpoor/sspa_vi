@@ -180,6 +180,19 @@ class CAVI:
         safe = np.maximum(np.abs(zeta), 1e-8)
         return np.tanh(safe / 2.0) / (4.0 * safe)
 
+    @staticmethod
+    def _lambda_bohning(zeta):
+        """Bohning-floored JJ curvature: max(λ_JJ(ζ), 1/8).
+
+        Used consistently in ALL updates and ELBO to define a single
+        coherent variational objective.  The Bohning bound guarantees
+        curvature ≥ 1/8 for the logistic, keeping θ bounded while
+        avoiding the split-λ inconsistency that caused ELBO drops.
+        """
+        safe = np.maximum(np.abs(zeta), 1e-8)
+        lam_jj = np.tanh(safe / 2.0) / (4.0 * safe)
+        return np.maximum(lam_jj, 0.125)
+
     # =================================================================
     # Initialization (scHPF pattern)
     # =================================================================
@@ -436,31 +449,21 @@ class CAVI:
         b_poisson = self.E_xi[:, None] + beta_sum[None, :]
 
         if self.regression_weight > 0:
-            n_inner = 5
-            self._theta_inner_iters = 0
-            for inner in range(n_inner):
-                R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
-                b_base = b_poisson + self.regression_weight * R_linear
-                c_quad = self.regression_weight * R_quad_coeff  # (n, K), always >= 0
+            # Single-step quadratic solve using Bohning-floored λ.
+            # No inner θ-ζ loop: the inner loop caused NaN by amplifying
+            # C_minus feedback when θ changed dramatically within a step.
+            # With Bohning curvature ≥ 1/8 everywhere, the quadratic
+            # braking is always present and one step suffices.
+            R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
+            b_base = b_poisson + self.regression_weight * R_linear
+            c_quad = self.regression_weight * R_quad_coeff
 
-                # Solve quadratic: b² - b_base·b - c_quad·a_theta = 0
-                discriminant = b_base ** 2 + 4.0 * c_quad * self.a_theta
-                b_theta_new = (b_base + np.sqrt(discriminant)) / 2.0
+            discriminant = b_base ** 2 + 4.0 * c_quad * self.a_theta
+            self.b_theta = (b_base + np.sqrt(discriminant)) / 2.0
+            self._theta_inner_iters = 1
 
-                # Check convergence (skip on first iteration)
-                if inner > 0:
-                    rel_change = np.abs(b_theta_new - self.b_theta).max() / (
-                        np.abs(self.b_theta).max() + 1e-10)
-                    self.b_theta = b_theta_new
-                    self._theta_inner_iters = inner + 1
-                    if rel_change < 1e-3:
-                        break
-                else:
-                    self.b_theta = b_theta_new
-                    self._theta_inner_iters = 1
-
-                # Re-tighten ζ for updated θ
-                self._update_zeta(X_aux)
+            # Re-tighten ζ for updated θ
+            self._update_zeta(X_aux)
         else:
             self.b_theta = b_poisson
             self._theta_inner_iters = 0
@@ -499,7 +502,7 @@ class CAVI:
         R_quad_coeff : (n, K) — coefficient of E[θ_{iℓ}], always >= 0
         """
         y_exp = y if y.ndim > 1 else y[:, None]  # (n, kappa)
-        lam = self._lambda_jj(self.zeta)           # (n, kappa)
+        lam = self._lambda_bohning(self.zeta)       # (n, kappa) — Bohning-floored
         E_theta = self.E_theta                      # (n, K)
         E_v = self.mu_v                             # (kappa, K)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
@@ -520,14 +523,7 @@ class CAVI:
         ).sum(axis=1)
 
         # Quadratic coefficient: (n, kappa, K) → sum over kappa → (n, K)
-        # Floor λ at 1/8 (Bohning bound) for the quadratic term.
-        # The JJ curvature λ(ζ) → 0 as ζ → ∞, which removes the braking
-        # force on θ and causes runaway divergence.  The Bohning bound
-        # guarantees curvature ≥ 1/8 for the logistic, so the quadratic
-        # regularizer always scales as regression_weight * E[v²] / 4,
-        # keeping θ bounded.
-        lam_quad = np.maximum(lam, 0.125)  # 1/8 = Bohning curvature
-        R_quad_coeff = (2 * lam_quad[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
+        R_quad_coeff = (2 * lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
 
         return R_linear, R_quad_coeff
 
@@ -545,7 +541,7 @@ class CAVI:
             variational posterior on the scale mixture variable s_{kℓ}.
         """
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_jj(self.zeta)
+        lam = self._lambda_bohning(self.zeta)  # Bohning-floored
         E_theta = self.E_theta
         Var_theta = self.a_theta / (self.b_theta ** 2)
         E_theta_sq = E_theta ** 2 + Var_theta
@@ -571,13 +567,9 @@ class CAVI:
             # E_q[s^{-1}] = 1/(b_v * ω) + 1/ω^2
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
-        # Precision: (kappa, K)
-        # Use Bohning-floored λ for precision (diagonal E[θ²]·E[v²] terms),
-        # matching the θ update's quadratic coefficient and the ELBO's diagonal.
-        lam_quad = np.maximum(lam, 0.125)
-        precision = prior_precision + 2 * np.einsum('ik,id->kd', lam_quad, E_theta_sq)
+        # Precision and mean: both use Bohning-floored λ for full consistency
+        precision = prior_precision + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
 
-        # Mean*precision: (kappa, K) — uses raw λ for cross terms (C_minus)
         term1 = np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
         term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
         mean_prec = term1 - term2
@@ -608,8 +600,7 @@ class CAVI:
         if self.p_aux == 0:
             return
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_jj(self.zeta)
-        lam_quad = np.maximum(lam, 0.125)  # Bohning floor for precision
+        lam = self._lambda_bohning(self.zeta)  # Bohning-floored
         E_theta = self.E_theta
 
         # Same adaptive damping schedule as v
@@ -618,12 +609,12 @@ class CAVI:
 
         for k in range(self.kappa):
             prec_prior = np.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            # Precision: 1/σ² I + 2 Σ_i λ_quad(ζ_{ik}) x^aux_i x^aux_i^T
-            weighted_X = X_aux * (2 * lam_quad[:, k])[:, None]
+            # Precision: 1/σ² I + 2 Σ_i λ(ζ_{ik}) x^aux_i x^aux_i^T
+            weighted_X = X_aux * (2 * lam[:, k])[:, None]
             prec_lik = weighted_X.T @ X_aux
             prec = prec_prior + prec_lik
 
-            # Residual: y - 0.5 - 2λ_raw(ζ) θ·v — raw λ for cross terms
+            # Residual: y - 0.5 - 2λ(ζ) θ·v
             theta_v_k = E_theta @ self.mu_v[k]
             residual = (y_exp[:, k] - 0.5) - 2 * lam[:, k] * theta_v_k
             mean_prec = X_aux.T @ residual
@@ -662,27 +653,18 @@ class CAVI:
         poisson_ll -= np.sum(gammaln(self._X_data + 1))
         elbo += poisson_ll
 
-        # === JJ Bernoulli likelihood ===
-        # Split -λ·E[A²] into diagonal and cross terms to match the θ update,
-        # which uses Bohning-floored λ (max(λ,1/8)) for the diagonal
-        # E[θ²]·E[v²] terms and raw λ for the cross terms.
+        # === JJ Bernoulli likelihood (Bohning-floored) ===
+        # Uses max(λ_JJ, 1/8) consistently — same as all updates.
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_jj(self.zeta)
-        lam_quad = np.maximum(lam, 0.125)  # Bohning floor (same as θ update)
+        lam = self._lambda_bohning(self.zeta)
         E_A = E_theta @ self.mu_v.T
         if self.p_aux > 0:
             E_A = E_A + X_aux @ self.mu_gamma.T
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
-        E_theta_sq = E_theta ** 2 + self.a_theta / (self.b_theta ** 2)
+        Var_theta = self.a_theta / (self.b_theta ** 2)
+        E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T
 
-        # Diagonal: Σ_ℓ E[θ²_ℓ]·E[v²_ℓ] — uses floored λ (Bohning)
-        diag = E_theta_sq @ E_v_sq.T  # (n, kappa)
-        # Cross: E[A²] - diag — uses raw λ
-        E_A_sq = E_A ** 2 + (self.a_theta / (self.b_theta ** 2)) @ E_v_sq.T
-        cross = E_A_sq - diag
-
-        regression_ll = np.sum((y_exp - 0.5) * E_A
-                               - lam_quad * diag - lam * cross)
+        regression_ll = np.sum((y_exp - 0.5) * E_A - lam * E_A_sq)
         regression_ll += np.sum(lam * self.zeta ** 2 - 0.5 * self.zeta
                                 + np.log(1 / (1 + np.exp(-self.zeta))))
         elbo += self.regression_weight * regression_ll
