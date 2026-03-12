@@ -115,6 +115,7 @@ class CAVI:
         v_prior: str = 'normal',
         sigma_gamma: float = 1.0,
         regression_weight: float = 1.0,
+        class_weights: Optional[str] = 'balanced',
         random_state: Optional[int] = None,
         mode: str = 'unmasked',
         pathway_mask: Optional[np.ndarray] = None,
@@ -135,6 +136,7 @@ class CAVI:
             raise ValueError(f"v_prior must be 'normal' or 'laplace', got '{v_prior}'")
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
+        self.class_weights = class_weights
         # Cap on JJ auxiliary ζ.  Keeps λ_JJ(ζ) ≥ λ_JJ(ζ_max) > 0,
         # preventing the quadratic braking on θ from vanishing.
         # At ζ_max=4: λ_min ≈ 0.060.  The JJ bound remains valid for any ζ.
@@ -160,6 +162,42 @@ class CAVI:
         # Will be set in fit()
         self.n = self.p = self.kappa = self.p_aux = None
         self.bp = self.dp = None
+
+    # =================================================================
+    # Class weight computation
+    # =================================================================
+
+    @staticmethod
+    def _compute_sample_weights(y, class_weights):
+        """Compute per-sample, per-label weights for class imbalance.
+
+        Parameters
+        ----------
+        y : (n, kappa) array
+            Binary label matrix.
+        class_weights : str or None
+            'balanced' for inverse-frequency weighting, None for uniform.
+
+        Returns
+        -------
+        w : (n, kappa) array
+            Per-sample weights (mean 1.0 per label column).
+        """
+        n, kappa = y.shape
+        if class_weights is None:
+            return np.ones((n, kappa), dtype=np.float64)
+
+        w = np.ones((n, kappa), dtype=np.float64)
+        for k in range(kappa):
+            n_pos = np.sum(y[:, k] > 0.5)
+            n_neg = n - n_pos
+            if n_pos == 0 or n_neg == 0:
+                continue
+            # sklearn-style balanced: w_c = n / (2 * n_c)
+            w_pos = n / (2.0 * n_pos)
+            w_neg = n / (2.0 * n_neg)
+            w[:, k] = np.where(y[:, k] > 0.5, w_pos, w_neg)
+        return w
 
     # =================================================================
     # scHPF empirical hyperparameters
@@ -496,6 +534,11 @@ class CAVI:
         E_v = self.mu_v                             # (kappa, K)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
 
+        # Class-balanced weights: scale (y-0.5) and λ by per-sample weights
+        w = self._sample_weights                    # (n, kappa)
+        w_y_shift = w * (y_exp - 0.5)              # (n, kappa)
+        w_lam = w * lam                             # (n, kappa)
+
         # Full linear predictor: (n, kappa)
         theta_v = E_theta @ E_v.T
         if self.p_aux > 0:
@@ -507,12 +550,12 @@ class CAVI:
 
         # Linear part: (n, kappa, K) → sum over kappa → (n, K)
         R_linear = (
-            -(y_exp[:, :, None] - 0.5) * E_v[None, :, :]
-            + 2 * lam[:, :, None] * E_v[None, :, :] * C_minus
+            -w_y_shift[:, :, None] * E_v[None, :, :]
+            + 2 * w_lam[:, :, None] * E_v[None, :, :] * C_minus
         ).sum(axis=1)
 
         # Quadratic coefficient: (n, kappa, K) → sum over kappa → (n, K)
-        R_quad_coeff = (2 * lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
+        R_quad_coeff = (2 * w_lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
 
         return R_linear, R_quad_coeff
 
@@ -536,6 +579,11 @@ class CAVI:
         E_theta_sq = E_theta ** 2 + Var_theta
         E_v = self.mu_v
 
+        # Class-balanced weights
+        w = self._sample_weights                    # (n, kappa)
+        w_y_shift = w * (y_exp - 0.5)              # (n, kappa)
+        w_lam = w * lam                             # (n, kappa)
+
         # Full predictor: (n, kappa)
         theta_v = E_theta @ E_v.T
         if self.p_aux > 0:
@@ -556,11 +604,11 @@ class CAVI:
             # E_q[s^{-1}] = 1/(b_v * ω) + 1/ω^2
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
-        # Precision and mean: both use raw λ_JJ (ζ-capped)
-        precision = prior_precision + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
+        # Precision and mean: use weighted λ for class balance
+        precision = prior_precision + 2 * np.einsum('ik,id->kd', w_lam, E_theta_sq)
 
-        term1 = np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
-        term2 = 2 * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
+        term1 = np.einsum('ik,id->kd', w_y_shift, E_theta)
+        term2 = 2 * np.einsum('ik,ikd,id->kd', w_lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
         sigma_v_diag_new = 1.0 / precision
@@ -592,20 +640,25 @@ class CAVI:
         lam = self._lambda_jj(self.zeta)
         E_theta = self.E_theta
 
+        # Class-balanced weights
+        w = self._sample_weights                    # (n, kappa)
+        w_lam = w * lam                             # (n, kappa)
+        w_y_shift = w * (y_exp - 0.5)              # (n, kappa)
+
         # Same adaptive damping schedule as v
         alpha_max = 0.15
         alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
             prec_prior = np.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            # Precision: 1/σ² I + 2 Σ_i λ(ζ_{ik}) x^aux_i x^aux_i^T
-            weighted_X = X_aux * (2 * lam[:, k])[:, None]
+            # Precision: 1/σ² I + 2 Σ_i w_ik λ(ζ_{ik}) x^aux_i x^aux_i^T
+            weighted_X = X_aux * (2 * w_lam[:, k])[:, None]
             prec_lik = weighted_X.T @ X_aux
             prec = prec_prior + prec_lik
 
-            # Residual: y - 0.5 - 2λ(ζ) θ·v
+            # Residual: w*(y - 0.5) - 2*w*λ(ζ)*θ·v
             theta_v_k = E_theta @ self.mu_v[k]
-            residual = (y_exp[:, k] - 0.5) - 2 * lam[:, k] * theta_v_k
+            residual = w_y_shift[:, k] - 2 * w_lam[:, k] * theta_v_k
             mean_prec = X_aux.T @ residual
 
             self.Sigma_gamma[k] = np.linalg.inv(prec)
@@ -642,9 +695,10 @@ class CAVI:
         poisson_ll -= np.sum(gammaln(self._X_data + 1))
         elbo += poisson_ll
 
-        # === JJ Bernoulli likelihood ===
+        # === JJ Bernoulli likelihood (class-weighted) ===
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
+        w = self._sample_weights                    # (n, kappa)
         E_A = E_theta @ self.mu_v.T
         if self.p_aux > 0:
             E_A = E_A + X_aux @ self.mu_gamma.T
@@ -652,9 +706,9 @@ class CAVI:
         Var_theta = self.a_theta / (self.b_theta ** 2)
         E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T
 
-        regression_ll = np.sum((y_exp - 0.5) * E_A - lam * E_A_sq)
-        regression_ll += np.sum(lam * self.zeta ** 2 - 0.5 * self.zeta
-                                + np.log(1 / (1 + np.exp(-self.zeta))))
+        regression_ll = np.sum(w * ((y_exp - 0.5) * E_A - lam * E_A_sq))
+        regression_ll += np.sum(w * (lam * self.zeta ** 2 - 0.5 * self.zeta
+                                + np.log(1 / (1 + np.exp(-self.zeta)))))
         elbo += self.regression_weight * regression_ll
 
         # === Prior: p(θ|ξ) ===
@@ -862,6 +916,9 @@ class CAVI:
         if y.ndim == 1:
             y = y[:, None]
         X_aux = np.asarray(X_aux_train, dtype=np.float64)
+
+        # Compute per-sample class weights for label imbalance
+        self._sample_weights = self._compute_sample_weights(y, self.class_weights)
 
         # Initialize
         self._initialize(X_train, y, X_aux)

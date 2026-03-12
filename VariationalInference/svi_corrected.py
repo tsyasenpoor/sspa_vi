@@ -47,6 +47,7 @@ class SVI:
         v_prior: str = 'normal',
         sigma_gamma: float = 1.0,
         regression_weight: float = 1.0,
+        class_weights: Optional[str] = 'balanced',
         # SVI-specific
         batch_size: int = 128,
         learning_rate_delay: float = 1.0,    # τ
@@ -72,6 +73,7 @@ class SVI:
             raise ValueError(f"v_prior must be 'normal' or 'laplace', got '{v_prior}'")
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
+        self.class_weights = class_weights
 
         self.batch_size = batch_size
         self.tau = learning_rate_delay
@@ -97,6 +99,42 @@ class SVI:
 
         self.n = self.p = self.n_outcomes = self.p_aux = None
         self.bp = self.dp = None
+
+    # =================================================================
+    # Class weight computation
+    # =================================================================
+
+    @staticmethod
+    def _compute_sample_weights(y, class_weights):
+        """Compute per-sample, per-label weights for class imbalance.
+
+        Parameters
+        ----------
+        y : (n, kappa) array
+            Binary label matrix.
+        class_weights : str or None
+            'balanced' for inverse-frequency weighting, None for uniform.
+
+        Returns
+        -------
+        w : (n, kappa) array
+            Per-sample weights (mean 1.0 per label column).
+        """
+        n, kappa = y.shape
+        if class_weights is None:
+            return np.ones((n, kappa), dtype=np.float64)
+
+        w = np.ones((n, kappa), dtype=np.float64)
+        for k in range(kappa):
+            n_pos = np.sum(y[:, k] > 0.5)
+            n_neg = n - n_pos
+            if n_pos == 0 or n_neg == 0:
+                continue
+            # sklearn-style balanced: w_c = n / (2 * n_c)
+            w_pos = n / (2.0 * n_pos)
+            w_neg = n / (2.0 * n_neg)
+            w[:, k] = np.where(y[:, k] > 0.5, w_pos, w_neg)
+        return w
 
     # =================================================================
     # Helpers (same as CAVI)
@@ -232,7 +270,8 @@ class SVI:
     # Local inference (full optimization per mini-batch)
     # =================================================================
 
-    def _optimize_local(self, X_batch, y_batch, X_aux_batch, use_regression):
+    def _optimize_local(self, X_batch, y_batch, X_aux_batch, use_regression,
+                         w_batch=None):
         """
         Fully optimize θ, ξ for a mini-batch (freeze globals).
 
@@ -278,7 +317,8 @@ class SVI:
             # Regression correction to θ rate
             if use_regression and self.regression_weight > 0:
                 R = self._regression_correction_batch(
-                    y_batch, X_aux_batch, E_theta, E_v, E_v_sq, zeta)
+                    y_batch, X_aux_batch, E_theta, E_v, E_v_sq, zeta,
+                    w_batch)
                 b_theta = b_theta + self.regression_weight * R
                 b_theta = np.maximum(b_theta, 1e-6)
 
@@ -298,10 +338,19 @@ class SVI:
         return a_theta, b_theta, a_xi, b_xi, zeta
 
     def _regression_correction_batch(self, y_batch, X_aux_batch,
-                                      E_theta, E_v, E_v_sq, zeta):
+                                      E_theta, E_v, E_v_sq, zeta,
+                                      w_batch=None):
         """JJ regression correction to θ rate for a batch."""
         y_exp = y_batch if y_batch.ndim > 1 else y_batch[:, None]
         lam = self._lambda_jj(zeta)
+
+        # Class-balanced weights
+        if w_batch is None:
+            w = np.ones_like(y_exp)
+        else:
+            w = w_batch
+        w_y_shift = w * (y_exp - 0.5)              # (B, kappa)
+        w_lam = w * lam                             # (B, kappa)
 
         theta_v = E_theta @ E_v.T
         if self.p_aux > 0:
@@ -310,9 +359,9 @@ class SVI:
         C_minus = theta_v[:, :, None] - E_theta[:, None, :] * E_v[None, :, :]
 
         R = (
-            -(y_exp[:, :, None] - 0.5) * E_v[None, :, :]
-            + 2 * lam[:, :, None] * E_v[None, :, :] * C_minus
-            + 2 * lam[:, :, None] * E_v_sq[None, :, :] * E_theta[:, None, :]
+            -w_y_shift[:, :, None] * E_v[None, :, :]
+            + 2 * w_lam[:, :, None] * E_v[None, :, :] * C_minus
+            + 2 * w_lam[:, :, None] * E_v_sq[None, :, :] * E_theta[:, None, :]
         )
         return R.sum(axis=1)
 
@@ -346,12 +395,20 @@ class SVI:
         return a_eta_hat, b_eta_hat
 
     def _intermediate_v(self, y_batch, X_aux_batch, E_theta,
-                        a_theta, b_theta, zeta, scale):
+                        a_theta, b_theta, zeta, scale, w_batch=None):
         """Compute v̂ (same equations as CAVI but with scale)."""
         y_exp = y_batch if y_batch.ndim > 1 else y_batch[:, None]
         lam = self._lambda_jj(zeta)
         Var_theta = a_theta / (b_theta ** 2)
         E_theta_sq = E_theta ** 2 + Var_theta
+
+        # Class-balanced weights
+        if w_batch is None:
+            w = np.ones_like(y_exp)
+        else:
+            w = w_batch
+        w_y_shift = w * (y_exp - 0.5)              # (B, kappa)
+        w_lam = w * lam                             # (B, kappa)
 
         theta_v = E_theta @ self.mu_v.T
         if self.p_aux > 0:
@@ -368,10 +425,10 @@ class SVI:
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
         precision = prior_precision + \
-                    2 * scale * np.einsum('ik,id->kd', lam, E_theta_sq)
+                    2 * scale * np.einsum('ik,id->kd', w_lam, E_theta_sq)
 
-        term1 = scale * np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
-        term2 = 2 * scale * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
+        term1 = scale * np.einsum('ik,id->kd', w_y_shift, E_theta)
+        term2 = 2 * scale * np.einsum('ik,ikd,id->kd', w_lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
         if self.v_prior == 'normal':
@@ -383,7 +440,7 @@ class SVI:
         return mu_v_hat, sigma_v_hat
 
     def _intermediate_gamma(self, y_batch, X_aux_batch, E_theta,
-                            zeta, scale):
+                            zeta, scale, w_batch=None):
         """Compute γ̂."""
         if self.p_aux == 0:
             return self.mu_gamma.copy(), self.Sigma_gamma.copy()
@@ -391,16 +448,24 @@ class SVI:
         y_exp = y_batch if y_batch.ndim > 1 else y_batch[:, None]
         lam = self._lambda_jj(zeta)
 
+        # Class-balanced weights
+        if w_batch is None:
+            w = np.ones_like(y_exp)
+        else:
+            w = w_batch
+        w_y_shift = w * (y_exp - 0.5)
+        w_lam = w * lam
+
         mu_gamma_hat = np.zeros_like(self.mu_gamma)
         Sigma_gamma_hat = np.zeros_like(self.Sigma_gamma)
 
         for k in range(self.n_outcomes):
             prec_prior = np.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            weighted_X = X_aux_batch * (2 * scale * lam[:, k])[:, None]
+            weighted_X = X_aux_batch * (2 * scale * w_lam[:, k])[:, None]
             prec = prec_prior + weighted_X.T @ X_aux_batch
 
             theta_v_k = E_theta @ self.mu_v[k]
-            residual = (y_exp[:, k] - 0.5) - 2 * lam[:, k] * theta_v_k
+            residual = w_y_shift[:, k] - 2 * w_lam[:, k] * theta_v_k
             mean_prec = scale * X_aux_batch.T @ residual
 
             Sigma_gamma_hat[k] = np.linalg.inv(prec)
@@ -487,6 +552,9 @@ class SVI:
             y = y[:, None]
         X_aux = np.asarray(X_aux_train, dtype=np.float64)
 
+        # Compute per-sample class weights for label imbalance
+        self._sample_weights = self._compute_sample_weights(y, self.class_weights)
+
         if X_val is not None and X_aux_val is None:
             X_aux_val = np.zeros((X_val.shape[0], 0))
 
@@ -527,6 +595,7 @@ class SVI:
                     X_b = X_train[idx]
                 y_b = y[idx]
                 X_aux_b = X_aux[idx]
+                w_b = self._sample_weights[idx]
 
                 # Step size: ρ_t = (τ + t)^{-κ}
                 rho_t = (self.tau + global_step) ** (-self.kappa)
@@ -534,7 +603,7 @@ class SVI:
 
                 # 1. Optimize local parameters
                 a_theta, b_theta, a_xi, b_xi, zeta = \
-                    self._optimize_local(X_b, y_b, X_aux_b, use_regression)
+                    self._optimize_local(X_b, y_b, X_aux_b, use_regression, w_b)
 
                 E_theta = a_theta / b_theta
                 E_log_theta = digamma(a_theta) - np.log(b_theta)
@@ -556,13 +625,13 @@ class SVI:
                 if use_regression:
                     mu_v_hat, sigma_v_hat = self._intermediate_v(
                         y_b, X_aux_b, E_theta, a_theta, b_theta,
-                        zeta, actual_scale)
+                        zeta, actual_scale, w_b)
                     self.mu_v = (1 - rho_t) * self.mu_v + rho_t * mu_v_hat
                     self.sigma_v_diag = (1 - rho_t) * self.sigma_v_diag + rho_t * sigma_v_hat
 
                     if self.p_aux > 0:
                         mu_g_hat, Sig_g_hat = self._intermediate_gamma(
-                            y_b, X_aux_b, E_theta, zeta, actual_scale)
+                            y_b, X_aux_b, E_theta, zeta, actual_scale, w_b)
                         self.mu_gamma = (1 - rho_t) * self.mu_gamma + rho_t * mu_g_hat
 
             # End of epoch — check convergence

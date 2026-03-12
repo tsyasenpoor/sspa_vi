@@ -145,6 +145,7 @@ class VIConfig:
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
     regression_weight: float = 1.0
+    class_weights: Optional[str] = 'balanced'
 
     # Training parameters
     max_iter: int = 200
@@ -217,6 +218,7 @@ class VIConfig:
             'spike_variance_v': self.spike_variance_v,
             'spike_value_beta': self.spike_value_beta,
             'regression_weight': self.regression_weight,
+            'class_weights': self.class_weights,
         }
 
     def training_params(self) -> Dict[str, Any]:
@@ -481,6 +483,7 @@ class SVIConfig:
     pi_beta: float = 0.05
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
+    class_weights: Optional[str] = 'balanced'
 
     # Training parameters
     max_epochs: int = 100
@@ -570,6 +573,7 @@ class SVIConfig:
             'pi_beta': self.pi_beta,
             'spike_variance_v': self.spike_variance_v,
             'spike_value_beta': self.spike_value_beta,
+            'class_weights': self.class_weights,
             # Early stopping parameters
             'early_stopping_metric': self.early_stopping_metric,
             'heldout_ll_patience': self.heldout_ll_patience,
