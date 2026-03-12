@@ -208,6 +208,9 @@ class CAVI:
         # --- Empirical hyperparameters (scHPF: scalar bp, dp) ---
         self.bp = self.ap * self._mean_var_ratio(X, axis=1)
         self.dp = self.cp * self._mean_var_ratio(X, axis=0)
+        # Floor bp and dp to prevent extreme rate parameters
+        self.bp = max(self.bp, 0.01)
+        self.dp = max(self.dp, 0.01)
         # Clip if bp >> dp (scHPF)
         if self.bp > 1000 * self.dp:
             old_dp = self.dp
@@ -386,6 +389,7 @@ class CAVI:
             # φ_{ijk} ∝ exp(ψ(a^θ_{ik}) - log(b^θ_{ik}) + ψ(a^β_{jk}) - log(b^β_{jk}))
             log_phi = (self._E_log_theta_cache[self._X_row]
                        + self._E_log_beta_cache[self._X_col])
+            log_phi = np.clip(log_phi, -700, 700)  # prevent exp overflow
             log_phi -= _logsumexp_rows(log_phi)
             phi = np.exp(log_phi)
 
@@ -424,9 +428,15 @@ class CAVI:
             b² - b_base·b - c_quad·a_theta = 0
             b = (b_base + sqrt(b_base² + 4·c_quad·a_theta)) / 2
         which is always positive (given c_quad > 0, guaranteed by the ζ cap).
+
+        Uses adaptive damping and rate clipping for numerical stability.
         """
+        # Store old b_theta for damping
+        b_theta_old = self.b_theta.copy()
+
         # a^θ_{ik} = a + Σ_j x_{ij} φ_{ijk}
         self.a_theta = self.a + z_sum_theta
+        self.a_theta = np.maximum(self.a_theta, self.a * 0.5)  # never too small
 
         # b_base = E[ξ_i] + Σ_j E[β_{jk}] + regression_weight * R_linear
         beta_sum = self.E_beta.sum(axis=0)  # (K,)
@@ -440,8 +450,17 @@ class CAVI:
             b_base = b_poisson + self.regression_weight * R_linear
             c_quad = self.regression_weight * R_quad_coeff
 
+            # Safe quadratic: clamp discriminant to avoid NaN from negative values
             discriminant = b_base ** 2 + 4.0 * c_quad * self.a_theta
-            self.b_theta = (b_base + np.sqrt(discriminant)) / 2.0
+            discriminant = np.maximum(discriminant, 0.0)
+            new_b = (b_base + np.sqrt(discriminant)) / 2.0
+
+            # Adaptive damping (same schedule as v/γ)
+            alpha = min(0.25, 0.05 + 0.20 * (self.current_iter / 200.0))
+            self.b_theta = (1.0 - alpha) * b_theta_old + alpha * new_b
+
+            # Hard floor — prevents b_theta → 0 which causes E[θ] explosion
+            self.b_theta = np.maximum(self.b_theta, 1e-4)
             self._theta_inner_iters = 1
 
             # Re-tighten ζ for updated θ
@@ -454,6 +473,13 @@ class CAVI:
         """ξ rate (scHPF): b^ξ_i = b' + Σ_k E[θ_{ik}]."""
         # a^ξ is constant = ap + K*a (set in init)
         self.b_xi = self.bp + self.E_theta.sum(axis=1)
+
+    def _clip_rates(self):
+        """Global safety net: floor all rate parameters to prevent division-by-zero / overflow."""
+        self.b_theta = np.maximum(self.b_theta, 1e-4)
+        self.b_beta  = np.maximum(self.b_beta,  1e-6)
+        self.b_xi    = np.maximum(self.b_xi,    1e-4)
+        self.b_eta   = np.maximum(self.b_eta,   1e-6)
 
     def _update_zeta(self, X_aux):
         """JJ auxiliary: ζ_{ik} = min(sqrt(E[A²_{ik}]), ζ_max).
@@ -896,7 +922,10 @@ class CAVI:
         best_holl_reg_params = None
         holl_reg_patience = 10
 
+        self.current_iter = 0  # needed for damping schedule in _update_theta
+
         for t in range(max_iter):
+            self.current_iter = t
             diag = verbose and (t % check_freq == 0)
 
             # 1. Compute φ and z_sums (sparse)
@@ -906,6 +935,7 @@ class CAVI:
             # 2. Update β, η (gene side first — scHPF order)
             self._update_beta(z_sum_beta)
             self._update_eta()
+            self._clip_rates()  # safety net after gene-side rate updates
             if diag:
                 print(f"  [diag t={t}] after β,η: "
                       f"E[β]=[{self.E_beta.min():.4e},{self.E_beta.max():.4e}] "
@@ -922,6 +952,7 @@ class CAVI:
             # 4. Update θ, ξ (cell side — with full regression from start)
             self._update_theta(z_sum_theta, y, X_aux)
             self._update_xi()
+            self._clip_rates()  # safety net after cell-side rate updates
             if diag:
                 E_th = self.E_theta
                 inner_info = f" inner={self._theta_inner_iters}" if self._theta_inner_iters > 0 else ""
