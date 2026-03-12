@@ -135,6 +135,10 @@ class CAVI:
             raise ValueError(f"v_prior must be 'normal' or 'laplace', got '{v_prior}'")
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
+        # Cap on JJ auxiliary ζ.  Keeps λ_JJ(ζ) ≥ λ_JJ(ζ_max) > 0,
+        # preventing the quadratic braking on θ from vanishing.
+        # At ζ_max=4: λ_min ≈ 0.060.  The JJ bound remains valid for any ζ.
+        self.zeta_max = 4.0
 
         self.mode = mode
         self.pathway_mask = pathway_mask
@@ -179,19 +183,6 @@ class CAVI:
         """λ(ζ) = tanh(ζ/2) / (4ζ), with λ(0)=1/8."""
         safe = np.maximum(np.abs(zeta), 1e-8)
         return np.tanh(safe / 2.0) / (4.0 * safe)
-
-    @staticmethod
-    def _lambda_bohning(zeta):
-        """Bohning-floored JJ curvature: max(λ_JJ(ζ), 1/8).
-
-        Used consistently in ALL updates and ELBO to define a single
-        coherent variational objective.  The Bohning bound guarantees
-        curvature ≥ 1/8 for the logistic, keeping θ bounded while
-        avoiding the split-λ inconsistency that caused ELBO drops.
-        """
-        safe = np.maximum(np.abs(zeta), 1e-8)
-        lam_jj = np.tanh(safe / 2.0) / (4.0 * safe)
-        return np.maximum(lam_jj, 0.125)
 
     # =================================================================
     # Initialization (scHPF pattern)
@@ -429,17 +420,10 @@ class CAVI:
         """
         θ shape and rate (scHPF Eq 7, cell side + JJ regression).
 
-        Uses inner iteration over (θ, ζ) to maintain a tight JJ bound.
-        The JJ auxiliary ζ must satisfy ζ = sqrt(E[A²]) for the bound to be
-        tight. When θ changes significantly in one step, ζ becomes stale and
-        the quadratic regularization λ(ζ)E[v²]θ² vanishes (since λ→0 as ζ→∞),
-        creating a runaway feedback loop. The inner loop re-tightens ζ after
-        each θ update, preventing this.
-
-        Within each inner step we solve the quadratic:
+        Solves the quadratic for b_theta in one step:
             b² - b_base·b - c_quad·a_theta = 0
             b = (b_base + sqrt(b_base² + 4·c_quad·a_theta)) / 2
-        which is always positive.
+        which is always positive (given c_quad > 0, guaranteed by the ζ cap).
         """
         # a^θ_{ik} = a + Σ_j x_{ij} φ_{ijk}
         self.a_theta = self.a + z_sum_theta
@@ -449,11 +433,9 @@ class CAVI:
         b_poisson = self.E_xi[:, None] + beta_sum[None, :]
 
         if self.regression_weight > 0:
-            # Single-step quadratic solve using Bohning-floored λ.
-            # No inner θ-ζ loop: the inner loop caused NaN by amplifying
-            # C_minus feedback when θ changed dramatically within a step.
-            # With Bohning curvature ≥ 1/8 everywhere, the quadratic
-            # braking is always present and one step suffices.
+            # Single-step quadratic solve (no inner θ-ζ loop).
+            # The ζ cap keeps λ bounded from below, ensuring the
+            # quadratic braking on θ never vanishes.
             R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
             b_base = b_poisson + self.regression_weight * R_linear
             c_quad = self.regression_weight * R_quad_coeff
@@ -474,7 +456,13 @@ class CAVI:
         self.b_xi = self.bp + self.E_theta.sum(axis=1)
 
     def _update_zeta(self, X_aux):
-        """JJ auxiliary: ζ_{ik} = sqrt(E[A²_{ik}])."""
+        """JJ auxiliary: ζ_{ik} = min(sqrt(E[A²_{ik}]), ζ_max).
+
+        Capping ζ keeps λ_JJ(ζ) bounded from below, which prevents the
+        quadratic braking on θ from vanishing.  The JJ lower bound is valid
+        for ANY ζ, so capping gives a slightly looser but still valid bound.
+        Each CAVI update still provably increases this capped-ζ ELBO.
+        """
         E_theta = self.E_theta
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
         Var_theta = self.a_theta / (self.b_theta ** 2)  # (n, K)
@@ -484,7 +472,8 @@ class CAVI:
             E_A = E_A + X_aux @ self.mu_gamma.T
 
         E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T  # (n, kappa)
-        self.zeta = np.sqrt(np.maximum(E_A_sq, 1e-8))
+        zeta_raw = np.sqrt(np.maximum(E_A_sq, 1e-8))
+        self.zeta = np.minimum(zeta_raw, self.zeta_max)
 
     def _regression_rate_parts(self, y, X_aux):
         """
@@ -502,7 +491,7 @@ class CAVI:
         R_quad_coeff : (n, K) — coefficient of E[θ_{iℓ}], always >= 0
         """
         y_exp = y if y.ndim > 1 else y[:, None]  # (n, kappa)
-        lam = self._lambda_bohning(self.zeta)       # (n, kappa) — Bohning-floored
+        lam = self._lambda_jj(self.zeta)           # (n, kappa)
         E_theta = self.E_theta                      # (n, K)
         E_v = self.mu_v                             # (kappa, K)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
@@ -541,7 +530,7 @@ class CAVI:
             variational posterior on the scale mixture variable s_{kℓ}.
         """
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_bohning(self.zeta)  # Bohning-floored
+        lam = self._lambda_jj(self.zeta)
         E_theta = self.E_theta
         Var_theta = self.a_theta / (self.b_theta ** 2)
         E_theta_sq = E_theta ** 2 + Var_theta
@@ -567,7 +556,7 @@ class CAVI:
             # E_q[s^{-1}] = 1/(b_v * ω) + 1/ω^2
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
-        # Precision and mean: both use Bohning-floored λ for full consistency
+        # Precision and mean: both use raw λ_JJ (ζ-capped)
         precision = prior_precision + 2 * np.einsum('ik,id->kd', lam, E_theta_sq)
 
         term1 = np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
@@ -600,7 +589,7 @@ class CAVI:
         if self.p_aux == 0:
             return
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_bohning(self.zeta)  # Bohning-floored
+        lam = self._lambda_jj(self.zeta)
         E_theta = self.E_theta
 
         # Same adaptive damping schedule as v
@@ -653,10 +642,9 @@ class CAVI:
         poisson_ll -= np.sum(gammaln(self._X_data + 1))
         elbo += poisson_ll
 
-        # === JJ Bernoulli likelihood (Bohning-floored) ===
-        # Uses max(λ_JJ, 1/8) consistently — same as all updates.
+        # === JJ Bernoulli likelihood ===
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self._lambda_bohning(self.zeta)
+        lam = self._lambda_jj(self.zeta)
         E_A = E_theta @ self.mu_v.T
         if self.p_aux > 0:
             E_A = E_A + X_aux @ self.mu_gamma.T
