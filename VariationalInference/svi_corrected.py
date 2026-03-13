@@ -511,12 +511,20 @@ class SVI:
             X_val=None, y_val=None, X_aux_val=None,
             max_epochs=500, check_freq=5,
             v_warmup=50, verbose=True,
-            heldout_patience=50):
+            heldout_patience=50,
+            early_stopping='heldout_ll'):
         """
         Fit via SVI.
 
         One epoch = one pass through all mini-batches.
         Global params updated after each mini-batch.
+
+        Parameters
+        ----------
+        early_stopping : str
+            'heldout_ll' — stop when held-out LL plateaus (default).
+            'elbo' — stop when ELBO plateaus.
+            'none' — disable early stopping, run all epochs.
         """
         t0 = time.time()
 
@@ -536,6 +544,11 @@ class SVI:
         B = min(self.batch_size, N)
         n_batches = (N + B - 1) // B
         scale = float(N) / B
+
+        if early_stopping == 'elbo' and verbose:
+            print("Warning: SVI does not compute full ELBO. "
+                  "'elbo' early stopping treated as 'none' for SVI.")
+            early_stopping = 'none'
 
         self.elbo_history_ = []
         self.holl_history_ = []
@@ -628,11 +641,12 @@ class SVI:
                           f"{beta_range}  {v_str}{holl_str}")
 
                 # Early stopping
-                if patience_counter >= heldout_patience and epoch >= v_warmup + 20:
-                    if verbose:
-                        print(f"Early stopping at epoch {epoch} "
-                              f"(no HO-LL improvement for {heldout_patience} checks)")
-                    break
+                if early_stopping == 'heldout_ll':
+                    if patience_counter >= heldout_patience and epoch >= v_warmup + 20:
+                        if verbose:
+                            print(f"Early stopping at epoch {epoch} "
+                                  f"(no HO-LL improvement for {heldout_patience} checks)")
+                        break
 
         elapsed = time.time() - t0
         if verbose:
@@ -640,8 +654,10 @@ class SVI:
             if best_params is not None:
                 print(f"Best HO-LL: {best_holl:.4f}")
 
-        if best_params is not None:
+        if early_stopping != 'none' and best_params is not None:
             self._restore(best_params)
+        elif early_stopping == 'none' and verbose:
+            print("Early stopping disabled — keeping final parameters.")
 
         return self
 

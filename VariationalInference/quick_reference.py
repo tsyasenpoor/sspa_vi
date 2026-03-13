@@ -340,6 +340,14 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help='[SVI] Epochs without HO-LL improvement before stopping'
     )
+    parser.add_argument(
+        '--early-stopping',
+        type=str,
+        choices=['heldout_ll', 'elbo', 'none'],
+        default='heldout_ll',
+        help='Early stopping criterion: heldout_ll (default, stop on held-out LL), '
+             'elbo (stop on ELBO convergence), none (disable early stopping)'
+    )
 
     # VI (CAVI) specific training options
     parser.add_argument(
@@ -773,6 +781,7 @@ def main():
             v_warmup=args.v_warmup,
             verbose=True,
             heldout_patience=args.heldout_patience,
+            early_stopping=args.early_stopping,
         )
     else:
         fit_kwargs = dict(
@@ -787,6 +796,7 @@ def main():
             tol=args.tol,
             v_warmup=args.v_warmup,
             verbose=True,
+            early_stopping=args.early_stopping,
         )
 
     # Train model
