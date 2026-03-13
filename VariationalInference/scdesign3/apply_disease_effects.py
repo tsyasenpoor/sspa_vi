@@ -406,7 +406,7 @@ class DiseaseEffectSimulator:
         with open(output_dir / "ground_truth.json", "w") as f:
             json.dump(ground_truth, f, indent=2)
         
-        # Save disease labels for SVI
+        # Save disease labels for VI
         y = disease.astype(np.int32)
         np.save(output_dir / "disease_labels.npy", y)
         

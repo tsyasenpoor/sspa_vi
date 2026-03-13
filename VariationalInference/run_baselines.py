@@ -4,7 +4,7 @@ Run Baseline Classification Methods on EMTAB Data
 =================================================
 
 This script runs baseline classification methods (SVM, LR, Lasso LR, Ridge LR, 
-NMF+LR variants) on the same preprocessed EMTAB data used for SVI experiments.
+NMF+LR variants) on the same preprocessed EMTAB data used for VI experiments.
 
 Usage:
     python run_baselines.py \
@@ -96,7 +96,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # =========================================================================
-    # STEP 1: Load and Preprocess Data (same as SVI)
+    # STEP 1: Load and Preprocess Data (same as VI)
     # =========================================================================
     print("\n" + "=" * 80)
     print("Loading and Preprocessing Data")
