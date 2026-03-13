@@ -133,6 +133,10 @@ DATASET_PRESETS = {
         'n_factors': ('int', 100, 2000, 100),
         'regression_weight': ('log_float', 1.0, 200.0),
     },
+    'covid': {
+        'n_factors': ('int', 500, 5000, 100),
+        'regression_weight': ('log_float', 1.0, 500.0),
+    },
 }
 
 
@@ -1012,7 +1016,7 @@ def parse_args(argv=None):
 
     # Dataset preset
     parser.add_argument(
-        '--dataset-preset', default=None, choices=['pbmc', 'simulation', 'emtab'],
+        '--dataset-preset', default=None, choices=['pbmc', 'simulation', 'emtab', 'covid'],
         help='Dataset-specific search space preset'
     )
 
