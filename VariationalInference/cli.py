@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-Command-Line Interface for Stochastic Variational Inference
-============================================================
+Command-Line Interface for Variational Inference
+==================================================
 
-This module provides a command-line interface for running SVI experiments
+This module provides a command-line interface for running VI (CAVI) experiments
 on single-cell RNA-seq data.
 
 Usage:
@@ -14,8 +14,7 @@ Usage:
     python -m VariationalInference.cli train \
         --data /path/to/data.h5ad \
         --n-factors 50 \
-        --batch-size 128 \
-        --max-epochs 100 \
+        --max-iter 600 \
         --label-column t2dm \
         --aux-columns Sex \
         --output-dir ./results \
@@ -23,7 +22,7 @@ Usage:
 
     # Predict with trained model
     python -m VariationalInference.cli predict \
-        --model ./results/svi_model.pkl \
+        --model ./results/vi_model.pkl \
         --data /path/to/new_data.h5ad \
         --output predictions.csv
 """
@@ -39,7 +38,7 @@ def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser for the CLI."""
     parser = argparse.ArgumentParser(
         prog='VariationalInference',
-        description='Stochastic Variational Inference for Single-Cell Analysis',
+        description='Variational Inference for Single-Cell Analysis',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -190,59 +189,13 @@ def create_parser() -> argparse.ArgumentParser:
         help='Check convergence / compute held-out LL every N iterations/epochs'
     )
 
-    # Inference method selection
-    train_parser.add_argument(
-        '--method',
-        type=str,
-        default='svi',
-        choices=['vi', 'svi'],
-        help='Inference method: vi (coordinate ascent, full-batch) or svi (stochastic, mini-batch)'
-    )
-
-    # SVI-specific parameters (only used when --method svi)
-    train_parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=128,
-        help='Mini-batch size for SVI (only used with --method svi)'
-    )
-    train_parser.add_argument(
-        '--max-epochs',
-        type=int,
-        default=500,
-        help='Maximum epochs for SVI (only used with --method svi)'
-    )
-    train_parser.add_argument(
-        '--learning-rate-decay',
-        type=float,
-        default=0.75,
-        help='Learning rate decay exponent (kappa) for SVI Robbins-Monro schedule'
-    )
-    train_parser.add_argument(
-        '--learning-rate-delay',
-        type=float,
-        default=1.0,
-        help='Learning rate delay (tau) for SVI Robbins-Monro schedule'
-    )
-    train_parser.add_argument(
-        '--local-iterations',
-        type=int,
-        default=10,
-        help='Number of local parameter iterations per batch for SVI'
-    )
-    train_parser.add_argument(
-        '--heldout-patience',
-        type=int,
-        default=50,
-        help='[SVI] Epochs without HO-LL improvement before stopping'
-    )
     train_parser.add_argument(
         '--early-stopping',
         type=str,
-        choices=['heldout_ll', 'elbo', 'none'],
-        default='heldout_ll',
-        help='Early stopping criterion: heldout_ll (default, stop on held-out LL), '
-             'elbo (stop on ELBO convergence), none (disable early stopping)'
+        choices=['elbo', 'none'],
+        default='elbo',
+        help='Early stopping criterion: elbo (default, stop on ELBO convergence), '
+             'none (disable early stopping)'
     )
 
     train_parser.add_argument(
@@ -385,11 +338,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     from .data_loader import DataLoader
     from .utils import save_results, compute_metrics, print_model_summary
 
-    method = getattr(args, 'method', 'svi').lower()
-    if method == 'vi':
-        from .vi_cavi import CAVI as ModelClass
-    else:
-        from .svi_corrected import SVI as ModelClass
+    from .vi_cavi import CAVI as ModelClass
 
     # Initialize profiler if requested
     profiler = None
@@ -398,20 +347,14 @@ def cmd_train(args: argparse.Namespace) -> int:
         profiler.enable()
         print("\n[PROFILER] Profiling enabled - measuring function execution times...")
 
-    method_label = 'COORDINATE ASCENT VI' if method == 'vi' else 'STOCHASTIC VI'
     print("=" * 60)
-    print(f"{method_label} TRAINING")
+    print("COORDINATE ASCENT VI TRAINING")
     print("=" * 60)
 
     # Print configuration
     print(f"\nData: {args.data}")
-    print(f"Method: {method}")
     print(f"n_factors: {args.n_factors}")
-    if method == 'svi':
-        print(f"batch_size: {args.batch_size}")
-        print(f"max_epochs: {args.max_epochs}")
-    else:
-        print(f"max_iter: {args.max_iter}")
+    print(f"max_iter: {args.max_iter}")
     print(f"label_column: {args.label_column}")
     print(f"aux_columns: {args.aux_columns}")
     print(f"random_state: {args.seed if args.seed else 'None (random)'}")
@@ -453,10 +396,9 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     # Create and train model
     print("\n" + "-" * 40)
-    print(f"Training {method.upper()} model...")
+    print("Training VI model...")
     print("-" * 40)
 
-    # Build common model kwargs
     model_kwargs = dict(
         n_factors=args.n_factors,
         a=args.a,
@@ -471,47 +413,22 @@ def cmd_train(args: argparse.Namespace) -> int:
         random_state=args.seed,
     )
 
-    if method == 'svi':
-        model_kwargs.update(
-            batch_size=args.batch_size,
-            learning_rate_delay=args.learning_rate_delay,
-            learning_rate_decay=args.learning_rate_decay,
-            local_iterations=args.local_iterations,
-        )
-
     model = ModelClass(**model_kwargs)
 
-    # Build fit kwargs
-    if method == 'svi':
-        fit_kwargs = dict(
-            X_train=X_train,
-            y_train=y_train,
-            X_aux_train=X_aux_train,
-            X_val=X_val,
-            y_val=y_val,
-            X_aux_val=X_aux_val,
-            max_epochs=args.max_epochs,
-            check_freq=args.check_freq,
-            v_warmup=args.v_warmup,
-            verbose=args.verbose,
-            heldout_patience=args.heldout_patience,
-            early_stopping=args.early_stopping,
-        )
-    else:
-        fit_kwargs = dict(
-            X_train=X_train,
-            y_train=y_train,
-            X_aux_train=X_aux_train,
-            X_val=X_val,
-            y_val=y_val,
-            X_aux_val=X_aux_val,
-            max_iter=args.max_iter,
-            check_freq=args.check_freq,
-            tol=args.tol,
-            v_warmup=args.v_warmup,
-            verbose=args.verbose,
-            early_stopping=args.early_stopping,
-        )
+    fit_kwargs = dict(
+        X_train=X_train,
+        y_train=y_train,
+        X_aux_train=X_aux_train,
+        X_val=X_val,
+        y_val=y_val,
+        X_aux_val=X_aux_val,
+        max_iter=args.max_iter,
+        check_freq=args.check_freq,
+        tol=args.tol,
+        v_warmup=args.v_warmup,
+        verbose=args.verbose,
+        early_stopping=args.early_stopping,
+    )
 
     model.fit(**fit_kwargs)
 
