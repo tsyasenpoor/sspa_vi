@@ -72,8 +72,9 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         '--label-column',
         type=str,
-        default='t2dm',
-        help='Column name in adata.obs for labels'
+        nargs='+',
+        default=['t2dm'],
+        help='Column name(s) in adata.obs for labels (e.g., severity outcome)'
     )
     train_parser.add_argument(
         '--aux-columns',
@@ -161,6 +162,102 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help='Gaussian prior std for gamma (auxiliary effects)'
+    )
+    train_parser.add_argument(
+        '--alpha-theta',
+        type=float,
+        default=None,
+        help='Gamma shape prior for theta (overrides --a if set)'
+    )
+    train_parser.add_argument(
+        '--alpha-beta',
+        type=float,
+        default=None,
+        help='Gamma shape prior for beta (overrides --c if set)'
+    )
+    train_parser.add_argument(
+        '--alpha-xi',
+        type=float,
+        default=None,
+        help='Gamma shape prior for xi (=ap in scHPF). Default 1.0.'
+    )
+    train_parser.add_argument(
+        '--alpha-eta',
+        type=float,
+        default=None,
+        help='Gamma shape prior for eta (=cp in scHPF). Default 1.0.'
+    )
+    train_parser.add_argument(
+        '--lambda-xi',
+        type=float,
+        default=None,
+        help='Rate multiplier for xi prior'
+    )
+    train_parser.add_argument(
+        '--lambda-eta',
+        type=float,
+        default=None,
+        help='Rate multiplier for eta prior'
+    )
+    train_parser.add_argument(
+        '--pi-v',
+        type=float,
+        default=None,
+        help='Prior probability of v being active (spike-and-slab)'
+    )
+    train_parser.add_argument(
+        '--pi-beta',
+        type=float,
+        default=None,
+        help='Prior probability of beta being active (spike-and-slab)'
+    )
+
+    # Damping parameters (passed through to model)
+    train_parser.add_argument(
+        '--theta-damping',
+        type=float,
+        default=None,
+        help='Damping for theta updates'
+    )
+    train_parser.add_argument(
+        '--beta-damping',
+        type=float,
+        default=None,
+        help='Damping for beta updates'
+    )
+    train_parser.add_argument(
+        '--v-damping',
+        type=float,
+        default=None,
+        help='Damping for v updates'
+    )
+    train_parser.add_argument(
+        '--gamma-damping',
+        type=float,
+        default=None,
+        help='Damping for gamma updates'
+    )
+    train_parser.add_argument(
+        '--xi-damping',
+        type=float,
+        default=None,
+        help='Damping for xi updates'
+    )
+    train_parser.add_argument(
+        '--eta-damping',
+        type=float,
+        default=None,
+        help='Damping for eta updates'
+    )
+
+    # Model mode
+    train_parser.add_argument(
+        '--mode',
+        type=str,
+        default='unmasked',
+        choices=['unmasked', 'masked', 'pathway_init', 'combined'],
+        help='Model mode: unmasked (standard), masked (pathway-constrained), '
+             'pathway_init (initialized from pathways), combined (pathway + DRGPs)'
     )
 
     # Training parameters
@@ -371,12 +468,14 @@ def cmd_train(args: argparse.Namespace) -> int:
         verbose=args.verbose
     )
 
+    label_column = args.label_column if len(args.label_column) > 1 else args.label_column[0]
+
     data = loader.load_and_preprocess(
-        label_column=args.label_column,
+        label_column=label_column,
         aux_columns=args.aux_columns,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
-        stratify_by=args.label_column,
+        stratify_by=label_column,
         min_cells_expressing=args.min_cells,
         layer=args.layer,
         convert_to_ensembl=not args.no_ensembl,
@@ -399,18 +498,26 @@ def cmd_train(args: argparse.Namespace) -> int:
     print("Training VI model...")
     print("-" * 40)
 
+    # Bayes opt names override scHPF names when provided:
+    #   alpha_theta -> a,  alpha_beta -> c,  alpha_xi -> ap,  alpha_eta -> cp
+    a_val = args.alpha_theta if args.alpha_theta is not None else args.a
+    c_val = args.alpha_beta if args.alpha_beta is not None else args.c
+    ap_val = args.alpha_xi if args.alpha_xi is not None else 1.0
+    cp_val = args.alpha_eta if args.alpha_eta is not None else 1.0
+
     model_kwargs = dict(
         n_factors=args.n_factors,
-        a=args.a,
-        ap=1.0,
-        c=args.c,
-        cp=1.0,
+        a=a_val,
+        ap=ap_val,
+        c=c_val,
+        cp=cp_val,
         sigma_v=args.sigma_v,
         b_v=args.b_v,
         v_prior=args.v_prior,
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
         random_state=args.seed,
+        mode=args.mode,
     )
 
     model = ModelClass(**model_kwargs)
