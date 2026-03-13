@@ -269,6 +269,10 @@ class CAVI:
         # --- JJ auxiliary ---
         self.zeta = np.ones((self.n, self.kappa))
 
+        # --- Oscillation tracking for v update ---
+        self._v_prev_mu = None
+        self._v_raw_prev = None
+
         # --- Class weights for imbalanced labels ---
         # W[i,k] = n / (2 * n_class_k) where n_class_k is count of y[i,k]'s class
         # For balanced labels this is ~1.0; for imbalanced labels the minority
@@ -616,7 +620,36 @@ class CAVI:
             # alpha_max over ~200 iterations.
             alpha_max = 0.15
             alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
-            self.mu_v = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+            mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+
+            # --- Period-2 oscillation detection and correction ---
+            # The CAVI update for v can enter a stable limit cycle where the
+            # raw update alternates between +clip and -clip each iteration.
+            # With damping alpha and clip V, this creates oscillation at
+            # ±alpha*V/(2-alpha).  Detect consecutive sign flips and correct
+            # by averaging raw updates from the last two iterations, which
+            # cancels the oscillation and lets v decay toward the true optimum.
+            if not hasattr(self, '_v_prev_mu') or self._v_prev_mu is None:
+                self._v_prev_mu = np.zeros_like(self.mu_v)
+                self._v_raw_prev = np.zeros_like(self.mu_v)
+
+            sign_flip_now = (self.mu_v * mu_v_candidate) < 0
+            sign_flip_prev = (self._v_prev_mu * self.mu_v) < 0
+            oscillating = sign_flip_now & sign_flip_prev
+
+            if oscillating.any():
+                # Average consecutive raw updates to cancel the oscillation.
+                # When raw updates alternate ±V, their average ≈ 0, so
+                # oscillating elements decay toward zero at rate (1-alpha).
+                avg_raw = 0.5 * (mu_v_new + self._v_raw_prev)
+                mu_v_candidate[oscillating] = (
+                    (1.0 - alpha) * self.mu_v[oscillating]
+                    + alpha * avg_raw[oscillating]
+                )
+
+            self._v_prev_mu = self.mu_v.copy()
+            self._v_raw_prev = mu_v_new.copy()
+            self.mu_v = mu_v_candidate
             # Damp sigma_v_diag consistently with mu_v to keep q(v) coherent
             self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
         else:
