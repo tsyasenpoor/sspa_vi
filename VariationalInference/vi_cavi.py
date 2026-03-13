@@ -127,6 +127,7 @@ class CAVI:
         pathway_mask: Optional[np.ndarray] = None,
         pathway_names: Optional[List[str]] = None,
         n_pathway_factors: Optional[int] = None,
+        nnz_chunk_size: int = 1_000_000,
         # Ignored SVI-compat kwargs
         **_ignored,
     ):
@@ -148,6 +149,7 @@ class CAVI:
         # At ζ_max=4: λ_min ≈ 0.060.  The JJ bound remains valid for any ζ.
         self.zeta_max = 4.0
 
+        self.nnz_chunk_size = nnz_chunk_size
         self.mode = mode
         self.pathway_mask = pathway_mask
         self.pathway_names = pathway_names
@@ -412,30 +414,45 @@ class CAVI:
 
     def _compute_phi_sparse(self, random_init=False):
         """
-        Compute Xφ using only nonzero entries.
+        Compute Xφ using only nonzero entries, processed in chunks to
+        bound peak memory at O(chunk_size * K) instead of O(nnz * K).
 
         Returns:
             z_sum_beta: (p, K) = Σ_i x_{ij} φ_{ijk}
             z_sum_theta: (n, K) = Σ_j x_{ij} φ_{ijk}
         """
         K = self.K
+        nnz = self._nnz
+        chunk = self.nnz_chunk_size
+        z_sum_beta = np.zeros((self.p, K))
+        z_sum_theta = np.zeros((self.n, K))
 
-        if random_init:
-            # First iteration: random Dirichlet φ (scHPF)
-            phi = np.random.dirichlet(np.ones(K), self._nnz)
-        else:
-            # φ_{ijk} ∝ exp(ψ(a^θ_{ik}) - log(b^θ_{ik}) + ψ(a^β_{jk}) - log(b^β_{jk}))
-            log_phi = (self._E_log_theta_cache[self._X_row]
-                       + self._E_log_beta_cache[self._X_col])
-            log_phi -= _logsumexp_rows(log_phi)
-            phi = np.exp(log_phi)
+        for start in range(0, nnz, chunk):
+            end = min(start + chunk, nnz)
+            row_c = self._X_row[start:end]
+            col_c = self._X_col[start:end]
+            data_c = self._X_data[start:end]
 
-        # x_{ij} * φ_{ijk}
-        Xphi = self._X_data[:, None] * phi  # (nnz, K)
+            if random_init:
+                Xphi = np.random.dirichlet(np.ones(K), end - start)
+                Xphi *= data_c[:, None]
+            else:
+                # Compute phi in-place to minimize peak memory:
+                # work array holds log_phi → phi → Xphi sequentially
+                work = (self._E_log_theta_cache[row_c]
+                        + self._E_log_beta_cache[col_c])   # (chunk, K)
+                work -= _logsumexp_rows(work)               # normalize
+                np.exp(work, out=work)                      # phi in-place
+                work *= data_c[:, None]                     # Xphi in-place
+                Xphi = work
 
-        # Accumulate via bincount (10-20× faster than np.add.at)
-        z_sum_beta = _scatter_add(self._X_col, Xphi, self.p)
-        z_sum_theta = _scatter_add(self._X_row, Xphi, self.n)
+            # Accumulate via bincount
+            for k in range(K):
+                z_sum_beta[:, k] += np.bincount(
+                    col_c, weights=Xphi[:, k], minlength=self.p)
+                z_sum_theta[:, k] += np.bincount(
+                    row_c, weights=Xphi[:, k], minlength=self.n)
+            del Xphi
 
         return z_sum_beta, z_sum_theta
 
@@ -526,6 +543,9 @@ class CAVI:
                                 + 2λ(ζ_{ik}) v_{kℓ} C^{(-ℓ)}_{ik}]
           R_quad_coeff_{iℓ} = Σ_k [2λ(ζ_{ik}) E[v²_{kℓ}]]
 
+        Memory-efficient: avoids (n, kappa, K) C_minus intermediate by
+        algebraic decomposition into (n, kappa) @ (kappa, K) matmuls.
+
         Returns
         -------
         R_linear : (n, K) — terms not depending on E[θ_{iℓ}]
@@ -543,19 +563,19 @@ class CAVI:
         if self.p_aux > 0:
             theta_v = theta_v + X_aux @ self.mu_gamma.T
 
-        # C^{(-ℓ)}_{ik} = A_{ik} - θ_{iℓ} v_{kℓ}
-        full_lp = theta_v[:, :, None]  # (n, kappa, 1)
-        C_minus = full_lp - E_theta[:, None, :] * E_v[None, :, :]  # (n, kappa, K)
+        W_lam = W * lam  # (n, kappa)
 
-        # Weighted linear part: (n, kappa, K) → sum over kappa → (n, K)
-        Wk = W[:, :, None]  # (n, kappa, 1) for broadcasting
-        R_linear = (
-            Wk * (-(y_exp[:, :, None] - 0.5) * E_v[None, :, :]
-                  + 2 * lam[:, :, None] * E_v[None, :, :] * C_minus)
-        ).sum(axis=1)
+        # Decompose C_minus terms using matmuls to avoid (n, kappa, K) array:
+        #   R_linear[i,l] = -(W*(y-0.5)) @ v[:,l]
+        #                   + 2*(W_lam*theta_v) @ v[:,l]
+        #                   - 2*E_theta[i,l] * (W_lam @ v[:,l]^2)
+        term_a = -(W * (y_exp - 0.5)) @ E_v                  # (n, K)
+        term_b = 2.0 * (W_lam * theta_v) @ E_v               # (n, K)
+        term_c = 2.0 * E_theta * (W_lam @ (E_v ** 2))        # (n, K)
+        R_linear = term_a + term_b - term_c
 
-        # Weighted quadratic coefficient: (n, kappa, K) → sum over kappa → (n, K)
-        R_quad_coeff = (Wk * 2 * lam[:, :, None] * E_v_sq[None, :, :]).sum(axis=1)
+        # R_quad_coeff[i,l] = sum_k 2*W[i,k]*lam[i,k]*E_v_sq[k,l]
+        R_quad_coeff = (2.0 * W_lam) @ E_v_sq                # (n, K)
 
         return R_linear, R_quad_coeff
 
@@ -571,6 +591,9 @@ class CAVI:
             precision_{kℓ} = E_q[1/s_{kℓ}] + 2 Σ_i λ(ζ_{ik}) E[θ²_{iℓ}]
             where E_q[1/s_{kℓ}] is computed from the inverse Gaussian
             variational posterior on the scale mixture variable s_{kℓ}.
+
+        Memory-efficient: avoids (n, kappa, K) C_minus intermediate by
+        decomposing into (kappa, n) @ (n, K) matmuls → (kappa, K).
         """
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
@@ -585,27 +608,30 @@ class CAVI:
         if self.p_aux > 0:
             theta_v = theta_v + X_aux @ self.mu_gamma.T
 
-        # C^{(-ℓ)}: (n, kappa, K)
-        C_minus = theta_v[:, :, None] - E_theta[:, None, :] * E_v[None, :, :]
-
         if self.v_prior == 'normal':
             # K-scaled prior: each v_kl has prior variance sigma_v^2 / K
             sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
             prior_precision = 1.0 / sigma_v_eff_sq
         else:
             # Laplace (Bayesian Lasso): adaptive precision from E_q[1/s_{kl}]
-            # ω_{kl} = sqrt(E_q[v_{kl}^2]) = sqrt(mu_v^2 + sigma_v_diag)
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
             omega = np.sqrt(np.maximum(E_v_sq, 1e-12))
-            # E_q[s^{-1}] = 1/(b_v * ω) + 1/ω^2
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
-        # Precision and mean: both use raw λ_JJ (ζ-capped), weighted by W
-        W_lam = W * lam  # (n, kappa) — class-weighted λ
-        precision = prior_precision + 2 * np.einsum('ik,id->kd', W_lam, E_theta_sq)
+        # Precision and mean via matmuls — avoids (n, kappa, K) C_minus
+        W_lam = W * lam                              # (n, kappa)
+        precision = prior_precision + 2 * (W_lam.T @ E_theta_sq)  # (kappa, K)
 
-        term1 = np.einsum('ik,id->kd', W * (y_exp - 0.5), E_theta)
-        term2 = 2 * np.einsum('ik,ikd,id->kd', W_lam, C_minus, E_theta)
+        # term1[k,d] = sum_i W[i,k]*(y[i,k]-0.5)*E_theta[i,d]
+        term1 = (W * (y_exp - 0.5)).T @ E_theta      # (kappa, K)
+
+        # Decompose term2 = 2*sum_i W_lam[i,k]*C_minus[i,k,d]*E_theta[i,d]
+        #   = 2*(W_lam*theta_v).T @ E_theta - 2*v*(W_lam.T @ E_theta^2)
+        E_theta_plain_sq = E_theta ** 2               # (n, K) — not E_theta_sq
+        part_a = (W_lam * theta_v).T @ E_theta        # (kappa, K)
+        part_b = E_v * (W_lam.T @ E_theta_plain_sq)   # (kappa, K)
+        term2 = 2.0 * (part_a - part_b)
+
         mean_prec = term1 - term2
 
         sigma_v_diag_new = 1.0 / precision
@@ -705,17 +731,25 @@ class CAVI:
 
         elbo = 0.0
 
-        # === Poisson likelihood (collapsed z) ===
-        # Use sparse computation
-        E_log_theta_nnz = E_log_theta[self._X_row]
-        E_log_beta_nnz = E_log_beta[self._X_col]
-        log_rates = E_log_theta_nnz + E_log_beta_nnz  # (nnz, K)
-        log_rates_max = log_rates.max(axis=1)
-        log_sum_rates = log_rates_max + np.log(
-            np.exp(log_rates - log_rates_max[:, None]).sum(axis=1))  # (nnz,)
-        poisson_ll = np.sum(self._X_data * log_sum_rates)
+        # === Poisson likelihood (collapsed z) — chunked to avoid (nnz, K) ===
+        poisson_ll = 0.0
+        gammaln_term = 0.0
+        nnz = self._nnz
+        chunk = self.nnz_chunk_size
+        for start in range(0, nnz, chunk):
+            end = min(start + chunk, nnz)
+            row_c = self._X_row[start:end]
+            col_c = self._X_col[start:end]
+            data_c = self._X_data[start:end]
+            log_rates_c = E_log_theta[row_c] + E_log_beta[col_c]  # (chunk, K)
+            lrm = log_rates_c.max(axis=1, keepdims=True)
+            log_sum_c = lrm.ravel() + np.log(
+                np.exp(log_rates_c - lrm).sum(axis=1))
+            poisson_ll += np.sum(data_c * log_sum_c)
+            gammaln_term += np.sum(gammaln(data_c + 1))
+            del log_rates_c
         poisson_ll -= np.sum(E_theta.sum(axis=0) * E_beta.sum(axis=0))
-        poisson_ll -= np.sum(gammaln(self._X_data + 1))
+        poisson_ll -= gammaln_term
         elbo += poisson_ll
 
         # === JJ Bernoulli likelihood ===
@@ -845,34 +879,54 @@ class CAVI:
         row = X_val_coo.row
         col = X_val_coo.col
         data = X_val_coo.data if X_val_coo.data.dtype == np.float64 else X_val_coo.data.astype(np.float64)
+        nnz_val = len(data)
+        chunk = self.nnz_chunk_size
 
         for _ in range(n_iter):
             E_log_theta_v = digamma(a_theta_v) - np.log(b_theta_v)
             E_theta_v = a_theta_v / b_theta_v
             E_xi_v = a_xi_v / b_xi_v
 
-            # φ sparse
-            log_phi = E_log_theta_v[row] + E_log_beta[col]
-            log_phi -= _logsumexp_rows(log_phi)
-            Xphi = data[:, None] * np.exp(log_phi)
-
-            z_sum = _scatter_add(row, Xphi, n_val)
+            # φ sparse — chunked
+            z_sum = np.zeros((n_val, self.K))
+            for start in range(0, nnz_val, chunk):
+                end = min(start + chunk, nnz_val)
+                row_c = row[start:end]
+                col_c = col[start:end]
+                data_c = data[start:end]
+                work = E_log_theta_v[row_c] + E_log_beta[col_c]
+                work -= _logsumexp_rows(work)
+                np.exp(work, out=work)
+                work *= data_c[:, None]
+                for k in range(self.K):
+                    z_sum[:, k] += np.bincount(
+                        row_c, weights=work[:, k], minlength=n_val)
+                del work
 
             a_theta_v = self.a + z_sum
             b_theta_v = E_xi_v[:, None] + beta_col_sums[None, :]
             b_xi_v = self.bp + E_theta_v.sum(axis=1)
 
-        # Poisson LL per sample
+        # Poisson LL per sample — chunked
         E_log_theta_v = digamma(a_theta_v) - np.log(b_theta_v)
         E_theta_v = a_theta_v / b_theta_v
-        log_rates = E_log_theta_v[row] + E_log_beta[col]
-        log_rates_max = log_rates.max(axis=1, keepdims=True)
-        log_sum_rates = (log_rates_max.ravel()
-                         + np.log(np.exp(log_rates - log_rates_max).sum(axis=1)))
+        poisson_ll = 0.0
+        gammaln_term = 0.0
+        for start in range(0, nnz_val, chunk):
+            end = min(start + chunk, nnz_val)
+            row_c = row[start:end]
+            col_c = col[start:end]
+            data_c = data[start:end]
+            log_rates_c = E_log_theta_v[row_c] + E_log_beta[col_c]
+            lrm = log_rates_c.max(axis=1, keepdims=True)
+            log_sum_c = lrm.ravel() + np.log(
+                np.exp(log_rates_c - lrm).sum(axis=1))
+            poisson_ll += np.sum(data_c * log_sum_c)
+            gammaln_term += np.sum(gammaln(data_c + 1))
+            del log_rates_c
 
-        poisson_ll = np.sum(data * log_sum_rates)
         poisson_ll -= np.sum(E_theta_v.sum(axis=0) * E_beta.sum(axis=0))
-        poisson_ll -= np.sum(gammaln(data + 1))
+        poisson_ll -= gammaln_term
         poisson_ll_per_sample = poisson_ll / n_val
 
         # Regression LL on validation data (if labels provided)
@@ -1181,6 +1235,49 @@ class CAVI:
     # predict / transform (API compat)
     # =================================================================
 
+    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20):
+        """Infer θ for new data using chunked sparse phi. Returns a_theta, b_theta."""
+        a_theta = np.random.uniform(0.5 * self.a, 1.5 * self.a, (n_new, self.K))
+        b_theta = np.full((n_new, self.K), self.bp)
+        a_xi = np.full(n_new, self.ap + self.K * self.a)
+        b_xi = np.full(n_new, self.bp)
+
+        E_log_beta = self.E_log_beta
+        beta_col_sums = self.E_beta.sum(axis=0)
+
+        row, col = X_coo.row, X_coo.col
+        data = X_coo.data if X_coo.data.dtype == np.float64 else X_coo.data.astype(np.float64)
+        nnz = len(data)
+        chunk = self.nnz_chunk_size
+        K = self.K
+
+        for _ in range(n_iter):
+            E_log_theta = digamma(a_theta) - np.log(b_theta)
+            E_theta = a_theta / b_theta
+            E_xi = a_xi / b_xi
+
+            # Chunked phi + scatter
+            z_sum = np.zeros((n_new, K))
+            for start in range(0, nnz, chunk):
+                end = min(start + chunk, nnz)
+                row_c = row[start:end]
+                col_c = col[start:end]
+                data_c = data[start:end]
+                work = E_log_theta[row_c] + E_log_beta[col_c]
+                work -= _logsumexp_rows(work)
+                np.exp(work, out=work)
+                work *= data_c[:, None]
+                for k in range(K):
+                    z_sum[:, k] += np.bincount(
+                        row_c, weights=work[:, k], minlength=n_new)
+                del work
+
+            a_theta = self.a + z_sum
+            b_theta = E_xi[:, None] + beta_col_sums[None, :]
+            b_xi = self.bp + E_theta.sum(axis=1)
+
+        return a_theta, b_theta
+
     def predict_proba(self, X_new, X_aux_new=None, n_iter=20):
         """Predict P(y=1 | X_new)."""
         if sp.issparse(X_new):
@@ -1192,32 +1289,7 @@ class CAVI:
         if X_aux_new is None:
             X_aux_new = np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0))
 
-        # Infer θ
-        a_theta = np.random.uniform(0.5 * self.a, 1.5 * self.a, (n_new, self.K))
-        b_theta = np.full((n_new, self.K), self.bp)
-        a_xi = np.full(n_new, self.ap + self.K * self.a)
-        b_xi = np.full(n_new, self.bp)
-
-        E_log_beta = self.E_log_beta
-        E_beta = self.E_beta
-        beta_col_sums = E_beta.sum(axis=0)
-
-        row, col = X_coo.row, X_coo.col
-        data = X_coo.data if X_coo.data.dtype == np.float64 else X_coo.data.astype(np.float64)
-
-        for _ in range(n_iter):
-            E_log_theta = digamma(a_theta) - np.log(b_theta)
-            E_theta = a_theta / b_theta
-            E_xi = a_xi / b_xi
-
-            log_phi = E_log_theta[row] + E_log_beta[col]
-            log_phi -= _logsumexp_rows(log_phi)
-            Xphi = data[:, None] * np.exp(log_phi)
-            z_sum = _scatter_add(row, Xphi, n_new)
-
-            a_theta = self.a + z_sum
-            b_theta = E_xi[:, None] + beta_col_sums[None, :]
-            b_xi = self.bp + E_theta.sum(axis=1)
+        a_theta, b_theta = self._infer_theta_sparse(X_coo, n_new, n_iter)
 
         E_theta = a_theta / b_theta
         logits = E_theta @ self.mu_v.T
@@ -1235,29 +1307,7 @@ class CAVI:
             X_coo = sp.coo_matrix(X_new)
 
         n_new = X_new.shape[0]
-        a_theta = np.random.uniform(0.5 * self.a, 1.5 * self.a, (n_new, self.K))
-        b_theta = np.full((n_new, self.K), self.bp)
-        a_xi = np.full(n_new, self.ap + self.K * self.a)
-        b_xi = np.full(n_new, self.bp)
-
-        E_log_beta = self.E_log_beta
-        beta_col_sums = self.E_beta.sum(axis=0)
-        row, col = X_coo.row, X_coo.col
-        data = X_coo.data if X_coo.data.dtype == np.float64 else X_coo.data.astype(np.float64)
-
-        for _ in range(n_iter):
-            E_log_theta = digamma(a_theta) - np.log(b_theta)
-            E_theta = a_theta / b_theta
-            E_xi = a_xi / b_xi
-
-            log_phi = E_log_theta[row] + E_log_beta[col]
-            log_phi -= _logsumexp_rows(log_phi)
-            Xphi = data[:, None] * np.exp(log_phi)
-            z_sum = _scatter_add(row, Xphi, n_new)
-
-            a_theta = self.a + z_sum
-            b_theta = E_xi[:, None] + beta_col_sums[None, :]
-            b_xi = self.bp + E_theta.sum(axis=1)
+        a_theta, b_theta = self._infer_theta_sparse(X_coo, n_new, n_iter)
 
         return {
             'E_theta': a_theta / b_theta,
