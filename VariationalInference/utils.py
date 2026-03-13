@@ -550,7 +550,7 @@ def get_active_programs(model: Any) -> Dict[str, Any]:
 
     Parameters
     ----------
-    model : CAVI or SVI
+    model : CAVI
         Trained model.
 
     Returns

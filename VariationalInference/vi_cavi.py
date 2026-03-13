@@ -128,7 +128,6 @@ class CAVI:
         pathway_names: Optional[List[str]] = None,
         n_pathway_factors: Optional[int] = None,
         nnz_chunk_size: int = 1_000_000,
-        # Ignored SVI-compat kwargs
         **_ignored,
     ):
         self.K = n_factors

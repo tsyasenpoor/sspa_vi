@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-Bayesian Optimization for VI/SVI Hyperparameter Tuning
-======================================================
+Bayesian Optimization for VI (CAVI) Hyperparameter Tuning
+==========================================================
 
-Uses Optuna to find optimal hyperparameters for either batch VI (CAVI)
-or stochastic VI (SVI) by maximizing validation AUC.
+Uses Optuna to find optimal hyperparameters for batch VI (CAVI)
+by maximizing validation AUC.
 
-Works with the config-based architecture (VIConfig / SVIConfig) and
+Works with the config-based architecture (VIConfig) and
 supports all data formats handled by DataLoader.
 
 Usage:
-    # SVI on h5ad data
+    # VI on h5ad data
     python -m VariationalInference.bayes_opt \
         --data /path/to/data.h5ad \
-        --method svi \
         --label-column t2dm \
         --n-trials 100
 
     # VI on EMTAB directory
     python -m VariationalInference.bayes_opt \
         --data /path/to/EMTAB11349/preprocessed \
-        --method vi \
         --label-column IBD \
         --aux-columns sex_female \
         --gene-annotation /path/to/gene_annotation.csv \
@@ -29,8 +27,7 @@ Usage:
     # Only tune specific params
     python -m VariationalInference.bayes_opt \
         --data /path/to/data.h5ad \
-        --method svi \
-        --params-to-tune n_factors learning_rate regression_weight \
+        --params-to-tune n_factors regression_weight \
         --n-trials 30
 """
 import os
@@ -62,7 +59,7 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 from VariationalInference.data_loader import DataLoader
-from VariationalInference.config import VIConfig, SVIConfig
+from VariationalInference.config import VIConfig
 
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -73,7 +70,7 @@ logger = logging.getLogger(__name__)
 # Search space definitions
 # =========================================================================
 
-# --- Shared model hyperparameters (used by both VI and SVI) ---
+# --- Model hyperparameters ---
 SHARED_SEARCH_SPACE = {
     'n_factors': ('int', 50, 2000, 50),       # (type, low, high, step)
     'alpha_theta': ('float', 0.5, 4.0),
@@ -88,13 +85,7 @@ SHARED_SEARCH_SPACE = {
     'regression_weight': ('log_float', 0.1, 500.0),
 }
 
-# --- Spike-and-slab params (SVI only; vi_cavi has no spike-and-slab) ---
-SPIKE_SLAB_SEARCH_SPACE = {
-    'pi_v': ('float', 0.3, 0.99),
-    'pi_beta': ('float', 0.01, 0.20),
-}
-
-# --- VI-specific search space ---
+# --- VI (CAVI) damping parameters ---
 VI_SEARCH_SPACE = {
     'theta_damping': ('float', 0.3, 0.95),
     'beta_damping': ('float', 0.3, 0.95),
@@ -102,16 +93,6 @@ VI_SEARCH_SPACE = {
     'gamma_damping': ('float', 0.2, 0.9),
     'xi_damping': ('float', 0.5, 0.99),
     'eta_damping': ('float', 0.5, 0.99),
-}
-
-# --- SVI-specific search space ---
-SVI_SEARCH_SPACE = {
-    'batch_size': ('categorical', [64, 128, 256, 512]),
-    'learning_rate': ('log_float', 1e-3, 0.5),
-    'learning_rate_decay': ('float', 0.5, 1.0),
-    'learning_rate_delay': ('float', 1.0, 20.0),
-    'local_iterations': ('int', 3, 20, 1),
-    'regression_lr_multiplier': ('log_float', 1.0, 50.0),
 }
 
 # --- Dataset-specific presets ---
@@ -127,7 +108,6 @@ DATASET_PRESETS = {
         'regression_weight': ('log_float', 0.5, 50.0),
         'alpha_theta': ('float', 1.5, 4.0),
         'alpha_beta': ('float', 1.5, 4.0),
-        'local_iterations': ('int', 15, 40, 1),
     },
     'emtab': {
         'n_factors': ('int', 100, 2000, 100),
@@ -157,17 +137,15 @@ def _suggest_param(trial: optuna.Trial, name: str, spec: tuple):
         raise ValueError(f"Unknown param type: {ptype}")
 
 
-def build_search_space(method: str, dataset_preset: Optional[str] = None,
+def build_search_space(dataset_preset: Optional[str] = None,
                        v_prior: str = 'normal') -> Dict[str, tuple]:
     """
-    Build the full search space for a given method and optional dataset preset.
+    Build the full search space for VI (CAVI).
 
     Parameters
     ----------
-    method : str
-        'vi' or 'svi'.
     dataset_preset : str, optional
-        One of 'pbmc', 'simulation', 'emtab'. Overrides defaults for
+        One of 'pbmc', 'simulation', 'emtab', 'covid'. Overrides defaults for
         dataset-specific ranges.
     v_prior : str, default='normal'
         Prior for v: 'normal' or 'laplace'. When 'laplace', tunes b_v
@@ -186,12 +164,7 @@ def build_search_space(method: str, dataset_preset: Optional[str] = None,
     else:
         space.pop('b_v', None)
 
-    if method == 'vi':
-        space.update(VI_SEARCH_SPACE)
-        # vi_cavi has no spike-and-slab — skip pi_v, pi_beta
-    else:
-        space.update(SPIKE_SLAB_SEARCH_SPACE)
-        space.update(SVI_SEARCH_SPACE)
+    space.update(VI_SEARCH_SPACE)
 
     if dataset_preset and dataset_preset in DATASET_PRESETS:
         space.update(DATASET_PRESETS[dataset_preset])
@@ -205,12 +178,10 @@ def build_search_space(method: str, dataset_preset: Optional[str] = None,
 
 class TrialObjective:
     """
-    Optuna objective that trains a VI or SVI model and returns validation AUC.
+    Optuna objective that trains a VI (CAVI) model and returns validation AUC.
 
     Parameters
     ----------
-    method : str
-        'vi' or 'svi'.
     X_train, y_train, X_aux_train : array-like
         Training data.
     X_val, y_val, X_aux_val : array-like
@@ -231,8 +202,6 @@ class TrialObjective:
         Number of pathway factors for 'combined' mode.
     max_iter : int
         Max iterations for VI (default 200).
-    max_epochs : int
-        Max epochs for SVI (default 100).
     random_state : int, optional
         Random seed.
     subsample_ratio : float, optional
@@ -241,7 +210,6 @@ class TrialObjective:
 
     def __init__(
         self,
-        method: str,
         X_train, y_train, X_aux_train,
         X_val, y_val, X_aux_val,
         search_space: Dict[str, tuple],
@@ -252,12 +220,10 @@ class TrialObjective:
         pathway_names=None,
         n_pathway_factors=None,
         max_iter: int = 200,
-        max_epochs: int = 100,
         random_state: Optional[int] = None,
         subsample_ratio: Optional[float] = None,
         label_names: Optional[List[str]] = None,
     ):
-        self.method = method
         self.X_train = X_train
         self.y_train = y_train
         self.X_aux_train = X_aux_train
@@ -272,7 +238,6 @@ class TrialObjective:
         self.pathway_names = pathway_names
         self.n_pathway_factors = n_pathway_factors
         self.max_iter = max_iter
-        self.max_epochs = max_epochs
         self.random_state = random_state
         self.subsample_ratio = subsample_ratio
         self.label_names = label_names
@@ -309,34 +274,23 @@ class TrialObjective:
         return params
 
     def _build_config(self, params: Dict[str, Any]):
-        """Build a VIConfig or SVIConfig from sampled params."""
-        if self.method == 'vi':
-            config_cls = VIConfig
-            # Set training params
-            config_kwargs = {
-                'n_factors': params.get('n_factors', 50),
-                'max_iter': self.max_iter,
-                'verbose': False,
-                'debug': False,
-            }
-        else:
-            config_cls = SVIConfig
-            config_kwargs = {
-                'n_factors': params.get('n_factors', 50),
-                'max_epochs': self.max_epochs,
-                'verbose': False,
-                'debug': False,
-            }
+        """Build a VIConfig from sampled params."""
+        config_kwargs = {
+            'n_factors': params.get('n_factors', 50),
+            'max_iter': self.max_iter,
+            'verbose': False,
+            'debug': False,
+        }
 
         if self.random_state is not None:
             config_kwargs['random_state'] = self.random_state
 
         # Map sampled params into config
         for key, val in params.items():
-            if hasattr(config_cls, key) or key == 'n_factors':
+            if hasattr(VIConfig, key) or key == 'n_factors':
                 config_kwargs[key] = val
 
-        return config_cls(**config_kwargs)
+        return VIConfig(**config_kwargs)
 
     @staticmethod
     def _compute_label_metrics(y_true, y_proba, label_name=None):
@@ -378,11 +332,7 @@ class TrialObjective:
             params = self._sample_hyperparams(trial)
             config = self._build_config(params)
 
-            # Import model class
-            if self.method == 'vi':
-                from VariationalInference.vi_cavi import CAVI as ModelClass
-            else:
-                from VariationalInference.svi_corrected import SVI as ModelClass
+            from VariationalInference.vi_cavi import CAVI as ModelClass
 
             # Build model kwargs from config
             model_kwargs = config.model_params()
@@ -410,13 +360,12 @@ class TrialObjective:
                 'X_aux_val': self.X_aux_val,
             })
 
-            # Filter to only params accepted by the specific fit() method
-            if self.method == 'vi':
-                vi_fit_params = {
-                    'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
-                    'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
-                }
-                fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
+            # Filter to only params accepted by the CAVI fit() method
+            vi_fit_params = {
+                'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
+                'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
+            }
+            fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
 
             model.fit(**fit_kwargs)
 
@@ -427,10 +376,10 @@ class TrialObjective:
             y_val_proba = np.asarray(y_val_proba)
             y_val = np.asarray(self.y_val)
 
-            # Determine number of labels (κ)
+            # Determine number of labels
             if y_val.ndim == 1:
                 n_labels = 1
-                y_val = y_val[:, None]          # (n, 1)
+                y_val = y_val[:, None]
                 y_val_proba = y_val_proba.reshape(-1, 1)
             else:
                 n_labels = y_val.shape[1]
@@ -494,12 +443,10 @@ class TrialObjective:
 
 class HyperparameterOptimizer:
     """
-    Orchestrates Optuna-based hyperparameter search for VI / SVI.
+    Orchestrates Optuna-based hyperparameter search for VI (CAVI).
 
     Parameters
     ----------
-    method : str
-        'vi' or 'svi'.
     data_path : str
         Path to data (h5ad file or EMTAB directory).
     label_column : str
@@ -509,7 +456,7 @@ class HyperparameterOptimizer:
     gene_annotation_path : str, optional
         Path to gene annotation CSV.
     dataset_preset : str, optional
-        'pbmc', 'simulation', or 'emtab' for dataset-specific ranges.
+        'pbmc', 'simulation', 'emtab', or 'covid' for dataset-specific ranges.
     mode : str
         Model mode (default 'unmasked').
     gmt_file : str, optional
@@ -524,8 +471,6 @@ class HyperparameterOptimizer:
         Params fixed at specific values (not tuned).
     max_iter : int
         Max iterations for VI trials (default 200).
-    max_epochs : int
-        Max epochs for SVI trials (default 100).
     subsample_ratio : float, optional
         Subsample training data for faster trials.
     train_ratio : float
@@ -542,7 +487,6 @@ class HyperparameterOptimizer:
 
     def __init__(
         self,
-        method: str = 'svi',
         data_path: str = None,
         label_column: Union[str, List[str]] = None,
         aux_columns: Optional[List[str]] = None,
@@ -555,7 +499,6 @@ class HyperparameterOptimizer:
         params_to_tune: Optional[List[str]] = None,
         fixed_params: Optional[Dict[str, Any]] = None,
         max_iter: int = 200,
-        max_epochs: int = 100,
         subsample_ratio: Optional[float] = None,
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
@@ -564,9 +507,6 @@ class HyperparameterOptimizer:
         study_name: Optional[str] = None,
         v_prior: str = 'normal',
     ):
-        self.method = method.lower()
-        assert self.method in ('vi', 'svi'), f"method must be 'vi' or 'svi', got '{method}'"
-
         self.data_path = data_path
         # Normalise label_column to list for consistent handling
         if label_column is None:
@@ -585,14 +525,13 @@ class HyperparameterOptimizer:
         self.params_to_tune = params_to_tune
         self.fixed_params = fixed_params or {}
         self.max_iter = max_iter
-        self.max_epochs = max_epochs
         self.subsample_ratio = subsample_ratio
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.random_state = random_state
         self.output_dir = Path(output_dir)
         self.v_prior = v_prior.lower()
-        self.study_name = study_name or f'{self.method}_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
+        self.study_name = study_name or f'vi_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
 
         # Will be populated by load_data / load_pathways
         self.data = None
@@ -678,7 +617,7 @@ class HyperparameterOptimizer:
         self.load_pathways()
 
         # Build search space
-        self.search_space = build_search_space(self.method, self.dataset_preset, self.v_prior)
+        self.search_space = build_search_space(self.dataset_preset, self.v_prior)
 
         # Always pass v_prior as a fixed param so the model knows which prior to use
         if 'v_prior' not in self.fixed_params:
@@ -695,7 +634,6 @@ class HyperparameterOptimizer:
 
         # Create objective
         objective = TrialObjective(
-            method=self.method,
             X_train=X_train, y_train=y_train, X_aux_train=X_aux_train,
             X_val=X_val, y_val=y_val, X_aux_val=X_aux_val,
             search_space=self.search_space,
@@ -706,7 +644,6 @@ class HyperparameterOptimizer:
             pathway_names=self.pathway_names,
             n_pathway_factors=self.n_pathway_factors,
             max_iter=self.max_iter,
-            max_epochs=self.max_epochs,
             random_state=self.random_state,
             subsample_ratio=self.subsample_ratio,
             label_names=self.label_column,
@@ -730,7 +667,7 @@ class HyperparameterOptimizer:
         # Run optimization
         self.output_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
-            f"Starting {self.method.upper()} Bayesian optimization: "
+            f"Starting VI Bayesian optimization: "
             f"{self.n_trials} trials"
         )
         t0 = time.time()
@@ -750,7 +687,7 @@ class HyperparameterOptimizer:
         n_labels = len(self.label_column)
 
         print("\n" + "=" * 70)
-        print(f"  {self.method.upper()} BAYESIAN OPTIMIZATION COMPLETE")
+        print(f"  VI BAYESIAN OPTIMIZATION COMPLETE")
         print("=" * 70)
         print(f"  Trials:        {len(study.trials)}")
         print(f"  Best trial:    #{best.number}")
@@ -791,7 +728,7 @@ class HyperparameterOptimizer:
 
         # Save best params as JSON
         results = {
-            'method': self.method,
+            'method': 'vi',
             'study_name': self.study_name,
             'n_trials': len(study.trials),
             'best_trial': best.number,
@@ -809,7 +746,7 @@ class HyperparameterOptimizer:
             'timestamp': timestamp,
         }
 
-        json_path = self.output_dir / f'best_params_{self.method}_{timestamp}.json'
+        json_path = self.output_dir / f'best_params_vi_{timestamp}.json'
         with open(json_path, 'w') as f:
             json.dump(results, f, indent=2, default=str)
         logger.info(f"Best params saved to {json_path}")
@@ -817,7 +754,7 @@ class HyperparameterOptimizer:
         # Save all trials as CSV
         try:
             df = study.trials_dataframe()
-            csv_path = self.output_dir / f'all_trials_{self.method}_{timestamp}.csv'
+            csv_path = self.output_dir / f'all_trials_vi_{timestamp}.csv'
             df.to_csv(csv_path, index=False)
             logger.info(f"All trials saved to {csv_path}")
         except Exception as e:
@@ -828,25 +765,17 @@ class HyperparameterOptimizer:
         best_config_dict.update(self.fixed_params)
         if 'n_factors' not in best_config_dict:
             best_config_dict['n_factors'] = 50
-        # Add non-tuned training params
-        if self.method == 'vi':
-            best_config_dict.setdefault('max_iter', self.max_iter)
-        else:
-            best_config_dict.setdefault('max_epochs', self.max_epochs)
+        best_config_dict.setdefault('max_iter', self.max_iter)
 
-        config_path = self.output_dir / f'best_config_{self.method}_{timestamp}.json'
+        config_path = self.output_dir / f'best_config_vi_{timestamp}.json'
         with open(config_path, 'w') as f:
             json.dump(best_config_dict, f, indent=2)
         logger.info(f"Best config saved to {config_path}")
 
         # Print usage hint
         print(f"\nTo use the best config:")
-        if self.method == 'vi':
-            print(f"  config = VIConfig.from_json('{config_path}')")
-            print(f"  model = CAVI(**config.model_params())")
-        else:
-            print(f"  config = SVIConfig.from_json('{config_path}')")
-            print(f"  model = SVI(**config.model_params())")
+        print(f"  config = VIConfig.from_json('{config_path}')")
+        print(f"  model = CAVI(**config.model_params())")
 
     def evaluate_best(self, study: optuna.Study) -> Dict[str, float]:
         """
@@ -866,10 +795,7 @@ class HyperparameterOptimizer:
         best_params.update(self.fixed_params)
         config = self._build_best_config(best_params)
 
-        if self.method == 'vi':
-            from VariationalInference.vi_cavi import CAVI as ModelClass
-        else:
-            from VariationalInference.svi_corrected import SVI as ModelClass
+        from VariationalInference.vi_cavi import CAVI as ModelClass
 
         model_kwargs = config.model_params()
         model_kwargs['mode'] = self.mode
@@ -897,13 +823,12 @@ class HyperparameterOptimizer:
             'verbose': True,
         })
 
-        # Filter to only params accepted by the specific fit() method
-        if self.method == 'vi':
-            vi_fit_params = {
-                'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
-                'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
-            }
-            fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
+        # Filter to only params accepted by the CAVI fit() method
+        vi_fit_params = {
+            'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
+            'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
+        }
+        fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
 
         logger.info("Re-training with best hyperparameters on full training data...")
         model.fit(**fit_kwargs)
@@ -954,7 +879,7 @@ class HyperparameterOptimizer:
         print("=" * 50)
 
         # Save model
-        model_path = self.output_dir / f'best_model_{self.method}.pkl'
+        model_path = self.output_dir / f'best_model_vi.pkl'
         with open(model_path, 'wb') as f:
             pickle.dump(model, f)
         logger.info(f"Best model saved to {model_path}")
@@ -963,29 +888,20 @@ class HyperparameterOptimizer:
 
     def _build_best_config(self, params: Dict[str, Any]):
         """Build config from best parameters."""
-        if self.method == 'vi':
-            config_cls = VIConfig
-            config_kwargs = {
-                'n_factors': params.get('n_factors', 50),
-                'max_iter': self.max_iter,
-                'verbose': True,
-            }
-        else:
-            config_cls = SVIConfig
-            config_kwargs = {
-                'n_factors': params.get('n_factors', 50),
-                'max_epochs': self.max_epochs,
-                'verbose': True,
-            }
+        config_kwargs = {
+            'n_factors': params.get('n_factors', 50),
+            'max_iter': self.max_iter,
+            'verbose': True,
+        }
 
         if self.random_state is not None:
             config_kwargs['random_state'] = self.random_state
 
         for key, val in params.items():
-            if hasattr(config_cls, key) or key == 'n_factors':
+            if hasattr(VIConfig, key) or key == 'n_factors':
                 config_kwargs[key] = val
 
-        return config_cls(**config_kwargs)
+        return VIConfig(**config_kwargs)
 
 
 # =========================================================================
@@ -994,7 +910,7 @@ class HyperparameterOptimizer:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description='Bayesian optimization for VI/SVI hyperparameters',
+        description='Bayesian optimization for VI (CAVI) hyperparameters',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1007,12 +923,6 @@ def parse_args(argv=None):
     )
     parser.add_argument('--aux-columns', nargs='+', default=None, help='Auxiliary feature columns')
     parser.add_argument('--gene-annotation', default=None, help='Gene annotation CSV path')
-
-    # Method
-    parser.add_argument(
-        '--method', default='svi', choices=['vi', 'svi'],
-        help='Inference method to optimize'
-    )
 
     # Dataset preset
     parser.add_argument(
@@ -1046,8 +956,6 @@ def parse_args(argv=None):
     # Training limits for each trial
     parser.add_argument('--max-iter', type=int, default=200,
                         help='Max iterations per VI trial')
-    parser.add_argument('--max-epochs', type=int, default=100,
-                        help='Max epochs per SVI trial')
 
     # Subsampling
     parser.add_argument('--subsample-ratio', type=float, default=None,
@@ -1114,7 +1022,6 @@ def main(argv=None):
     )
 
     optimizer = HyperparameterOptimizer(
-        method=args.method,
         data_path=args.data,
         label_column=args.label_column,
         aux_columns=args.aux_columns,
@@ -1127,7 +1034,6 @@ def main(argv=None):
         params_to_tune=args.params_to_tune,
         fixed_params=_parse_fixed_params(args.fixed_params),
         max_iter=args.max_iter,
-        max_epochs=args.max_epochs,
         subsample_ratio=args.subsample_ratio,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,

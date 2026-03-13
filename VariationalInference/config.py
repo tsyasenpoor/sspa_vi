@@ -1,26 +1,22 @@
 """
-Generic Configuration for Variational Inference
+Configuration for Variational Inference (CAVI)
 ================================================
 
-This module provides a flexible configuration system for both VI and SVI models
-that can be used with any single-cell dataset.
+This module provides a configuration system for the VI (CAVI) model.
 
 Usage:
-    from VariationalInference.config import VIConfig, SVIConfig
+    from VariationalInference.config import VIConfig
 
     # Use VI defaults
     config = VIConfig(n_factors=50)
 
-    # Use SVI defaults
-    config = SVIConfig(n_factors=50, batch_size=128)
-
     # Load from JSON
-    config = SVIConfig.from_json('my_config.json')
+    config = VIConfig.from_json('my_config.json')
 
     # Create model from config
-    from VariationalInference.svi_corrected import SVI
+    from VariationalInference.vi_cavi import CAVI
 
-    model = SVI(**config.model_params())  # for SVIConfig
+    model = CAVI(**config.model_params())
 """
 
 from dataclasses import dataclass, field, asdict
@@ -318,327 +314,6 @@ class VIConfig:
         return VIConfig.from_dict(d)
 
 
-@dataclass
-class SVIConfig:
-    """
-    Configuration for SVI (Stochastic Variational Inference) model and training.
-
-    This dataclass holds all hyperparameters for running SVI experiments.
-    SVI is preferred for large datasets as it processes mini-batches instead
-    of the full dataset.
-
-    Parameters
-    ----------
-    n_factors : int
-        Number of latent gene programs to discover. Required.
-
-    SVI-Specific Parameters
-    -----------------------
-    batch_size : int, default=128
-        Size of mini-batches for stochastic updates.
-    learning_rate : float, default=0.01
-        Initial learning rate for global parameter updates.
-    learning_rate_decay : float, default=0.75
-        Decay exponent (kappa) for learning rate schedule.
-    learning_rate_delay : float, default=1.0
-        Delay parameter (tau) for learning rate schedule.
-    learning_rate_min : float, default=1e-4
-        Minimum learning rate to prevent stagnation in late training.
-    warmup_epochs : int, default=5
-        Number of epochs for learning rate warmup.
-    local_iterations : int, default=5
-        Number of iterations to optimize local parameters per mini-batch.
-    regression_weight : float, default=1.0
-        Weight for classification objective. Higher values make classification
-        more influential on theta updates. Values above 5.0 may cause instability.
-    lr_reduction_patience : int, default=5
-        Number of consecutive epochs of ELBO degradation before reducing learning rate.
-        This helps SVI stabilize when it overshoots the optimum.
-    lr_reduction_factor : float, default=0.5
-        Factor by which to reduce learning rate when ELBO degrades consistently.
-        Learning rate is multiplied by this factor (0.5 = halve the learning rate).
-    restore_best : bool, default=True
-        Whether to restore the best parameters when reducing learning rate or at end
-        of training. This helps the model recover from overshooting the optimum.
-    regression_lr_multiplier : float, default=10.0
-        Multiplier for learning rate when updating regression parameters (v, gamma).
-    rho_v_delay_epochs : int, default=0
-        Number of epochs to delay rho_v updates to let mu_v learn first.
-    reset_lr_on_restore : bool, default=True
-        Whether to partially reset learning rate multiplier when restoring parameters.
-    use_spike_slab : bool, default=True
-        Whether to use spike-and-slab priors. If False, uses simple Normal/Gamma priors.
-
-    Model Hyperparameters (Same as VI)
-    ----------------------------------
-    alpha_theta, alpha_beta, alpha_xi, alpha_eta : float, default=2.0
-    lambda_xi, lambda_eta : float, default=1.5
-    sigma_v : float, default=0.2
-    b_v : float, default=1.0
-    v_prior : str, default='normal'
-    sigma_gamma : float, default=0.5
-    pi_v : float, default=0.9
-    pi_beta : float, default=0.05
-
-    Training Parameters
-    -------------------
-    max_epochs : int, default=100
-        Maximum number of epochs (passes through data).
-    elbo_freq : int, default=10
-        Compute ELBO every N mini-batch iterations.
-    min_epochs : int, default=10
-        Minimum epochs before checking convergence.
-    patience : int, default=5
-        Early stopping patience.
-    tol : float, default=10.0
-        Absolute ELBO tolerance.
-    rel_tol : float, default=2e-4
-        Relative ELBO tolerance.
-
-    Early Stopping (HO-LL) Parameters
-    ---------------------------------
-    early_stopping_metric : str, default='elbo'
-        Metric to use for early stopping: 'elbo', 'heldout_ll', or 'heldout_regression_ll'.
-        When 'heldout_ll', stops when combined held-out log-likelihood hasn't improved.
-        When 'heldout_regression_ll', stops when the regression (Bernoulli) component
-        of held-out log-likelihood hasn't improved. Use this when the Poisson component
-        dominates due to high gene dimensionality, causing premature convergence.
-    heldout_ll_patience : int, default=10
-        Number of epochs without HO-LL improvement before stopping.
-    heldout_ll_ema_decay : float, default=0.9
-        Exponential moving average decay for smoothing HO-LL.
-    restore_best_heldout : bool, default=True
-        Whether to restore model parameters from the epoch with best HO-LL.
-    min_epochs_before_stopping : int, default=20
-        Minimum epochs to train before early stopping can trigger.
-    """
-
-    # Required
-    n_factors: int
-
-    # SVI-specific parameters
-    batch_size: int = 128
-    learning_rate: float = 0.01
-    learning_rate_decay: float = 0.75
-    learning_rate_delay: float = 1.0
-    learning_rate_min: float = 1e-4
-    warmup_epochs: int = 5
-    local_iterations: int = 5
-    regression_weight: float = 1.0
-    use_class_weights: bool = True
-
-    # Adaptive learning rate parameters
-    lr_reduction_patience: int = 5
-    lr_reduction_factor: float = 0.5
-    restore_best: bool = True
-    regression_lr_multiplier: float = 10.0
-    rho_v_delay_epochs: int = 0
-    reset_lr_on_restore: bool = True
-
-    # Spike-and-slab toggle
-    use_spike_slab: bool = True
-
-    # Numerical stability
-    count_scale: float = 1.0  # Divide counts by this value for numerical stability
-
-    # ==========================================================================
-    # V-COLLAPSE MITIGATION OPTIONS
-    # These options help prevent v (regression coefficients) from collapsing
-    # to near-zero values, which causes poor classification despite good
-    # reconstruction. Choose ONE approach or combine bias + another.
-    # ==========================================================================
-
-    # Option 1: Bias/Intercept term in logit
-    # Adds a learnable intercept b to: logit = theta @ v + aux @ gamma + b
-    # This separates "base probability" from "factor contributions"
-    use_intercept: bool = False
-    sigma_intercept: float = 1.0  # Prior std for intercept (wider = less regularized)
-
-    # Option 2: Two-step training (staged inference)
-    # Phase 1: Learn gene programs with regression_weight=0 (reconstruction only)
-    # Phase 2: Learn regression with frozen/low-lr beta
-    two_step_training: bool = False
-    two_step_phase1_ratio: float = 0.3  # Fraction of epochs for phase 1 (0.3 = 30%)
-    two_step_freeze_beta: bool = True  # If True, freeze beta in phase 2; else use low lr
-    two_step_phase2_beta_lr_mult: float = 0.1  # Beta lr multiplier in phase 2 (if not frozen)
-
-    # Option 3: Adaptive regression weight scheduling
-    # Gradually increases regression_weight from 0 to target over warmup period
-    # Allows reconstruction to stabilize before adding classification pressure
-    adaptive_regression_weight: bool = False
-    regression_weight_warmup_epochs: int = 100  # Epochs to ramp up regression_weight
-    regression_weight_schedule: str = 'linear'  # 'linear', 'cosine', or 'exponential'
-
-    # Model hyperparameters (same as VI)
-    alpha_theta: float = 2.0
-    alpha_beta: float = 2.0
-    alpha_xi: float = 2.0
-    alpha_eta: float = 2.0
-    lambda_xi: float = 1.5
-    lambda_eta: float = 1.5
-    sigma_v: float = 0.2
-    b_v: float = 1.0
-    v_prior: str = 'normal'
-    sigma_gamma: float = 0.5
-    pi_v: float = 0.9
-    pi_beta: float = 0.05
-    spike_variance_v: float = 1e-6
-    spike_value_beta: float = 1e-6
-
-    # Training parameters
-    max_epochs: int = 100
-    elbo_freq: int = 10
-    min_epochs: int = 10
-    patience: int = 5
-    tol: float = 10.0
-    rel_tol: float = 2e-4
-
-    # Early stopping based on held-out log-likelihood
-    early_stopping_metric: str = 'elbo'  # 'elbo', 'heldout_ll', or 'heldout_regression_ll'
-    heldout_ll_patience: int = 10  # epochs without improvement before stopping
-    heldout_ll_ema_decay: float = 0.9  # EMA smoothing for HO-LL
-    restore_best_heldout: bool = True  # restore to best HO-LL epoch
-    min_epochs_before_stopping: int = 20  # minimum epochs before early stopping
-
-    # Data parameters
-    label_column: str = 't2dm'
-    aux_columns: Optional[List[str]] = None
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15
-    min_cells_expressing: float = 0.02
-
-    # Output parameters
-    output_dir: Optional[str] = None
-    cache_dir: Optional[str] = None
-    verbose: bool = True
-    debug: bool = False
-
-    # Random state
-    random_state: Optional[int] = None
-
-    def __post_init__(self):
-        """Validate configuration."""
-        if self.n_factors < 1:
-            raise ValueError("n_factors must be at least 1")
-        if self.batch_size < 1:
-            raise ValueError("batch_size must be at least 1")
-        if not 0 < self.learning_rate_decay <= 1:
-            raise ValueError("learning_rate_decay must be in (0, 1]")
-        if not 0 < self.train_ratio < 1:
-            raise ValueError("train_ratio must be between 0 and 1")
-        if not 0 < self.val_ratio < 1:
-            raise ValueError("val_ratio must be between 0 and 1")
-        if self.train_ratio + self.val_ratio >= 1:
-            raise ValueError("train_ratio + val_ratio must be less than 1")
-
-    def model_params(self) -> Dict[str, Any]:
-        """
-        Get parameters for SVI model constructor.
-
-        Returns
-        -------
-        dict
-            Parameters to pass to SVI.__init__()
-        """
-        return {
-            'n_factors': self.n_factors,
-            'batch_size': self.batch_size,
-            'learning_rate': self.learning_rate,
-            'learning_rate_decay': self.learning_rate_decay,
-            'learning_rate_delay': self.learning_rate_delay,
-            'learning_rate_min': self.learning_rate_min,
-            'warmup_epochs': self.warmup_epochs,
-            'local_iterations': self.local_iterations,
-            'regression_weight': self.regression_weight,
-            'use_class_weights': self.use_class_weights,
-            'lr_reduction_patience': self.lr_reduction_patience,
-            'lr_reduction_factor': self.lr_reduction_factor,
-            'restore_best': self.restore_best,
-            'regression_lr_multiplier': self.regression_lr_multiplier,
-            'rho_v_delay_epochs': self.rho_v_delay_epochs,
-            'reset_lr_on_restore': self.reset_lr_on_restore,
-            'use_spike_slab': self.use_spike_slab,
-            'count_scale': self.count_scale,
-            'alpha_theta': self.alpha_theta,
-            'alpha_beta': self.alpha_beta,
-            'alpha_xi': self.alpha_xi,
-            'alpha_eta': self.alpha_eta,
-            'lambda_xi': self.lambda_xi,
-            'lambda_eta': self.lambda_eta,
-            'sigma_v': self.sigma_v,
-            'b_v': self.b_v,
-            'v_prior': self.v_prior,
-            'sigma_gamma': self.sigma_gamma,
-            'random_state': self.random_state,
-            'pi_v': self.pi_v,
-            'pi_beta': self.pi_beta,
-            'spike_variance_v': self.spike_variance_v,
-            'spike_value_beta': self.spike_value_beta,
-            # Early stopping parameters
-            'early_stopping_metric': self.early_stopping_metric,
-            'heldout_ll_patience': self.heldout_ll_patience,
-            'heldout_ll_ema_decay': self.heldout_ll_ema_decay,
-            'restore_best_heldout': self.restore_best_heldout,
-            'min_epochs_before_stopping': self.min_epochs_before_stopping,
-            # V-collapse mitigation options
-            'use_intercept': self.use_intercept,
-            'sigma_intercept': self.sigma_intercept,
-            'two_step_training': self.two_step_training,
-            'two_step_phase1_ratio': self.two_step_phase1_ratio,
-            'two_step_freeze_beta': self.two_step_freeze_beta,
-            'two_step_phase2_beta_lr_mult': self.two_step_phase2_beta_lr_mult,
-            'adaptive_regression_weight': self.adaptive_regression_weight,
-            'regression_weight_warmup_epochs': self.regression_weight_warmup_epochs,
-            'regression_weight_schedule': self.regression_weight_schedule,
-        }
-
-    def training_params(self) -> Dict[str, Any]:
-        """
-        Get parameters for SVI.fit() method.
-
-        Returns
-        -------
-        dict
-            Parameters to pass to SVI.fit()
-        """
-        return {
-            'max_epochs': self.max_epochs,
-            'elbo_freq': self.elbo_freq,
-            'min_epochs': self.min_epochs,
-            'patience': self.patience,
-            'tol': self.tol,
-            'rel_tol': self.rel_tol,
-            'verbose': self.verbose,
-            'debug': self.debug,
-        }
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert config to dictionary."""
-        return asdict(self)
-
-    def to_json(self, path: str) -> None:
-        """Save configuration to JSON file."""
-        with open(path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> 'SVIConfig':
-        """Create config from dictionary."""
-        return cls(**d)
-
-    @classmethod
-    def from_json(cls, path: str) -> 'SVIConfig':
-        """Load configuration from JSON file."""
-        with open(path) as f:
-            return cls.from_dict(json.load(f))
-
-    def copy(self, **updates) -> 'SVIConfig':
-        """Create a copy of this config with optional updates."""
-        d = self.to_dict()
-        d.update(updates)
-        return SVIConfig.from_dict(d)
-
-
 # Preset configurations for common use cases
 PRESETS = {
     'default': VIConfig(n_factors=50),
@@ -672,36 +347,8 @@ PRESETS = {
     ),
 }
 
-# SVI presets
-SVI_PRESETS = {
-    'default': SVIConfig(n_factors=50, batch_size=128),
 
-    'small': SVIConfig(
-        n_factors=20,
-        batch_size=64,
-        max_epochs=50,
-        min_epochs=5,
-    ),
-
-    'large': SVIConfig(
-        n_factors=100,
-        batch_size=256,
-        max_epochs=200,
-        min_epochs=20,
-    ),
-
-    'fast': SVIConfig(
-        n_factors=50,
-        batch_size=256,
-        max_epochs=50,
-        elbo_freq=20,
-        min_epochs=5,
-        patience=3,
-    ),
-}
-
-
-def get_preset(name: str, method: str = 'vi') -> Union[VIConfig, SVIConfig]:
+def get_preset(name: str) -> VIConfig:
     """
     Get a preset configuration by name.
 
@@ -709,27 +356,17 @@ def get_preset(name: str, method: str = 'vi') -> Union[VIConfig, SVIConfig]:
     ----------
     name : str
         Preset name. One of: 'default', 'small', 'large', 'conservative', 'fast'
-    method : str, default='vi'
-        Inference method. Either 'vi' for batch VI or 'svi' for stochastic VI.
 
     Returns
     -------
-    VIConfig or SVIConfig
+    VIConfig
         Configuration object.
 
     Examples
     --------
-    >>> config = get_preset('fast', method='vi')
-    >>> model = VI(**config.model_params())
-
-    >>> config = get_preset('fast', method='svi')
-    >>> model = SVI(**config.model_params())
+    >>> config = get_preset('fast')
+    >>> model = CAVI(**config.model_params())
     """
-    if method.lower() == 'svi':
-        if name not in SVI_PRESETS:
-            raise ValueError(f"Unknown SVI preset '{name}'. Available: {list(SVI_PRESETS.keys())}")
-        return SVI_PRESETS[name].copy()
-    else:
-        if name not in PRESETS:
-            raise ValueError(f"Unknown VI preset '{name}'. Available: {list(PRESETS.keys())}")
-        return PRESETS[name].copy()
+    if name not in PRESETS:
+        raise ValueError(f"Unknown preset '{name}'. Available: {list(PRESETS.keys())}")
+    return PRESETS[name].copy()
