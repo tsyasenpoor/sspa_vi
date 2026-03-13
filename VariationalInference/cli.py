@@ -236,7 +236,15 @@ def create_parser() -> argparse.ArgumentParser:
         default=50,
         help='[SVI] Epochs without HO-LL improvement before stopping'
     )
-    
+    train_parser.add_argument(
+        '--early-stopping',
+        type=str,
+        choices=['heldout_ll', 'elbo', 'none'],
+        default='heldout_ll',
+        help='Early stopping criterion: heldout_ll (default, stop on held-out LL), '
+             'elbo (stop on ELBO convergence), none (disable early stopping)'
+    )
+
     train_parser.add_argument(
         '--regression-weight',
         type=float,
@@ -487,6 +495,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             v_warmup=args.v_warmup,
             verbose=args.verbose,
             heldout_patience=args.heldout_patience,
+            early_stopping=args.early_stopping,
         )
     else:
         fit_kwargs = dict(
@@ -501,6 +510,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             tol=args.tol,
             v_warmup=args.v_warmup,
             verbose=args.verbose,
+            early_stopping=args.early_stopping,
         )
 
     model.fit(**fit_kwargs)

@@ -882,7 +882,8 @@ class CAVI:
     def fit(self, X_train, y_train, X_aux_train=None,
             X_val=None, y_val=None, X_aux_val=None,
             max_iter=600, check_freq=5, tol=0.001,
-            v_warmup=50, verbose=True):
+            v_warmup=50, verbose=True,
+            early_stopping='heldout_ll'):
         """
         Fit the supervised Poisson factorization model.
 
@@ -897,6 +898,10 @@ class CAVI:
         tol : float — convergence if |pct_change| < tol twice in a row
         v_warmup : int — deprecated, kept for CLI compatibility (ignored)
         verbose : bool
+        early_stopping : str
+            'heldout_ll' — stop on held-out LL / regression LL plateau (default).
+            'elbo' — stop only on ELBO convergence.
+            'none' — disable all early stopping, run all iterations.
         """
         t0 = time.time()
 
@@ -1062,34 +1067,37 @@ class CAVI:
                           f"Pois={pois_ll:.4e}  Reg={reg_ll:.4e}  "
                           f"v={self.mu_v.ravel()[:3]}{holl_str}")
 
-                # HO-LL regression early stopping (preferred when validation available)
-                if X_val is not None and holl_reg is not None:
-                    iters_since_best = t - best_holl_reg_iter
-                    if iters_since_best >= holl_reg_patience and t >= 30:
+                # Early stopping checks (gated by early_stopping mode)
+                if early_stopping == 'heldout_ll':
+                    # HO-LL regression early stopping (preferred when validation available)
+                    if X_val is not None and holl_reg is not None:
+                        iters_since_best = t - best_holl_reg_iter
+                        if iters_since_best >= holl_reg_patience and t >= 30:
+                            if verbose:
+                                print(f"HO-LL Reg early stop at iter {t}: "
+                                      f"HO-Reg hasn't improved in {iters_since_best} iters "
+                                      f"(best HO-Reg={best_holl_reg:.4e} at iter {best_holl_reg_iter})")
+                            break
+
+                    # Regression early stopping (training): if Reg has been degrading for
+                    # reg_patience consecutive iters, stop and restore best.
+                    iters_since_best = t - best_reg_iter
+                    if iters_since_best >= reg_patience and t >= 30:
                         if verbose:
-                            print(f"HO-LL Reg early stop at iter {t}: "
-                                  f"HO-Reg hasn't improved in {iters_since_best} iters "
-                                  f"(best HO-Reg={best_holl_reg:.4e} at iter {best_holl_reg_iter})")
+                            print(f"Regression early stop at iter {t}: "
+                                  f"Reg hasn't improved in {iters_since_best} iters "
+                                  f"(best Reg={best_reg_ll:.4e} at iter {best_reg_iter})")
                         break
 
-                # Regression early stopping (training): if Reg has been degrading for
-                # reg_patience consecutive iters, stop and restore best.
-                iters_since_best = t - best_reg_iter
-                if iters_since_best >= reg_patience and t >= 30:
-                    if verbose:
-                        print(f"Regression early stop at iter {t}: "
-                              f"Reg hasn't improved in {iters_since_best} iters "
-                              f"(best Reg={best_reg_ll:.4e} at iter {best_reg_iter})")
-                    break
-
-                # Convergence check on full ELBO (not just Poisson term)
-                if len(loss_list) >= 3 and t >= 30:
-                    c1 = abs(pct_changes[-1]) < tol
-                    c2 = abs(pct_changes[-2]) < tol
-                    if c1 and c2:
-                        if verbose:
-                            print(f"Converged at iter {t}")
-                        break
+                if early_stopping in ('heldout_ll', 'elbo'):
+                    # Convergence check on full ELBO (not just Poisson term)
+                    if len(loss_list) >= 3 and t >= 30:
+                        c1 = abs(pct_changes[-1]) < tol
+                        c2 = abs(pct_changes[-2]) < tol
+                        if c1 and c2:
+                            if verbose:
+                                print(f"Converged at iter {t}")
+                            break
 
         elapsed = time.time() - t0
         if verbose:
@@ -1097,20 +1105,23 @@ class CAVI:
             if best_params is not None:
                 print(f"Best HO-LL: {best_holl:.4f}")
 
-        # Restore best: prefer HO-LL reg checkpoint > HO-LL total > training Reg
-        if best_holl_reg_params is not None:
-            if verbose:
-                print(f"Restoring best HO-LL regression checkpoint (iter {best_holl_reg_iter}, "
-                      f"HO-Reg={best_holl_reg:.4e})")
-            self._restore(best_holl_reg_params)
-        elif best_params is not None:
-            if verbose:
-                print(f"Restoring best HO-LL checkpoint (HO-LL={best_holl:.4f})")
-            self._restore(best_params)
-        elif best_reg_params is not None:
-            if verbose:
-                print(f"Restoring best regression checkpoint (iter {best_reg_iter})")
-            self._restore(best_reg_params)
+        # Restore best checkpoint (skip when early stopping is disabled)
+        if early_stopping != 'none':
+            if best_holl_reg_params is not None:
+                if verbose:
+                    print(f"Restoring best HO-LL regression checkpoint (iter {best_holl_reg_iter}, "
+                          f"HO-Reg={best_holl_reg:.4e})")
+                self._restore(best_holl_reg_params)
+            elif best_params is not None:
+                if verbose:
+                    print(f"Restoring best HO-LL checkpoint (HO-LL={best_holl:.4f})")
+                self._restore(best_params)
+            elif best_reg_params is not None:
+                if verbose:
+                    print(f"Restoring best regression checkpoint (iter {best_reg_iter})")
+                self._restore(best_reg_params)
+        elif verbose:
+            print("Early stopping disabled — keeping final parameters.")
 
         return self
 
