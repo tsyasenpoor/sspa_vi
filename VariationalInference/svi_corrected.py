@@ -47,6 +47,7 @@ class SVI:
         v_prior: str = 'normal',
         sigma_gamma: float = 1.0,
         regression_weight: float = 1.0,
+        use_class_weights: bool = True,
         # SVI-specific
         batch_size: int = 128,
         learning_rate_delay: float = 1.0,    # τ
@@ -72,6 +73,7 @@ class SVI:
             raise ValueError(f"v_prior must be 'normal' or 'laplace', got '{v_prior}'")
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
+        self.use_class_weights = use_class_weights
 
         self.batch_size = batch_size
         self.tau = learning_rate_delay
@@ -166,9 +168,26 @@ class SVI:
             self.mu_gamma = np.zeros((self.n_outcomes, 0))
             self.Sigma_gamma = np.zeros((self.n_outcomes, 0, 0))
 
+        # Class weights for imbalanced labels
+        # Store w_pos[k] and w_neg[k] per label; build per-sample W at batch time
+        y_2d = y if y.ndim > 1 else y[:, None]
+        self._class_w_pos = np.ones(self.n_outcomes, dtype=np.float64)
+        self._class_w_neg = np.ones(self.n_outcomes, dtype=np.float64)
+        if self.use_class_weights:
+            for k in range(self.n_outcomes):
+                n_pos = np.sum(y_2d[:, k] > 0.5)
+                n_neg = self.n - n_pos
+                if n_pos > 0 and n_neg > 0:
+                    self._class_w_pos[k] = self.n / (2.0 * n_pos)
+                    self._class_w_neg[k] = self.n / (2.0 * n_neg)
+
         print(f"SVI Init: n={self.n}, p={self.p}, K={K}")
         print(f"  bp={bp:.4f}, dp={dp:.4f}")
         print(f"  E[beta] range: [{self.E_beta.min():.4f}, {self.E_beta.max():.4f}]")
+        if self.use_class_weights:
+            for k in range(self.n_outcomes):
+                print(f"  class_weights[{k}]: w_pos={self._class_w_pos[k]:.3f}, "
+                      f"w_neg={self._class_w_neg[k]:.3f}")
 
     def _init_beta_mask(self):
         """Same as CAVI."""
@@ -211,6 +230,21 @@ class SVI:
                                               self.a_beta[:, k], small_a)
                 self.b_beta[:, k] = np.where(self.beta_mask[:, k] > 0.5,
                                               self.b_beta[:, k], large_b)
+
+    def _batch_sample_weights(self, y_batch):
+        """Build per-sample class weights for a mini-batch.
+
+        Returns W of shape (B, n_outcomes).
+        """
+        y_exp = y_batch if y_batch.ndim > 1 else y_batch[:, None]
+        W = np.ones_like(y_exp, dtype=np.float64)
+        for k in range(self.n_outcomes):
+            W[:, k] = np.where(
+                y_exp[:, k] > 0.5,
+                self._class_w_pos[k],
+                self._class_w_neg[k],
+            )
+        return W
 
     # =================================================================
     # Expected values
@@ -302,6 +336,7 @@ class SVI:
         """JJ regression correction to θ rate for a batch."""
         y_exp = y_batch if y_batch.ndim > 1 else y_batch[:, None]
         lam = self._lambda_jj(zeta)
+        W = self._batch_sample_weights(y_batch)     # (B, n_outcomes)
 
         theta_v = E_theta @ E_v.T
         if self.p_aux > 0:
@@ -309,10 +344,11 @@ class SVI:
 
         C_minus = theta_v[:, :, None] - E_theta[:, None, :] * E_v[None, :, :]
 
+        Wk = W[:, :, None]  # (B, n_outcomes, 1) for broadcasting
         R = (
-            -(y_exp[:, :, None] - 0.5) * E_v[None, :, :]
-            + 2 * lam[:, :, None] * E_v[None, :, :] * C_minus
-            + 2 * lam[:, :, None] * E_v_sq[None, :, :] * E_theta[:, None, :]
+            Wk * (-(y_exp[:, :, None] - 0.5) * E_v[None, :, :]
+                  + 2 * lam[:, :, None] * E_v[None, :, :] * C_minus
+                  + 2 * lam[:, :, None] * E_v_sq[None, :, :] * E_theta[:, None, :])
         )
         return R.sum(axis=1)
 
@@ -350,6 +386,7 @@ class SVI:
         """Compute v̂ (same equations as CAVI but with scale)."""
         y_exp = y_batch if y_batch.ndim > 1 else y_batch[:, None]
         lam = self._lambda_jj(zeta)
+        W = self._batch_sample_weights(y_batch)     # (B, n_outcomes)
         Var_theta = a_theta / (b_theta ** 2)
         E_theta_sq = E_theta ** 2 + Var_theta
 
@@ -367,11 +404,12 @@ class SVI:
             omega = np.sqrt(np.maximum(E_v_sq, 1e-12))
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
+        W_lam = W * lam  # (B, n_outcomes) — class-weighted λ
         precision = prior_precision + \
-                    2 * scale * np.einsum('ik,id->kd', lam, E_theta_sq)
+                    2 * scale * np.einsum('ik,id->kd', W_lam, E_theta_sq)
 
-        term1 = scale * np.einsum('ik,id->kd', y_exp - 0.5, E_theta)
-        term2 = 2 * scale * np.einsum('ik,ikd,id->kd', lam, C_minus, E_theta)
+        term1 = scale * np.einsum('ik,id->kd', W * (y_exp - 0.5), E_theta)
+        term2 = 2 * scale * np.einsum('ik,ikd,id->kd', W_lam, C_minus, E_theta)
         mean_prec = term1 - term2
 
         if self.v_prior == 'normal':
@@ -390,17 +428,19 @@ class SVI:
 
         y_exp = y_batch if y_batch.ndim > 1 else y_batch[:, None]
         lam = self._lambda_jj(zeta)
+        W = self._batch_sample_weights(y_batch)     # (B, n_outcomes)
 
         mu_gamma_hat = np.zeros_like(self.mu_gamma)
         Sigma_gamma_hat = np.zeros_like(self.Sigma_gamma)
 
         for k in range(self.n_outcomes):
             prec_prior = np.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            weighted_X = X_aux_batch * (2 * scale * lam[:, k])[:, None]
+            W_lam_k = W[:, k] * lam[:, k]  # (B,) — class-weighted λ
+            weighted_X = X_aux_batch * (2 * scale * W_lam_k)[:, None]
             prec = prec_prior + weighted_X.T @ X_aux_batch
 
             theta_v_k = E_theta @ self.mu_v[k]
-            residual = (y_exp[:, k] - 0.5) - 2 * lam[:, k] * theta_v_k
+            residual = W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k
             mean_prec = scale * X_aux_batch.T @ residual
 
             Sigma_gamma_hat[k] = np.linalg.inv(prec)
