@@ -76,7 +76,7 @@ def _auto_chunk_size(nnz, K, target_gb=None):
                 import jax
                 dev = [d for d in jax.devices() if d.platform == "gpu"][0]
                 mem_bytes = dev.memory_stats()["bytes_limit"]
-                target_gb = mem_bytes / (1024 ** 3) * 0.50
+                target_gb = mem_bytes / (1024 ** 3) * 0.25
             except Exception:
                 target_gb = 12.0  # conservative GPU default
         else:
@@ -499,7 +499,11 @@ class CAVI:
 
             # Accumulate via vectorized scatter-add
             # row indices are pre-sorted, enabling segment_sum on GPU
-            z_sum_beta = scatter_add_to(z_sum_beta, col_c, Xphi)
+            # Sort col indices within chunk to also use segment_sum for beta
+            col_order = xp.argsort(col_c)
+            z_sum_beta = scatter_add_to(z_sum_beta, col_c[col_order],
+                                         Xphi[col_order],
+                                         sorted_indices=True)
             z_sum_theta = scatter_add_to(z_sum_theta, row_c, Xphi,
                                          sorted_indices=True)
             del Xphi
@@ -928,7 +932,8 @@ class CAVI:
                 col_c = col[start:end]
                 data_c = data[start:end]
                 Xphi = phi_chunk_core(E_log_theta_v[row_c], E_log_beta[col_c], data_c)
-                z_sum = scatter_add_to(z_sum, row_c, Xphi)
+                z_sum = scatter_add_to(z_sum, row_c, Xphi,
+                                       sorted_indices=True)
                 del Xphi
 
             a_theta_v = self.a + z_sum
@@ -1318,7 +1323,8 @@ class CAVI:
                 col_c = col[start:end]
                 data_c = data[start:end]
                 Xphi = phi_chunk_core(E_log_theta[row_c], E_log_beta[col_c], data_c)
-                z_sum = scatter_add_to(z_sum, row_c, Xphi)
+                z_sum = scatter_add_to(z_sum, row_c, Xphi,
+                                       sorted_indices=True)
                 del Xphi
 
             a_theta = self.a + z_sum
