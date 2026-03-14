@@ -37,7 +37,7 @@ References:
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.special import digamma, gammaln, logsumexp as _scipy_logsumexp
+from scipy.special import digamma, gammaln, logsumexp as _scipy_logsumexp, log_expit
 from typing import Tuple, Optional, Dict, Any, List
 import time
 
@@ -45,6 +45,17 @@ import time
 def _logsumexp_rows(a):
     """Row-wise logsumexp using scipy's compiled C implementation."""
     return _scipy_logsumexp(a, axis=1, keepdims=True)
+
+
+def _softmax_rows_inplace(work):
+    """In-place row-wise softmax.  Avoids the extra log+exp of logsumexp.
+
+    Overwrites *work* with exp(work - max) / sum(exp(work - max)).
+    6 memory passes instead of ~8 for the logsumexp-then-exp path.
+    """
+    work -= work.max(axis=1, keepdims=True)  # shift for stability
+    np.exp(work, out=work)                   # exp in-place
+    work /= work.sum(axis=1, keepdims=True)  # normalize in-place
 
 
 def _scatter_add(indices, values, n_out):
@@ -336,6 +347,12 @@ class CAVI:
         self._E_theta_cache = None
         self._E_beta_cache = None
 
+        # Cache digamma/gammaln for constant-shape parameters (a_xi, a_eta)
+        self._digamma_a_xi = digamma(self.a_xi)
+        self._gammaln_a_xi = gammaln(self.a_xi)
+        self._digamma_a_eta = digamma(self.a_eta)
+        self._gammaln_a_eta = gammaln(self.a_eta)
+
         # Pre-compute digamma caches (avoid repeated recomputation)
         self._refresh_log_caches()
 
@@ -430,9 +447,15 @@ class CAVI:
         self._E_beta_cache = None
 
     def _refresh_log_caches(self):
-        """Recompute cached digamma arrays after theta/beta updates."""
-        self._E_log_theta_cache = digamma(self.a_theta) - np.log(self.b_theta)
-        self._E_log_beta_cache = digamma(self.a_beta) - np.log(self.b_beta)
+        """Recompute cached digamma arrays after theta/beta updates.
+
+        Also caches raw digamma(a_theta) and digamma(a_beta) for reuse
+        in ELBO entropy computation (avoids recomputing 30M+ digamma evals).
+        """
+        self._digamma_a_theta = digamma(self.a_theta)
+        self._digamma_a_beta = digamma(self.a_beta)
+        self._E_log_theta_cache = self._digamma_a_theta - np.log(self.b_theta)
+        self._E_log_beta_cache = self._digamma_a_beta - np.log(self.b_beta)
 
     @property
     def E_xi(self):
@@ -471,12 +494,10 @@ class CAVI:
                 Xphi = np.random.dirichlet(np.ones(K), end - start)
                 Xphi *= data_c[:, None]
             else:
-                # Compute phi in-place to minimize peak memory:
-                # work array holds log_phi → phi → Xphi sequentially
+                # Direct softmax → phi, then scale by data (all in-place)
                 work = (self._E_log_theta_cache[row_c]
                         + self._E_log_beta_cache[col_c])   # (chunk, K)
-                work -= _logsumexp_rows(work)               # normalize
-                np.exp(work, out=work)                      # phi in-place
+                _softmax_rows_inplace(work)                 # phi in-place
                 work *= data_c[:, None]                     # Xphi in-place
                 Xphi = work
 
@@ -530,11 +551,15 @@ class CAVI:
             # The ζ cap keeps λ bounded from below, ensuring the
             # quadratic braking on θ never vanishes.
             R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
-            b_base = b_poisson + self.regression_weight * R_linear
-            c_quad = self.regression_weight * R_quad_coeff
-
-            discriminant = b_base ** 2 + 4.0 * c_quad * self.a_theta
-            self.b_theta = (b_base + np.sqrt(discriminant)) / 2.0
+            # Fuse: b_base, discriminant, b_theta with minimal temporaries
+            # b_base = b_poisson + w * R_linear
+            b_poisson += self.regression_weight * R_linear     # reuse b_poisson
+            R_quad_coeff *= self.regression_weight              # c_quad in-place
+            # discriminant = b_base² + 4·c_quad·a_theta → reuse R_quad_coeff
+            R_quad_coeff *= 4.0 * self.a_theta                 # 4·c·a in-place
+            R_quad_coeff += np.square(b_poisson)               # + b_base²
+            np.sqrt(R_quad_coeff, out=R_quad_coeff)            # sqrt in-place
+            self.b_theta = (b_poisson + R_quad_coeff) / 2.0
             self._theta_inner_iters = 1
 
             # Re-tighten ζ for updated θ
@@ -559,16 +584,22 @@ class CAVI:
         Each CAVI update still provably increases this capped-ζ ELBO.
         """
         E_theta = self.E_theta
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
-        Var_theta = self.a_theta / (self.b_theta ** 2)  # (n, K)
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K) — tiny
 
-        E_A = E_theta @ self.mu_v.T  # (n, kappa)
+        # Var_theta in-place: avoid two (n,K) temporaries
+        Var_theta = np.square(self.b_theta)            # (n, K)
+        np.divide(self.a_theta, Var_theta, out=Var_theta)
+
+        E_A = E_theta @ self.mu_v.T                   # (n, kappa) — BLAS
         if self.p_aux > 0:
-            E_A = E_A + X_aux @ self.mu_gamma.T
+            E_A += X_aux @ self.mu_gamma.T
 
-        E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T  # (n, kappa)
-        zeta_raw = np.sqrt(np.maximum(E_A_sq, 1e-8))
-        self.zeta = np.minimum(zeta_raw, self.zeta_max)
+        # E_A_sq → zeta in-place: fuse square + matmul + sqrt + clip
+        np.square(E_A, out=E_A)                        # E_A² in-place
+        E_A += Var_theta @ E_v_sq.T                    # + Var_theta @ E_v_sq.T
+        np.maximum(E_A, 1e-8, out=E_A)
+        np.sqrt(E_A, out=E_A)
+        np.minimum(E_A, self.zeta_max, out=self.zeta)
 
     def _regression_rate_parts(self, y, X_aux):
         """
@@ -595,24 +626,23 @@ class CAVI:
         E_v = self.mu_v                             # (kappa, K)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
 
-        # Full linear predictor: (n, kappa)
+        # Full linear predictor: (n, kappa) — BLAS
         theta_v = E_theta @ E_v.T
         if self.p_aux > 0:
-            theta_v = theta_v + X_aux @ self.mu_gamma.T
+            theta_v += X_aux @ self.mu_gamma.T
 
         W_lam = W * lam  # (n, kappa)
 
-        # Decompose C_minus terms using matmuls to avoid (n, kappa, K) array:
-        #   R_linear[i,l] = -(W*(y-0.5)) @ v[:,l]
-        #                   + 2*(W_lam*theta_v) @ v[:,l]
-        #                   - 2*E_theta[i,l] * (W_lam @ v[:,l]^2)
-        term_a = -(W * (y_exp - 0.5)) @ E_v                  # (n, K)
-        term_b = 2.0 * (W_lam * theta_v) @ E_v               # (n, K)
-        term_c = 2.0 * E_theta * (W_lam @ (E_v ** 2))        # (n, K)
-        R_linear = term_a + term_b - term_c
+        # BLAS matmuls to avoid (n, kappa, K) C_minus intermediate:
+        # R_linear = -(W*(y-0.5)) @ v + 2*(W_lam*theta_v) @ v
+        #            - 2*E_theta * (W_lam @ v²)
+        E_v_sq_col = np.square(E_v)                            # (kappa, K) — tiny
+        R_linear = -(W * (y_exp - 0.5)) @ E_v                 # (n, K)
+        R_linear += 2.0 * ((W_lam * theta_v) @ E_v)           # fuse add
+        R_linear -= 2.0 * E_theta * (W_lam @ E_v_sq_col)      # fuse subtract
 
-        # R_quad_coeff[i,l] = sum_k 2*W[i,k]*lam[i,k]*E_v_sq[k,l]
-        R_quad_coeff = (2.0 * W_lam) @ E_v_sq                # (n, K)
+        # R_quad via single BLAS matmul
+        R_quad_coeff = (2.0 * W_lam) @ E_v_sq                 # (n, K)
 
         return R_linear, R_quad_coeff
 
@@ -636,35 +666,39 @@ class CAVI:
         lam = self._lambda_jj(self.zeta)
         W = self._sample_weights                    # (n, kappa)
         E_theta = self.E_theta
-        Var_theta = self.a_theta / (self.b_theta ** 2)
-        E_theta_sq = E_theta ** 2 + Var_theta
         E_v = self.mu_v
 
-        # Full predictor: (n, kappa)
+        # E_theta² — compute once, reuse for E_theta_sq and term2
+        E_theta_plain_sq = np.square(E_theta)        # (n, K)
+
+        # Var_theta in-place to avoid extra (n,K) temporary
+        Var_theta = np.square(self.b_theta)
+        np.divide(self.a_theta, Var_theta, out=Var_theta)
+        E_theta_sq = E_theta_plain_sq + Var_theta    # (n, K)
+
+        # Full predictor: (n, kappa) — BLAS matmul
         theta_v = E_theta @ E_v.T
         if self.p_aux > 0:
-            theta_v = theta_v + X_aux @ self.mu_gamma.T
+            theta_v += X_aux @ self.mu_gamma.T
 
         if self.v_prior == 'normal':
-            # K-scaled prior: each v_kl has prior variance sigma_v^2 / K
             sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
             prior_precision = 1.0 / sigma_v_eff_sq
         else:
-            # Laplace (Bayesian Lasso): adaptive precision from E_q[1/s_{kl}]
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
             omega = np.sqrt(np.maximum(E_v_sq, 1e-12))
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
-        # Precision and mean via matmuls — avoids (n, kappa, K) C_minus
+        # Precision and mean via BLAS matmuls — avoids (n, kappa, K) C_minus
         W_lam = W * lam                              # (n, kappa)
         precision = prior_precision + 2 * (W_lam.T @ E_theta_sq)  # (kappa, K)
 
-        # term1[k,d] = sum_i W[i,k]*(y[i,k]-0.5)*E_theta[i,d]
-        term1 = (W * (y_exp - 0.5)).T @ E_theta      # (kappa, K)
+        # W_y = W*(y-0.5) computed once for term1
+        W_y = W * (y_exp - 0.5)                      # (n, kappa)
+        term1 = W_y.T @ E_theta                      # (kappa, K)
 
-        # Decompose term2 = 2*sum_i W_lam[i,k]*C_minus[i,k,d]*E_theta[i,d]
-        #   = 2*(W_lam*theta_v).T @ E_theta - 2*v*(W_lam.T @ E_theta^2)
-        E_theta_plain_sq = E_theta ** 2               # (n, K) — not E_theta_sq
+        # Decompose term2 using BLAS matmuls:
+        #   2*(W_lam*theta_v).T @ E_theta - 2*v*(W_lam.T @ E_theta²)
         part_a = (W_lam * theta_v).T @ E_theta        # (kappa, K)
         part_b = E_v * (W_lam.T @ E_theta_plain_sq)   # (kappa, K)
         term2 = 2.0 * (part_a - part_b)
@@ -763,8 +797,9 @@ class CAVI:
         E_log_beta = self._E_log_beta_cache
         E_xi = self.E_xi
         E_eta = self.E_eta
-        E_log_xi = digamma(self.a_xi) - np.log(self.b_xi)
-        E_log_eta = digamma(self.a_eta) - np.log(self.b_eta)
+        # Reuse cached digamma for constant-shape a_xi, a_eta
+        E_log_xi = self._digamma_a_xi - np.log(self.b_xi)
+        E_log_eta = self._digamma_a_eta - np.log(self.b_eta)
 
         elbo = 0.0
 
@@ -788,17 +823,19 @@ class CAVI:
         # === JJ Bernoulli likelihood ===
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = self._lambda_jj(self.zeta)
-        E_A = E_theta @ self.mu_v.T
+        E_A = E_theta @ self.mu_v.T                   # BLAS
         if self.p_aux > 0:
-            E_A = E_A + X_aux @ self.mu_gamma.T
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
-        Var_theta = self.a_theta / (self.b_theta ** 2)
+            E_A += X_aux @ self.mu_gamma.T
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag   # tiny (kappa, K)
+        # Var_theta in-place
+        Var_theta = np.square(self.b_theta)
+        np.divide(self.a_theta, Var_theta, out=Var_theta)
         E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T
 
         W = self._sample_weights  # (n, kappa)
         regression_ll = np.sum(W * ((y_exp - 0.5) * E_A - lam * E_A_sq))
         regression_ll += np.sum(W * (lam * self.zeta ** 2 - 0.5 * self.zeta
-                                + np.log(1 / (1 + np.exp(-self.zeta)))))
+                                + log_expit(self.zeta)))
         elbo += self.regression_weight * regression_ll
 
         # === Prior: p(θ|ξ) ===
@@ -853,22 +890,24 @@ class CAVI:
                                         / np.maximum(lambda_s, 1e-12)))
 
         # === Entropy: -E[log q] ===
-        # q(θ) Gamma entropy
+        # q(θ) Gamma entropy — reuse cached digamma(a_theta) from _refresh_log_caches
+        psi_a_theta = self._digamma_a_theta          # already computed
         elbo += np.sum(self.a_theta - np.log(self.b_theta)
                        + gammaln(self.a_theta)
-                       + (1 - self.a_theta) * digamma(self.a_theta))
-        # q(β)
+                       + (1 - self.a_theta) * psi_a_theta)
+        # q(β) — reuse cached digamma(a_beta)
+        psi_a_beta = self._digamma_a_beta             # already computed
         elbo += np.sum(self.a_beta - np.log(self.b_beta)
                        + gammaln(self.a_beta)
-                       + (1 - self.a_beta) * digamma(self.a_beta))
-        # q(ξ)
+                       + (1 - self.a_beta) * psi_a_beta)
+        # q(ξ) — a_xi is constant, use cached digamma/gammaln
         elbo += np.sum(self.a_xi - np.log(self.b_xi)
-                       + gammaln(self.a_xi)
-                       + (1 - self.a_xi) * digamma(self.a_xi))
-        # q(η)
+                       + self._gammaln_a_xi
+                       + (1 - self.a_xi) * self._digamma_a_xi)
+        # q(η) — a_eta is constant, use cached digamma/gammaln
         elbo += np.sum(self.a_eta - np.log(self.b_eta)
-                       + gammaln(self.a_eta)
-                       + (1 - self.a_eta) * digamma(self.a_eta))
+                       + self._gammaln_a_eta
+                       + (1 - self.a_eta) * self._digamma_a_eta)
         # q(v) Gaussian entropy
         elbo += 0.5 * np.sum(np.log(2 * np.pi * np.e * self.sigma_v_diag))
 
@@ -928,8 +967,7 @@ class CAVI:
                 col_c = col[start:end]
                 data_c = data[start:end]
                 work = E_log_theta_v[row_c] + E_log_beta[col_c]
-                work -= _logsumexp_rows(work)
-                np.exp(work, out=work)
+                _softmax_rows_inplace(work)
                 work *= data_c[:, None]
                 for k in range(self.K):
                     z_sum[:, k] += np.bincount(
@@ -983,7 +1021,7 @@ class CAVI:
 
             reg_ll = np.sum((y_v - 0.5) * E_A - lam * E_A_sq)
             reg_ll += np.sum(lam * zeta_val ** 2 - 0.5 * zeta_val
-                             + np.log(1 / (1 + np.exp(-zeta_val))))
+                             + log_expit(zeta_val))
             regression_ll_per_sample = float(reg_ll / n_val)
 
         total_ll = poisson_ll_per_sample
@@ -1303,8 +1341,7 @@ class CAVI:
                 col_c = col[start:end]
                 data_c = data[start:end]
                 work = E_log_theta[row_c] + E_log_beta[col_c]
-                work -= _logsumexp_rows(work)
-                np.exp(work, out=work)
+                _softmax_rows_inplace(work)
                 work *= data_c[:, None]
                 for k in range(K):
                     z_sum[:, k] += np.bincount(
