@@ -61,12 +61,26 @@ except ImportError:
     )
 
 
-def _auto_chunk_size(nnz, K, target_gb=4.0):
+def _auto_chunk_size(nnz, K, target_gb=None):
     """Auto-tune chunk size to target a given work-array memory budget.
 
     With K factors, each chunk of C entries uses C * K * 8 bytes.
-    Target ~4GB by default to balance memory usage vs Python loop overhead.
+    On GPU, uses a larger budget (up to available VRAM) to reduce loop overhead.
+    On CPU, targets ~4GB by default.
     """
+    if target_gb is None:
+        if HAS_GPU:
+            # Use up to ~50% of GPU memory for work arrays (leave room for
+            # parameters, caches, and OS).  Query actual VRAM if possible.
+            try:
+                import jax
+                dev = [d for d in jax.devices() if d.platform == "gpu"][0]
+                mem_bytes = dev.memory_stats()["bytes_limit"]
+                target_gb = mem_bytes / (1024 ** 3) * 0.50
+            except Exception:
+                target_gb = 12.0  # conservative GPU default
+        else:
+            target_gb = 4.0
     max_by_mem = int(target_gb * (1024 ** 3) / (K * 8))
     # At least 1M, at most nnz (single pass)
     return max(1_000_000, min(max_by_mem, nnz))
@@ -295,10 +309,16 @@ class CAVI:
             X_coo = X.tocoo()
         else:
             X_coo = sp.coo_matrix(X)
-        self._X_row = X_coo.row.astype(np.int32)
-        self._X_col = X_coo.col.astype(np.int32)
-        self._X_data = X_coo.data.astype(np.float64)
-        self._nnz = len(self._X_data)
+        row = X_coo.row.astype(np.int32)
+        col = X_coo.col.astype(np.int32)
+        data = X_coo.data.astype(np.float64)
+        self._nnz = len(data)
+
+        # Pre-sort by row for cache locality and segment_sum on GPU
+        row_order = np.argsort(row, kind='mergesort')
+        self._X_row = row[row_order]
+        self._X_col = col[row_order]
+        self._X_data = data[row_order]
 
         # Auto-tune chunk size based on K (target ~4GB work arrays)
         self._effective_chunk = _auto_chunk_size(self._nnz, K)
@@ -478,8 +498,10 @@ class CAVI:
                 )
 
             # Accumulate via vectorized scatter-add
+            # row indices are pre-sorted, enabling segment_sum on GPU
             z_sum_beta = scatter_add_to(z_sum_beta, col_c, Xphi)
-            z_sum_theta = scatter_add_to(z_sum_theta, row_c, Xphi)
+            z_sum_theta = scatter_add_to(z_sum_theta, row_c, Xphi,
+                                         sorted_indices=True)
             del Xphi
 
         return z_sum_beta, z_sum_theta
