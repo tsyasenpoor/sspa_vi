@@ -51,8 +51,7 @@ def _scatter_add(indices, values, n_out):
     """
     Scatter-add: out[i] += values[idx == i] for each column.
 
-    Uses sparse matrix multiplication for O(1) dispatch regardless of K,
-    replacing the previous O(K) bincount loop.
+    Uses np.bincount which is implemented as a single C loop.
 
     Parameters
     ----------
@@ -64,12 +63,22 @@ def _scatter_add(indices, values, n_out):
     -------
     out : (n_out, K) float array
     """
-    nnz = len(indices)
-    indicator = sp.csr_matrix(
-        (np.ones(nnz, dtype=values.dtype), indices, np.arange(nnz + 1)),
-        shape=(nnz, n_out)
-    ).T  # (n_out, nnz)
-    return indicator.dot(values)
+    K = values.shape[1]
+    out = np.empty((n_out, K))
+    for k in range(K):
+        out[:, k] = np.bincount(indices, weights=values[:, k], minlength=n_out)
+    return out
+
+
+def _auto_chunk_size(nnz, K, target_gb=4.0):
+    """Auto-tune chunk size to target a given work-array memory budget.
+
+    With K factors, each chunk of C entries uses C × K × 8 bytes.
+    Target ~4GB by default to balance memory usage vs Python loop overhead.
+    """
+    max_by_mem = int(target_gb * (1024 ** 3) / (K * 8))
+    # At least 1M, at most nnz (single pass)
+    return max(1_000_000, min(max_by_mem, nnz))
 
 
 class CAVI:
@@ -313,23 +322,15 @@ class CAVI:
         self._X_data = X_coo.data.astype(np.float64)
         self._nnz = len(self._X_data)
 
-        # Pre-build sparse indicator matrices for scatter-add (reused every iteration)
-        self._phi_scatter_row = []
-        self._phi_scatter_col = []
-        chunk = self.nnz_chunk_size
-        for start in range(0, self._nnz, chunk):
-            end = min(start + chunk, self._nnz)
-            chunk_len = end - start
-            row_c = self._X_row[start:end]
-            col_c = self._X_col[start:end]
-            arange_chunk = np.arange(chunk_len + 1)
-            ones_chunk = np.ones(chunk_len, dtype=np.float64)
-            self._phi_scatter_row.append(
-                sp.csr_matrix((ones_chunk, row_c, arange_chunk),
-                              shape=(chunk_len, self.n)).T)
-            self._phi_scatter_col.append(
-                sp.csr_matrix((ones_chunk, col_c, arange_chunk),
-                              shape=(chunk_len, self.p)).T)
+        # Auto-tune chunk size based on K (target ~4GB work arrays)
+        self._effective_chunk = _auto_chunk_size(self._nnz, K)
+        n_chunks = (self._nnz + self._effective_chunk - 1) // self._effective_chunk
+        print(f"  Chunk size: {self._effective_chunk:,} "
+              f"({n_chunks} chunks for {self._nnz:,} nnz)")
+
+        # Cache gammaln(data+1) — constant, only needed for ELBO
+        self._gammaln_data_cache = gammaln(self._X_data + 1)
+        self._gammaln_data_sum = float(np.sum(self._gammaln_data_cache))
 
         # Initialize E_theta/E_beta caches
         self._E_theta_cache = None
@@ -450,19 +451,17 @@ class CAVI:
         Compute Xφ using only nonzero entries, processed in chunks to
         bound peak memory at O(chunk_size * K) instead of O(nnz * K).
 
-        Uses pre-built sparse indicator matrices for O(1)-in-K scatter-add.
-
         Returns:
             z_sum_beta: (p, K) = Σ_i x_{ij} φ_{ijk}
             z_sum_theta: (n, K) = Σ_j x_{ij} φ_{ijk}
         """
         K = self.K
         nnz = self._nnz
-        chunk = self.nnz_chunk_size
+        chunk = self._effective_chunk
         z_sum_beta = np.zeros((self.p, K))
         z_sum_theta = np.zeros((self.n, K))
 
-        for ci, start in enumerate(range(0, nnz, chunk)):
+        for start in range(0, nnz, chunk):
             end = min(start + chunk, nnz)
             row_c = self._X_row[start:end]
             col_c = self._X_col[start:end]
@@ -481,11 +480,12 @@ class CAVI:
                 work *= data_c[:, None]                     # Xphi in-place
                 Xphi = work
 
-            # Accumulate via pre-built sparse indicator matrices
-            z_sum_col = self._phi_scatter_col[ci]
-            z_sum_row = self._phi_scatter_row[ci]
-            z_sum_beta += z_sum_col.dot(Xphi)
-            z_sum_theta += z_sum_row.dot(Xphi)
+            # Accumulate via bincount scatter-add
+            for k in range(K):
+                z_sum_beta[:, k] += np.bincount(
+                    col_c, weights=Xphi[:, k], minlength=self.p)
+                z_sum_theta[:, k] += np.bincount(
+                    row_c, weights=Xphi[:, k], minlength=self.n)
             del Xphi
 
         return z_sum_beta, z_sum_theta
@@ -770,23 +770,19 @@ class CAVI:
 
         # === Poisson likelihood (collapsed z) — chunked to avoid (nnz, K) ===
         poisson_ll = 0.0
-        gammaln_term = 0.0
         nnz = self._nnz
-        chunk = self.nnz_chunk_size
+        chunk = self._effective_chunk
         for start in range(0, nnz, chunk):
             end = min(start + chunk, nnz)
             row_c = self._X_row[start:end]
             col_c = self._X_col[start:end]
             data_c = self._X_data[start:end]
             log_rates_c = E_log_theta[row_c] + E_log_beta[col_c]  # (chunk, K)
-            lrm = log_rates_c.max(axis=1, keepdims=True)
-            log_sum_c = lrm.ravel() + np.log(
-                np.exp(log_rates_c - lrm).sum(axis=1))
-            poisson_ll += np.sum(data_c * log_sum_c)
-            gammaln_term += np.sum(gammaln(data_c + 1))
+            log_sum_c = _logsumexp_rows(log_rates_c).ravel()
+            poisson_ll += np.dot(data_c, log_sum_c)
             del log_rates_c
         poisson_ll -= np.sum(E_theta.sum(axis=0) * E_beta.sum(axis=0))
-        poisson_ll -= gammaln_term
+        poisson_ll -= self._gammaln_data_sum  # cached at init
         elbo += poisson_ll
 
         # === JJ Bernoulli likelihood ===
@@ -917,7 +913,7 @@ class CAVI:
         col = X_val_coo.col
         data = X_val_coo.data if X_val_coo.data.dtype == np.float64 else X_val_coo.data.astype(np.float64)
         nnz_val = len(data)
-        chunk = self.nnz_chunk_size
+        chunk = _auto_chunk_size(nnz_val, self.K)
 
         for _ in range(n_iter):
             E_log_theta_v = digamma(a_theta_v) - np.log(b_theta_v)
@@ -935,7 +931,9 @@ class CAVI:
                 work -= _logsumexp_rows(work)
                 np.exp(work, out=work)
                 work *= data_c[:, None]
-                z_sum += _scatter_add(row_c, work, n_val)
+                for k in range(self.K):
+                    z_sum[:, k] += np.bincount(
+                        row_c, weights=work[:, k], minlength=n_val)
                 del work
 
             a_theta_v = self.a + z_sum
@@ -946,18 +944,15 @@ class CAVI:
         E_log_theta_v = digamma(a_theta_v) - np.log(b_theta_v)
         E_theta_v = a_theta_v / b_theta_v
         poisson_ll = 0.0
-        gammaln_term = 0.0
+        gammaln_term = float(np.sum(gammaln(data + 1)))
         for start in range(0, nnz_val, chunk):
             end = min(start + chunk, nnz_val)
             row_c = row[start:end]
             col_c = col[start:end]
             data_c = data[start:end]
             log_rates_c = E_log_theta_v[row_c] + E_log_beta[col_c]
-            lrm = log_rates_c.max(axis=1, keepdims=True)
-            log_sum_c = lrm.ravel() + np.log(
-                np.exp(log_rates_c - lrm).sum(axis=1))
-            poisson_ll += np.sum(data_c * log_sum_c)
-            gammaln_term += np.sum(gammaln(data_c + 1))
+            log_sum_c = _logsumexp_rows(log_rates_c).ravel()
+            poisson_ll += np.dot(data_c, log_sum_c)
             del log_rates_c
 
         poisson_ll -= np.sum(E_theta_v.sum(axis=0) * E_beta.sum(axis=0))
@@ -1069,10 +1064,13 @@ class CAVI:
 
         for t in range(max_iter):
             diag = verbose and (t % check_freq == 0)
+            t_iter_start = time.time()
 
             # 1. Compute φ and z_sums (sparse)
             random_phi = (t == 0)  # scHPF: random Dirichlet on first iter
             z_sum_beta, z_sum_theta = self._compute_phi_sparse(random_init=random_phi)
+            if diag:
+                print(f"  [timing t={t}] phi: {time.time() - t_iter_start:.1f}s")
 
             # 2. Update β, η (gene side first — scHPF order)
             self._update_beta(z_sum_beta)
@@ -1118,6 +1116,7 @@ class CAVI:
             self._update_zeta(X_aux)
 
             if diag:
+                t_updates = time.time() - t_iter_start
                 print(f"  [diag t={t}] after v,γ: "
                       f"μ_v=[{self.mu_v.min():.4e},{self.mu_v.max():.4e}] "
                       f"σ²_v=[{self.sigma_v_diag.min():.4e},{self.sigma_v_diag.max():.4e}] "
@@ -1126,6 +1125,7 @@ class CAVI:
                       f"  [diag t={t}] after v:   "
                       f"μ_v=[{self.mu_v.min():.4e},{self.mu_v.max():.4e}] "
                       f"σ²_v=[{self.sigma_v_diag.min():.4e},{self.sigma_v_diag.max():.4e}]")
+                print(f"  [timing t={t}] updates: {t_updates:.1f}s")
 
             # 6. Check convergence
             if t % check_freq == 0:
@@ -1185,9 +1185,11 @@ class CAVI:
                         holl_str = "".join(holl_parts)
                     else:
                         holl_str = ""
+                    t_total = time.time() - t_iter_start
                     print(f"Iter {t:4d}: ELBO={elbo:.4e}  "
                           f"Pois={pois_ll:.4e}  Reg={reg_ll:.4e}  "
-                          f"v={self.mu_v.ravel()[:3]}{holl_str}")
+                          f"v={self.mu_v.ravel()[:3]}{holl_str}  "
+                          f"[{t_total:.1f}s]")
 
                 # Early stopping checks (gated by early_stopping mode)
                 if early_stopping == 'heldout_ll':
@@ -1285,7 +1287,7 @@ class CAVI:
         row, col = X_coo.row, X_coo.col
         data = X_coo.data if X_coo.data.dtype == np.float64 else X_coo.data.astype(np.float64)
         nnz = len(data)
-        chunk = self.nnz_chunk_size
+        chunk = _auto_chunk_size(nnz, self.K)
         K = self.K
 
         for _ in range(n_iter):
@@ -1304,7 +1306,9 @@ class CAVI:
                 work -= _logsumexp_rows(work)
                 np.exp(work, out=work)
                 work *= data_c[:, None]
-                z_sum += _scatter_add(row_c, work, n_new)
+                for k in range(K):
+                    z_sum[:, k] += np.bincount(
+                        row_c, weights=work[:, k], minlength=n_new)
                 del work
 
             a_theta = self.a + z_sum
