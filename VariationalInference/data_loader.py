@@ -209,8 +209,61 @@ class DataLoader:
             return self._cached_obs
         if self.adata is not None:
             return self.adata.obs
-        self.load_adata()
-        return self.adata.obs
+        # Load only obs metadata (not expression data) to avoid full h5ad reload
+        self._load_obs_only()
+        return self._cached_obs
+
+    def _load_obs_only(self):
+        """Load only obs metadata from h5ad without reading expression data."""
+        import h5py
+        import pandas as pd
+        self._log(f"Loading obs metadata only from: {self.data_path}")
+        with h5py.File(str(self.data_path).strip(), 'r') as f:
+            obs_group = f['obs']
+            obs_dict = {}
+            # Read the index
+            if '_index' in obs_group:
+                index = obs_group['_index'][()].astype(str)
+            elif '__categories' in obs_group.attrs:
+                index = None
+            else:
+                index = None
+
+            # Read column encoding from attrs
+            column_order = None
+            if 'column-order' in obs_group.attrs:
+                column_order = list(obs_group.attrs['column-order'])
+            elif '_column_order' in obs_group.attrs:
+                column_order = list(obs_group.attrs['_column_order'])
+
+            # Read each column
+            categories_key = '__categories' if '__categories' in obs_group else None
+            for key in obs_group.keys():
+                if key.startswith('_') or key == '__categories':
+                    continue
+                item = obs_group[key]
+                if isinstance(item, h5py.Dataset):
+                    data = item[()]
+                    if data.dtype.kind == 'O' or data.dtype.kind == 'S':
+                        data = data.astype(str)
+                    # Check for categorical encoding
+                    if 'categories' in item.attrs:
+                        cat_ref = item.attrs['categories']
+                        if isinstance(cat_ref, str) and cat_ref in obs_group:
+                            cats = obs_group[cat_ref][()].astype(str)
+                            data = pd.Categorical.from_codes(data, categories=cats)
+                    obs_dict[key] = data
+                elif isinstance(item, h5py.Group):
+                    # Categorical stored as group with 'codes' and 'categories'
+                    if 'codes' in item and 'categories' in item:
+                        codes = item['codes'][()]
+                        cats = item['categories'][()].astype(str)
+                        obs_dict[key] = pd.Categorical.from_codes(codes, categories=cats)
+
+            if index is not None:
+                self._cached_obs = pd.DataFrame(obs_dict, index=index)
+            else:
+                self._cached_obs = pd.DataFrame(obs_dict)
 
     def load_adata(self, layer: str = 'raw') -> 'AnnData':
         """
@@ -761,6 +814,8 @@ class DataLoader:
                     # Restore obs metadata if cached (avoids reloading h5ad)
                     if 'obs_df' in cached:
                         self._cached_obs = cached['obs_df']
+                    else:
+                        self._log("Cache missing obs metadata — will load obs only from h5ad on first access")
                     # v2 cache stores sparse CSR; v1 stores dense DataFrame
                     if 'sparse_X' in cached:
                         self._sparse_X = cached['sparse_X']
