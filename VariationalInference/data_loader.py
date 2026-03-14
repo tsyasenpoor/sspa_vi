@@ -848,13 +848,12 @@ class DataLoader:
                 raise ValueError(f"Label column '{label_column}' not found. Available: {list(self.responses_df.columns)}")
             return self.responses_df[label_column].values.astype(int)
 
-        if self.adata is None:
-            self.load_adata()
+        obs = self._get_obs()
 
-        if label_column not in self.adata.obs.columns:
-            raise ValueError(f"Label column '{label_column}' not found. Available: {list(self.adata.obs.columns)}")
+        if label_column not in obs.columns:
+            raise ValueError(f"Label column '{label_column}' not found. Available: {list(obs.columns)}")
 
-        labels = self.adata.obs.loc[self.cell_ids, label_column].values
+        labels = obs.loc[self.cell_ids, label_column].values
         return labels.astype(int)
 
     def get_auxiliary_features(self, aux_columns: List[str]) -> np.ndarray:
