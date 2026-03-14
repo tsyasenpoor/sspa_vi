@@ -47,14 +47,14 @@ import time
 
 try:
     from .jax_backend import (
-        xp, USE_JAX, to_device, to_numpy,
+        xp, USE_JAX, HAS_GPU, to_device, to_numpy,
         digamma, gammaln, logsumexp_rows, softmax_rows,
         log_expit, lambda_jj, scatter_add_to, phi_chunk_core,
         expit as _expit, backend_info,
     )
 except ImportError:
     from jax_backend import (
-        xp, USE_JAX, to_device, to_numpy,
+        xp, USE_JAX, HAS_GPU, to_device, to_numpy,
         digamma, gammaln, logsumexp_rows, softmax_rows,
         log_expit, lambda_jj, scatter_add_to, phi_chunk_core,
         expit as _expit, backend_info,
