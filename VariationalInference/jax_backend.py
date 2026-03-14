@@ -104,11 +104,20 @@ if USE_JAX:
         safe = jnp.maximum(jnp.abs(zeta), 1e-8)
         return jnp.tanh(safe / 2.0) / (4.0 * safe)
 
-    def scatter_add_to(target, indices, values):
+    @jit
+    def _segment_sum_sorted(values, indices, num_segments):
+        """segment_sum for pre-sorted indices (much faster than scatter)."""
+        return jax.ops.segment_sum(values, indices, num_segments=num_segments)
+
+    def scatter_add_to(target, indices, values, *, sorted_indices=False):
         """Accumulate *values* into *target* at *indices*.
 
+        When *sorted_indices* is True, uses segment_sum which is significantly
+        faster on GPU than atomic scatter for non-unique indices.
         Returns a **new** array (JAX arrays are immutable).
         """
+        if sorted_indices:
+            return target + _segment_sum_sorted(values, indices, target.shape[0])
         return target.at[indices].add(values)
 
     @jit
@@ -146,14 +155,23 @@ else:
         safe = np.maximum(np.abs(zeta), 1e-8)
         return np.tanh(safe / 2.0) / (4.0 * safe)
 
-    def scatter_add_to(target, indices, values):
-        """Accumulate via bincount (fast C loop). Modifies *target* in-place."""
-        K = values.shape[1]
+    def scatter_add_to(target, indices, values, *, sorted_indices=False):
+        """Accumulate via sparse CSC matmul (no Python K-loop).
+
+        Builds a CSC matrix M of shape (n_out, chunk) from *indices*
+        in O(chunk) time (no sorting needed), then computes
+        target += M @ values  in a single BLAS call.
+        """
+        from scipy.sparse import csc_matrix
+        chunk = len(indices)
         n_out = target.shape[0]
-        for k in range(K):
-            target[:, k] += np.bincount(
-                indices, weights=values[:, k], minlength=n_out
-            )
+        # CSC format: each column j has exactly one entry at row indices[j]
+        M = csc_matrix(
+            (np.ones(chunk, dtype=values.dtype), indices,
+             np.arange(chunk + 1, dtype=np.int32)),
+            shape=(n_out, chunk),
+        )
+        target += M @ values
         return target
 
     def phi_chunk_core(E_log_theta_rows, E_log_beta_cols, data_c):
