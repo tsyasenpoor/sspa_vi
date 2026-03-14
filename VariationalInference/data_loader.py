@@ -1010,11 +1010,17 @@ class DataLoader:
                 return codes.astype(int)
         elif self.is_emtab:
             cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
-            return self.responses_df[label_column].values[cell_idx].astype(int)
+            raw_y = self.responses_df[label_column].values[cell_idx]
         else:
             if self.adata is None:
                 self.load_adata()
-            return self.adata.obs.loc[cell_ids, label_column].values.astype(int)
+            raw_y = self.adata.obs.loc[cell_ids, label_column].values
+        try:
+            return raw_y.astype(int)
+        except (ValueError, TypeError):
+            codes, uniques = pd.factorize(raw_y, sort=True)
+            self._log(f"  Label encoding '{label_column}': {dict(enumerate(uniques))}")
+            return codes.astype(int)
 
     def get_matrices(
         self,
