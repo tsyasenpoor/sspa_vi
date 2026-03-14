@@ -15,6 +15,7 @@ Usage::
 """
 
 import numpy as np
+from functools import partial
 
 # ── Backend detection ───────────────────────────────────────────────
 USE_JAX = False
@@ -104,7 +105,7 @@ if USE_JAX:
         safe = jnp.maximum(jnp.abs(zeta), 1e-8)
         return jnp.tanh(safe / 2.0) / (4.0 * safe)
 
-    @jit
+    @partial(jit, static_argnums=(2,))
     def _segment_sum_sorted(values, indices, num_segments):
         """segment_sum for pre-sorted indices (much faster than scatter)."""
         return jax.ops.segment_sum(values, indices, num_segments=num_segments)
@@ -117,7 +118,7 @@ if USE_JAX:
         Returns a **new** array (JAX arrays are immutable).
         """
         if sorted_indices:
-            return target + _segment_sum_sorted(values, indices, target.shape[0])
+            return target + _segment_sum_sorted(values, indices, int(target.shape[0]))
         return target.at[indices].add(values)
 
     @jit
