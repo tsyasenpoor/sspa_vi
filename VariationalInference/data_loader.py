@@ -121,6 +121,9 @@ class DataLoader:
         self.gene_list = None
         self.cell_ids = None
         self._gene_converter = None
+        self._sparse_X = None       # sparse CSR backing store (populated after preprocess)
+        self._cached_obs = None     # cached obs DataFrame (populated from cache)
+        self._cell_id_to_idx = None # cell ID → row index map
 
         # EMTAB-specific data containers
         self.responses_df = None
@@ -752,13 +755,20 @@ class DataLoader:
                 self._log(f"Loading preprocessed data from cache: {cache_file}")
                 with open(cache_file, 'rb') as f:
                     cached = pickle.load(f)
-                    self.raw_df = cached['raw_df']
                     self.gene_list = cached['gene_list']
                     self.cell_ids = cached['cell_ids']
                     self.adata = None  # Don't store full adata in cache
                     # Restore obs metadata if cached (avoids reloading h5ad)
                     if 'obs_df' in cached:
                         self._cached_obs = cached['obs_df']
+                    # v2 cache stores sparse CSR; v1 stores dense DataFrame
+                    if 'sparse_X' in cached:
+                        self._sparse_X = cached['sparse_X']
+                        self.raw_df = None  # no dense copy needed
+                    else:
+                        self.raw_df = cached['raw_df']
+                        self._sparse_X = None
+                self._log(f"Loaded from cache: {len(self.cell_ids)} cells x {len(self.gene_list)} genes")
                 return self.raw_df
 
         # Load data
@@ -789,13 +799,19 @@ class DataLoader:
 
         self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} {self.feature_type}s")
 
+        # Convert to sparse CSR for fast row slicing in get_matrices()
+        self._sparse_X = sp.csr_matrix(self.raw_df.values)
+
         # Save to cache (include obs metadata to avoid reloading h5ad)
+        # Store expression data as sparse CSR to reduce cache size dramatically
+        # (e.g. 64 GB dense → ~10 GB sparse for 85% sparse data).
         if self.use_cache:
             self._log(f"Saving preprocessed data to cache: {cache_file}")
             cache_dict = {
-                'raw_df': self.raw_df,
+                'sparse_X': self._sparse_X,
                 'gene_list': self.gene_list,
                 'cell_ids': self.cell_ids,
+                'cache_version': 2,
             }
             if self.adata is not None:
                 cache_dict['obs_df'] = self.adata.obs
@@ -1066,18 +1082,25 @@ class DataLoader:
         y : np.ndarray
             Label array (n_cells,) for single label, (n_cells, κ) for multi-label.
         """
-        if self.raw_df is None:
+        if self.raw_df is None and not hasattr(self, '_sparse_X'):
             raise ValueError("Must preprocess data first")
 
-        # Get expression matrix using fast integer indexing instead of
-        # pandas .loc (which is very slow for 500K+ string keys).
-        if not hasattr(self, '_cell_id_to_idx'):
-            self._cell_id_to_idx = {cid: i for i, cid in enumerate(self.raw_df.index)}
+        # Build cell-ID → row-index map once
+        if not hasattr(self, '_cell_id_to_idx') or self._cell_id_to_idx is None:
+            self._cell_id_to_idx = {cid: i for i, cid in enumerate(self.cell_ids)}
         int_idx = np.array([self._cell_id_to_idx[cid] for cid in cell_ids],
                            dtype=np.int64)
-        X = self.raw_df.values[int_idx]
-        if return_sparse:
-            X = sp.csr_matrix(X)
+
+        # Prefer sparse backing store (v2 cache) — avoids ever
+        # materialising the full dense matrix.
+        if hasattr(self, '_sparse_X') and self._sparse_X is not None:
+            X = self._sparse_X[int_idx]          # CSR row-slice → CSR
+            if not return_sparse:
+                X = X.toarray()
+        else:
+            X = self.raw_df.values[int_idx]
+            if return_sparse:
+                X = sp.csr_matrix(X)
 
         # --- Normalise label_column to list for uniform handling ---
         if isinstance(label_column, str):
