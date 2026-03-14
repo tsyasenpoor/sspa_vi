@@ -76,7 +76,7 @@ def _auto_chunk_size(nnz, K, target_gb=None):
                 import jax
                 dev = [d for d in jax.devices() if d.platform == "gpu"][0]
                 mem_bytes = dev.memory_stats()["bytes_limit"]
-                target_gb = mem_bytes / (1024 ** 3) * 0.25
+                target_gb = mem_bytes / (1024 ** 3) * 0.10
             except Exception:
                 target_gb = 12.0  # conservative GPU default
         else:
@@ -499,11 +499,9 @@ class CAVI:
 
             # Accumulate via vectorized scatter-add
             # row indices are pre-sorted, enabling segment_sum on GPU
-            # Sort col indices within chunk to also use segment_sum for beta
-            col_order = xp.argsort(col_c)
-            z_sum_beta = scatter_add_to(z_sum_beta, col_c[col_order],
-                                         Xphi[col_order],
-                                         sorted_indices=True)
+            # Use unsorted scatter for beta to avoid argsort + copy (saves ~2x chunk memory)
+            z_sum_beta = scatter_add_to(z_sum_beta, col_c, Xphi,
+                                         sorted_indices=False)
             z_sum_theta = scatter_add_to(z_sum_theta, row_c, Xphi,
                                          sorted_indices=True)
             del Xphi
