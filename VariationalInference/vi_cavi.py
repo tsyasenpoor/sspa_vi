@@ -37,23 +37,22 @@ References:
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.special import digamma, gammaln
+from scipy.special import digamma, gammaln, logsumexp as _scipy_logsumexp
 from typing import Tuple, Optional, Dict, Any, List
 import time
 
 
 def _logsumexp_rows(a):
-    """Fast row-wise logsumexp, avoids scipy dispatch overhead."""
-    a_max = a.max(axis=1, keepdims=True)
-    return a_max + np.log(np.exp(a - a_max).sum(axis=1, keepdims=True))
+    """Row-wise logsumexp using scipy's compiled C implementation."""
+    return _scipy_logsumexp(a, axis=1, keepdims=True)
 
 
 def _scatter_add(indices, values, n_out):
     """
     Scatter-add: out[i] += values[idx == i] for each column.
 
-    ~10-20× faster than np.add.at by using np.bincount which is
-    implemented as a single C loop with no Python overhead.
+    Uses sparse matrix multiplication for O(1) dispatch regardless of K,
+    replacing the previous O(K) bincount loop.
 
     Parameters
     ----------
@@ -65,11 +64,12 @@ def _scatter_add(indices, values, n_out):
     -------
     out : (n_out, K) float array
     """
-    K = values.shape[1]
-    out = np.empty((n_out, K))
-    for k in range(K):
-        out[:, k] = np.bincount(indices, weights=values[:, k], minlength=n_out)
-    return out
+    nnz = len(indices)
+    indicator = sp.csr_matrix(
+        (np.ones(nnz, dtype=values.dtype), indices, np.arange(nnz + 1)),
+        shape=(nnz, n_out)
+    ).T  # (n_out, nnz)
+    return indicator.dot(values)
 
 
 class CAVI:
@@ -313,6 +313,28 @@ class CAVI:
         self._X_data = X_coo.data.astype(np.float64)
         self._nnz = len(self._X_data)
 
+        # Pre-build sparse indicator matrices for scatter-add (reused every iteration)
+        self._phi_scatter_row = []
+        self._phi_scatter_col = []
+        chunk = self.nnz_chunk_size
+        for start in range(0, self._nnz, chunk):
+            end = min(start + chunk, self._nnz)
+            chunk_len = end - start
+            row_c = self._X_row[start:end]
+            col_c = self._X_col[start:end]
+            arange_chunk = np.arange(chunk_len + 1)
+            ones_chunk = np.ones(chunk_len, dtype=np.float64)
+            self._phi_scatter_row.append(
+                sp.csr_matrix((ones_chunk, row_c, arange_chunk),
+                              shape=(chunk_len, self.n)).T)
+            self._phi_scatter_col.append(
+                sp.csr_matrix((ones_chunk, col_c, arange_chunk),
+                              shape=(chunk_len, self.p)).T)
+
+        # Initialize E_theta/E_beta caches
+        self._E_theta_cache = None
+        self._E_beta_cache = None
+
         # Pre-compute digamma caches (avoid repeated recomputation)
         self._refresh_log_caches()
 
@@ -380,7 +402,9 @@ class CAVI:
 
     @property
     def E_theta(self):
-        return self.a_theta / self.b_theta
+        if self._E_theta_cache is None:
+            self._E_theta_cache = self.a_theta / self.b_theta
+        return self._E_theta_cache
 
     @property
     def E_log_theta(self):
@@ -388,11 +412,21 @@ class CAVI:
 
     @property
     def E_beta(self):
-        return self.a_beta / self.b_beta
+        if self._E_beta_cache is None:
+            self._E_beta_cache = self.a_beta / self.b_beta
+        return self._E_beta_cache
 
     @property
     def E_log_beta(self):
         return digamma(self.a_beta) - np.log(self.b_beta)
+
+    def _invalidate_theta_cache(self):
+        """Invalidate E_theta cache after a_theta or b_theta changes."""
+        self._E_theta_cache = None
+
+    def _invalidate_beta_cache(self):
+        """Invalidate E_beta cache after a_beta or b_beta changes."""
+        self._E_beta_cache = None
 
     def _refresh_log_caches(self):
         """Recompute cached digamma arrays after theta/beta updates."""
@@ -416,6 +450,8 @@ class CAVI:
         Compute Xφ using only nonzero entries, processed in chunks to
         bound peak memory at O(chunk_size * K) instead of O(nnz * K).
 
+        Uses pre-built sparse indicator matrices for O(1)-in-K scatter-add.
+
         Returns:
             z_sum_beta: (p, K) = Σ_i x_{ij} φ_{ijk}
             z_sum_theta: (n, K) = Σ_j x_{ij} φ_{ijk}
@@ -426,7 +462,7 @@ class CAVI:
         z_sum_beta = np.zeros((self.p, K))
         z_sum_theta = np.zeros((self.n, K))
 
-        for start in range(0, nnz, chunk):
+        for ci, start in enumerate(range(0, nnz, chunk)):
             end = min(start + chunk, nnz)
             row_c = self._X_row[start:end]
             col_c = self._X_col[start:end]
@@ -445,12 +481,11 @@ class CAVI:
                 work *= data_c[:, None]                     # Xphi in-place
                 Xphi = work
 
-            # Accumulate via bincount
-            for k in range(K):
-                z_sum_beta[:, k] += np.bincount(
-                    col_c, weights=Xphi[:, k], minlength=self.p)
-                z_sum_theta[:, k] += np.bincount(
-                    row_c, weights=Xphi[:, k], minlength=self.n)
+            # Accumulate via pre-built sparse indicator matrices
+            z_sum_col = self._phi_scatter_col[ci]
+            z_sum_row = self._phi_scatter_row[ci]
+            z_sum_beta += z_sum_col.dot(Xphi)
+            z_sum_theta += z_sum_row.dot(Xphi)
             del Xphi
 
         return z_sum_beta, z_sum_theta
@@ -467,6 +502,7 @@ class CAVI:
         theta_sum = self.E_theta.sum(axis=0)  # (K,)
         self.b_beta = self.E_eta[:, None] + theta_sum[None, :]
         self._enforce_beta_mask()
+        self._invalidate_beta_cache()
 
     def _update_eta(self):
         """η rate (scHPF): b^η_j = d' + Σ_k E[β_{jk}]."""
@@ -502,10 +538,12 @@ class CAVI:
             self._theta_inner_iters = 1
 
             # Re-tighten ζ for updated θ
+            self._invalidate_theta_cache()
             self._update_zeta(X_aux)
         else:
             self.b_theta = b_poisson
             self._theta_inner_iters = 0
+        self._invalidate_theta_cache()
 
     def _update_xi(self):
         """ξ rate (scHPF): b^ξ_i = b' + Σ_k E[θ_{ik}]."""
@@ -897,9 +935,7 @@ class CAVI:
                 work -= _logsumexp_rows(work)
                 np.exp(work, out=work)
                 work *= data_c[:, None]
-                for k in range(self.K):
-                    z_sum[:, k] += np.bincount(
-                        row_c, weights=work[:, k], minlength=n_val)
+                z_sum += _scatter_add(row_c, work, n_val)
                 del work
 
             a_theta_v = self.a + z_sum
@@ -1229,6 +1265,8 @@ class CAVI:
     def _restore(self, cp):
         for k, v in cp.items():
             setattr(self, k, v)
+        self._invalidate_theta_cache()
+        self._invalidate_beta_cache()
 
     # =================================================================
     # predict / transform (API compat)
@@ -1266,9 +1304,7 @@ class CAVI:
                 work -= _logsumexp_rows(work)
                 np.exp(work, out=work)
                 work *= data_c[:, None]
-                for k in range(K):
-                    z_sum[:, k] += np.bincount(
-                        row_c, weights=work[:, k], minlength=n_new)
+                z_sum += _scatter_add(row_c, work, n_new)
                 del work
 
             a_theta = self.a + z_sum
