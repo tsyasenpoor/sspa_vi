@@ -200,6 +200,15 @@ class DataLoader:
             self._gene_converter = GeneIDConverter(cache_file=str(cache_file))
         return self._gene_converter
 
+    def _get_obs(self):
+        """Return obs DataFrame, preferring cached copy over reloading h5ad."""
+        if hasattr(self, '_cached_obs') and self._cached_obs is not None:
+            return self._cached_obs
+        if self.adata is not None:
+            return self.adata.obs
+        self.load_adata()
+        return self.adata.obs
+
     def load_adata(self, layer: str = 'raw') -> 'AnnData':
         """
         Load AnnData object from h5ad file.
@@ -747,6 +756,9 @@ class DataLoader:
                     self.gene_list = cached['gene_list']
                     self.cell_ids = cached['cell_ids']
                     self.adata = None  # Don't store full adata in cache
+                    # Restore obs metadata if cached (avoids reloading h5ad)
+                    if 'obs_df' in cached:
+                        self._cached_obs = cached['obs_df']
                 return self.raw_df
 
         # Load data
@@ -777,15 +789,18 @@ class DataLoader:
 
         self._log(f"Final shape: {self.raw_df.shape[0]} cells x {self.raw_df.shape[1]} {self.feature_type}s")
 
-        # Save to cache
+        # Save to cache (include obs metadata to avoid reloading h5ad)
         if self.use_cache:
             self._log(f"Saving preprocessed data to cache: {cache_file}")
+            cache_dict = {
+                'raw_df': self.raw_df,
+                'gene_list': self.gene_list,
+                'cell_ids': self.cell_ids,
+            }
+            if self.adata is not None:
+                cache_dict['obs_df'] = self.adata.obs
             with open(cache_file, 'wb') as f:
-                pickle.dump({
-                    'raw_df': self.raw_df,
-                    'gene_list': self.gene_list,
-                    'cell_ids': self.cell_ids
-                }, f)
+                pickle.dump(cache_dict, f)
 
         return self.raw_df
 
@@ -864,18 +879,17 @@ class DataLoader:
 
             return self.aux_data_df[aux_columns].values.astype(float)
 
-        if self.adata is None:
-            self.load_adata()
+        obs = self._get_obs()
 
         if not aux_columns:
             return np.zeros((len(self.cell_ids), 0))
 
         aux_data = []
         for col in aux_columns:
-            if col not in self.adata.obs.columns:
-                raise ValueError(f"Auxiliary column '{col}' not found. Available: {list(self.adata.obs.columns)}")
+            if col not in obs.columns:
+                raise ValueError(f"Auxiliary column '{col}' not found. Available: {list(obs.columns)}")
 
-            values = self.adata.obs.loc[self.cell_ids, col]
+            values = obs.loc[self.cell_ids, col]
 
             # Encode categorical columns
             if values.dtype == 'object' or values.dtype.name == 'category':
@@ -1012,9 +1026,8 @@ class DataLoader:
             cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
             raw_y = self.responses_df[label_column].values[cell_idx]
         else:
-            if self.adata is None:
-                self.load_adata()
-            raw_y = self.adata.obs.loc[cell_ids, label_column].values
+            obs = self._get_obs()
+            raw_y = obs.loc[cell_ids, label_column].values
         try:
             return raw_y.astype(int)
         except (ValueError, TypeError):
@@ -1056,8 +1069,13 @@ class DataLoader:
         if self.raw_df is None:
             raise ValueError("Must preprocess data first")
 
-        # Get expression matrix and convert to sparse if requested
-        X = self.raw_df.loc[cell_ids].values
+        # Get expression matrix using fast integer indexing instead of
+        # pandas .loc (which is very slow for 500K+ string keys).
+        if not hasattr(self, '_cell_id_to_idx'):
+            self._cell_id_to_idx = {cid: i for i, cid in enumerate(self.raw_df.index)}
+        int_idx = np.array([self._cell_id_to_idx[cid] for cid in cell_ids],
+                           dtype=np.int64)
+        X = self.raw_df.values[int_idx]
         if return_sparse:
             X = sp.csr_matrix(X)
 
@@ -1080,8 +1098,11 @@ class DataLoader:
         # Get auxiliary features
         if aux_columns and not self.is_simulated:
             X_aux = self.get_auxiliary_features(aux_columns)
-            # Subset to requested cells
-            cell_idx = [self.cell_ids.index(cid) for cid in cell_ids]
+            # Subset to requested cells (reuse prebuilt index map)
+            if not hasattr(self, '_cell_id_to_idx'):
+                self._cell_id_to_idx = {cid: i for i, cid in enumerate(self.cell_ids)}
+            cell_idx = np.array([self._cell_id_to_idx[cid] for cid in cell_ids],
+                                dtype=np.int64)
             X_aux = X_aux[cell_idx]
         elif aux_columns and self.is_simulated and hasattr(self, 'sim_metadata'):
             # Extract aux columns from simulated metadata
