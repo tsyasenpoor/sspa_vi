@@ -550,6 +550,16 @@ class CAVI:
             c_quad = self.regression_weight * R_quad_coeff
             disc = xp.sqrt(xp.square(b_base) + 4.0 * c_quad * self.a_theta)
             self.b_theta = (b_base + disc) / 2.0
+
+            # Floor b_theta at a fraction of b_poisson.
+            # In masked mode, b_poisson can be very small (few active genes per
+            # factor), so the regression correction can collapse b_theta → 0,
+            # causing theta to explode.  Flooring at 10% of b_poisson keeps the
+            # Poisson factorization structure intact.  The floor is harmless in
+            # unmasked mode where b_poisson is already large.
+            b_theta_floor = 0.1 * b_poisson
+            self.b_theta = xp.maximum(self.b_theta, b_theta_floor)
+
             self._theta_inner_iters = 1
 
             # Re-tighten zeta for updated theta
@@ -750,6 +760,9 @@ class CAVI:
             else:
                 self.Sigma_gamma[k] = np.linalg.inv(prec)
             mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
+            # Clip gamma to prevent explosion (analogous to v_clip)
+            gamma_clip = 5.0
+            mu_gamma_new = xp.clip(mu_gamma_new, -gamma_clip, gamma_clip)
             new_mu_k = (1.0 - alpha) * self.mu_gamma[k] + alpha * mu_gamma_new
             if USE_JAX:
                 self.mu_gamma = self.mu_gamma.at[k].set(new_mu_k)
