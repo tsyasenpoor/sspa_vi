@@ -594,6 +594,7 @@ class HyperparameterOptimizer:
             val_ratio=self.val_ratio,
             stratify_by=stratify_col,
             random_state=self.random_state,
+            train_subsample_ratio=self.subsample_ratio,
         )
         X_train, X_aux_train, y_train = self.data['train']
         X_val, X_aux_val, y_val = self.data['val']
@@ -604,6 +605,12 @@ class HyperparameterOptimizer:
             f"{X_test.shape[0]} test, {self.data['n_genes']} genes, "
             f"{self.data['n_aux']} aux features"
         )
+        if self.subsample_ratio is not None and self.subsample_ratio < 1.0:
+            logger.info(
+                "Train subsampling enabled at data-loading stage (ratio=%.3f); "
+                "per-trial subsampling disabled to avoid double subsampling",
+                self.subsample_ratio,
+            )
         return self.data
 
     def load_pathways(self):
@@ -684,7 +691,7 @@ class HyperparameterOptimizer:
             n_pathway_factors=self.n_pathway_factors,
             max_iter=self.max_iter,
             random_state=self.random_state,
-            subsample_ratio=self.subsample_ratio,
+            subsample_ratio=None,
             label_names=self.label_column,
         )
 
@@ -998,7 +1005,7 @@ def parse_args(argv=None):
 
     # Subsampling
     parser.add_argument('--subsample-ratio', type=float, default=None,
-                        help='Subsample training data for faster trials (e.g. 0.5)')
+                        help='Subsample training split for faster/lower-memory optimization (e.g. 0.5)')
     parser.add_argument(
         '--max-n-factors', type=int, default=None,
         help='Optional upper bound for n_factors search (useful to avoid OOM on large datasets)'

@@ -984,7 +984,8 @@ class DataLoader:
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
         stratify_by: Optional[str] = None,
-        random_state: Optional[int] = None
+        random_state: Optional[int] = None,
+        train_subsample_ratio: Optional[float] = None
     ) -> Dict[str, List[str]]:
         """
         Create random train/val/test splits.
@@ -1002,6 +1003,9 @@ class DataLoader:
             Column name in adata.obs for stratified splitting.
         random_state : int, optional
             Random seed for reproducibility. None = random.
+        train_subsample_ratio : float, optional
+            If set in (0, 1), subsample the training split to this fraction
+            before extracting matrices. Validation/test splits are unchanged.
 
         Returns
         -------
@@ -1066,7 +1070,54 @@ class DataLoader:
             'test': list(test_ids)
         }
 
+        # Optional train-only subsampling (for faster/lower-memory model search)
+        if train_subsample_ratio is not None:
+            if not (0.0 < train_subsample_ratio <= 1.0):
+                raise ValueError(
+                    f"train_subsample_ratio must be in (0, 1], got {train_subsample_ratio}"
+                )
+
+            if train_subsample_ratio < 1.0:
+                train_ids_list = splits['train']
+                n_train = len(train_ids_list)
+                n_sub = max(int(n_train * train_subsample_ratio), 10)
+                n_sub = min(n_sub, n_train)
+
+                if n_sub < n_train:
+                    rng = np.random.default_rng(random_state)
+
+                    # Preserve class balance when stratification labels are available
+                    if stratify is not None:
+                        cid_to_idx = {cid: i for i, cid in enumerate(self.cell_ids)}
+                        train_idx = np.array([cid_to_idx[cid] for cid in train_ids_list], dtype=np.int64)
+                        train_stratify = np.asarray(stratify)[train_idx]
+
+                        try:
+                            sampled_train_ids, _ = train_test_split(
+                                train_ids_list,
+                                train_size=n_sub,
+                                stratify=train_stratify,
+                                random_state=random_state,
+                            )
+                            splits['train'] = list(sampled_train_ids)
+                        except ValueError:
+                            sampled_idx = rng.choice(n_train, size=n_sub, replace=False)
+                            splits['train'] = [train_ids_list[i] for i in sampled_idx]
+                    else:
+                        sampled_idx = rng.choice(n_train, size=n_sub, replace=False)
+                        splits['train'] = [train_ids_list[i] for i in sampled_idx]
+
+                    self._log(
+                        f"Subsampled training split: {n_train} -> {len(splits['train'])} "
+                        f"({train_subsample_ratio*100:.1f}%)"
+                    )
+
         self._log(f"Split sizes: train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)}")
+        if len(splits['train']) != len(train_ids):
+            self._log(
+                f"Effective split sizes after train subsampling: "
+                f"train={len(splits['train'])}, val={len(val_ids)}, test={len(test_ids)}"
+            )
 
         return splits
 
@@ -1212,6 +1263,7 @@ class DataLoader:
         convert_to_ensembl: bool = True,
         filter_protein_coding: bool = True,
         random_state: Optional[int] = None,
+        train_subsample_ratio: Optional[float] = None,
         normalize: bool = False,
         normalize_target_sum: float = 1e4,
         normalize_method: str = 'library_size',
@@ -1242,6 +1294,9 @@ class DataLoader:
             Whether to filter for protein-coding genes.
         random_state : int, optional
             Random seed for splitting. None = random.
+        train_subsample_ratio : float, optional
+            If set in (0, 1), subsample only the training split to this
+            fraction before extracting matrices.
         normalize : bool, default=False
             Whether to normalize counts (library size + integer rounding).
         normalize_target_sum : float, default=1e4
@@ -1295,7 +1350,8 @@ class DataLoader:
             train_ratio=train_ratio,
             val_ratio=val_ratio,
             stratify_by=_stratify_col,
-            random_state=random_state
+            random_state=random_state,
+            train_subsample_ratio=train_subsample_ratio,
         )
 
         # Get matrices for each split (sparse by default for memory efficiency)
