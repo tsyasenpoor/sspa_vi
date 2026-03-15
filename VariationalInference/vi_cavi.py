@@ -707,8 +707,10 @@ class CAVI:
             v_clip = min(5.0, 10.0 / np.sqrt(self.K))
             mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
 
-            # Adaptive damping
-            alpha_max = 0.15
+            # Adaptive damping — scale with K so that the per-iteration logit
+            # change ≈ K * alpha * |v| stays bounded regardless of K.
+            # K=50 → 0.15 (unchanged); K=348 → ~0.043.
+            alpha_max = min(0.15, 7.5 / self.K)
             alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
@@ -745,8 +747,8 @@ class CAVI:
         W = self._sample_weights                    # (n, kappa)
         E_theta = self.E_theta
 
-        # Same adaptive damping schedule as v
-        alpha_max = 0.15
+        # Same adaptive damping schedule as v (K-scaled)
+        alpha_max = min(0.15, 7.5 / self.K)
         alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
