@@ -114,7 +114,7 @@ DATASET_PRESETS = {
         'regression_weight': ('log_float', 1.0, 200.0),
     },
     'covid': {
-        'n_factors': ('int', 20, 200, 10),
+        'n_factors': ('int', 50, 2000, 50),
         'regression_weight': ('log_float', 1.0, 500.0),
     },
 }
