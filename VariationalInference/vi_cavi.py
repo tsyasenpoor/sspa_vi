@@ -562,6 +562,13 @@ class CAVI:
 
             self._theta_inner_iters = 1
 
+            # Floor b_theta at bp to prevent theta explosion when beta is
+            # sparse (masked mode with few genes per factor).  Without this,
+            # b_theta → 0 as beta_sum collapses, creating a positive feedback
+            # loop: theta grows → b_beta grows → E[beta] shrinks → beta_sum
+            # shrinks → b_theta shrinks further.
+            self.b_theta = xp.maximum(self.b_theta, self.bp)
+
             # Re-tighten zeta for updated theta
             self._invalidate_theta_cache()
             self._update_zeta(X_aux)
