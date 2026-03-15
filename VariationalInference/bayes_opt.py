@@ -506,6 +506,7 @@ class HyperparameterOptimizer:
         output_dir: str = './bayes_opt_results',
         study_name: Optional[str] = None,
         v_prior: str = 'normal',
+        max_n_factors: Optional[int] = None,
     ):
         self.data_path = data_path
         # Normalise label_column to list for consistent handling
@@ -531,6 +532,7 @@ class HyperparameterOptimizer:
         self.random_state = random_state
         self.output_dir = Path(output_dir)
         self.v_prior = v_prior.lower()
+        self.max_n_factors = max_n_factors
         self.study_name = study_name or f'vi_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
 
         # Will be populated by load_data / load_pathways
@@ -538,6 +540,42 @@ class HyperparameterOptimizer:
         self.pathway_mask = None
         self.pathway_names = None
         self.search_space = None
+
+    def _apply_search_space_guards(self):
+        """Clamp known high-risk regions in search space to reduce OOM failures."""
+        if 'n_factors' not in self.search_space:
+            return
+
+        spec = self.search_space['n_factors']
+        if not isinstance(spec, tuple) or len(spec) < 3 or spec[0] != 'int':
+            return
+
+        low, high = int(spec[1]), int(spec[2])
+        step = int(spec[3]) if len(spec) > 3 else 1
+
+        # Optional explicit cap from CLI
+        effective_cap = self.max_n_factors
+
+        # Conservative auto-guard for COVID scale with aggressive subsampling.
+        # Past runs show many OOMs above ~1500 factors at subsample_ratio=0.1.
+        if (
+            effective_cap is None
+            and self.dataset_preset == 'covid'
+            and self.subsample_ratio is not None
+            and self.subsample_ratio <= 0.1
+        ):
+            effective_cap = 1500
+
+        if effective_cap is None:
+            return
+
+        capped_high = max(low, min(high, int(effective_cap)))
+        if capped_high < high:
+            self.search_space['n_factors'] = ('int', low, capped_high, step)
+            logger.warning(
+                "Capping n_factors search range from [%d, %d] to [%d, %d] to reduce OOM risk",
+                low, high, low, capped_high,
+            )
 
     def load_data(self):
         """Load and split data using DataLoader."""
@@ -618,6 +656,7 @@ class HyperparameterOptimizer:
 
         # Build search space
         self.search_space = build_search_space(self.dataset_preset, self.v_prior)
+        self._apply_search_space_guards()
 
         # Always pass v_prior as a fixed param so the model knows which prior to use
         if 'v_prior' not in self.fixed_params:
@@ -960,6 +999,10 @@ def parse_args(argv=None):
     # Subsampling
     parser.add_argument('--subsample-ratio', type=float, default=None,
                         help='Subsample training data for faster trials (e.g. 0.5)')
+    parser.add_argument(
+        '--max-n-factors', type=int, default=None,
+        help='Optional upper bound for n_factors search (useful to avoid OOM on large datasets)'
+    )
 
     # Splits
     parser.add_argument('--train-ratio', type=float, default=0.7, help='Train ratio')
@@ -1040,6 +1083,7 @@ def main(argv=None):
         random_state=args.seed,
         output_dir=args.output_dir,
         v_prior=args.v_prior,
+        max_n_factors=args.max_n_factors,
     )
 
     study = optimizer.run()

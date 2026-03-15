@@ -520,18 +520,23 @@ def main():
         print(f"Loading Pathways for {args.mode.upper()} Mode")
         print("=" * 80)
 
-        n_ensg = sum(1 for g in gene_list if g.startswith('ENSG'))
-        genes_are_ensembl = n_ensg > len(gene_list) * 0.5
+        valid_gene_list = [g for g in gene_list if isinstance(g, str) and g]
+        n_invalid_genes = len(gene_list) - len(valid_gene_list)
+        if n_invalid_genes > 0:
+            print(f"  Warning: {n_invalid_genes} invalid gene IDs detected (None/non-string/empty); excluding from pathway matching.")
+
+        n_ensg = sum(1 for g in valid_gene_list if g.startswith('ENSG'))
+        genes_are_ensembl = n_ensg > len(valid_gene_list) * 0.5 if len(valid_gene_list) > 0 else False
         convert_flag = genes_are_ensembl
         print(f"  Gene ID format: {'Ensembl' if genes_are_ensembl else 'Symbol'} "
-              f"({n_ensg}/{len(gene_list)} ENSG prefix)")
+              f"({n_ensg}/{len(valid_gene_list)} ENSG prefix among valid IDs)")
         print(f"  convert_to_ensembl = {convert_flag}")
 
         pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
             gmt_path=args.pathway_file,
             convert_to_ensembl=convert_flag,
             species='human',
-            gene_filter=gene_list,
+            gene_filter=valid_gene_list,
             min_genes=args.pathway_min_genes,
             max_genes=args.pathway_max_genes,
             cache_dir=args.cache_dir,
@@ -544,8 +549,8 @@ def main():
         gene_to_expr_idx = {g: i for i, g in enumerate(gene_list)}
         gene_to_pathway_idx = {g: i for i, g in enumerate(pathway_genes)}
 
-        common_genes = set(gene_list) & set(pathway_genes)
-        print(f"  Common genes: {len(common_genes)} / {len(gene_list)} expression genes")
+        common_genes = set(valid_gene_list) & set(pathway_genes)
+        print(f"  Common genes: {len(common_genes)} / {len(valid_gene_list)} valid expression genes")
 
         if len(common_genes) < 100:
             raise ValueError(
