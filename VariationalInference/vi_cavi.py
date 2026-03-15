@@ -552,6 +552,13 @@ class CAVI:
             self.b_theta = (b_base + disc) / 2.0
             self._theta_inner_iters = 1
 
+            # Floor b_theta at bp to prevent theta explosion when beta is
+            # sparse (masked mode with few genes per factor).  Without this,
+            # b_theta → 0 as beta_sum collapses, creating a positive feedback
+            # loop: theta grows → b_beta grows → E[beta] shrinks → beta_sum
+            # shrinks → b_theta shrinks further.
+            self.b_theta = xp.maximum(self.b_theta, self.bp)
+
             # Re-tighten zeta for updated theta
             self._invalidate_theta_cache()
             self._update_zeta(X_aux)
@@ -750,6 +757,9 @@ class CAVI:
             else:
                 self.Sigma_gamma[k] = np.linalg.inv(prec)
             mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
+            # Clip gamma to prevent explosion when theta is large (masked mode)
+            gamma_clip = 5.0 / max(1.0, self.sigma_gamma)
+            mu_gamma_new = xp.clip(mu_gamma_new, -gamma_clip, gamma_clip)
             new_mu_k = (1.0 - alpha) * self.mu_gamma[k] + alpha * mu_gamma_new
             if USE_JAX:
                 self.mu_gamma = self.mu_gamma.at[k].set(new_mu_k)
