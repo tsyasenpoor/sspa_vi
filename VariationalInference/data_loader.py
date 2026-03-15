@@ -1033,9 +1033,8 @@ class DataLoader:
                     raise ValueError("EMTAB data not loaded. Call preprocess() first.")
                 stratify = self.responses_df[stratify_by].values
             else:
-                if self.adata is None:
-                    self.load_adata()
-                stratify = self.adata.obs.loc[self.cell_ids, stratify_by].values
+                obs = self._get_obs()
+                stratify = obs.loc[self.cell_ids, stratify_by].values
 
         # First split: train vs (val+test)
         train_ids, temp_ids = train_test_split(
