@@ -459,13 +459,15 @@ class CAVI:
     def _refresh_log_caches(self):
         """Recompute cached digamma arrays after theta/beta updates.
 
-        Also caches raw digamma(a_theta) and digamma(a_beta) for reuse
-        in ELBO entropy computation (avoids recomputing 30M+ digamma evals).
+        Digamma values are computed as temporaries and discarded to save
+        GPU memory (~5 GiB for large n).  They are recomputed on demand
+        in _compute_elbo when needed for entropy terms.
         """
-        self._digamma_a_theta = digamma(self.a_theta)
-        self._digamma_a_beta = digamma(self.a_beta)
-        self._E_log_theta_cache = self._digamma_a_theta - xp.log(self.b_theta)
-        self._E_log_beta_cache = self._digamma_a_beta - xp.log(self.b_beta)
+        _dig_theta = digamma(self.a_theta)
+        _dig_beta = digamma(self.a_beta)
+        self._E_log_theta_cache = _dig_theta - xp.log(self.b_theta)
+        self._E_log_beta_cache = _dig_beta - xp.log(self.b_beta)
+        del _dig_theta, _dig_beta
 
     @property
     def E_xi(self):
@@ -526,7 +528,7 @@ class CAVI:
                 z_sum_beta_new = scatter_add_to(z_sum_beta, col_c, Xphi,
                                                 sorted_indices=False)
                 z_sum_theta_new = scatter_add_to(z_sum_theta, row_c, Xphi,
-                                                 sorted_indices=True)
+                                                 sorted_indices=False)
                 z_sum_beta = z_sum_beta_new
                 z_sum_theta = z_sum_theta_new
                 del Xphi
@@ -916,16 +918,18 @@ class CAVI:
                                         / xp.maximum(lambda_s, 1e-12)))
 
         # === Entropy: -E[log q] ===
-        # q(theta) Gamma entropy -- reuse cached digamma(a_theta) from _refresh_log_caches
-        psi_a_theta = self._digamma_a_theta
+        # q(theta) Gamma entropy -- recompute digamma (not cached to save GPU memory)
+        psi_a_theta = digamma(self.a_theta)
         elbo += xp.sum(self.a_theta - xp.log(self.b_theta)
                        + gammaln(self.a_theta)
                        + (1 - self.a_theta) * psi_a_theta)
+        del psi_a_theta
         # q(beta)
-        psi_a_beta = self._digamma_a_beta
+        psi_a_beta = digamma(self.a_beta)
         elbo += xp.sum(self.a_beta - xp.log(self.b_beta)
                        + gammaln(self.a_beta)
                        + (1 - self.a_beta) * psi_a_beta)
+        del psi_a_beta
         # q(xi)
         elbo += xp.sum(self.a_xi - xp.log(self.b_xi)
                        + self._gammaln_a_xi
@@ -995,7 +999,7 @@ class CAVI:
                 data_c = data[start:end]
                 Xphi = phi_chunk_core(E_log_theta_v[row_c], E_log_beta[col_c], data_c)
                 z_sum = scatter_add_to(z_sum, row_c, Xphi,
-                                       sorted_indices=True)
+                                       sorted_indices=False)
                 del Xphi
 
             a_theta_v = self.a + z_sum
@@ -1386,7 +1390,7 @@ class CAVI:
                 data_c = data[start:end]
                 Xphi = phi_chunk_core(E_log_theta[row_c], E_log_beta[col_c], data_c)
                 z_sum = scatter_add_to(z_sum, row_c, Xphi,
-                                       sorted_indices=True)
+                                       sorted_indices=False)
                 del Xphi
 
             a_theta = self.a + z_sum
