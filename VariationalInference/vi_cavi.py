@@ -82,8 +82,10 @@ def _auto_chunk_size(nnz, K, target_gb=None):
         else:
             target_gb = 4.0
     max_by_mem = int(target_gb * (1024 ** 3) / (K * 8))
-    # At least 1M, at most nnz (single pass)
-    return max(1_000_000, min(max_by_mem, nnz))
+    # Floor: target ~400MB work array regardless of K (was fixed 1M which
+    # is only 400MB at K=50 but 2.8GB at K=348).
+    floor = max(100_000, int(0.4 * (1024 ** 3) / (K * 8)))
+    return max(floor, min(max_by_mem, nnz))
 
 
 class CAVI:
@@ -486,10 +488,13 @@ class CAVI:
             data_c = self._X_data[start:end]
 
             if random_init:
-                # numpy random for Dirichlet, then transfer to device
-                Xphi_np = np.random.dirichlet(np.ones(K), end - start)
-                Xphi_np *= to_numpy(data_c)[:, None]
+                # numpy random for Dirichlet, then transfer to device.
+                # Use float32 and delete numpy copy before GPU transfer to
+                # halve peak memory (important for large K like masked mode).
+                Xphi_np = np.random.dirichlet(np.ones(K), end - start).astype(np.float32)
+                Xphi_np *= to_numpy(data_c).astype(np.float32)[:, None]
                 Xphi = to_device(Xphi_np)
+                del Xphi_np
             else:
                 Xphi = phi_chunk_core(
                     self._E_log_theta_cache[row_c],
