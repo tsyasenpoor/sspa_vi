@@ -65,27 +65,40 @@ def _auto_chunk_size(nnz, K, target_gb=None):
     """Auto-tune chunk size to target a given work-array memory budget.
 
     With K factors, each chunk of C entries uses C * K * 8 bytes.
-    On GPU, uses a larger budget (up to available VRAM) to reduce loop overhead.
+    On GPU, uses a conservative fraction of VRAM to leave headroom for
+    scatter promotions, parameter tensors, and allocator fragmentation.
     On CPU, targets ~4GB by default.
     """
     if target_gb is None:
         if HAS_GPU:
-            # Use up to ~50% of GPU memory for work arrays (leave room for
-            # parameters, caches, and OS).  Query actual VRAM if possible.
+            # Use ~3% of GPU memory for work arrays. In practice, scatter-add
+            # and dtype promotion can transiently require additional buffers,
+            # so this budget must remain conservative at large K.
             try:
                 import jax
                 dev = [d for d in jax.devices() if d.platform == "gpu"][0]
                 mem_bytes = dev.memory_stats()["bytes_limit"]
-                target_gb = mem_bytes / (1024 ** 3) * 0.10
+                target_gb = mem_bytes / (1024 ** 3) * 0.03
             except Exception:
-                target_gb = 12.0  # conservative GPU default
+                target_gb = 2.0  # conservative GPU default
         else:
             target_gb = 4.0
     max_by_mem = int(target_gb * (1024 ** 3) / (K * 8))
-    # Floor: target ~400MB work array regardless of K (was fixed 1M which
-    # is only 400MB at K=50 but 2.8GB at K=348).
-    floor = max(100_000, int(0.4 * (1024 ** 3) / (K * 8)))
+    # Floor: keep at least ~200MB work array (but never below 20k nnz)
+    # to avoid excessive loop overhead when K is very large.
+    floor = max(20_000, int(0.2 * (1024 ** 3) / (K * 8)))
     return max(floor, min(max_by_mem, nnz))
+
+
+def _is_oom_error(exc: Exception) -> bool:
+    """Best-effort detection of JAX/XLA OOM errors."""
+    msg = str(exc).lower()
+    return (
+        "resource_exhausted" in msg
+        or "out of memory" in msg
+        or "cuda_error_out_of_memory" in msg
+        or "allocator" in msg and "memory" in msg
+    )
 
 
 class CAVI:
@@ -477,39 +490,63 @@ class CAVI:
         """
         K = self.K
         nnz = self._nnz
-        chunk = self._effective_chunk
+        base_chunk = self._effective_chunk
+        adaptive_chunk = base_chunk
+        # Never shrink below ~50MB work array (or 2k nnz), otherwise overhead
+        # dominates and convergence becomes impractically slow.
+        min_chunk = max(2_000, int(0.05 * (1024 ** 3) / (K * 8)))
         z_sum_beta = xp.zeros((self.p, K))
         z_sum_theta = xp.zeros((self.n, K))
 
-        for start in range(0, nnz, chunk):
-            end = min(start + chunk, nnz)
+        start = 0
+        while start < nnz:
+            end = min(start + adaptive_chunk, nnz)
             row_c = self._X_row[start:end]
             col_c = self._X_col[start:end]
             data_c = self._X_data[start:end]
 
-            if random_init:
-                # numpy random for Dirichlet, then transfer to device.
-                # Use float32 and delete numpy copy before GPU transfer to
-                # halve peak memory (important for large K like masked mode).
-                Xphi_np = np.random.dirichlet(np.ones(K), end - start).astype(np.float32)
-                Xphi_np *= to_numpy(data_c).astype(np.float32)[:, None]
-                Xphi = to_device(Xphi_np)
-                del Xphi_np
-            else:
-                Xphi = phi_chunk_core(
-                    self._E_log_theta_cache[row_c],
-                    self._E_log_beta_cache[col_c],
-                    data_c,
-                )
+            try:
+                if random_init:
+                    # numpy random for Dirichlet, then transfer to device.
+                    # Use float32 and delete numpy copy before GPU transfer to
+                    # halve peak memory (important for large K like masked mode).
+                    Xphi_np = np.random.dirichlet(np.ones(K), end - start).astype(np.float32)
+                    Xphi_np *= to_numpy(data_c).astype(np.float32)[:, None]
+                    Xphi = to_device(Xphi_np)
+                    del Xphi_np
+                else:
+                    Xphi = phi_chunk_core(
+                        self._E_log_theta_cache[row_c],
+                        self._E_log_beta_cache[col_c],
+                        data_c,
+                    )
 
-            # Accumulate via vectorized scatter-add
-            # row indices are pre-sorted, enabling segment_sum on GPU
-            # Use unsorted scatter for beta to avoid argsort + copy (saves ~2x chunk memory)
-            z_sum_beta = scatter_add_to(z_sum_beta, col_c, Xphi,
-                                         sorted_indices=False)
-            z_sum_theta = scatter_add_to(z_sum_theta, row_c, Xphi,
-                                         sorted_indices=True)
-            del Xphi
+                # Build new arrays first so failed second scatter does not
+                # partially apply updates for this chunk.
+                z_sum_beta_new = scatter_add_to(z_sum_beta, col_c, Xphi,
+                                                sorted_indices=False)
+                z_sum_theta_new = scatter_add_to(z_sum_theta, row_c, Xphi,
+                                                 sorted_indices=True)
+                z_sum_beta = z_sum_beta_new
+                z_sum_theta = z_sum_theta_new
+                del Xphi
+
+                start = end
+                if adaptive_chunk < base_chunk:
+                    adaptive_chunk = min(base_chunk, int(adaptive_chunk * 1.25))
+
+            except Exception as exc:
+                if _is_oom_error(exc) and adaptive_chunk > min_chunk:
+                    new_chunk = max(min_chunk, adaptive_chunk // 2)
+                    if new_chunk == adaptive_chunk:
+                        raise
+                    print(
+                        f"  [OOM guard] shrinking phi chunk from {adaptive_chunk:,} "
+                        f"to {new_chunk:,} at nnz [{start:,}:{end:,}]"
+                    )
+                    adaptive_chunk = new_chunk
+                    continue
+                raise
 
         return z_sum_beta, z_sum_theta
 
