@@ -459,15 +459,16 @@ class CAVI:
     def _refresh_log_caches(self):
         """Recompute cached digamma arrays after theta/beta updates.
 
-        Digamma values are computed as temporaries and discarded to save
-        GPU memory (~5 GiB for large n).  They are recomputed on demand
-        in _compute_elbo when needed for entropy terms.
+        E_log_theta is NOT cached here: it is computed per-chunk inside
+        _compute_phi_sparse to avoid a persistent (n, K) GPU array
+        (~5 GiB for large n).  Only E_log_beta (p, K) is cached since
+        p is typically small.
+
+        Digamma values are recomputed on demand in _compute_elbo.
         """
-        _dig_theta = digamma(self.a_theta)
         _dig_beta = digamma(self.a_beta)
-        self._E_log_theta_cache = _dig_theta - xp.log(self.b_theta)
         self._E_log_beta_cache = _dig_beta - xp.log(self.b_beta)
-        del _dig_theta, _dig_beta
+        del _dig_beta
 
     @property
     def E_xi(self):
@@ -491,6 +492,10 @@ class CAVI:
             z_sum_theta: (n, K) = Sum_j x_{ij} phi_{ijk}
         """
         K = self.K
+
+        if random_init:
+            return self._random_init_z_sums()
+
         nnz = self._nnz
         base_chunk = self._effective_chunk
         adaptive_chunk = base_chunk
@@ -508,27 +513,20 @@ class CAVI:
             data_c = self._X_data[start:end]
 
             try:
-                if random_init:
-                    # numpy random for Dirichlet, then transfer to device.
-                    # Use float32 and delete numpy copy before GPU transfer to
-                    # halve peak memory (important for large K like masked mode).
-                    Xphi_np = np.random.dirichlet(np.ones(K), end - start).astype(np.float32)
-                    Xphi_np *= to_numpy(data_c).astype(np.float32)[:, None]
-                    Xphi = to_device(Xphi_np)
-                    del Xphi_np
-                else:
-                    Xphi = phi_chunk_core(
-                        self._E_log_theta_cache[row_c],
-                        self._E_log_beta_cache[col_c],
-                        data_c,
-                    )
+                # Compute E_log_theta per chunk to avoid caching a full
+                # (n, K) array on GPU (saves ~5 GiB at n=593K, K=1197).
+                E_log_theta_rows = digamma(self.a_theta[row_c]) - xp.log(self.b_theta[row_c])
+                Xphi = phi_chunk_core(
+                    E_log_theta_rows,
+                    self._E_log_beta_cache[col_c],
+                    data_c,
+                )
+                del E_log_theta_rows
 
-                # Build new arrays first so failed second scatter does not
-                # partially apply updates for this chunk.
                 z_sum_beta_new = scatter_add_to(z_sum_beta, col_c, Xphi,
                                                 sorted_indices=False)
                 z_sum_theta_new = scatter_add_to(z_sum_theta, row_c, Xphi,
-                                                 sorted_indices=False)
+                                                 sorted_indices=True)
                 z_sum_beta = z_sum_beta_new
                 z_sum_theta = z_sum_theta_new
                 del Xphi
@@ -549,6 +547,44 @@ class CAVI:
                     adaptive_chunk = new_chunk
                     continue
                 raise
+
+        return z_sum_beta, z_sum_theta
+
+    def _random_init_z_sums(self):
+        """Fast random initialization of z_sums using row/col sum Dirichlet.
+
+        Instead of sampling a K-dimensional Dirichlet for every nonzero
+        entry (O(nnz*K) Gamma draws -- hours for large datasets), we
+        sample one Dirichlet per cell and per gene and scale by the
+        respective row/col sums.  This is O((n+p)*K) and takes seconds.
+
+        The per-entry Dirichlet init produces:
+            z_sum_theta_{ik} = Sum_j x_{ij} * phi_{ijk}
+        where phi_{ij} ~ Dir(1,...,1) independently.  In expectation,
+        z_sum_theta_{ik} = row_sum_i / K.  Our approximation samples
+        a single Dirichlet per cell and scales by row_sum, preserving
+        the same mean and similar variance structure.
+        """
+        K = self.K
+        data_np = to_numpy(self._X_data)
+        row_np = to_numpy(self._X_row)
+        col_np = to_numpy(self._X_col)
+        row_sums = np.bincount(row_np, weights=data_np, minlength=self.n)
+        col_sums = np.bincount(col_np, weights=data_np, minlength=self.p)
+
+        # Dirichlet(1,...,1) = normalized Gamma(1,1) = normalized Exponential
+        # Exponential is much faster to sample than Gamma for large K.
+        z_theta_np = np.random.exponential(1.0, (self.n, K)).astype(np.float32)
+        z_theta_np /= z_theta_np.sum(axis=1, keepdims=True)
+        z_theta_np *= row_sums.astype(np.float32)[:, None]
+        z_sum_theta = to_device(z_theta_np)
+        del z_theta_np
+
+        z_beta_np = np.random.exponential(1.0, (self.p, K)).astype(np.float32)
+        z_beta_np /= z_beta_np.sum(axis=1, keepdims=True)
+        z_beta_np *= col_sums.astype(np.float32)[:, None]
+        z_sum_beta = to_device(z_beta_np)
+        del z_beta_np
 
         return z_sum_beta, z_sum_theta
 
@@ -829,7 +865,7 @@ class CAVI:
     def _compute_elbo(self, X_dense, y, X_aux):
         """Compute ELBO = E[log p] - E[log q]."""
         E_theta = self.E_theta
-        E_log_theta = self._E_log_theta_cache
+        E_log_theta = digamma(self.a_theta) - xp.log(self.b_theta)
         E_beta = self.E_beta
         E_log_beta = self._E_log_beta_cache
         E_xi = self.E_xi
