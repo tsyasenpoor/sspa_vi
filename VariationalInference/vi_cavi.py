@@ -932,9 +932,11 @@ class CAVI:
     # =================================================================
 
     def _compute_elbo(self, X_dense, y, X_aux):
-        """Compute ELBO = E[log p] - E[log q]."""
-        E_theta = self.E_theta
-        E_log_theta = digamma(self.a_theta) - xp.log(self.b_theta)
+        """Compute ELBO = E[log p] - E[log q].
+
+        Row-chunked for all theta-related (n, K) terms to avoid
+        materializing multiple full (n, K) temporaries simultaneously.
+        """
         E_beta = self.E_beta
         E_log_beta = self._E_log_beta_cache
         E_xi = self.E_xi
@@ -946,6 +948,18 @@ class CAVI:
         elbo = 0.0
 
         # === Poisson likelihood (collapsed z) -- chunked to avoid (nnz, K) ===
+        # E_log_theta is needed for random-access by sparse row indices,
+        # so we compute it in row chunks and concatenate, then delete after use.
+        chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=2)
+        elt_chunks = []
+        for i0 in range(0, self.n, chunk_n):
+            i1 = min(i0 + chunk_n, self.n)
+            elt_chunks.append(
+                digamma(self.a_theta[i0:i1]) - xp.log(self.b_theta[i0:i1])
+            )
+        E_log_theta = xp.concatenate(elt_chunks, axis=0) if len(elt_chunks) > 1 else elt_chunks[0]
+        del elt_chunks
+
         poisson_ll = 0.0
         nnz = self._nnz
         chunk = self._effective_chunk
@@ -958,31 +972,67 @@ class CAVI:
             log_sum_c = logsumexp_rows(log_rates_c).ravel()
             poisson_ll += xp.dot(data_c, log_sum_c)
             del log_rates_c
+
+        E_theta = self.E_theta
         poisson_ll -= xp.sum(E_theta.sum(axis=0) * E_beta.sum(axis=0))
         poisson_ll -= self._gammaln_data_sum  # cached at init
         elbo += poisson_ll
 
-        # === JJ Bernoulli likelihood ===
+        # === Row-chunked theta terms: JJ regression LL, prior, entropy ===
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = lambda_jj(self.zeta)
-        E_A = E_theta @ self.mu_v.T                   # BLAS
-        if self.p_aux > 0:
-            E_A = E_A + X_aux @ self.mu_gamma.T
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag   # tiny (kappa, K)
-        Var_theta = self.a_theta / xp.square(self.b_theta)
-        E_A_sq = E_A ** 2 + Var_theta @ E_v_sq.T
-
         W = self._sample_weights  # (n, kappa)
-        regression_ll = xp.sum(W * ((y_exp - 0.5) * E_A - lam * E_A_sq))
-        regression_ll += xp.sum(W * (lam * self.zeta ** 2 - 0.5 * self.zeta
-                                + log_expit(self.zeta)))
-        elbo += self.regression_weight * regression_ll
 
-        # === Prior: p(theta|xi) ===
-        elbo += xp.sum((self.a - 1) * E_log_theta
-                       + self.a * E_log_xi[:, None]
-                       - E_xi[:, None] * E_theta)
-        elbo -= self.n * self.K * gammaln(self.a)
+        regression_ll = 0.0
+        theta_prior = 0.0
+        theta_entropy = 0.0
+        gammaln_a = gammaln(self.a)
+
+        for i0 in range(0, self.n, chunk_n):
+            i1 = min(i0 + chunk_n, self.n)
+            a_theta_c = self.a_theta[i0:i1]
+            b_theta_c = self.b_theta[i0:i1]
+            E_theta_c = E_theta[i0:i1]
+            E_log_theta_c = E_log_theta[i0:i1]
+
+            # --- JJ regression likelihood ---
+            Var_theta_c = a_theta_c / xp.square(b_theta_c)       # (chunk, K)
+            E_A_c = E_theta_c @ self.mu_v.T                      # (chunk, kappa)
+            if self.p_aux > 0:
+                E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
+            E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T       # (chunk, kappa)
+            lam_c = lam[i0:i1]
+            W_c = W[i0:i1]
+            zeta_c = self.zeta[i0:i1]
+            regression_ll += xp.sum(
+                W_c * ((y_exp[i0:i1] - 0.5) * E_A_c - lam_c * E_A_sq_c)
+            )
+            regression_ll += xp.sum(
+                W_c * (lam_c * zeta_c ** 2 - 0.5 * zeta_c + log_expit(zeta_c))
+            )
+
+            # --- Prior p(theta|xi) ---
+            theta_prior += xp.sum(
+                (self.a - 1) * E_log_theta_c
+                + self.a * E_log_xi[i0:i1, None]
+                - E_xi[i0:i1, None] * E_theta_c
+            )
+
+            # --- Entropy -E[log q(theta)] ---
+            psi_a_c = digamma(a_theta_c)
+            theta_entropy += xp.sum(
+                a_theta_c - xp.log(b_theta_c)
+                + gammaln(a_theta_c)
+                + (1 - a_theta_c) * psi_a_c
+            )
+
+        del E_log_theta  # free the full (n, K) array
+
+        elbo += self.regression_weight * regression_ll
+        elbo += theta_prior
+        elbo -= self.n * self.K * gammaln_a
+        elbo += theta_entropy
 
         # === Prior: p(beta|eta) ===
         elbo += xp.sum((self.c - 1) * E_log_beta
@@ -1023,12 +1073,6 @@ class CAVI:
                                         / xp.maximum(lambda_s, 1e-12)))
 
         # === Entropy: -E[log q] ===
-        # q(theta) Gamma entropy -- recompute digamma (not cached to save GPU memory)
-        psi_a_theta = digamma(self.a_theta)
-        elbo += xp.sum(self.a_theta - xp.log(self.b_theta)
-                       + gammaln(self.a_theta)
-                       + (1 - self.a_theta) * psi_a_theta)
-        del psi_a_theta
         # q(beta)
         psi_a_beta = digamma(self.a_beta)
         elbo += xp.sum(self.a_beta - xp.log(self.b_beta)
