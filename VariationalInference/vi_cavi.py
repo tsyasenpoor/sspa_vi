@@ -112,10 +112,11 @@ def _row_chunk_size(n, K, n_intermediates=2, target_gb=None):
                 import jax
                 dev = [d for d in jax.devices() if d.platform == "gpu"][0]
                 mem_bytes = dev.memory_stats()["bytes_limit"]
-                # Use ~5% of VRAM for row-chunked temporaries
-                target_gb = mem_bytes / (1024 ** 3) * 0.05
+                # Use ~3% of VRAM for row-chunked temporaries (conservative
+                # to leave headroom for allocator fragmentation and other ops)
+                target_gb = mem_bytes / (1024 ** 3) * 0.03
             except Exception:
-                target_gb = 1.0
+                target_gb = 0.5
         else:
             target_gb = 2.0
     bytes_per_row = n_intermediates * K * 8
@@ -390,6 +391,11 @@ class CAVI:
 
         # ── Transfer all numpy arrays to device (GPU if available) ──
         self._to_device()
+
+        # Adaptive row chunk size for (n, K) operations -- shared across
+        # _update_zeta, _update_theta, _update_v, _compute_elbo.
+        # Starts at auto-tuned value and shrinks on OOM.
+        self._row_chunk = _row_chunk_size(self.n, self.K, n_intermediates=4)
 
         # Pre-compute digamma caches (now on device)
         self._refresh_log_caches()
@@ -669,35 +675,44 @@ class CAVI:
             E_v_sq_col = xp.square(E_v)                      # (kappa, K)
             rw = self.regression_weight
 
-            chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=4)
+            min_chunk = max(1024, self.n // 256)
             b_theta_chunks = []
-            for i0 in range(0, self.n, chunk_n):
-                i1 = min(i0 + chunk_n, self.n)
-                # --- inline _regression_rate_parts for this chunk ---
-                E_theta_c = E_theta_full[i0:i1]
-                W_c = W[i0:i1]
-                W_lam_c = W_c * lam[i0:i1]
-                theta_v_c = E_theta_c @ E_v.T                             # (chunk, kappa)
-                if self.p_aux > 0:
-                    theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
+            i0 = 0
+            while i0 < self.n:
+                i1 = min(i0 + self._row_chunk, self.n)
+                try:
+                    # --- inline _regression_rate_parts for this chunk ---
+                    E_theta_c = E_theta_full[i0:i1]
+                    W_c = W[i0:i1]
+                    W_lam_c = W_c * lam[i0:i1]
+                    theta_v_c = E_theta_c @ E_v.T                             # (chunk, kappa)
+                    if self.p_aux > 0:
+                        theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
-                R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
-                R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
-                R_lin_c = R_lin_c - 2.0 * E_theta_c * (W_lam_c @ E_v_sq_col)
-                R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
+                    R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
+                    R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
+                    R_lin_c = R_lin_c - 2.0 * E_theta_c * (W_lam_c @ E_v_sq_col)
+                    R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
 
-                # --- solve quadratic for b_theta ---
-                b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
-                b_base_c = b_poisson_c + rw * R_lin_c
-                c_quad_c = rw * R_quad_c
-                disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1])
-                b_theta_c = (b_base_c + disc_c) / 2.0
+                    # --- solve quadratic for b_theta ---
+                    b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
+                    b_base_c = b_poisson_c + rw * R_lin_c
+                    c_quad_c = rw * R_quad_c
+                    disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1])
+                    b_theta_c = (b_base_c + disc_c) / 2.0
 
-                # Floor at 10% of b_poisson
-                b_theta_c = xp.maximum(b_theta_c, 0.1 * b_poisson_c)
-                # Floor at bp
-                b_theta_c = xp.maximum(b_theta_c, self.bp)
-                b_theta_chunks.append(b_theta_c)
+                    # Floor at 10% of b_poisson
+                    b_theta_c = xp.maximum(b_theta_c, 0.1 * b_poisson_c)
+                    # Floor at bp
+                    b_theta_c = xp.maximum(b_theta_c, self.bp)
+                    b_theta_chunks.append(b_theta_c)
+                    i0 = i1
+                except Exception as exc:
+                    if _is_oom_error(exc) and self._row_chunk > min_chunk:
+                        self._row_chunk = max(min_chunk, self._row_chunk // 2)
+                        print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
+                        continue
+                    raise
 
             self.b_theta = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
             self._theta_inner_iters = 1
@@ -723,25 +738,32 @@ class CAVI:
         for ANY zeta, so capping gives a slightly looser but still valid bound.
         Each CAVI update still provably increases this capped-zeta ELBO.
 
-        Row-chunked to avoid materializing a full (n, K) Var_theta temporary.
+        Row-chunked with adaptive OOM guard.
         """
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K) -- tiny
+        min_chunk = max(1024, self.n // 256)
 
-        chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=2)
         zeta_chunks = []
-        for i0 in range(0, self.n, chunk_n):
-            i1 = min(i0 + chunk_n, self.n)
-            E_theta_c = self.E_theta[i0:i1]              # (chunk, K) -- slice
-            Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
-
-            E_A_c = E_theta_c @ self.mu_v.T              # (chunk, kappa)
-            if self.p_aux > 0:
-                E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
-
-            E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
-            zeta_chunks.append(
-                xp.minimum(xp.sqrt(xp.maximum(E_A_sq_c, 1e-8)), self.zeta_max)
-            )
+        i0 = 0
+        while i0 < self.n:
+            i1 = min(i0 + self._row_chunk, self.n)
+            try:
+                E_theta_c = self.E_theta[i0:i1]
+                Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
+                E_A_c = E_theta_c @ self.mu_v.T
+                if self.p_aux > 0:
+                    E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
+                E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
+                zeta_chunks.append(
+                    xp.minimum(xp.sqrt(xp.maximum(E_A_sq_c, 1e-8)), self.zeta_max)
+                )
+                i0 = i1
+            except Exception as exc:
+                if _is_oom_error(exc) and self._row_chunk > min_chunk:
+                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
+                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
+                    continue
+                raise
         self.zeta = xp.concatenate(zeta_chunks, axis=0) if len(zeta_chunks) > 1 else zeta_chunks[0]
 
     def _regression_rate_parts(self, y, X_aux):
@@ -819,30 +841,40 @@ class CAVI:
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
         # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
-        chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=3)
+        # Uses self._row_chunk with adaptive OOM guard.
+        min_chunk = max(1024, self.n // 256)
         prec_sum = xp.zeros((self.kappa, self.K))   # W_lam.T @ E_theta_sq
         term1_sum = xp.zeros((self.kappa, self.K))   # W_y.T @ E_theta
         parta_sum = xp.zeros((self.kappa, self.K))   # (W_lam * theta_v).T @ E_theta
         partb_sum = xp.zeros((self.kappa, self.K))   # W_lam.T @ E_theta_plain_sq
 
-        for i0 in range(0, self.n, chunk_n):
-            i1 = min(i0 + chunk_n, self.n)
-            E_theta_c = self.E_theta[i0:i1]                        # (chunk, K)
-            E_theta_psq_c = xp.square(E_theta_c)                   # (chunk, K)
-            Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
-            E_theta_sq_c = E_theta_psq_c + Var_theta_c             # (chunk, K)
+        i0 = 0
+        while i0 < self.n:
+            i1 = min(i0 + self._row_chunk, self.n)
+            try:
+                E_theta_c = self.E_theta[i0:i1]                        # (chunk, K)
+                E_theta_psq_c = xp.square(E_theta_c)                   # (chunk, K)
+                Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
+                E_theta_sq_c = E_theta_psq_c + Var_theta_c             # (chunk, K)
 
-            theta_v_c = E_theta_c @ E_v.T                          # (chunk, kappa)
-            if self.p_aux > 0:
-                theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
+                theta_v_c = E_theta_c @ E_v.T                          # (chunk, kappa)
+                if self.p_aux > 0:
+                    theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
-            W_lam_c = W[i0:i1] * lam[i0:i1]                       # (chunk, kappa)
-            W_y_c = W[i0:i1] * (y_exp[i0:i1] - 0.5)              # (chunk, kappa)
+                W_lam_c = W[i0:i1] * lam[i0:i1]                       # (chunk, kappa)
+                W_y_c = W[i0:i1] * (y_exp[i0:i1] - 0.5)              # (chunk, kappa)
 
-            prec_sum = prec_sum + W_lam_c.T @ E_theta_sq_c
-            term1_sum = term1_sum + W_y_c.T @ E_theta_c
-            parta_sum = parta_sum + (W_lam_c * theta_v_c).T @ E_theta_c
-            partb_sum = partb_sum + W_lam_c.T @ E_theta_psq_c
+                prec_sum = prec_sum + W_lam_c.T @ E_theta_sq_c
+                term1_sum = term1_sum + W_y_c.T @ E_theta_c
+                parta_sum = parta_sum + (W_lam_c * theta_v_c).T @ E_theta_c
+                partb_sum = partb_sum + W_lam_c.T @ E_theta_psq_c
+                i0 = i1
+            except Exception as exc:
+                if _is_oom_error(exc) and self._row_chunk > min_chunk:
+                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
+                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
+                    continue
+                raise
 
         precision = prior_precision + 2 * prec_sum                  # (kappa, K)
         term1 = term1_sum
@@ -950,13 +982,22 @@ class CAVI:
         # === Poisson likelihood (collapsed z) -- chunked to avoid (nnz, K) ===
         # E_log_theta is needed for random-access by sparse row indices,
         # so we compute it in row chunks and concatenate, then delete after use.
-        chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=2)
+        min_chunk = max(1024, self.n // 256)
         elt_chunks = []
-        for i0 in range(0, self.n, chunk_n):
-            i1 = min(i0 + chunk_n, self.n)
-            elt_chunks.append(
-                digamma(self.a_theta[i0:i1]) - xp.log(self.b_theta[i0:i1])
-            )
+        i0 = 0
+        while i0 < self.n:
+            i1 = min(i0 + self._row_chunk, self.n)
+            try:
+                elt_chunks.append(
+                    digamma(self.a_theta[i0:i1]) - xp.log(self.b_theta[i0:i1])
+                )
+                i0 = i1
+            except Exception as exc:
+                if _is_oom_error(exc) and self._row_chunk > min_chunk:
+                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
+                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
+                    continue
+                raise
         E_log_theta = xp.concatenate(elt_chunks, axis=0) if len(elt_chunks) > 1 else elt_chunks[0]
         del elt_chunks
 
@@ -989,43 +1030,52 @@ class CAVI:
         theta_entropy = 0.0
         gammaln_a = gammaln(self.a)
 
-        for i0 in range(0, self.n, chunk_n):
-            i1 = min(i0 + chunk_n, self.n)
-            a_theta_c = self.a_theta[i0:i1]
-            b_theta_c = self.b_theta[i0:i1]
-            E_theta_c = E_theta[i0:i1]
-            E_log_theta_c = E_log_theta[i0:i1]
+        i0 = 0
+        while i0 < self.n:
+            i1 = min(i0 + self._row_chunk, self.n)
+            try:
+                a_theta_c = self.a_theta[i0:i1]
+                b_theta_c = self.b_theta[i0:i1]
+                E_theta_c = E_theta[i0:i1]
+                E_log_theta_c = E_log_theta[i0:i1]
 
-            # --- JJ regression likelihood ---
-            Var_theta_c = a_theta_c / xp.square(b_theta_c)       # (chunk, K)
-            E_A_c = E_theta_c @ self.mu_v.T                      # (chunk, kappa)
-            if self.p_aux > 0:
-                E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
-            E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T       # (chunk, kappa)
-            lam_c = lam[i0:i1]
-            W_c = W[i0:i1]
-            zeta_c = self.zeta[i0:i1]
-            regression_ll += xp.sum(
-                W_c * ((y_exp[i0:i1] - 0.5) * E_A_c - lam_c * E_A_sq_c)
-            )
-            regression_ll += xp.sum(
-                W_c * (lam_c * zeta_c ** 2 - 0.5 * zeta_c + log_expit(zeta_c))
-            )
+                # --- JJ regression likelihood ---
+                Var_theta_c = a_theta_c / xp.square(b_theta_c)       # (chunk, K)
+                E_A_c = E_theta_c @ self.mu_v.T                      # (chunk, kappa)
+                if self.p_aux > 0:
+                    E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
+                E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T       # (chunk, kappa)
+                lam_c = lam[i0:i1]
+                W_c = W[i0:i1]
+                zeta_c = self.zeta[i0:i1]
+                regression_ll += xp.sum(
+                    W_c * ((y_exp[i0:i1] - 0.5) * E_A_c - lam_c * E_A_sq_c)
+                )
+                regression_ll += xp.sum(
+                    W_c * (lam_c * zeta_c ** 2 - 0.5 * zeta_c + log_expit(zeta_c))
+                )
 
-            # --- Prior p(theta|xi) ---
-            theta_prior += xp.sum(
-                (self.a - 1) * E_log_theta_c
-                + self.a * E_log_xi[i0:i1, None]
-                - E_xi[i0:i1, None] * E_theta_c
-            )
+                # --- Prior p(theta|xi) ---
+                theta_prior += xp.sum(
+                    (self.a - 1) * E_log_theta_c
+                    + self.a * E_log_xi[i0:i1, None]
+                    - E_xi[i0:i1, None] * E_theta_c
+                )
 
-            # --- Entropy -E[log q(theta)] ---
-            psi_a_c = digamma(a_theta_c)
-            theta_entropy += xp.sum(
-                a_theta_c - xp.log(b_theta_c)
-                + gammaln(a_theta_c)
-                + (1 - a_theta_c) * psi_a_c
-            )
+                # --- Entropy -E[log q(theta)] ---
+                psi_a_c = digamma(a_theta_c)
+                theta_entropy += xp.sum(
+                    a_theta_c - xp.log(b_theta_c)
+                    + gammaln(a_theta_c)
+                    + (1 - a_theta_c) * psi_a_c
+                )
+                i0 = i1
+            except Exception as exc:
+                if _is_oom_error(exc) and self._row_chunk > min_chunk:
+                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
+                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
+                    continue
+                raise
 
         del E_log_theta  # free the full (n, K) array
 
