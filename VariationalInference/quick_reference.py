@@ -494,6 +494,7 @@ def main():
     X_test, X_aux_test, y_test = data['test']
     gene_list = data['gene_list']
     splits = data['splits']
+    aux_column_names = data.get('aux_column_names', None)
 
     print(f"\nData Summary:")
     print(f"  Genes:          {len(gene_list)}")
@@ -806,18 +807,7 @@ def main():
     train_metrics = train_metrics_all[label_columns[0]]
     y_train_pred = (_proba_train_2d[:, 0] > 0.5).astype(int)
 
-    # Save training results immediately
-    train_results_path = output_dir / 'training_results.pkl'
-    with open(train_results_path, 'wb') as f:
-        pickle.dump({
-            'label_columns': label_columns,
-            'metrics': train_metrics_all,
-            'predictions': {lc: (_proba_train_2d[:, k] > 0.5).astype(int) for k, lc in enumerate(label_columns)},
-            'probabilities': {lc: _proba_train_2d[:, k] for k, lc in enumerate(label_columns)},
-            'logits': train_logits,
-            'E_theta': E_theta_train
-        }, f)
-    print(f"Training results saved to {train_results_path}")
+    # Training metrics printed above; predictions saved in CSV below.
 
     # =========================================================================
     # STEP 6: Evaluate on Validation Set
@@ -859,18 +849,7 @@ def main():
     val_metrics = val_metrics_all[label_columns[0]]
     y_val_pred = (_proba_val_2d[:, 0] > optimal_threshold).astype(int)
 
-    # Save validation results immediately
-    val_results_path = output_dir / 'validation_results.pkl'
-    with open(val_results_path, 'wb') as f:
-        pickle.dump({
-            'label_columns': label_columns,
-            'metrics': val_metrics_all,
-            'predictions': {lc: (_proba_val_2d[:, k] > optimal_thresholds[lc]).astype(int) for k, lc in enumerate(label_columns)},
-            'probabilities': {lc: _proba_val_2d[:, k] for k, lc in enumerate(label_columns)},
-            'optimal_thresholds': optimal_thresholds,
-            'E_theta': E_theta_val
-        }, f)
-    print(f"Validation results saved to {val_results_path}")
+    # Validation metrics printed above; predictions saved in CSV below.
 
     # =========================================================================
     # STEP 7: Evaluate on Test Set
@@ -904,18 +883,7 @@ def main():
     test_metrics = test_metrics_all[label_columns[0]]
     y_test_pred = (_proba_test_2d[:, 0] > optimal_threshold).astype(int)
 
-    # Save test results immediately
-    test_results_path = output_dir / 'test_results.pkl'
-    with open(test_results_path, 'wb') as f:
-        pickle.dump({
-            'label_columns': label_columns,
-            'metrics': test_metrics_all,
-            'predictions': {lc: (_proba_test_2d[:, k] > optimal_thresholds[lc]).astype(int) for k, lc in enumerate(label_columns)},
-            'probabilities': {lc: _proba_test_2d[:, k] for k, lc in enumerate(label_columns)},
-            'optimal_thresholds': optimal_thresholds,
-            'E_theta': E_theta_test
-        }, f)
-    print(f"Test results saved to {test_results_path}")
+    # Test metrics printed above; predictions saved in CSV below.
 
     # =========================================================================
     # STEP 8: Save Results
@@ -934,7 +902,9 @@ def main():
         compress=True,
         optimal_threshold=optimal_thresholds,
         program_names=pathway_names,
-        mode=args.mode
+        mode=args.mode,
+        label_columns=label_columns,
+        aux_columns=aux_column_names,
     )
 
     # Predictions (per-outcome columns)
@@ -957,6 +927,22 @@ def main():
     test_pred_df = _build_pred_df(splits['test'], _y_test_2d, _proba_test_2d, optimal_thresholds)
     test_pred_df.to_csv(output_dir / f'{prefix}_test_predictions.csv.gz', compression='gzip', index=False)
     print(f"Saved predictions to {output_dir}")
+
+    # Save consolidated metrics CSV (replaces separate pkl files)
+    metrics_rows = []
+    for split_name, metrics_dict, thresholds in [
+        ('train', train_metrics_all, {lc: 0.5 for lc in label_columns}),
+        ('val', val_metrics_all, optimal_thresholds),
+        ('test', test_metrics_all, optimal_thresholds),
+    ]:
+        for lc, m in metrics_dict.items():
+            row = {'split': split_name, 'label': lc, 'threshold': thresholds.get(lc, 0.5)}
+            row.update(m)
+            metrics_rows.append(row)
+    metrics_df = pd.DataFrame(metrics_rows)
+    metrics_path = output_dir / f'{prefix}_metrics.csv'
+    metrics_df.to_csv(metrics_path, index=False)
+    print(f"Saved metrics to {metrics_path}")
 
     # =========================================================================
     # STEP 8: Model Summary
@@ -1032,8 +1018,10 @@ def main():
     print(f"\nSaved files:")
     for name, path in saved_files.items():
         print(f"  - {path}")
+    print(f"  - {output_dir / f'{prefix}_train_predictions.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_val_predictions.csv.gz'}")
     print(f"  - {output_dir / f'{prefix}_test_predictions.csv.gz'}")
+    print(f"  - {output_dir / f'{prefix}_metrics.csv'}")
 
     print(f"\nNext steps:")
     print(f"  1. Load gene programs: pd.read_csv('{prefix}_gene_programs.csv.gz')")

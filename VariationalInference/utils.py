@@ -264,7 +264,9 @@ def save_results(
     feature_type: str = 'gene',
     optimal_threshold: Union[float, Dict[str, float]] = 0.5,
     program_names: Optional[List[str]] = None,
-    mode: str = 'unmasked'
+    mode: str = 'unmasked',
+    label_columns: Optional[List[str]] = None,
+    aux_columns: Optional[List[str]] = None,
 ) -> Dict[str, Path]:
     """
     Save VI model results to files.
@@ -290,13 +292,19 @@ def save_results(
         essential parameters to reduce memory during save.
     feature_type : str, default='gene'
         Type of features ('gene' or 'pathway').
-    optimal_threshold : float, default=0.5
+    optimal_threshold : float or dict, default=0.5
         Optimal classification threshold tuned on validation set.
     program_names : list of str, optional
         Custom names for programs/factors (e.g., pathway names). If None,
         defaults to GP1, GP2, etc.
     mode : str, default='unmasked'
         Model mode ('unmasked', 'masked', or 'pathway_init').
+    label_columns : list of str, optional
+        Names of label columns (e.g., ['CoVID-19 severity', 'Outcome']).
+        Used for naming v_weight columns and gamma rows in output files.
+    aux_columns : list of str, optional
+        Names of auxiliary feature columns. Used for naming gamma weight
+        columns in output files.
 
     Returns
     -------
@@ -377,7 +385,11 @@ def save_results(
     if hasattr(model, 'mu_v'):
         n_outcomes = model.mu_v.shape[0]
         for k in range(n_outcomes):
-            beta_df.insert(0, f'v_weight_class{k}', model.mu_v[k])
+            if label_columns is not None and k < len(label_columns):
+                col_name = f'v_weight_{label_columns[k]}'
+            else:
+                col_name = f'v_weight_class{k}'
+            beta_df.insert(0, col_name, model.mu_v[k])
 
     beta_path = output_dir / f'{prefix}_{feature_type}_programs{ext}'
     beta_df.to_csv(beta_path, compression=compression)
@@ -395,6 +407,46 @@ def save_results(
         theta_train_df.to_csv(theta_path, compression=compression)
         saved_files['theta_train'] = theta_path
         print(f"Saved training theta to {theta_path}")
+
+    # Save gamma (auxiliary feature weights) if available
+    if hasattr(model, 'mu_gamma') and model.mu_gamma.size > 0:
+        # mu_gamma shape: (kappa, p_aux)
+        if aux_columns is not None and len(aux_columns) == model.mu_gamma.shape[1]:
+            gamma_col_names = aux_columns
+        else:
+            gamma_col_names = [f'aux_{j}' for j in range(model.mu_gamma.shape[1])]
+
+        if label_columns is not None and len(label_columns) == model.mu_gamma.shape[0]:
+            gamma_row_names = label_columns
+        else:
+            gamma_row_names = [f'outcome_{k}' for k in range(model.mu_gamma.shape[0])]
+
+        gamma_df = pd.DataFrame(
+            np.array(model.mu_gamma),
+            index=gamma_row_names,
+            columns=gamma_col_names
+        )
+        gamma_df.index.name = 'label'
+        gamma_path = output_dir / f'{prefix}_gamma_weights{ext}'
+        gamma_df.to_csv(gamma_path, compression=compression)
+        saved_files['gamma_weights'] = gamma_path
+        print(f"Saved gamma weights to {gamma_path}")
+
+        # Also save gamma variance (diagonal of Sigma_gamma) for reference
+        if hasattr(model, 'Sigma_gamma') and model.Sigma_gamma.size > 0:
+            Sigma_gamma = np.array(model.Sigma_gamma)
+            # Extract diagonal variances: (kappa, p_aux)
+            gamma_var = np.stack([np.diag(Sigma_gamma[k]) for k in range(Sigma_gamma.shape[0])])
+            gamma_var_df = pd.DataFrame(
+                gamma_var,
+                index=gamma_row_names,
+                columns=gamma_col_names
+            )
+            gamma_var_df.index.name = 'label'
+            gamma_var_path = output_dir / f'{prefix}_gamma_variance{ext}'
+            gamma_var_df.to_csv(gamma_var_path, compression=compression)
+            saved_files['gamma_variance'] = gamma_var_path
+            print(f"Saved gamma variance to {gamma_var_path}")
 
     # Save summary
     summary = {
@@ -422,6 +474,8 @@ def save_results(
             'n_iterations': model.elbo_history_[-1][0] if hasattr(model, 'elbo_history_') and model.elbo_history_ else None,
             'final_holl': model.holl_history_[-1][1] if hasattr(model, 'holl_history_') and model.holl_history_ else None,
         },
+        'label_columns': label_columns,
+        'aux_columns': aux_columns,
         'classification': {
             'optimal_threshold': optimal_threshold,
         }

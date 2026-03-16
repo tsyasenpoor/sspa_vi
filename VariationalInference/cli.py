@@ -466,13 +466,16 @@ def cmd_train(args: argparse.Namespace) -> int:
     print("-" * 40)
 
     output_dir = Path(args.output_dir)
+    label_cols = args.label_column if isinstance(args.label_column, list) else [args.label_column]
     saved_files = save_results(
         model=model,
         output_dir=output_dir,
         gene_list=data['gene_list'],
         splits=data['splits'],
         prefix=args.prefix,
-        compress=not args.no_compress
+        compress=not args.no_compress,
+        label_columns=label_cols,
+        aux_columns=getattr(args, 'aux_columns', None),
     )
 
     # Print model summary

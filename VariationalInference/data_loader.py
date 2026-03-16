@@ -955,6 +955,7 @@ class DataLoader:
             return np.zeros((len(self.cell_ids), 0))
 
         aux_data = []
+        aux_col_names = []
         for col in aux_columns:
             if col not in obs.columns:
                 raise ValueError(f"Auxiliary column '{col}' not found. Available: {list(obs.columns)}")
@@ -969,14 +970,18 @@ class DataLoader:
                     # Binary: single column (0/1)
                     mapping = {unique_vals[0]: 0, unique_vals[1]: 1}
                     aux_data.append(values.map(mapping).values.reshape(-1, 1))
+                    aux_col_names.append(col)
                 else:
                     # Multi-class: one-hot encode
                     dummies = pd.get_dummies(values, prefix=col, drop_first=True)
                     aux_data.append(dummies.values)
+                    aux_col_names.extend(dummies.columns.tolist())
             else:
                 # Numeric: use directly
                 aux_data.append(values.values.reshape(-1, 1))
+                aux_col_names.append(col)
 
+        self._aux_column_names = aux_col_names
         return np.hstack(aux_data).astype(float)
 
     def split_data(
@@ -1376,7 +1381,8 @@ class DataLoader:
             'n_aux': X_aux_train.shape[1],
             'feature_type': self.feature_type,
             'is_singscore': self.is_singscore,
-            'is_emtab': self.is_emtab
+            'is_emtab': self.is_emtab,
+            'aux_column_names': getattr(self, '_aux_column_names', None),
         }
 
 
