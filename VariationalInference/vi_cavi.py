@@ -90,6 +90,39 @@ def _auto_chunk_size(nnz, K, target_gb=None):
     return max(floor, min(max_by_mem, nnz))
 
 
+def _row_chunk_size(n, K, n_intermediates=2, target_gb=None):
+    """Return number of rows to process at a time for (n, K) operations.
+
+    Limits the peak memory of row-wise temporaries to *target_gb*.
+
+    Parameters
+    ----------
+    n : int
+        Total number of rows (cells).
+    K : int
+        Number of factors.
+    n_intermediates : int
+        Number of simultaneous (chunk, K) temporaries at peak.
+    target_gb : float or None
+        Memory budget in GiB.  ``None`` auto-selects based on backend.
+    """
+    if target_gb is None:
+        if HAS_GPU:
+            try:
+                import jax
+                dev = [d for d in jax.devices() if d.platform == "gpu"][0]
+                mem_bytes = dev.memory_stats()["bytes_limit"]
+                # Use ~5% of VRAM for row-chunked temporaries
+                target_gb = mem_bytes / (1024 ** 3) * 0.05
+            except Exception:
+                target_gb = 1.0
+        else:
+            target_gb = 2.0
+    bytes_per_row = n_intermediates * K * 8
+    max_rows = max(1024, int(target_gb * (1024 ** 3) / bytes_per_row))
+    return min(max_rows, n)
+
+
 def _is_oom_error(exc: Exception) -> bool:
     """Best-effort detection of JAX/XLA OOM errors."""
     msg = str(exc).lower()
@@ -615,45 +648,65 @@ class CAVI:
             b^2 - b_base*b - c_quad*a_theta = 0
             b = (b_base + sqrt(b_base^2 + 4*c_quad*a_theta)) / 2
         which is always positive (given c_quad > 0, guaranteed by the zeta cap).
+
+        Row-chunked when regression is active to avoid multiple full (n, K)
+        intermediates (R_linear, R_quad, b_base, disc) living simultaneously.
         """
         # a^theta_{ik} = a + Sum_j x_{ij} phi_{ijk}
         self.a_theta = self.a + z_sum_theta
 
         # b_base = E[xi_i] + Sum_j E[beta_{jk}] + regression_weight * R_linear
         beta_sum = self.E_beta.sum(axis=0)  # (K,)
-        b_poisson = self.E_xi[:, None] + beta_sum[None, :]
 
         if self.regression_weight > 0:
-            R_linear, R_quad_coeff = self._regression_rate_parts(y, X_aux)
-            # Fuse: b_base, discriminant, b_theta
-            b_base = b_poisson + self.regression_weight * R_linear
-            c_quad = self.regression_weight * R_quad_coeff
-            disc = xp.sqrt(xp.square(b_base) + 4.0 * c_quad * self.a_theta)
-            self.b_theta = (b_base + disc) / 2.0
+            # Pre-compute tiny (kappa, K) quantities for _regression_rate_parts
+            y_exp = y if y.ndim > 1 else y[:, None]        # (n, kappa)
+            lam = lambda_jj(self.zeta)                       # (n, kappa)
+            W = self._sample_weights                         # (n, kappa)
+            E_theta_full = self.E_theta                      # (n, K) cached
+            E_v = self.mu_v                                  # (kappa, K)
+            E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
+            E_v_sq_col = xp.square(E_v)                      # (kappa, K)
+            rw = self.regression_weight
 
-            # Floor b_theta at a fraction of b_poisson.
-            # In masked mode, b_poisson can be very small (few active genes per
-            # factor), so the regression correction can collapse b_theta → 0,
-            # causing theta to explode.  Flooring at 10% of b_poisson keeps the
-            # Poisson factorization structure intact.  The floor is harmless in
-            # unmasked mode where b_poisson is already large.
-            b_theta_floor = 0.1 * b_poisson
-            self.b_theta = xp.maximum(self.b_theta, b_theta_floor)
+            chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=4)
+            b_theta_chunks = []
+            for i0 in range(0, self.n, chunk_n):
+                i1 = min(i0 + chunk_n, self.n)
+                # --- inline _regression_rate_parts for this chunk ---
+                E_theta_c = E_theta_full[i0:i1]
+                W_c = W[i0:i1]
+                W_lam_c = W_c * lam[i0:i1]
+                theta_v_c = E_theta_c @ E_v.T                             # (chunk, kappa)
+                if self.p_aux > 0:
+                    theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
+                R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
+                R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
+                R_lin_c = R_lin_c - 2.0 * E_theta_c * (W_lam_c @ E_v_sq_col)
+                R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
+
+                # --- solve quadratic for b_theta ---
+                b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
+                b_base_c = b_poisson_c + rw * R_lin_c
+                c_quad_c = rw * R_quad_c
+                disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1])
+                b_theta_c = (b_base_c + disc_c) / 2.0
+
+                # Floor at 10% of b_poisson
+                b_theta_c = xp.maximum(b_theta_c, 0.1 * b_poisson_c)
+                # Floor at bp
+                b_theta_c = xp.maximum(b_theta_c, self.bp)
+                b_theta_chunks.append(b_theta_c)
+
+            self.b_theta = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
             self._theta_inner_iters = 1
-
-            # Floor b_theta at bp to prevent theta explosion when beta is
-            # sparse (masked mode with few genes per factor).  Without this,
-            # b_theta → 0 as beta_sum collapses, creating a positive feedback
-            # loop: theta grows → b_beta grows → E[beta] shrinks → beta_sum
-            # shrinks → b_theta shrinks further.
-            self.b_theta = xp.maximum(self.b_theta, self.bp)
 
             # Re-tighten zeta for updated theta
             self._invalidate_theta_cache()
             self._update_zeta(X_aux)
         else:
-            self.b_theta = b_poisson
+            self.b_theta = self.E_xi[:, None] + beta_sum[None, :]
             self._theta_inner_iters = 0
         self._invalidate_theta_cache()
 
@@ -669,18 +722,27 @@ class CAVI:
         quadratic braking on theta from vanishing.  The JJ lower bound is valid
         for ANY zeta, so capping gives a slightly looser but still valid bound.
         Each CAVI update still provably increases this capped-zeta ELBO.
+
+        Row-chunked to avoid materializing a full (n, K) Var_theta temporary.
         """
-        E_theta = self.E_theta
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K) -- tiny
 
-        Var_theta = self.a_theta / xp.square(self.b_theta)   # (n, K)
+        chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=2)
+        zeta_chunks = []
+        for i0 in range(0, self.n, chunk_n):
+            i1 = min(i0 + chunk_n, self.n)
+            E_theta_c = self.E_theta[i0:i1]              # (chunk, K) -- slice
+            Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
 
-        E_A = E_theta @ self.mu_v.T                          # (n, kappa) -- BLAS
-        if self.p_aux > 0:
-            E_A = E_A + X_aux @ self.mu_gamma.T
+            E_A_c = E_theta_c @ self.mu_v.T              # (chunk, kappa)
+            if self.p_aux > 0:
+                E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
 
-        E_A_sq = xp.square(E_A) + Var_theta @ E_v_sq.T
-        self.zeta = xp.minimum(xp.sqrt(xp.maximum(E_A_sq, 1e-8)), self.zeta_max)
+            E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
+            zeta_chunks.append(
+                xp.minimum(xp.sqrt(xp.maximum(E_A_sq_c, 1e-8)), self.zeta_max)
+            )
+        self.zeta = xp.concatenate(zeta_chunks, axis=0) if len(zeta_chunks) > 1 else zeta_chunks[0]
 
     def _regression_rate_parts(self, y, X_aux):
         """
@@ -738,25 +800,14 @@ class CAVI:
             where E_q[1/s_{kl}] is computed from the inverse Gaussian
             variational posterior on the scale mixture variable s_{kl}.
 
-        Memory-efficient: avoids (n, kappa, K) C_minus intermediate by
-        decomposing into (kappa, n) @ (n, K) matmuls -> (kappa, K).
+        Memory-efficient: row-chunked to avoid full (n, K) temporaries
+        (E_theta_sq, Var_theta) while accumulating (kappa, K) sufficient
+        statistics via BLAS matmuls.
         """
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = lambda_jj(self.zeta)
         W = self._sample_weights                    # (n, kappa)
-        E_theta = self.E_theta
         E_v = self.mu_v
-
-        # E_theta^2
-        E_theta_plain_sq = xp.square(E_theta)        # (n, K)
-
-        Var_theta = self.a_theta / xp.square(self.b_theta)
-        E_theta_sq = E_theta_plain_sq + Var_theta    # (n, K)
-
-        # Full predictor: (n, kappa) -- BLAS matmul
-        theta_v = E_theta @ E_v.T
-        if self.p_aux > 0:
-            theta_v = theta_v + X_aux @ self.mu_gamma.T
 
         if self.v_prior == 'normal':
             sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
@@ -766,18 +817,36 @@ class CAVI:
             omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
             prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
 
-        # Precision and mean via BLAS matmuls
-        W_lam = W * lam                              # (n, kappa)
-        precision = prior_precision + 2 * (W_lam.T @ E_theta_sq)  # (kappa, K)
+        # Accumulate (kappa, K) sufficient statistics in chunks to avoid
+        # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
+        chunk_n = _row_chunk_size(self.n, self.K, n_intermediates=3)
+        prec_sum = xp.zeros((self.kappa, self.K))   # W_lam.T @ E_theta_sq
+        term1_sum = xp.zeros((self.kappa, self.K))   # W_y.T @ E_theta
+        parta_sum = xp.zeros((self.kappa, self.K))   # (W_lam * theta_v).T @ E_theta
+        partb_sum = xp.zeros((self.kappa, self.K))   # W_lam.T @ E_theta_plain_sq
 
-        W_y = W * (y_exp - 0.5)                      # (n, kappa)
-        term1 = W_y.T @ E_theta                      # (kappa, K)
+        for i0 in range(0, self.n, chunk_n):
+            i1 = min(i0 + chunk_n, self.n)
+            E_theta_c = self.E_theta[i0:i1]                        # (chunk, K)
+            E_theta_psq_c = xp.square(E_theta_c)                   # (chunk, K)
+            Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
+            E_theta_sq_c = E_theta_psq_c + Var_theta_c             # (chunk, K)
 
-        # Decompose term2 using BLAS matmuls:
-        part_a = (W_lam * theta_v).T @ E_theta        # (kappa, K)
-        part_b = E_v * (W_lam.T @ E_theta_plain_sq)   # (kappa, K)
-        term2 = 2.0 * (part_a - part_b)
+            theta_v_c = E_theta_c @ E_v.T                          # (chunk, kappa)
+            if self.p_aux > 0:
+                theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
+            W_lam_c = W[i0:i1] * lam[i0:i1]                       # (chunk, kappa)
+            W_y_c = W[i0:i1] * (y_exp[i0:i1] - 0.5)              # (chunk, kappa)
+
+            prec_sum = prec_sum + W_lam_c.T @ E_theta_sq_c
+            term1_sum = term1_sum + W_y_c.T @ E_theta_c
+            parta_sum = parta_sum + (W_lam_c * theta_v_c).T @ E_theta_c
+            partb_sum = partb_sum + W_lam_c.T @ E_theta_psq_c
+
+        precision = prior_precision + 2 * prec_sum                  # (kappa, K)
+        term1 = term1_sum
+        term2 = 2.0 * (parta_sum - E_v * partb_sum)
         mean_prec = term1 - term2
 
         sigma_v_diag_new = 1.0 / precision
