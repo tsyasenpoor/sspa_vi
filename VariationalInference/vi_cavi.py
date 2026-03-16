@@ -636,7 +636,12 @@ class CAVI:
         # a^beta_{jk} = c + Sum_i x_{ij} phi_{ijk}
         self.a_beta = self.c + z_sum_beta
         # b^beta_{jk} = E[eta_j] + Sum_i E[theta_{ik}]
-        theta_sum = self.E_theta.sum(axis=0)  # (K,)
+        # Compute theta_sum in chunks to avoid materializing E_theta cache
+        # when z_sum_theta may still be alive (saves one (n, K) array).
+        theta_sum = xp.zeros(self.K)
+        for i0 in range(0, self.n, self._row_chunk):
+            i1 = min(i0 + self._row_chunk, self.n)
+            theta_sum = theta_sum + (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=0)
         self.b_beta = self.E_eta[:, None] + theta_sum[None, :]
         self._enforce_beta_mask()
         self._invalidate_beta_cache()
@@ -669,7 +674,8 @@ class CAVI:
             y_exp = y if y.ndim > 1 else y[:, None]        # (n, kappa)
             lam = lambda_jj(self.zeta)                       # (n, kappa)
             W = self._sample_weights                         # (n, kappa)
-            E_theta_full = self.E_theta                      # (n, K) cached
+            # NOTE: do NOT use self.E_theta here — it materializes the full
+            # (n, K) cache.  Row slices are computed on-the-fly below.
             E_v = self.mu_v                                  # (kappa, K)
             E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
             E_v_sq_col = xp.square(E_v)                      # (kappa, K)
@@ -682,7 +688,7 @@ class CAVI:
                 i1 = min(i0 + self._row_chunk, self.n)
                 try:
                     # --- inline _regression_rate_parts for this chunk ---
-                    E_theta_c = E_theta_full[i0:i1]
+                    E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
                     W_c = W[i0:i1]
                     W_lam_c = W_c * lam[i0:i1]
                     theta_v_c = E_theta_c @ E_v.T                             # (chunk, kappa)
@@ -728,7 +734,15 @@ class CAVI:
     def _update_xi(self):
         """xi rate (scHPF): b^xi_i = b' + Sum_k E[theta_{ik}]."""
         # a^xi is constant = ap + K*a (set in init)
-        self.b_xi = self.bp + self.E_theta.sum(axis=1)
+        # Compute E[theta].sum(axis=1) in chunks to avoid caching full (n,K).
+        theta_row_sum_chunks = []
+        for i0 in range(0, self.n, self._row_chunk):
+            i1 = min(i0 + self._row_chunk, self.n)
+            theta_row_sum_chunks.append(
+                (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=1)
+            )
+        theta_row_sum = xp.concatenate(theta_row_sum_chunks) if len(theta_row_sum_chunks) > 1 else theta_row_sum_chunks[0]
+        self.b_xi = self.bp + theta_row_sum
 
     def _update_zeta(self, X_aux):
         """JJ auxiliary: zeta_{ik} = min(sqrt(E[A^2_{ik}]), zeta_max).
@@ -748,8 +762,9 @@ class CAVI:
         while i0 < self.n:
             i1 = min(i0 + self._row_chunk, self.n)
             try:
-                E_theta_c = self.E_theta[i0:i1]
-                Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
+                b_theta_c = self.b_theta[i0:i1]
+                E_theta_c = self.a_theta[i0:i1] / b_theta_c
+                Var_theta_c = E_theta_c / b_theta_c      # a/(b^2) = (a/b)/b
                 E_A_c = E_theta_c @ self.mu_v.T
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
@@ -852,9 +867,10 @@ class CAVI:
         while i0 < self.n:
             i1 = min(i0 + self._row_chunk, self.n)
             try:
-                E_theta_c = self.E_theta[i0:i1]                        # (chunk, K)
+                b_theta_c = self.b_theta[i0:i1]
+                E_theta_c = self.a_theta[i0:i1] / b_theta_c            # (chunk, K)
                 E_theta_psq_c = xp.square(E_theta_c)                   # (chunk, K)
-                Var_theta_c = self.a_theta[i0:i1] / xp.square(self.b_theta[i0:i1])
+                Var_theta_c = E_theta_c / b_theta_c                    # a/b^2 = (a/b)/b
                 E_theta_sq_c = E_theta_psq_c + Var_theta_c             # (chunk, K)
 
                 theta_v_c = E_theta_c @ E_v.T                          # (chunk, kappa)
@@ -926,7 +942,16 @@ class CAVI:
         y_exp = y if y.ndim > 1 else y[:, None]
         lam = lambda_jj(self.zeta)
         W = self._sample_weights                    # (n, kappa)
-        E_theta = self.E_theta
+
+        # Pre-compute theta @ mu_v.T in chunks to avoid caching full E_theta
+        theta_v = xp.zeros((self.n, self.kappa))
+        for i0 in range(0, self.n, self._row_chunk):
+            i1 = min(i0 + self._row_chunk, self.n)
+            E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
+            if USE_JAX:
+                theta_v = theta_v.at[i0:i1].set(E_theta_c @ self.mu_v.T)
+            else:
+                theta_v[i0:i1] = E_theta_c @ self.mu_v.T
 
         # Same adaptive damping schedule as v (K-scaled)
         alpha_max = min(0.15, 7.5 / self.K)
@@ -941,7 +966,7 @@ class CAVI:
             prec = prec_prior + prec_lik
 
             # Residual: W*(y - 0.5) - 2*W*lambda(zeta) theta*v
-            theta_v_k = E_theta @ self.mu_v[k]
+            theta_v_k = theta_v[:, k]
             residual = W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k
             mean_prec = X_aux.T @ residual
 
@@ -1014,8 +1039,12 @@ class CAVI:
             poisson_ll += xp.dot(data_c, log_sum_c)
             del log_rates_c
 
-        E_theta = self.E_theta
-        poisson_ll -= xp.sum(E_theta.sum(axis=0) * E_beta.sum(axis=0))
+        # Compute E[theta].sum(axis=0) in chunks to avoid (n,K) cache
+        theta_col_sum = xp.zeros(self.K)
+        for i0 in range(0, self.n, self._row_chunk):
+            i1 = min(i0 + self._row_chunk, self.n)
+            theta_col_sum = theta_col_sum + (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=0)
+        poisson_ll -= xp.sum(theta_col_sum * E_beta.sum(axis=0))
         poisson_ll -= self._gammaln_data_sum  # cached at init
         elbo += poisson_ll
 
@@ -1036,11 +1065,11 @@ class CAVI:
             try:
                 a_theta_c = self.a_theta[i0:i1]
                 b_theta_c = self.b_theta[i0:i1]
-                E_theta_c = E_theta[i0:i1]
+                E_theta_c = a_theta_c / b_theta_c
                 E_log_theta_c = E_log_theta[i0:i1]
 
                 # --- JJ regression likelihood ---
-                Var_theta_c = a_theta_c / xp.square(b_theta_c)       # (chunk, K)
+                Var_theta_c = E_theta_c / b_theta_c                  # a/b^2 = (a/b)/b
                 E_A_c = E_theta_c @ self.mu_v.T                      # (chunk, kappa)
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
@@ -1341,6 +1370,9 @@ class CAVI:
             t_iter_start = time.time()
 
             # 1. Compute phi and z_sums (sparse)
+            # Free E_theta cache to make room for z_sum_theta (both are n×K).
+            # Phi uses a_theta/b_theta directly; cache is recomputed lazily.
+            self._invalidate_theta_cache()
             random_phi = (t == 0)  # scHPF: random Dirichlet on first iter
             z_sum_beta, z_sum_theta = self._compute_phi_sparse(random_init=random_phi)
             if diag:
@@ -1348,6 +1380,7 @@ class CAVI:
 
             # 2. Update beta, eta (gene side first -- scHPF order)
             self._update_beta(z_sum_beta)
+            del z_sum_beta
             self._update_eta()
             if diag:
                 print(f"  [diag t={t}] after beta,eta: "
@@ -1365,12 +1398,21 @@ class CAVI:
 
             # 4. Update theta, xi (cell side -- with full regression from start)
             self._update_theta(z_sum_theta, y, X_aux)
+            del z_sum_theta
             self._update_xi()
             if diag:
-                E_th = self.E_theta
+                # Compute E[theta] stats without caching full (n,K)
+                eth_min, eth_max, eth_sum = float('inf'), float('-inf'), 0.0
+                for _i0 in range(0, self.n, self._row_chunk):
+                    _i1 = min(_i0 + self._row_chunk, self.n)
+                    _etc = self.a_theta[_i0:_i1] / self.b_theta[_i0:_i1]
+                    eth_min = min(eth_min, float(_etc.min()))
+                    eth_max = max(eth_max, float(_etc.max()))
+                    eth_sum += float(_etc.sum())
+                eth_mean = eth_sum / (self.n * self.K)
                 inner_info = f" inner={self._theta_inner_iters}" if self._theta_inner_iters > 0 else ""
                 print(f"  [diag t={t}] after theta,xi: "
-                      f"E[theta]=[{float(E_th.min()):.4e},{float(E_th.max()):.4e}] mean={float(E_th.mean()):.4e} "
+                      f"E[theta]=[{eth_min:.4e},{eth_max:.4e}] mean={eth_mean:.4e} "
                       f"b_theta=[{float(self.b_theta.min()):.4e},{float(self.b_theta.max()):.4e}] "
                       f"a_theta=[{float(self.a_theta.min()):.4e},{float(self.a_theta.max()):.4e}]{inner_info}")
                 if self._theta_inner_iters > 0:
