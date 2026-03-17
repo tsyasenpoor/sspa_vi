@@ -169,7 +169,7 @@ def main():
         adata=adata,
         gene_set_dictionary=gene_set_dict,
         L=args.n_factors,
-        use_highly_variable=True,
+        use_highly_variable=False,   # all genes already pre-selected; avoids pandas Series → scipy sparse bug
         cell_type_key=None,
         use_cell_types=False,
         use_weights=False,  # must be False with empty gs_dict to avoid NaN from amatrix_weighted

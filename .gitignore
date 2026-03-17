@@ -387,3 +387,5 @@ jobs_sh/submit_pbmc_bayes_opt_laplace.sh
 jobs_sh/pbmc_best_hypers_all_modes.json
 jobs_sh/covid_spectra.sh
 jobs_sh/covid_schpf.sh
+jobs_sh/covid_baselines.sh
+VariationalInference/run_spectra.py
