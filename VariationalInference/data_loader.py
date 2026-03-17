@@ -911,7 +911,11 @@ class DataLoader:
         labels = obs.loc[self.cell_ids, label_column].values
         return labels.astype(int)
 
-    def get_auxiliary_features(self, aux_columns: List[str]) -> np.ndarray:
+    def get_auxiliary_features(
+        self,
+        aux_columns: List[str],
+        aux_missing_values: Optional[List[str]] = None,
+    ) -> np.ndarray:
         """
         Get auxiliary features from adata.obs or EMTAB aux_data.
 
@@ -921,12 +925,19 @@ class DataLoader:
         ----------
         aux_columns : list of str
             Column names in adata.obs or aux_data.csv.gz for auxiliary features.
+        aux_missing_values : list of str, optional
+            Values to treat as missing/uninformative in categorical aux columns.
+            These values are collapsed into the reference (dropped) category so
+            they don't generate their own dummy column.  Default: ['exclude',
+            'unknown'].
 
         Returns
         -------
         np.ndarray
             Auxiliary feature matrix (n_cells, n_aux).
         """
+        if aux_missing_values is None:
+            aux_missing_values = ['exclude', 'unknown']
         # Simulated data has no auxiliary features
         if self.is_simulated:
             if not aux_columns:
@@ -960,10 +971,27 @@ class DataLoader:
             if col not in obs.columns:
                 raise ValueError(f"Auxiliary column '{col}' not found. Available: {list(obs.columns)}")
 
-            values = obs.loc[self.cell_ids, col]
+            values = obs.loc[self.cell_ids, col].copy()
 
             # Encode categorical columns
             if values.dtype == 'object' or values.dtype.name == 'category':
+                # Collapse missing/uninformative values into the reference level.
+                # This prevents creating artifact dummies like cm_asthma_copd_exclude.
+                if aux_missing_values:
+                    mask = values.isin(aux_missing_values)
+                    n_collapsed = mask.sum()
+                    if n_collapsed > 0:
+                        # Find the most common non-missing value to use as reference
+                        valid_vals = values[~mask]
+                        if len(valid_vals) > 0:
+                            ref_val = valid_vals.value_counts().index[0]
+                        else:
+                            ref_val = values.value_counts().index[0]
+                        values = values.where(~mask, ref_val)
+                        self._log(f"  Aux '{col}': collapsed {n_collapsed} "
+                                  f"missing values ({aux_missing_values}) → "
+                                  f"reference '{ref_val}'")
+
                 # One-hot encode (or dummy encode with drop_first)
                 unique_vals = values.unique()
                 if len(unique_vals) == 2:

@@ -29,6 +29,8 @@ import pandas as pd
 from matplotlib.ticker import MaxNLocator
 from sklearn.metrics import roc_curve, auc
 
+from VariationalInference.gene_convertor import GeneIDConverter
+
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -112,6 +114,44 @@ def extract_beta(programs_df: pd.DataFrame) -> pd.DataFrame:
     """Extract beta (gene loadings) from the programs DataFrame."""
     non_v = [c for c in programs_df.columns if not c.startswith('v_weight')]
     return programs_df[non_v].copy()
+
+
+def convert_ensg_to_symbols(
+    programs_df: pd.DataFrame,
+    cache_file: Optional[str] = None,
+) -> pd.DataFrame:
+    """Replace ENSG column names with gene symbols using mygene.
+
+    Only renames columns that look like Ensembl IDs (ENSG...).
+    Falls back to the original ID if no symbol is found.
+    """
+    beta_cols = [c for c in programs_df.columns if not c.startswith('v_weight')]
+    # Check if columns are Ensembl IDs
+    ensg_cols = [c for c in beta_cols if c.startswith('ENSG')]
+    if not ensg_cols:
+        print("  Gene names already in symbol format; skipping conversion.")
+        return programs_df
+
+    print(f"  Converting {len(ensg_cols)} Ensembl IDs to gene symbols ...")
+    if cache_file is None:
+        # Default to a cache file in the user's home or current directory
+        cache_file = str(Path.home() / '.cache' / 'sspa_vi' / 'gene_id_cache.json')
+        Path(cache_file).parent.mkdir(parents=True, exist_ok=True)
+    converter = GeneIDConverter(cache_file=cache_file)
+    mapping, _ = converter.ensembl_to_symbols(ensg_cols)
+
+    rename = {}
+    n_found = 0
+    for ensg in ensg_cols:
+        sym = mapping.get(ensg)
+        if sym and sym != ensg:
+            rename[ensg] = sym
+            n_found += 1
+        # else keep original ENSG id
+
+    print(f"  Mapped {n_found}/{len(ensg_cols)} IDs to symbols "
+          f"({len(ensg_cols) - n_found} kept as ENSG).")
+    return programs_df.rename(columns=rename)
 
 
 # ── 1. Gene program loading bar charts ───────────────────────────────────────
@@ -457,8 +497,18 @@ def analyze(
     n_top_programs: int = 10,
     n_top_genes: int = 25,
     output_dir: Optional[str] = None,
+    gene_symbols: bool = True,
+    gene_cache_file: Optional[str] = None,
 ):
-    """Run the full analysis pipeline on saved VI results."""
+    """Run the full analysis pipeline on saved VI results.
+
+    Parameters
+    ----------
+    gene_symbols : bool, default True
+        Convert Ensembl IDs to gene symbols (via mygene) for plots.
+    gene_cache_file : str, optional
+        Path to a JSON cache for gene ID conversions.
+    """
     results_dir = Path(results_dir)
     if output_dir is None:
         output_path = results_dir / 'figures'
@@ -475,6 +525,11 @@ def analyze(
     # 1. Gene program loading plots
     if 'programs' in data:
         programs = data['programs']
+
+        # Convert ENSG → gene symbols for readability
+        if gene_symbols:
+            programs = convert_ensg_to_symbols(programs, cache_file=gene_cache_file)
+
         v_df = extract_v_weights(programs)
 
         if not label_columns:
@@ -535,6 +590,10 @@ def main():
                         help='Number of top genes to show per program (default: 25)')
     parser.add_argument('--output-dir', default=None,
                         help='Output directory for figures (default: <results-dir>/figures)')
+    parser.add_argument('--no-gene-symbols', action='store_true',
+                        help='Skip ENSG→symbol conversion (keep Ensembl IDs in plots)')
+    parser.add_argument('--gene-cache', default=None,
+                        help='Path to gene ID conversion cache JSON file')
     args = parser.parse_args()
 
     analyze(
@@ -543,6 +602,8 @@ def main():
         n_top_programs=args.n_top_programs,
         n_top_genes=args.n_top_genes,
         output_dir=args.output_dir,
+        gene_symbols=not args.no_gene_symbols,
+        gene_cache_file=args.gene_cache,
     )
 
 
