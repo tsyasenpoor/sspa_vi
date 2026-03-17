@@ -23,13 +23,22 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Allow direct script execution without requiring external PYTHONPATH.
+script_dir = Path(__file__).resolve().parent
+parent_dir = script_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.ticker import MaxNLocator
 from sklearn.metrics import roc_curve, auc
 
-from VariationalInference.gene_convertor import GeneIDConverter
+try:
+    from VariationalInference.gene_convertor import GeneIDConverter
+except ModuleNotFoundError:
+    from gene_convertor import GeneIDConverter
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

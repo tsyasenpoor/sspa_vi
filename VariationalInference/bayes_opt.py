@@ -342,7 +342,8 @@ class TrialObjective:
             if self.pathway_names is not None:
                 model_kwargs['pathway_names'] = self.pathway_names
             if self.n_pathway_factors is not None:
-                model_kwargs['n_pathway_factors'] = self.n_pathway_factors
+                n_factors_trial = int(model_kwargs.get('n_factors', params.get('n_factors', 50)))
+                model_kwargs['n_pathway_factors'] = min(int(self.n_pathway_factors), n_factors_trial)
 
             model = ModelClass(**model_kwargs)
 
@@ -507,6 +508,7 @@ class HyperparameterOptimizer:
         study_name: Optional[str] = None,
         v_prior: str = 'normal',
         max_n_factors: Optional[int] = None,
+        convert_to_ensembl: bool = True,
     ):
         self.data_path = data_path
         # Normalise label_column to list for consistent handling
@@ -533,6 +535,7 @@ class HyperparameterOptimizer:
         self.output_dir = Path(output_dir)
         self.v_prior = v_prior.lower()
         self.max_n_factors = max_n_factors
+        self.convert_to_ensembl = convert_to_ensembl
         self.study_name = study_name or f'vi_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
 
         # Will be populated by load_data / load_pathways
@@ -626,6 +629,7 @@ class HyperparameterOptimizer:
         pathway_mat, pw_names, pw_genes = load_pathways(
             gmt_path=self.gmt_file,
             gene_filter=gene_list,
+            convert_to_ensembl=self.convert_to_ensembl,
         )
 
         # Map pathway matrix columns to data gene order
@@ -668,6 +672,16 @@ class HyperparameterOptimizer:
         # Always pass v_prior as a fixed param so the model knows which prior to use
         if 'v_prior' not in self.fixed_params:
             self.fixed_params['v_prior'] = self.v_prior
+
+        # For combined mode, auto-compute n_pathway_factors from pathway_mask
+        if self.mode == 'combined' and self.pathway_mask is not None and self.n_pathway_factors is None:
+            self.n_pathway_factors = int(self.pathway_mask.shape[0])
+            logger.info("Auto-computed n_pathway_factors for combined mode: %d", self.n_pathway_factors)
+
+        # For combined mode, optimize n_factors in [5, 100] with step 5
+        if self.mode == 'combined' and 'n_factors' in self.search_space:
+            self.search_space['n_factors'] = ('int', 5, 100, 5)
+            logger.info("Combined mode: using n_factors search range [5, 100] with step 5")
 
         # Filter search space if params_to_tune is set
         if self.params_to_tune:
@@ -850,7 +864,8 @@ class HyperparameterOptimizer:
         if self.pathway_names is not None:
             model_kwargs['pathway_names'] = self.pathway_names
         if self.n_pathway_factors is not None:
-            model_kwargs['n_pathway_factors'] = self.n_pathway_factors
+            n_factors_best = int(model_kwargs.get('n_factors', best_params.get('n_factors', 50)))
+            model_kwargs['n_pathway_factors'] = min(int(self.n_pathway_factors), n_factors_best)
 
         model = ModelClass(**model_kwargs)
 
@@ -1025,6 +1040,14 @@ def parse_args(argv=None):
         help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)"
     )
 
+    # Gene ID conversion
+    parser.add_argument(
+        '--convert-to-ensembl', type=lambda x: x.lower() in ('true', '1', 'yes'), 
+        default=True,
+        help='Convert gene symbols to Ensembl IDs when loading pathways (default: True; '
+             'set to False for synthetic data with gene symbols)'
+    )
+
     # Evaluation
     parser.add_argument('--evaluate-best', action='store_true',
                         help='Re-train best params and evaluate on test set')
@@ -1091,6 +1114,7 @@ def main(argv=None):
         output_dir=args.output_dir,
         v_prior=args.v_prior,
         max_n_factors=args.max_n_factors,
+        convert_to_ensembl=args.convert_to_ensembl,
     )
 
     study = optimizer.run()
