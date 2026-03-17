@@ -673,14 +673,14 @@ class CAVI:
             s_beta = 1.0 / s_theta  # Ensure product theta*beta unchanged
 
             # Rescale theta: E[theta_k] *= s_theta  (divide b by s_theta)
-            self.b_theta[:, k] /= s_theta
+            self.b_theta = self.b_theta.at[:, k].set(self.b_theta[:, k] / s_theta)
             # Rescale beta: E[beta_k] *= s_beta  (divide b by s_beta)
-            self.b_beta[:, k] /= s_beta
+            self.b_beta = self.b_beta.at[:, k].set(self.b_beta[:, k] / s_beta)
 
             # Compensate v to keep logit = theta @ v invariant:
             # new_theta = s_theta * old_theta, so new_v = old_v / s_theta
-            self.mu_v[:, k] /= s_theta
-            self.sigma_v_diag[:, k] /= (s_theta ** 2)
+            self.mu_v = self.mu_v.at[:, k].set(self.mu_v[:, k] / s_theta)
+            self.sigma_v_diag = self.sigma_v_diag.at[:, k].set(self.sigma_v_diag[:, k] / (s_theta ** 2))
 
         # Invalidate caches after modifying b_theta, b_beta
         self._invalidate_theta_cache()
