@@ -930,10 +930,33 @@ class CAVI:
             # Damp sigma_v_diag consistently with mu_v to keep q(v) coherent
             self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
         else:
-            # Laplace: no clip needed -- adaptive E[1/s] acts as automatic shrinkage
-            mu_v_new = mean_prec / precision
-            self.mu_v = mu_v_new
-            self.sigma_v_diag = sigma_v_diag_new
+            # Laplace: adaptive E[1/s] provides shrinkage, but still needs
+            # damping + clipping to prevent magnitude explosion in CAVI.
+            v_clip = min(5.0, 10.0 / np.sqrt(self.K))
+            mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
+
+            # Adaptive damping (same schedule as Gaussian branch)
+            alpha_max = min(0.15, 7.5 / self.K)
+            alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
+            mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+
+            # Period-2 oscillation detection and correction
+            if self._v_prev_mu is None:
+                self._v_prev_mu = xp.zeros_like(self.mu_v)
+                self._v_raw_prev = xp.zeros_like(self.mu_v)
+
+            sign_flip_now = (self.mu_v * mu_v_candidate) < 0
+            sign_flip_prev = (self._v_prev_mu * self.mu_v) < 0
+            oscillating = sign_flip_now & sign_flip_prev
+
+            avg_raw = 0.5 * (mu_v_new + self._v_raw_prev)
+            corrected = (1.0 - alpha) * self.mu_v + alpha * avg_raw
+            mu_v_candidate = xp.where(oscillating, corrected, mu_v_candidate)
+
+            self._v_prev_mu = xp.array(self.mu_v)
+            self._v_raw_prev = xp.array(mu_v_new)
+            self.mu_v = mu_v_candidate
+            self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
         """gamma posterior (Gaussian, JJ bound)."""
@@ -1641,7 +1664,12 @@ class CAVI:
         return a_theta, b_theta
 
     def predict_proba(self, X_new, X_aux_new=None, n_iter=20):
-        """Predict P(y=1 | X_new)."""
+        """Predict P(y=1 | X_new).
+
+        Uses the probit approximation to account for posterior variance in
+        both theta and v, improving probability calibration:
+            P(y=1) ≈ sigmoid(E[logit] / sqrt(1 + pi * Var[logit] / 3))
+        """
         if sp.issparse(X_new):
             X_coo = X_new.tocoo()
         else:
@@ -1660,7 +1688,22 @@ class CAVI:
         if self.p_aux > 0:
             logits = logits + X_aux_new @ self.mu_gamma.T
 
-        return to_numpy(_expit(logits)).squeeze()
+        # Probit approximation: shrink logits by posterior variance of the
+        # linear predictor A = theta @ v.  Var[A] ≈ Var[theta] @ E[v^2] +
+        # E[theta]^2 @ Var[v] (independent posteriors).
+        Var_theta = E_theta / b_theta                          # a/b^2 = (a/b)/b
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag            # (kappa, K)
+        var_logits = Var_theta @ E_v_sq.T + xp.square(E_theta) @ self.sigma_v_diag.T
+        if self.p_aux > 0:
+            # Add gamma variance contribution (diagonal of Sigma_gamma)
+            gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
+                                  for k in range(self.kappa)])  # (kappa, p_aux)
+            var_logits = var_logits + xp.square(X_aux_new) @ gamma_var.T
+
+        scale = xp.sqrt(1.0 + (np.pi / 3.0) * var_logits)
+        logits_calibrated = logits / scale
+
+        return to_numpy(_expit(logits_calibrated)).squeeze()
 
     def transform(self, X_new, y_new=None, X_aux_new=None, n_iter=20, **kwargs):
         """Infer theta for new data. Returns dict with E_theta, a_theta, b_theta."""
