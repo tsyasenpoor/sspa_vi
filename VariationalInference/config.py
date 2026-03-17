@@ -107,7 +107,7 @@ class VIConfig:
         Proportion of data for training.
     val_ratio : float, default=0.15
         Proportion of data for validation.
-    min_cells_expressing : float, default=0.02
+    min_cells_expressing : float, default=0.001
         Minimum fraction of cells expressing a gene (filter threshold).
 
     Output Parameters
@@ -165,7 +165,7 @@ class VIConfig:
     aux_columns: Optional[List[str]] = None
     train_ratio: float = 0.7
     val_ratio: float = 0.15
-    min_cells_expressing: float = 0.02
+    min_cells_expressing: float = 0.001
 
     # Output parameters
     output_dir: Optional[str] = None

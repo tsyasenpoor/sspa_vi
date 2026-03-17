@@ -596,6 +596,7 @@ class HyperparameterOptimizer:
             train_ratio=self.train_ratio,
             val_ratio=self.val_ratio,
             stratify_by=stratify_col,
+            min_cells_expressing=0.001,
             random_state=self.random_state,
             train_subsample_ratio=self.subsample_ratio,
         )

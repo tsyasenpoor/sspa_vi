@@ -97,7 +97,7 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         '--min-cells',
         type=float,
-        default=0.02,
+        default=0.001,
         help='Minimum fraction of cells expressing each gene'
     )
     train_parser.add_argument(

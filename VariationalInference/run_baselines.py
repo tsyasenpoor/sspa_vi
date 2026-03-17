@@ -118,7 +118,7 @@ def main():
         train_ratio=0.7,
         val_ratio=0.15,
         stratify_by=args.label_column,
-        min_cells_expressing=0.02,
+        min_cells_expressing=0.001,
         layer='raw',
         convert_to_ensembl=True,
         filter_protein_coding=args.gene_annotation is not None,

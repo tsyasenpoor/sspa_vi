@@ -37,7 +37,7 @@ Usage:
     data = loader.load_and_preprocess(
         label_column='t2dm',  # or 'IBD' for EMTAB
         aux_columns=['Sex'],  # or ['sex_female'] for EMTAB
-        min_cells_expressing=0.02
+        min_cells_expressing=0.001
     )
 
     # Access splits
@@ -589,13 +589,13 @@ class DataLoader:
         self._log(f"Removed {n_before - n_after} all-zero {self.feature_type}s: {n_before} -> {n_after}")
         return self.raw_df
 
-    def filter_min_cells(self, min_fraction: float = 0.02) -> pd.DataFrame:
+    def filter_min_cells(self, min_fraction: float = 0.001) -> pd.DataFrame:
         """
         Keep only genes/pathways expressed in at least min_fraction of cells.
 
         Parameters
         ----------
-        min_fraction : float, default=0.02
+        min_fraction : float, default=0.001
             Minimum fraction of cells that must express the gene/pathway.
 
         Returns
@@ -693,7 +693,7 @@ class DataLoader:
         layer: str = 'raw',
         convert_to_ensembl: bool = True,
         filter_protein_coding: bool = True,
-        min_cells_expressing: float = 0.02,
+        min_cells_expressing: float = 0.001,
         normalize: bool = False,
         normalize_target_sum: float = 1e4,
         normalize_method: str = 'library_size',
@@ -715,7 +715,7 @@ class DataLoader:
             Whether to convert gene symbols to Ensembl IDs (ignored for pathways/simulated).
         filter_protein_coding : bool, default=True
             Whether to filter for protein-coding genes (ignored for pathways/simulated).
-        min_cells_expressing : float, default=0.02
+        min_cells_expressing : float, default=0.001
             Minimum fraction of cells expressing each gene/pathway.
         normalize : bool, default=False
             Whether to normalize counts (library size normalization + integer rounding).
@@ -1291,7 +1291,7 @@ class DataLoader:
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
         stratify_by: Optional[str] = None,
-        min_cells_expressing: float = 0.02,
+        min_cells_expressing: float = 0.001,
         layer: str = 'raw',
         convert_to_ensembl: bool = True,
         filter_protein_coding: bool = True,
@@ -1317,7 +1317,7 @@ class DataLoader:
             Proportion for validation set.
         stratify_by : str, optional
             Column for stratified splitting.
-        min_cells_expressing : float, default=0.02
+        min_cells_expressing : float, default=0.001
             Minimum fraction of cells expressing each gene.
         layer : str, default='raw'
             Which layer to use.
