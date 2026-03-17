@@ -267,6 +267,8 @@ def save_results(
     mode: str = 'unmasked',
     label_columns: Optional[List[str]] = None,
     aux_columns: Optional[List[str]] = None,
+    val_test_data: Optional[Dict[str, Any]] = None,
+    cell_metadata: Optional[Any] = None,
 ) -> Dict[str, Path]:
     """
     Save VI model results to files.
@@ -305,6 +307,12 @@ def save_results(
     aux_columns : list of str, optional
         Names of auxiliary feature columns. Used for naming gamma weight
         columns in output files.
+    val_test_data : dict, optional
+        Dictionary with validation/test data for inferring theta:
+        {'X_val': ..., 'X_aux_val': ..., 'X_test': ..., 'X_aux_test': ...}
+    cell_metadata : DataFrame, optional
+        DataFrame indexed by cell ID with metadata columns (e.g. majorType).
+        If provided, metadata columns are prepended to theta DataFrames.
 
     Returns
     -------
@@ -396,6 +404,16 @@ def save_results(
     saved_files[f'{feature_type}_programs'] = beta_path
     print(f"Saved {feature_type} programs to {beta_path}")
 
+    # --- Helper to add cell metadata columns to a theta DataFrame ---
+    def _add_cell_metadata(theta_df):
+        if cell_metadata is not None:
+            # Match on index (cell IDs)
+            common_ids = theta_df.index.intersection(cell_metadata.index)
+            if len(common_ids) > 0:
+                for col in cell_metadata.columns:
+                    theta_df.insert(0, col, cell_metadata.reindex(theta_df.index)[col])
+        return theta_df
+
     # Save training theta
     if hasattr(model, 'E_theta'):
         theta_train_df = pd.DataFrame(
@@ -403,10 +421,34 @@ def save_results(
             index=splits['train'],
             columns=prog_labels
         )
+        theta_train_df.index.name = 'cell_id'
+        _add_cell_metadata(theta_train_df)
         theta_path = output_dir / f'{prefix}_theta_train{ext}'
         theta_train_df.to_csv(theta_path, compression=compression)
         saved_files['theta_train'] = theta_path
         print(f"Saved training theta to {theta_path}")
+
+    # Save validation and test theta (inferred with frozen model parameters)
+    if val_test_data is not None:
+        for split_name in ('val', 'test'):
+            X_key = f'X_{split_name}'
+            X_aux_key = f'X_aux_{split_name}'
+            if X_key not in val_test_data or split_name not in splits:
+                continue
+            X_split = val_test_data[X_key]
+            X_aux_split = val_test_data.get(X_aux_key)
+            result = model.transform(X_split, X_aux_new=X_aux_split)
+            theta_split_df = pd.DataFrame(
+                result['E_theta'],
+                index=splits[split_name],
+                columns=prog_labels
+            )
+            theta_split_df.index.name = 'cell_id'
+            _add_cell_metadata(theta_split_df)
+            theta_split_path = output_dir / f'{prefix}_theta_{split_name}{ext}'
+            theta_split_df.to_csv(theta_split_path, compression=compression)
+            saved_files[f'theta_{split_name}'] = theta_split_path
+            print(f"Saved {split_name} theta to {theta_split_path}")
 
     # Save gamma (auxiliary feature weights) if available
     if hasattr(model, 'mu_gamma') and model.mu_gamma.size > 0:

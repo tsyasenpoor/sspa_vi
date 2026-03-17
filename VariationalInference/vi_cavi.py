@@ -628,6 +628,65 @@ class CAVI:
         return z_sum_beta, z_sum_theta
 
     # =================================================================
+    # Theta-Beta Scale Balancing
+    # =================================================================
+
+    def _rescale_factors(self):
+        """Rescale theta and beta per factor to maintain comparable scales.
+
+        In Poisson factorization X ≈ theta @ beta.T, the product theta*beta
+        is identifiable but the individual scales are not.  When beta is much
+        larger than theta (common with many genes), the regression coupling
+        logit = theta @ v requires v to compensate, causing v magnitude
+        explosion.
+
+        This method rescales each factor k so that mean(E[theta_k]) and
+        mean(E[beta_k]) are at their geometric mean, and compensates v
+        (and its variance) to keep logits invariant.
+
+        For a Gamma(a, b) variational factor, E = a/b.  Scaling E by s
+        while preserving the shape a is done by dividing b by s.
+        """
+        for k in range(self.K):
+            # Compute mean E[theta_k] in chunks to avoid full (n,K) materialization
+            theta_sum = 0.0
+            for i0 in range(0, self.n, self._row_chunk):
+                i1 = min(i0 + self._row_chunk, self.n)
+                theta_sum += float(
+                    (self.a_theta[i0:i1, k] / self.b_theta[i0:i1, k]).sum()
+                )
+            mean_theta_k = theta_sum / self.n
+
+            mean_beta_k = float(
+                (self.a_beta[:, k] / self.b_beta[:, k]).mean()
+            )
+
+            if mean_theta_k < 1e-30 or mean_beta_k < 1e-30:
+                continue
+
+            target = np.sqrt(mean_theta_k * mean_beta_k)
+            s_theta = target / mean_theta_k   # > 1 when theta is small
+            s_beta = target / mean_beta_k     # > 1 when beta is small
+
+            # Limit per-step rescaling to avoid destabilizing other updates
+            s_theta = np.clip(s_theta, 0.5, 2.0)
+            s_beta = 1.0 / s_theta  # Ensure product theta*beta unchanged
+
+            # Rescale theta: E[theta_k] *= s_theta  (divide b by s_theta)
+            self.b_theta[:, k] /= s_theta
+            # Rescale beta: E[beta_k] *= s_beta  (divide b by s_beta)
+            self.b_beta[:, k] /= s_beta
+
+            # Compensate v to keep logit = theta @ v invariant:
+            # new_theta = s_theta * old_theta, so new_v = old_v / s_theta
+            self.mu_v[:, k] /= s_theta
+            self.sigma_v_diag[:, k] /= (s_theta ** 2)
+
+        # Invalidate caches after modifying b_theta, b_beta
+        self._invalidate_theta_cache()
+        self._invalidate_beta_cache()
+
+    # =================================================================
     # CAVI Updates
     # =================================================================
 
@@ -930,10 +989,33 @@ class CAVI:
             # Damp sigma_v_diag consistently with mu_v to keep q(v) coherent
             self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
         else:
-            # Laplace: no clip needed -- adaptive E[1/s] acts as automatic shrinkage
-            mu_v_new = mean_prec / precision
-            self.mu_v = mu_v_new
-            self.sigma_v_diag = sigma_v_diag_new
+            # Laplace: adaptive E[1/s] provides shrinkage, but still needs
+            # damping + clipping to prevent magnitude explosion in CAVI.
+            v_clip = min(5.0, 10.0 / np.sqrt(self.K))
+            mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
+
+            # Adaptive damping (same schedule as Gaussian branch)
+            alpha_max = min(0.15, 7.5 / self.K)
+            alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
+            mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+
+            # Period-2 oscillation detection and correction
+            if self._v_prev_mu is None:
+                self._v_prev_mu = xp.zeros_like(self.mu_v)
+                self._v_raw_prev = xp.zeros_like(self.mu_v)
+
+            sign_flip_now = (self.mu_v * mu_v_candidate) < 0
+            sign_flip_prev = (self._v_prev_mu * self.mu_v) < 0
+            oscillating = sign_flip_now & sign_flip_prev
+
+            avg_raw = 0.5 * (mu_v_new + self._v_raw_prev)
+            corrected = (1.0 - alpha) * self.mu_v + alpha * avg_raw
+            mu_v_candidate = xp.where(oscillating, corrected, mu_v_candidate)
+
+            self._v_prev_mu = xp.array(self.mu_v)
+            self._v_raw_prev = xp.array(mu_v_new)
+            self.mu_v = mu_v_candidate
+            self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
         """gamma posterior (Gaussian, JJ bound)."""
@@ -1195,16 +1277,17 @@ class CAVI:
 
         n_val = X_val.shape[0]
 
-        # Infer theta for validation cells (freeze globals)
-        a_theta_v = to_device(np.random.uniform(0.5 * self.a, 1.5 * self.a,
-                                                 (n_val, self.K)))
-        b_theta_v = to_device(np.full((n_val, self.K), self.bp))
-        a_xi_v = to_device(np.full(n_val, self.ap + self.K * self.a))
-        b_xi_v = to_device(np.full(n_val, self.bp))
+        # Infer theta for validation cells (freeze globals) via shared method
+        if X_aux_val is None:
+            X_aux_v_dev = to_device(np.zeros((n_val, self.p_aux if self.p_aux > 0 else 0)))
+        else:
+            X_aux_v_dev = to_device(np.asarray(X_aux_val, dtype=np.float64))
+
+        a_theta_v, b_theta_v = self._infer_theta_sparse(
+            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev)
 
         E_log_beta = self._E_log_beta_cache
         E_beta = self.E_beta
-        beta_col_sums = E_beta.sum(axis=0)
 
         row = to_device(X_val_coo.row.astype(np.int32))
         col = to_device(X_val_coo.col.astype(np.int32))
@@ -1212,27 +1295,6 @@ class CAVI:
         data = to_device(data_np)
         nnz_val = len(data_np)
         chunk = _auto_chunk_size(nnz_val, self.K)
-
-        for _ in range(n_iter):
-            E_log_theta_v = digamma(a_theta_v) - xp.log(b_theta_v)
-            E_theta_v = a_theta_v / b_theta_v
-            E_xi_v = a_xi_v / b_xi_v
-
-            # phi sparse -- chunked
-            z_sum = xp.zeros((n_val, self.K))
-            for start in range(0, nnz_val, chunk):
-                end = min(start + chunk, nnz_val)
-                row_c = row[start:end]
-                col_c = col[start:end]
-                data_c = data[start:end]
-                Xphi = phi_chunk_core(E_log_theta_v[row_c], E_log_beta[col_c], data_c)
-                z_sum = scatter_add_to(z_sum, row_c, Xphi,
-                                       sorted_indices=False)
-                del Xphi
-
-            a_theta_v = self.a + z_sum
-            b_theta_v = E_xi_v[:, None] + beta_col_sums[None, :]
-            b_xi_v = self.bp + E_theta_v.sum(axis=1)
 
         # Poisson LL per sample -- chunked
         E_log_theta_v = digamma(a_theta_v) - xp.log(b_theta_v)
@@ -1259,14 +1321,9 @@ class CAVI:
             y_v = to_device(np.asarray(y_val, dtype=np.float64))
             if y_v.ndim == 1:
                 y_v = y_v[:, None]
-            if X_aux_val is None:
-                X_aux_v = to_device(np.zeros((n_val, self.p_aux if self.p_aux > 0 else 0)))
-            else:
-                X_aux_v = to_device(np.asarray(X_aux_val, dtype=np.float64))
-
             E_A = E_theta_v @ self.mu_v.T
             if self.p_aux > 0:
-                E_A = E_A + X_aux_v @ self.mu_gamma.T
+                E_A = E_A + X_aux_v_dev @ self.mu_gamma.T
 
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
             Var_theta_v = a_theta_v / (b_theta_v ** 2)
@@ -1386,6 +1443,12 @@ class CAVI:
                 print(f"  [diag t={t}] after beta,eta: "
                       f"E[beta]=[{float(self.E_beta.min()):.4e},{float(self.E_beta.max()):.4e}] "
                       f"E[eta]=[{float(self.E_eta.min()):.4e},{float(self.E_eta.max()):.4e}]")
+
+            # 2b. Rescale factors to prevent theta-beta scale degeneracy.
+            # When beta >> theta, v must compensate, causing v explosion.
+            # Rescaling every iteration keeps scales balanced.
+            self._rescale_factors()
+            self._refresh_log_caches()
 
             # 3. Update zeta (JJ bound tightening)
             self._update_zeta(X_aux)
@@ -1599,8 +1662,17 @@ class CAVI:
     # predict / transform (API compat)
     # =================================================================
 
-    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20):
-        """Infer theta for new data using chunked sparse phi. Returns a_theta, b_theta."""
+    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None):
+        """Infer theta for new data using chunked sparse phi.
+
+        Includes the label-independent quadratic regularization from the JJ
+        bound (R_quad = 2 * lambda(zeta) @ E[v^2]) to match the training
+        regime where theta is updated with the full regression correction.
+        Without this, test-time theta is purely Poisson, creating a train-test
+        distribution shift.
+
+        Returns a_theta, b_theta.
+        """
         a_theta = to_device(np.random.uniform(0.5 * self.a, 1.5 * self.a, (n_new, self.K)))
         b_theta = to_device(np.full((n_new, self.K), self.bp))
         a_xi = to_device(np.full(n_new, self.ap + self.K * self.a))
@@ -1616,6 +1688,12 @@ class CAVI:
         nnz = len(data_np)
         chunk = _auto_chunk_size(nnz, self.K)
         K = self.K
+
+        # Pre-compute label-independent regression quantities (tiny, (kappa, K))
+        E_v = self.mu_v                                  # (kappa, K)
+        E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
+        has_regression = self.regression_weight > 0
+        rw = self.regression_weight
 
         for _ in range(n_iter):
             E_log_theta = digamma(a_theta) - xp.log(b_theta)
@@ -1635,13 +1713,43 @@ class CAVI:
                 del Xphi
 
             a_theta = self.a + z_sum
-            b_theta = E_xi[:, None] + beta_col_sums[None, :]
+            b_poisson = E_xi[:, None] + beta_col_sums[None, :]
+
+            if has_regression:
+                # Compute zeta for new data to get lambda(zeta)
+                theta_v = E_theta @ E_v.T                    # (n_new, kappa)
+                if X_aux_new is not None and self.p_aux > 0:
+                    theta_v = theta_v + X_aux_new @ self.mu_gamma.T
+                Var_theta = E_theta / b_theta
+                E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
+                zeta_new = xp.minimum(
+                    xp.sqrt(xp.maximum(E_A_sq, 1e-8)), self.zeta_max
+                )
+                lam = lambda_jj(zeta_new)                    # (n_new, kappa)
+
+                # Quadratic regularization: R_quad_coeff = 2 * lam @ E_v_sq
+                R_quad = (2.0 * lam) @ E_v_sq                # (n_new, K)
+
+                # Solve quadratic: b^2 - b_poisson*b - rw*R_quad*a_theta = 0
+                c_quad = rw * R_quad
+                disc = xp.sqrt(xp.square(b_poisson) + 4.0 * c_quad * a_theta)
+                b_theta = (b_poisson + disc) / 2.0
+                b_theta = xp.maximum(b_theta, 0.1 * b_poisson)
+                b_theta = xp.maximum(b_theta, self.bp)
+            else:
+                b_theta = b_poisson
+
             b_xi = self.bp + E_theta.sum(axis=1)
 
         return a_theta, b_theta
 
     def predict_proba(self, X_new, X_aux_new=None, n_iter=20):
-        """Predict P(y=1 | X_new)."""
+        """Predict P(y=1 | X_new).
+
+        Uses the probit approximation to account for posterior variance in
+        both theta and v, improving probability calibration:
+            P(y=1) ≈ sigmoid(E[logit] / sqrt(1 + pi * Var[logit] / 3))
+        """
         if sp.issparse(X_new):
             X_coo = X_new.tocoo()
         else:
@@ -1653,14 +1761,30 @@ class CAVI:
         else:
             X_aux_new = to_device(np.asarray(X_aux_new, dtype=np.float64))
 
-        a_theta, b_theta = self._infer_theta_sparse(X_coo, n_new, n_iter)
+        a_theta, b_theta = self._infer_theta_sparse(
+            X_coo, n_new, n_iter, X_aux_new=X_aux_new)
 
         E_theta = a_theta / b_theta
         logits = E_theta @ self.mu_v.T
         if self.p_aux > 0:
             logits = logits + X_aux_new @ self.mu_gamma.T
 
-        return to_numpy(_expit(logits)).squeeze()
+        # Probit approximation: shrink logits by posterior variance of the
+        # linear predictor A = theta @ v.  Var[A] ≈ Var[theta] @ E[v^2] +
+        # E[theta]^2 @ Var[v] (independent posteriors).
+        Var_theta = E_theta / b_theta                          # a/b^2 = (a/b)/b
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag            # (kappa, K)
+        var_logits = Var_theta @ E_v_sq.T + xp.square(E_theta) @ self.sigma_v_diag.T
+        if self.p_aux > 0:
+            # Add gamma variance contribution (diagonal of Sigma_gamma)
+            gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
+                                  for k in range(self.kappa)])  # (kappa, p_aux)
+            var_logits = var_logits + xp.square(X_aux_new) @ gamma_var.T
+
+        scale = xp.sqrt(1.0 + (np.pi / 3.0) * var_logits)
+        logits_calibrated = logits / scale
+
+        return to_numpy(_expit(logits_calibrated)).squeeze()
 
     def transform(self, X_new, y_new=None, X_aux_new=None, n_iter=20, **kwargs):
         """Infer theta for new data. Returns dict with E_theta, a_theta, b_theta."""
@@ -1670,7 +1794,12 @@ class CAVI:
             X_coo = sp.coo_matrix(X_new)
 
         n_new = X_new.shape[0]
-        a_theta, b_theta = self._infer_theta_sparse(X_coo, n_new, n_iter)
+        if X_aux_new is not None:
+            X_aux_dev = to_device(np.asarray(X_aux_new, dtype=np.float64))
+        else:
+            X_aux_dev = None
+        a_theta, b_theta = self._infer_theta_sparse(
+            X_coo, n_new, n_iter, X_aux_new=X_aux_dev)
 
         return {
             'E_theta': to_numpy(a_theta / b_theta),

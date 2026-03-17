@@ -476,6 +476,11 @@ def cmd_train(args: argparse.Namespace) -> int:
         compress=not args.no_compress,
         label_columns=label_cols,
         aux_columns=getattr(args, 'aux_columns', None),
+        val_test_data={
+            'X_val': X_val, 'X_aux_val': X_aux_val,
+            'X_test': X_test, 'X_aux_test': X_aux_test,
+        },
+        cell_metadata=data.get('cell_metadata'),
     )
 
     # Print model summary

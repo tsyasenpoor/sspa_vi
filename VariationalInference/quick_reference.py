@@ -905,6 +905,11 @@ def main():
         mode=args.mode,
         label_columns=label_columns,
         aux_columns=aux_column_names,
+        val_test_data={
+            'X_val': X_val, 'X_aux_val': X_aux_val,
+            'X_test': X_test, 'X_aux_test': X_aux_test,
+        },
+        cell_metadata=data.get('cell_metadata'),
     )
 
     # Predictions (per-outcome columns)

@@ -1398,6 +1398,14 @@ class DataLoader:
             splits['test'], label_column, aux_columns, return_sparse=return_sparse
         )
 
+        # Collect cell metadata (e.g. majorType) for all splits
+        obs = self._get_obs()
+        all_cell_ids = splits['train'] + splits['val'] + splits['test']
+        if obs is not None:
+            cell_metadata = obs.loc[obs.index.isin(all_cell_ids)].copy()
+        else:
+            cell_metadata = pd.DataFrame(index=all_cell_ids)
+
         return {
             'train': (X_train, X_aux_train, y_train),
             'val': (X_val, X_aux_val, y_val),
@@ -1411,6 +1419,7 @@ class DataLoader:
             'is_singscore': self.is_singscore,
             'is_emtab': self.is_emtab,
             'aux_column_names': getattr(self, '_aux_column_names', None),
+            'cell_metadata': cell_metadata,
         }
 
 
