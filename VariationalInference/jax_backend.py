@@ -24,7 +24,9 @@ _DEVICE_STR = "CPU (NumPy)"
 
 try:
     import jax
-    jax.config.update("jax_enable_x64", True)
+    # Use float32 globally to halve GPU memory for large (n, K) arrays.
+    # float32 provides sufficient precision for variational inference.
+    jax.config.update("jax_enable_x64", False)
     import jax.numpy as jnp
     from jax import jit
     import jax.scipy.special as _jsp

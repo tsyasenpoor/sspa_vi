@@ -97,7 +97,8 @@ class DataLoader:
         cache_dir: Optional[Union[str, Path]] = None,
         species: str = 'human',
         use_cache: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
+        adata: Optional[Any] = None
     ):
         self.data_path = Path(data_path)
         self.gene_annotation_path = Path(gene_annotation_path) if gene_annotation_path else None
@@ -116,7 +117,10 @@ class DataLoader:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Will be populated after loading
-        self.adata = None
+        self.adata = adata  # Accept pre-loaded AnnData (e.g. from on-the-fly subsampling)
+        if adata is not None:
+            # Disable caching when adata is pre-loaded (data differs from file on disk)
+            self.use_cache = False
         self.raw_df = None
         self.gene_list = None
         self.cell_ids = None
@@ -207,6 +211,9 @@ class DataLoader:
         """Return obs DataFrame, preferring cached copy over reloading h5ad."""
         if hasattr(self, '_cached_obs') and self._cached_obs is not None:
             return self._cached_obs
+        # Simulated CSV: metadata stored in sim_metadata, not adata
+        if hasattr(self, 'sim_metadata') and self.sim_metadata is not None:
+            return self.sim_metadata
         if self.adata is not None:
             return self.adata.obs
         # Load only obs metadata (not expression data) to avoid full h5ad reload
@@ -279,6 +286,10 @@ class DataLoader:
         AnnData
             Loaded AnnData object.
         """
+        if self.adata is not None:
+            self._log(f"Using pre-loaded AnnData ({self.adata.n_obs} cells x {self.adata.n_vars} {self.feature_type}s)")
+            return self.adata
+
         try:
             import scanpy as sc
         except ImportError:

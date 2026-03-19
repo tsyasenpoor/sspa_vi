@@ -142,6 +142,7 @@ class VIConfig:
     spike_value_beta: float = 1e-6
     regression_weight: float = 1.0
     use_class_weights: bool = True
+    use_intercept: bool = True
 
     # Training parameters
     max_iter: int = 200

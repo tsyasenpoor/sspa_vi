@@ -271,6 +271,12 @@ class TrialObjective:
             params[name] = _suggest_param(trial, name, spec)
         # Apply fixed params
         params.update(self.fixed_params)
+
+        # Combined mode: derive n_factors from pathway factors + free factors
+        if 'n_free_factors' in params and self.n_pathway_factors is not None:
+            n_free = int(params.pop('n_free_factors'))
+            params['n_factors'] = int(self.n_pathway_factors) + n_free
+
         return params
 
     def _build_config(self, params: Dict[str, Any]):
@@ -430,6 +436,9 @@ class TrialObjective:
                 ) if n_labels > 1 else "")
                 + f", Acc={all_metrics.get('accuracy', all_metrics.get(f'{label_names[0]}_accuracy', 0)):.4f}"
                 + f", n_factors={params.get('n_factors', '?')}"
+                + (f" ({self.n_pathway_factors}pw+{params['n_factors'] - self.n_pathway_factors}free)"
+                   if self.n_pathway_factors is not None and 'n_factors' in params
+                   else "")
             )
             return mean_auc
 
@@ -674,15 +683,32 @@ class HyperparameterOptimizer:
         if 'v_prior' not in self.fixed_params:
             self.fixed_params['v_prior'] = self.v_prior
 
+        # For masked / pathway_init: n_factors IS the number of pathways — not searchable.
+        if self.mode in ('masked', 'pathway_init') and self.pathway_mask is not None:
+            n_pathways = int(self.pathway_mask.shape[0])
+            self.fixed_params['n_factors'] = n_pathways
+            self.search_space.pop('n_factors', None)
+            logger.info(
+                "%s mode: fixing n_factors = %d (number of pathways)",
+                self.mode, n_pathways,
+            )
+
         # For combined mode, auto-compute n_pathway_factors from pathway_mask
         if self.mode == 'combined' and self.pathway_mask is not None and self.n_pathway_factors is None:
             self.n_pathway_factors = int(self.pathway_mask.shape[0])
             logger.info("Auto-computed n_pathway_factors for combined mode: %d", self.n_pathway_factors)
 
-        # For combined mode, optimize n_factors in [5, 100] with step 5
+        # For combined mode: pathway factors are fixed; search for de novo GPs (DRGPs).
+        # Replace n_factors with n_free_factors in the search space.
+        # Total n_factors = n_pathway_factors + n_free_factors (computed per trial).
         if self.mode == 'combined' and 'n_factors' in self.search_space:
-            self.search_space['n_factors'] = ('int', 5, 100, 5)
-            logger.info("Combined mode: using n_factors search range [5, 100] with step 5")
+            self.search_space.pop('n_factors')
+            self.search_space['n_free_factors'] = ('int', 5, 100, 5)
+            logger.info(
+                "Combined mode: searching n_free_factors in [5, 100] "
+                "(total K = %d pathways + n_free_factors)",
+                self.n_pathway_factors,
+            )
 
         # Filter search space if params_to_tune is set
         if self.params_to_tune:
@@ -803,6 +829,7 @@ class HyperparameterOptimizer:
             'label_column': self.label_column,
             'aux_columns': self.aux_columns,
             'mode': self.mode,
+            'n_pathway_factors': self.n_pathway_factors,
             'dataset_preset': self.dataset_preset,
             'timestamp': timestamp,
         }
@@ -824,6 +851,10 @@ class HyperparameterOptimizer:
         # Save best config as ready-to-use JSON
         best_config_dict = dict(best.params)
         best_config_dict.update(self.fixed_params)
+        # Combined mode: derive n_factors from n_free_factors + n_pathway_factors
+        if 'n_free_factors' in best_config_dict and self.n_pathway_factors is not None:
+            n_free = int(best_config_dict.pop('n_free_factors'))
+            best_config_dict['n_factors'] = int(self.n_pathway_factors) + n_free
         if 'n_factors' not in best_config_dict:
             best_config_dict['n_factors'] = 50
         best_config_dict.setdefault('max_iter', self.max_iter)
@@ -854,6 +885,12 @@ class HyperparameterOptimizer:
         """
         best_params = dict(study.best_params)
         best_params.update(self.fixed_params)
+
+        # Combined mode: derive n_factors from n_free_factors + n_pathway_factors
+        if 'n_free_factors' in best_params and self.n_pathway_factors is not None:
+            n_free = int(best_params.pop('n_free_factors'))
+            best_params['n_factors'] = int(self.n_pathway_factors) + n_free
+
         config = self._build_best_config(best_params)
 
         from VariationalInference.vi_cavi import CAVI as ModelClass

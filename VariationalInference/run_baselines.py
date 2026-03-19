@@ -67,7 +67,14 @@ def parse_args():
                         help='Algorithms to run')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Print progress')
-    
+    # On-the-fly subsampling (for scalability benchmarking without saving to disk)
+    parser.add_argument('--subsample-ratio', type=float, default=None,
+                        help='Subsample dataset to this fraction of patients before processing')
+    parser.add_argument('--subsample-n-patients', type=int, default=None,
+                        help='Subsample dataset to exactly this many patients')
+    parser.add_argument('--subsample-seed', type=int, default=0,
+                        help='Seed for patient-level subsampling')
+
     return parser.parse_args()
 
 
@@ -103,13 +110,33 @@ def main():
     print("=" * 80)
     
     from VariationalInference.data_loader import DataLoader
-    
+
+    # On-the-fly subsampling (avoids saving large subsample h5ad files to disk)
+    _preloaded_adata = None
+    if args.subsample_ratio is not None or args.subsample_n_patients is not None:
+        import anndata as ad
+        from VariationalInference.create_subsamples import subsample_adata
+        print(f"[SUBSAMPLE] Loading full h5ad for on-the-fly subsampling "
+              f"(ratio={args.subsample_ratio}, n_patients={args.subsample_n_patients}, "
+              f"seed={args.subsample_seed})")
+        _full_adata = ad.read_h5ad(args.data)
+        _full_adata.var_names_make_unique()
+        _preloaded_adata = subsample_adata(
+            _full_adata,
+            ratio=args.subsample_ratio,
+            n_patients=args.subsample_n_patients,
+            subsample_seed=args.subsample_seed,
+            verbose=True,
+        )
+        del _full_adata
+
     loader = DataLoader(
         data_path=args.data,
         gene_annotation_path=args.gene_annotation,
         cache_dir=args.cache_dir,
         use_cache=True,
-        verbose=args.verbose
+        verbose=args.verbose,
+        adata=_preloaded_adata,
     )
     
     data = loader.load_and_preprocess(

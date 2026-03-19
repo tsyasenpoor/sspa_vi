@@ -64,7 +64,7 @@ except ImportError:
 def _auto_chunk_size(nnz, K, target_gb=None):
     """Auto-tune chunk size to target a given work-array memory budget.
 
-    With K factors, each chunk of C entries uses C * K * 8 bytes.
+    With K factors, each chunk of C entries uses C * K * 4 bytes (float32).
     On GPU, uses a conservative fraction of VRAM to leave headroom for
     scatter promotions, parameter tensors, and allocator fragmentation.
     On CPU, targets ~4GB by default.
@@ -83,10 +83,10 @@ def _auto_chunk_size(nnz, K, target_gb=None):
                 target_gb = 2.0  # conservative GPU default
         else:
             target_gb = 4.0
-    max_by_mem = int(target_gb * (1024 ** 3) / (K * 8))
+    max_by_mem = int(target_gb * (1024 ** 3) / (K * 4))
     # Floor: keep at least ~200MB work array (but never below 20k nnz)
     # to avoid excessive loop overhead when K is very large.
-    floor = max(20_000, int(0.2 * (1024 ** 3) / (K * 8)))
+    floor = max(20_000, int(0.2 * (1024 ** 3) / (K * 4)))
     return max(floor, min(max_by_mem, nnz))
 
 
@@ -119,7 +119,7 @@ def _row_chunk_size(n, K, n_intermediates=2, target_gb=None):
                 target_gb = 0.5
         else:
             target_gb = 2.0
-    bytes_per_row = n_intermediates * K * 8
+    bytes_per_row = n_intermediates * K * 4  # float32
     max_rows = max(1024, int(target_gb * (1024 ** 3) / bytes_per_row))
     return min(max_rows, n)
 
@@ -185,6 +185,7 @@ class CAVI:
         sigma_gamma: float = 1.0,
         regression_weight: float = 1.0,
         use_class_weights: bool = True,
+        use_intercept: bool = True,
         random_state: Optional[int] = None,
         mode: str = 'unmasked',
         pathway_mask: Optional[np.ndarray] = None,
@@ -211,6 +212,7 @@ class CAVI:
         # At zeta_max=4: lambda_min ~ 0.060.  The JJ bound remains valid for any zeta.
         self.zeta_max = 4.0
 
+        self.use_intercept = use_intercept
         self.nnz_chunk_size = nnz_chunk_size
         self.mode = mode
         self.pathway_mask = pathway_mask
@@ -245,6 +247,22 @@ class CAVI:
         else:
             sums = np.asarray(X.sum(axis=axis)).ravel()
         return float(np.mean(sums) / max(np.var(sums), 1e-10))
+
+    # =================================================================
+    # Intercept helper
+    # =================================================================
+
+    def _prepend_intercept(self, X_aux, n=None):
+        """Prepend a column of ones to X_aux if use_intercept is True."""
+        if not self.use_intercept:
+            return X_aux
+        if X_aux is None or (hasattr(X_aux, 'size') and X_aux.size == 0):
+            if n is None:
+                raise ValueError("n required when X_aux is None with use_intercept=True")
+            return np.ones((n, 1), dtype=np.float32)
+        X_aux = np.asarray(X_aux, dtype=np.float32)
+        ones = np.ones((X_aux.shape[0], 1), dtype=X_aux.dtype)
+        return np.hstack([ones, X_aux])
 
     # =================================================================
     # Initialization (scHPF pattern)
@@ -307,7 +325,20 @@ class CAVI:
             # N(0, sigma_v^2/K) prior -- K-scaled so total logit theta*v has variance ~ sigma_v^2
             self.sigma_v_diag = np.full((self.kappa, K), (self.sigma_v ** 2) / K)
         else:
-            # Laplace (Bayesian Lasso): init sigma_v_diag from Laplace variance = 2*b_v^2
+            # Laplace (Bayesian Lasso): scale b_v so the prior precision is
+            # meaningful relative to the data precision.  The data contributes
+            # O(N * lambda * E[theta^2]) to the v precision; the prior contributes
+            # O(1/(b_v * |v|)).  Without scaling, b_v=1 is overwhelmed for large N
+            # (prior < 1% of total precision for N > 100K).
+            #
+            # Following Park & Casella (2008), the optimal Lasso penalty scales as
+            # sqrt(N).  We apply:  b_v_eff = b_v * sqrt(K) / sqrt(N)
+            # so that b_v=1.0 gives sensible shrinkage regardless of dataset size.
+            b_v_eff = self.b_v * np.sqrt(K) / np.sqrt(self.n)
+            print(f"  [Laplace] b_v auto-scaled: {self.b_v:.4f} -> {b_v_eff:.6f} "
+                  f"(N={self.n}, K={K})")
+            self.b_v = b_v_eff
+            # Init sigma_v_diag from Laplace variance = 2*b_v^2
             self.sigma_v_diag = np.full((self.kappa, K), 2.0 * self.b_v ** 2)
 
         # --- gamma: N(0, sigma_gamma^2) ---
@@ -317,6 +348,16 @@ class CAVI:
                 np.eye(self.p_aux) * self.sigma_gamma ** 2
                 for _ in range(self.kappa)
             ])
+            # Initialize intercept column (col 0) to empirical log-odds
+            if self.use_intercept:
+                y_2d = y if y.ndim > 1 else y[:, None]
+                for k in range(self.kappa):
+                    n_pos = np.sum(y_2d[:, k] > 0.5)
+                    n_neg = self.n - n_pos
+                    if n_pos > 0 and n_neg > 0:
+                        self.mu_gamma[k, 0] = np.log(n_pos / n_neg)
+                        print(f"  intercept[{k}] init = {self.mu_gamma[k, 0]:.4f} "
+                              f"(log-odds: {n_pos}/{n_neg})")
         else:
             self.mu_gamma = np.zeros((self.kappa, 0))
             self.Sigma_gamma = np.zeros((self.kappa, 0, 0))
@@ -331,7 +372,7 @@ class CAVI:
         # --- Class weights for imbalanced labels ---
         y_2d = y if y.ndim > 1 else y[:, None]
         if self.use_class_weights:
-            self._sample_weights = np.ones((self.n, self.kappa), dtype=np.float64)
+            self._sample_weights = np.ones((self.n, self.kappa), dtype=np.float32)
             for k in range(self.kappa):
                 n_pos = np.sum(y_2d[:, k] > 0.5)
                 n_neg = self.n - n_pos
@@ -342,7 +383,7 @@ class CAVI:
                         y_2d[:, k] > 0.5, w_pos, w_neg
                     )
         else:
-            self._sample_weights = np.ones((self.n, self.kappa), dtype=np.float64)
+            self._sample_weights = np.ones((self.n, self.kappa), dtype=np.float32)
 
         if self.use_class_weights:
             for k in range(self.kappa):
@@ -360,7 +401,7 @@ class CAVI:
             X_coo = sp.coo_matrix(X)
         row = X_coo.row.astype(np.int32)
         col = X_coo.col.astype(np.int32)
-        data = X_coo.data.astype(np.float64)
+        data = X_coo.data.astype(np.float32)
         self._nnz = len(data)
 
         # Pre-sort by row for cache locality and segment_sum on GPU
@@ -375,9 +416,16 @@ class CAVI:
         print(f"  Chunk size: {self._effective_chunk:,} "
               f"({n_chunks} chunks for {self._nnz:,} nnz)")
 
-        # Cache gammaln(data+1) -- constant, only needed for ELBO
-        self._gammaln_data_cache = gammaln(self._X_data + 1)
-        self._gammaln_data_sum = float(np.sum(self._gammaln_data_cache))
+        # Compute gammaln(data+1) sum in chunks to avoid a full-nnz GPU array
+        # (saves ~3 GiB at float32 / ~6 GiB at float64 for 828M nnz).
+        _gammaln_sum = 0.0
+        _gl_chunk = 500_000
+        for _gl_start in range(0, self._nnz, _gl_chunk):
+            _gl_end = min(_gl_start + _gl_chunk, self._nnz)
+            _gl_data = to_device(self._X_data[_gl_start:_gl_end])
+            _gammaln_sum += float(xp.sum(gammaln(_gl_data + 1)))
+            del _gl_data
+        self._gammaln_data_sum = _gammaln_sum
 
         # Initialize E_theta/E_beta caches
         self._E_theta_cache = None
@@ -406,16 +454,38 @@ class CAVI:
         print(f"  E[beta] range: [{float(self.E_beta.min()):.4f}, {float(self.E_beta.max()):.4f}]")
 
     def _to_device(self):
-        """Transfer all numpy parameter arrays to JAX device (no-op without JAX)."""
+        """Transfer numpy parameter arrays to JAX device (no-op without JAX).
+
+        Sparse structure arrays (_X_row, _X_col, _X_data) are kept on CPU
+        to save ~9 GiB of GPU memory.  They are transferred per-chunk
+        during phi / ELBO computation (JAX handles this transparently).
+        """
         if not USE_JAX:
             return
+        _cpu_only = {'_X_row', '_X_col', '_X_data'}
         for name in list(vars(self)):
+            if name in _cpu_only:
+                continue
             val = getattr(self, name)
             if isinstance(val, np.ndarray):
                 setattr(self, name, to_device(val))
 
     def _init_beta_mask(self):
-        """Build beta_mask array for pathway modes."""
+        """Build beta_mask array for pathway modes.
+
+        Modes
+        -----
+        masked : Hard constraint — beta priors are suppressed (near-zero)
+            for gene-factor pairs outside the pathway mask.  The mask is
+            re-enforced every iteration via ``_enforce_beta_mask``.
+        pathway_init : Soft warm-start — beta shape params (a_beta) are
+            boosted where the pathway mask is active, giving the model an
+            informed starting point.  No mask is enforced during training,
+            so beta is free to deviate from the pathway structure.
+        combined : First ``n_pathway_factors`` factors are hard-constrained
+            by the pathway mask (like masked); remaining factors are free
+            (like unmasked) for de novo gene program discovery.
+        """
         if self.mode == 'masked' and self.pathway_mask is not None:
             # pathway_mask: (n_pathways, n_genes) -> transpose to (n_genes, K)
             # pad or truncate to K columns
@@ -430,6 +500,25 @@ class CAVI:
             large_b = 100.0
             self.a_beta = np.where(self.beta_mask > 0.5, self.a_beta, small_a)
             self.b_beta = np.where(self.beta_mask > 0.5, self.b_beta, large_b)
+
+        elif self.mode == 'pathway_init' and self.pathway_mask is not None:
+            # Soft warm-start: boost a_beta where pathway is active so
+            # E[beta] = a_beta / b_beta starts higher for pathway genes.
+            # No mask is stored — beta evolves freely during training.
+            pm = self.pathway_mask.T  # (p, n_pathways)
+            if pm.shape[1] < self.K:
+                pw_indicator = np.hstack([
+                    pm, np.zeros((self.p, self.K - pm.shape[1]))
+                ])
+            else:
+                pw_indicator = pm[:, :self.K]
+            # Where pathway is active: multiply a_beta by a boost factor
+            # so initial E[beta] is ~boost_factor× higher for pathway genes.
+            boost = 5.0
+            self.a_beta = np.where(pw_indicator > 0.5,
+                                   self.a_beta * boost, self.a_beta)
+            self.beta_mask = None  # no enforcement during training
+
         elif self.mode == 'combined' and self.pathway_mask is not None:
             pm = self.pathway_mask.T
             npath = self.n_pathway_factors
@@ -540,7 +629,7 @@ class CAVI:
         adaptive_chunk = base_chunk
         # Never shrink below ~50MB work array (or 2k nnz), otherwise overhead
         # dominates and convergence becomes impractically slow.
-        min_chunk = max(2_000, int(0.05 * (1024 ** 3) / (K * 8)))
+        min_chunk = max(2_000, int(0.05 * (1024 ** 3) / (K * 4)))
         z_sum_beta = xp.zeros((self.p, K))
         z_sum_theta = xp.zeros((self.n, K))
 
@@ -985,13 +1074,17 @@ class CAVI:
 
             self._v_prev_mu = xp.array(self.mu_v)
             self._v_raw_prev = xp.array(mu_v_new)
-            self.mu_v = mu_v_candidate
+            self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
             # Damp sigma_v_diag consistently with mu_v to keep q(v) coherent
             self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
         else:
-            # Laplace: adaptive E[1/s] provides shrinkage, but still needs
-            # damping + clipping to prevent magnitude explosion in CAVI.
-            v_clip = min(5.0, 10.0 / np.sqrt(self.K))
+            # Laplace: the adaptive E[1/s] shrinkage already regularises v,
+            # so the clip can be much looser than for the normal prior.
+            # The normal branch uses 10/sqrt(K) assuming all K factors are
+            # active; Laplace drives most weights to ~0, so only a handful
+            # are large and the effective sum is << K.  Use a generous
+            # safety bound that still prevents numerical blow-up.
+            v_clip = 5.0
             mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
 
             # Adaptive damping (same schedule as Gaussian branch)
@@ -1014,7 +1107,7 @@ class CAVI:
 
             self._v_prev_mu = xp.array(self.mu_v)
             self._v_raw_prev = xp.array(mu_v_new)
-            self.mu_v = mu_v_candidate
+            self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
             self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
@@ -1279,9 +1372,10 @@ class CAVI:
 
         # Infer theta for validation cells (freeze globals) via shared method
         if X_aux_val is None:
-            X_aux_v_dev = to_device(np.zeros((n_val, self.p_aux if self.p_aux > 0 else 0)))
-        else:
-            X_aux_v_dev = to_device(np.asarray(X_aux_val, dtype=np.float64))
+            X_aux_val = np.zeros((n_val, 0))
+        X_aux_val = self._prepend_intercept(
+            np.asarray(X_aux_val, dtype=np.float32), n=n_val)
+        X_aux_v_dev = to_device(X_aux_val)
 
         a_theta_v, b_theta_v = self._infer_theta_sparse(
             X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev)
@@ -1291,7 +1385,7 @@ class CAVI:
 
         row = to_device(X_val_coo.row.astype(np.int32))
         col = to_device(X_val_coo.col.astype(np.int32))
-        data_np = X_val_coo.data if X_val_coo.data.dtype == np.float64 else X_val_coo.data.astype(np.float64)
+        data_np = X_val_coo.data if X_val_coo.data.dtype == np.float32 else X_val_coo.data.astype(np.float32)
         data = to_device(data_np)
         nnz_val = len(data_np)
         chunk = _auto_chunk_size(nnz_val, self.K)
@@ -1318,7 +1412,7 @@ class CAVI:
         # Regression LL on validation data (if labels provided)
         regression_ll_per_sample = None
         if y_val is not None:
-            y_v = to_device(np.asarray(y_val, dtype=np.float64))
+            y_v = to_device(np.asarray(y_val, dtype=np.float32))
             if y_v.ndim == 1:
                 y_v = y_v[:, None]
             E_A = E_theta_v @ self.mu_v.T
@@ -1380,10 +1474,13 @@ class CAVI:
 
         if X_aux_train is None:
             X_aux_train = np.zeros((X_train.shape[0], 0))
-        y = np.asarray(y_train, dtype=np.float64)
+        y = np.asarray(y_train, dtype=np.float32)
         if y.ndim == 1:
             y = y[:, None]
-        X_aux = np.asarray(X_aux_train, dtype=np.float64)
+        X_aux = np.asarray(X_aux_train, dtype=np.float32)
+
+        # Prepend intercept column (column of 1s) to X_aux
+        X_aux = self._prepend_intercept(X_aux, n=X_train.shape[0])
 
         # Initialize (creates numpy arrays, then transfers to device)
         self._initialize(X_train, y, X_aux)
@@ -1401,6 +1498,8 @@ class CAVI:
         # Validation setup
         if X_val is not None and X_aux_val is None:
             X_aux_val = np.zeros((X_val.shape[0], 0))
+        if X_val is not None:
+            X_aux_val = np.asarray(X_aux_val, dtype=np.float32)
 
         self.elbo_history_ = []
         self.holl_history_ = []
@@ -1683,7 +1782,7 @@ class CAVI:
 
         row = to_device(X_coo.row.astype(np.int32))
         col = to_device(X_coo.col.astype(np.int32))
-        data_np = X_coo.data if X_coo.data.dtype == np.float64 else X_coo.data.astype(np.float64)
+        data_np = X_coo.data if X_coo.data.dtype == np.float32 else X_coo.data.astype(np.float32)
         data = to_device(data_np)
         nnz = len(data_np)
         chunk = _auto_chunk_size(nnz, self.K)
@@ -1757,9 +1856,10 @@ class CAVI:
 
         n_new = X_new.shape[0]
         if X_aux_new is None:
-            X_aux_new = to_device(np.zeros((n_new, self.p_aux if self.p_aux > 0 else 0)))
-        else:
-            X_aux_new = to_device(np.asarray(X_aux_new, dtype=np.float64))
+            X_aux_new = np.zeros((n_new, 0))
+        X_aux_new = self._prepend_intercept(
+            np.asarray(X_aux_new, dtype=np.float32), n=n_new)
+        X_aux_new = to_device(X_aux_new)
 
         a_theta, b_theta = self._infer_theta_sparse(
             X_coo, n_new, n_iter, X_aux_new=X_aux_new)
@@ -1794,10 +1894,11 @@ class CAVI:
             X_coo = sp.coo_matrix(X_new)
 
         n_new = X_new.shape[0]
-        if X_aux_new is not None:
-            X_aux_dev = to_device(np.asarray(X_aux_new, dtype=np.float64))
-        else:
-            X_aux_dev = None
+        if X_aux_new is None:
+            X_aux_new = np.zeros((n_new, 0))
+        X_aux_new = self._prepend_intercept(
+            np.asarray(X_aux_new, dtype=np.float32), n=n_new)
+        X_aux_dev = to_device(X_aux_new)
         a_theta, b_theta = self._infer_theta_sparse(
             X_coo, n_new, n_iter, X_aux_new=X_aux_dev)
 

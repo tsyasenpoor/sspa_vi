@@ -1,4 +1,5 @@
-from sklearn.svm import SVC
+from sklearn.svm import LinearSVC
+from sklearn.calibration import CalibratedClassifierCV
 import os
 import numpy as np
 import scipy.sparse as sp
@@ -21,7 +22,7 @@ def _to_dense(x):
 
 # ── algorithm registry ──────────────────────────────────────────────────────
 _CLASSIFIERS = {
-    "svm": lambda: make_pipeline(StandardScaler(), SVC(probability=True)),
+    "svm": lambda: make_pipeline(StandardScaler(), CalibratedClassifierCV(LinearSVC(max_iter=5000, dual='auto'), cv=3)),
     "lr":  lambda: make_pipeline(StandardScaler(), LogisticRegression()),
     "lrl": lambda: make_pipeline(StandardScaler(), LogisticRegression(penalty="l1", solver="saga")),
     "lrr": lambda: make_pipeline(StandardScaler(), LogisticRegression(penalty="l2")),
