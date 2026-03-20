@@ -114,6 +114,7 @@ def _slurm_header(
         f"#SBATCH --mem={mem_gb}G",
         f"#SBATCH --time={time_str}",
         "#SBATCH --mail-type=END,FAIL",
+        "#SBATCH --exclude=mantis-034",
         f"#SBATCH --mail-user={MAIL_USER}",
         f"#SBATCH -o {RESULTS_ROOT}/logs/{job_name}_%A_%a.out",
         f"#SBATCH -e {RESULTS_ROOT}/logs/{job_name}_%A_%a.err",

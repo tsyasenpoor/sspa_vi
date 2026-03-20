@@ -804,7 +804,7 @@ def main():
     print("=" * 80)
 
     y_train_proba = model.predict_proba(X_train, X_aux_train, n_iter=20)
-    E_theta_train = model.transform(X_train)['E_theta']
+    E_theta_train = model.transform(X_train, X_aux_new=X_aux_train)['E_theta']
 
     _y_train_2d = y_train if y_train.ndim == 2 else y_train[:, np.newaxis]
     _proba_train_2d = y_train_proba if y_train_proba.ndim == 2 else y_train_proba[:, np.newaxis]
@@ -812,7 +812,8 @@ def main():
     # DEBUG: Compute logits and correlation with labels
     train_logits = E_theta_train @ np.array(model.mu_v).T
     if model.p_aux > 0 and model.mu_gamma is not None:
-        train_logits = train_logits + X_aux_train @ model.mu_gamma.T
+        _X_aux_debug = model._prepend_intercept(X_aux_train, n=X_aux_train.shape[0])
+        train_logits = train_logits + _X_aux_debug @ model.mu_gamma.T
     if train_logits.ndim == 1:
         train_logits = train_logits[:, np.newaxis]
 
@@ -864,7 +865,7 @@ def main():
     print("=" * 80)
 
     y_val_proba = model.predict_proba(X_val, X_aux_val, n_iter=20)
-    E_theta_val = model.transform(X_val)['E_theta']
+    E_theta_val = model.transform(X_val, X_aux_new=X_aux_val)['E_theta']
 
     _y_val_2d = y_val if y_val.ndim == 2 else y_val[:, np.newaxis]
     _proba_val_2d = y_val_proba if y_val_proba.ndim == 2 else y_val_proba[:, np.newaxis]
@@ -906,7 +907,7 @@ def main():
     print("=" * 80)
 
     y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=20)
-    E_theta_test = model.transform(X_test)['E_theta']
+    E_theta_test = model.transform(X_test, X_aux_new=X_aux_test)['E_theta']
 
     _y_test_2d = y_test if y_test.ndim == 2 else y_test[:, np.newaxis]
     _proba_test_2d = y_test_proba if y_test_proba.ndim == 2 else y_test_proba[:, np.newaxis]

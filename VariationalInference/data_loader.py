@@ -1005,7 +1005,13 @@ class DataLoader:
 
                 # One-hot encode (or dummy encode with drop_first)
                 unique_vals = values.unique()
-                if len(unique_vals) == 2:
+                if len(unique_vals) <= 1:
+                    # Constant column (e.g., no variation in subsample) — emit zeros + warn
+                    self._log(f"  WARNING: Aux '{col}' has only {len(unique_vals)} unique value(s) "
+                              f"after collapsing missing values. Emitting zero column.")
+                    aux_data.append(np.zeros((len(values), 1)))
+                    aux_col_names.append(col)
+                elif len(unique_vals) == 2:
                     # Binary: single column (0/1)
                     mapping = {unique_vals[0]: 0, unique_vals[1]: 1}
                     aux_data.append(values.map(mapping).values.reshape(-1, 1))
