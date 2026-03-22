@@ -1000,7 +1000,14 @@ class CAVI:
         else:
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
             omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-            prior_precision = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
+            # Laplace (Bayesian Lasso) prior precision from the inverse-
+            # Gaussian scale mixture.  For large |v| (omega >> 1) this
+            # vanishes as 1/(b_v*omega), removing all regularization and
+            # letting v explode.  Floor at 1/K so the prior always
+            # contributes at least weak Gaussian-like shrinkage, matching
+            # the effective per-factor prior strength of the normal branch.
+            prior_precision_raw = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
+            prior_precision = xp.maximum(prior_precision_raw, 1.0 / self.K)
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
         # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
@@ -1110,9 +1117,11 @@ class CAVI:
             self._v_prev_mu = xp.array(self.mu_v)
             self._v_raw_prev = xp.array(mu_v_new)
             self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
-            # Use exact posterior variance — damping sigma creates a one-way
-            # ratchet that exponentially collapses variance over iterations.
-            self.sigma_v_diag = sigma_v_diag_new
+            # Laplace prior precision depends on mu_v through omega, so
+            # sigma and mu must move in lockstep.  Damping both at the
+            # same rate keeps q(v) coherent.  (Unlike the normal branch
+            # where prior precision is constant and exact sigma is safe.)
+            self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
         """gamma posterior (Gaussian, JJ bound)."""
