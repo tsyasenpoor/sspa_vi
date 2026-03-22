@@ -1075,8 +1075,10 @@ class CAVI:
             self._v_prev_mu = xp.array(self.mu_v)
             self._v_raw_prev = xp.array(mu_v_new)
             self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
-            # Damp sigma_v_diag consistently with mu_v to keep q(v) coherent
-            self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
+            # Use exact posterior variance — damping sigma creates a one-way
+            # ratchet that exponentially collapses variance over iterations
+            # because the data precision only grows as theta scales up.
+            self.sigma_v_diag = sigma_v_diag_new
         else:
             # Laplace: the adaptive E[1/s] shrinkage already regularises v,
             # so the clip can be much looser than for the normal prior.
@@ -1108,7 +1110,9 @@ class CAVI:
             self._v_prev_mu = xp.array(self.mu_v)
             self._v_raw_prev = xp.array(mu_v_new)
             self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
-            self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
+            # Use exact posterior variance — damping sigma creates a one-way
+            # ratchet that exponentially collapses variance over iterations.
+            self.sigma_v_diag = sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
         """gamma posterior (Gaussian, JJ bound)."""
