@@ -1543,11 +1543,17 @@ class CAVI:
                       f"E[beta]=[{float(self.E_beta.min()):.4e},{float(self.E_beta.max()):.4e}] "
                       f"E[eta]=[{float(self.E_eta.min()):.4e},{float(self.E_eta.max()):.4e}]")
 
-            # 2b. Rescale factors to prevent theta-beta scale degeneracy.
-            # When beta >> theta, v must compensate, causing v explosion.
-            # Rescaling every iteration keeps scales balanced.
-            self._rescale_factors()
-            self._refresh_log_caches()
+            # 2b. Rescale factors — DISABLED.
+            # _rescale_factors() is not a valid CAVI coordinate-ascent step:
+            # it modifies b_theta, b_beta, mu_v, sigma_v_diag simultaneously
+            # without optimizing any variational objective, breaking ELBO
+            # monotonicity.  The clipping of s_theta to [0.5, 2.0] followed
+            # by s_beta = 1/s_theta also breaks the invariant theta*beta
+            # when clipping activates.  Empirically this causes sigma2_v
+            # collapse (divided by s_theta^2 every iteration) and ELBO
+            # divergence after ~25 iterations.
+            # self._rescale_factors()
+            self._refresh_log_caches()  # still needed: beta/eta just changed
 
             # 3. Update zeta (JJ bound tightening)
             self._update_zeta(X_aux)
