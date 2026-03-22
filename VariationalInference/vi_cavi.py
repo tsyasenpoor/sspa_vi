@@ -1003,11 +1003,11 @@ class CAVI:
             # Laplace (Bayesian Lasso) prior precision from the inverse-
             # Gaussian scale mixture.  For large |v| (omega >> 1) this
             # vanishes as 1/(b_v*omega), removing all regularization and
-            # letting v explode.  Floor at 1/K so the prior always
-            # contributes at least weak Gaussian-like shrinkage, matching
-            # the effective per-factor prior strength of the normal branch.
+            # letting v explode.  Floor at 1.0 to ensure sigma2_v never
+            # exceeds 1.0 per component, providing meaningful shrinkage
+            # comparable to a unit-variance Gaussian prior.
             prior_precision_raw = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
-            prior_precision = xp.maximum(prior_precision_raw, 1.0 / self.K)
+            prior_precision = xp.maximum(prior_precision_raw, 1.0)
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
         # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
