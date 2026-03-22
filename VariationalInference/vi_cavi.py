@@ -1096,8 +1096,10 @@ class CAVI:
             v_clip = 5.0
             mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
 
-            # Adaptive damping (same schedule as Gaussian branch)
-            alpha_max = min(0.15, 7.5 / self.K)
+            # Laplace sparsity means only ~20 factors are active, not K.
+            # Use a higher damping rate so v converges before theta
+            # over-adjusts, reducing ELBO oscillations in the Reg term.
+            alpha_max = 0.15
             alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
@@ -1141,8 +1143,8 @@ class CAVI:
             else:
                 theta_v[i0:i1] = E_theta_c @ self.mu_v.T
 
-        # Same adaptive damping schedule as v (K-scaled)
-        alpha_max = min(0.15, 7.5 / self.K)
+        # Gamma is low-dimensional (p_aux features), no need for K-scaling
+        alpha_max = 0.15
         alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
