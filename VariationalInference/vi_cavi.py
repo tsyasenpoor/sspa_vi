@@ -799,7 +799,7 @@ class CAVI:
         # a^eta is constant = cp + K*c (set in init, never changes)
         self.b_eta = self.dp + self.E_beta.sum(axis=1)
 
-    def _update_theta(self, z_sum_theta, y, X_aux, iteration=0):
+    def _update_theta(self, z_sum_theta, y, X_aux):
         """
         theta shape and rate (scHPF Eq 7, cell side + JJ regression).
 
@@ -812,8 +812,6 @@ class CAVI:
         intermediates (R_linear, R_quad, b_base, disc) living simultaneously.
         """
         # a^theta_{ik} = a + Sum_j x_{ij} phi_{ijk}
-        # Save old E[theta] for growth capping before updating a_theta.
-        a_theta_old = self.a_theta
         self.a_theta = self.a + z_sum_theta
 
         # b_base = E[xi_i] + Sum_j E[beta_{jk}] + regression_weight * R_linear
@@ -829,19 +827,7 @@ class CAVI:
             E_v = self.mu_v                                  # (kappa, K)
             E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
             E_v_sq_col = xp.square(E_v)                      # (kappa, K)
-            # Regression warmup: ramp regression_weight from 10% to 100%
-            # over the first 100 iterations.  This lets the Poisson factor
-            # model converge to reasonable theta before the regression
-            # correction (which depends on stale E[theta]) becomes strong.
-            warmup_iters = 100
-            warmup_frac = min(1.0, 0.1 + 0.9 * iteration / warmup_iters)
-            rw = self.regression_weight * warmup_frac
-
-            # Save old b_theta for damping — prevents the theta-v feedback
-            # loop from causing b_theta to change by orders of magnitude in a
-            # single iteration (the regression R_linear term depends on stale
-            # E[theta] from the previous iteration, so large steps overshoot).
-            b_theta_old = self.b_theta
+            rw = self.regression_weight
 
             min_chunk = max(1024, self.n // 256)
             b_theta_chunks = []
@@ -864,12 +850,6 @@ class CAVI:
 
                     # --- solve quadratic for b_theta ---
                     b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
-                    # Clamp regression linear term so it cannot drive b_base
-                    # below 10% of b_poisson.  Without this, large regression
-                    # weights (rw >> 1) combined with noisy R_linear can make
-                    # b_base negative → b_theta collapses → E[theta] explodes.
-                    R_lin_floor = -0.9 * b_poisson_c / xp.maximum(rw, 1e-8)
-                    R_lin_c = xp.maximum(R_lin_c, R_lin_floor)
                     b_base_c = b_poisson_c + rw * R_lin_c
                     c_quad_c = rw * R_quad_c
                     disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1])
@@ -893,27 +873,7 @@ class CAVI:
                         continue
                     raise
 
-            b_theta_new = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
-
-            # Cap per-iteration E[theta] growth to prevent the theta-v
-            # feedback loop.  Only apply after the warmup period — during
-            # initial convergence E[theta] needs to grow by orders of
-            # magnitude (from ~1e-8 to ~1e-2) and capping would prevent
-            # the Poisson factorization from converging.
-            # The divergence only happens once the regression coupling is
-            # strong (after warmup), so delaying the cap is safe.
-            if iteration >= warmup_iters:
-                E_theta_old = a_theta_old / xp.maximum(b_theta_old, 1e-30)
-                growth_cap = 1.5  # E[theta] can grow at most 50% per iteration
-                b_theta_floor_growth = self.a_theta / xp.maximum(growth_cap * E_theta_old, 1e-30)
-                b_theta_new = xp.maximum(b_theta_new, b_theta_floor_growth)
-
-            self.b_theta = b_theta_new
-            # Re-apply standard floors after growth cap
-            b_poisson_full = self.E_xi[:, None] + beta_sum[None, :]
-            self.b_theta = xp.maximum(self.b_theta, 0.1 * b_poisson_full)
-            self.b_theta = xp.maximum(self.b_theta, self.bp)
-            self.b_theta = xp.maximum(self.b_theta, 1e-2)
+            self.b_theta = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
             self._theta_inner_iters = 1
 
             # Re-tighten zeta for updated theta
@@ -1652,8 +1612,8 @@ class CAVI:
                       f"lambda(zeta)=[{float(lam_diag.min()):.4e},"
                       f"{float(lam_diag.max()):.4e}]")
 
-            # 4. Update theta, xi (cell side -- with regression warmup)
-            self._update_theta(z_sum_theta, y, X_aux, iteration=t)
+            # 4. Update theta, xi (cell side -- with full regression from start)
+            self._update_theta(z_sum_theta, y, X_aux)
             del z_sum_theta
             self._update_xi()
             if diag:
@@ -1706,34 +1666,13 @@ class CAVI:
                 elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux)
                 self.elbo_history_.append((t, elbo))
 
-                # ELBO monotonicity check & divergence detection
-                if len(self.elbo_history_) >= 2:
+                # ELBO monotonicity check
+                if diag and len(self.elbo_history_) >= 2:
                     prev_elbo = self.elbo_history_[-2][1]
                     delta = elbo - prev_elbo
                     if delta < -1.0:  # allow tiny numerical noise
-                        if diag:
-                            print(f"  [WARN t={t}] ELBO DECREASED by {delta:.4e} "
-                                  f"({prev_elbo:.4e} -> {elbo:.4e})")
-
-                # Divergence detection: compare current ELBO to the best
-                # ELBO seen so far.  If the ELBO has degraded by more than
-                # 100x the best absolute value, the model is clearly
-                # unstable and further training is wasteful.
-                if not hasattr(self, '_best_elbo_seen'):
-                    self._best_elbo_seen = elbo
-                else:
-                    self._best_elbo_seen = max(self._best_elbo_seen, elbo)
-                _elbo_ratio = abs(elbo) / max(abs(self._best_elbo_seen), 1.0)
-                if _elbo_ratio > 100 and t >= 50:
-                    _have_cp = (best_holl_reg_params is not None
-                                or best_params is not None
-                                or best_reg_params is not None)
-                    if _have_cp:
-                        if verbose:
-                            print(f"  [DIVERGENCE STOP t={t}] ELBO {elbo:.4e} is "
-                                  f"{_elbo_ratio:.0f}x worse than best "
-                                  f"{self._best_elbo_seen:.4e} — stopping")
-                        break
+                        print(f"  [WARN t={t}] ELBO DECREASED by {delta:.4e} "
+                              f"({prev_elbo:.4e} -> {elbo:.4e})")
 
                 # Held-out LL (with breakdown)
                 holl = None
