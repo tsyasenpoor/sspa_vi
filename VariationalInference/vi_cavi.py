@@ -812,6 +812,8 @@ class CAVI:
         intermediates (R_linear, R_quad, b_base, disc) living simultaneously.
         """
         # a^theta_{ik} = a + Sum_j x_{ij} phi_{ijk}
+        # Save old E[theta] for growth capping before updating a_theta.
+        a_theta_old = self.a_theta
         self.a_theta = self.a + z_sum_theta
 
         # b_base = E[xi_i] + Sum_j E[beta_{jk}] + regression_weight * R_linear
@@ -893,16 +895,22 @@ class CAVI:
 
             b_theta_new = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
 
-            # Damp b_theta updates to prevent the theta-v feedback loop from
-            # diverging.  The regression R_linear term uses stale E[theta], so
-            # taking the full step can overshoot badly when regression_weight
-            # is large.  Cap the per-element log-ratio change so that E[theta]
-            # changes by at most ~2x per iteration (log ratio ≤ 0.7).
-            log_ratio = xp.log(b_theta_new + 1e-30) - xp.log(b_theta_old + 1e-30)
-            max_log_change = 0.7  # ~2x change per iteration
-            log_ratio_clamped = xp.clip(log_ratio, -max_log_change, max_log_change)
-            self.b_theta = b_theta_old * xp.exp(log_ratio_clamped)
-            # Re-apply floors after damping
+            # Cap per-iteration E[theta] growth to prevent the theta-v
+            # feedback loop.  The root cause of divergence: a_theta grows
+            # from regression-influenced phi while b_theta is floored, so
+            # E[theta] = a_theta/b_theta grows without bound.  Rather than
+            # damping b_theta (which barely changes), we directly limit how
+            # much E[theta] can grow per iteration by enforcing:
+            #   b_theta_new >= a_theta_new / (growth_cap * E_theta_old)
+            # This ensures E[theta]_new <= growth_cap * E[theta]_old.
+            # Use old a_theta (before this iteration's update) for E_theta_old.
+            E_theta_old = a_theta_old / xp.maximum(b_theta_old, 1e-30)
+            growth_cap = 1.5  # E[theta] can grow at most 50% per iteration
+            b_theta_floor_growth = self.a_theta / xp.maximum(growth_cap * E_theta_old, 1e-30)
+            b_theta_new = xp.maximum(b_theta_new, b_theta_floor_growth)
+
+            self.b_theta = b_theta_new
+            # Re-apply standard floors after growth cap
             b_poisson_full = self.E_xi[:, None] + beta_sum[None, :]
             self.b_theta = xp.maximum(self.b_theta, 0.1 * b_poisson_full)
             self.b_theta = xp.maximum(self.b_theta, self.bp)
@@ -1707,27 +1715,25 @@ class CAVI:
                         if diag:
                             print(f"  [WARN t={t}] ELBO DECREASED by {delta:.4e} "
                                   f"({prev_elbo:.4e} -> {elbo:.4e})")
-                        # Track consecutive ELBO decreases for divergence detection
-                        if not hasattr(self, '_elbo_decrease_count'):
-                            self._elbo_decrease_count = 0
-                        self._elbo_decrease_count += 1
-                    else:
-                        if hasattr(self, '_elbo_decrease_count'):
-                            self._elbo_decrease_count = 0
 
-                # Divergence early stop: if ELBO has decreased for 5+
-                # consecutive checks AND we have a checkpoint, stop and
-                # restore.  This prevents wasting hundreds of iterations
-                # when the model is clearly unstable.
-                _dec_count = getattr(self, '_elbo_decrease_count', 0)
-                if _dec_count >= 5 and t >= 50:
+                # Divergence detection: compare current ELBO to the best
+                # ELBO seen so far.  If the ELBO has degraded by more than
+                # 100x the best absolute value, the model is clearly
+                # unstable and further training is wasteful.
+                if not hasattr(self, '_best_elbo_seen'):
+                    self._best_elbo_seen = elbo
+                else:
+                    self._best_elbo_seen = max(self._best_elbo_seen, elbo)
+                _elbo_ratio = abs(elbo) / max(abs(self._best_elbo_seen), 1.0)
+                if _elbo_ratio > 100 and t >= 50:
                     _have_cp = (best_holl_reg_params is not None
                                 or best_params is not None
                                 or best_reg_params is not None)
                     if _have_cp:
                         if verbose:
-                            print(f"  [DIVERGENCE STOP t={t}] ELBO decreased "
-                                  f"{_dec_count} consecutive checks — stopping")
+                            print(f"  [DIVERGENCE STOP t={t}] ELBO {elbo:.4e} is "
+                                  f"{_elbo_ratio:.0f}x worse than best "
+                                  f"{self._best_elbo_seen:.4e} — stopping")
                         break
 
                 # Held-out LL (with breakdown)
