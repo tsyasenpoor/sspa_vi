@@ -1091,25 +1091,25 @@ class CAVI:
             # so the clip can be much looser than for the normal prior.
             # The normal branch uses 10/sqrt(K) assuming all K factors are
             # active; Laplace drives most weights to ~0, so only a handful
-            # are large and the effective sum is << K.  Use a generous
-            # safety bound that still prevents numerical blow-up.
-            v_clip = 5.0
+            # are large and the effective sum is << K.
+            # However, in combined mode the pathway factors are mask-
+            # constrained (not sparsified), keeping effective K ≈ full K.
+            # Use K-dependent bounds so that the total logit change per
+            # iteration (≈ K * max_step) stays bounded regardless of K.
+            v_clip = min(5.0, 10.0 / np.sqrt(self.K))
             mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
 
-            # Damping: 0.022 (K-scaled) was too slow — v never learned;
-            # 0.15 was too fast — mu_v_new can be ±100s when data
-            # precision dominates, causing 0.15*mu_v_new ≈ ±15 steps
-            # that slam into v_clip every iteration, creating a limit
-            # cycle.  Use moderate alpha and a hard per-element step cap.
-            alpha_max = 0.06
-            alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
+            # Damping: K-scale alpha_max so combined mode (K=403) doesn't
+            # diverge while small-K models still converge quickly.
+            # K=50 → 0.06; K=348 → 0.009; K=403 → 0.007.
+            alpha_max = min(0.06, 3.0 / self.K)
+            alpha = min(alpha_max, 0.05 * alpha_max / 0.06 + (alpha_max - 0.05 * alpha_max / 0.06) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
-            # Per-element step cap: regardless of alpha, limit how much
-            # each v_{k,j} can change per iteration.  This prevents the
-            # coupled v-theta system from overshooting when mu_v_new is
-            # extreme.  v can still reach ±2.0 in ~40 iterations.
-            max_step = 0.05
+            # Per-element step cap: scale with K so total logit change
+            # (K * max_step) stays bounded at ~2.5 regardless of K.
+            # K=50 → 0.05; K=348 → 0.0072; K=403 → 0.0062.
+            max_step = min(0.05, 2.5 / self.K)
             delta = mu_v_candidate - self.mu_v
             delta = xp.clip(delta, -max_step, max_step)
             mu_v_candidate = self.mu_v + delta
@@ -1165,10 +1165,9 @@ class CAVI:
             else:
                 theta_v[i0:i1] = E_theta_c @ self.mu_v.T
 
-        # Gamma is low-dimensional (p_aux features), no need for K-scaling.
         # Match v damping rate to keep the coupled system stable.
-        alpha_max = 0.06
-        alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
+        alpha_max = min(0.06, 3.0 / self.K)
+        alpha = min(alpha_max, 0.05 * alpha_max / 0.06 + (alpha_max - 0.05 * alpha_max / 0.06) * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
@@ -1188,13 +1187,14 @@ class CAVI:
             else:
                 self.Sigma_gamma[k] = np.linalg.inv(prec)
             mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
-            # Clip gamma to prevent explosion (analogous to v_clip)
-            gamma_clip = 5.0
+            # Clip gamma to prevent explosion (K-scaled like v_clip)
+            gamma_clip = min(5.0, 10.0 / np.sqrt(self.K))
             mu_gamma_new = xp.clip(mu_gamma_new, -gamma_clip, gamma_clip)
             new_mu_k = (1.0 - alpha) * self.mu_gamma[k] + alpha * mu_gamma_new
-            # Per-element step cap (same rationale as v update)
+            # Per-element step cap (same K-scaling as v update)
+            gamma_step = min(0.05, 2.5 / self.K)
             delta_k = new_mu_k - self.mu_gamma[k]
-            delta_k = xp.clip(delta_k, -0.05, 0.05)
+            delta_k = xp.clip(delta_k, -gamma_step, gamma_step)
             new_mu_k = self.mu_gamma[k] + delta_k
             if USE_JAX:
                 self.mu_gamma = self.mu_gamma.at[k].set(new_mu_k)
