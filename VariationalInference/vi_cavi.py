@@ -1096,21 +1096,39 @@ class CAVI:
             v_clip = 5.0
             mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
 
-            # Laplace sparsity means only ~20 factors are active, not K.
-            # Use a higher damping rate so v converges before theta
-            # over-adjusts, reducing ELBO oscillations in the Reg term.
-            alpha_max = 0.15
+            # Damping: 0.022 (K-scaled) was too slow — v never learned;
+            # 0.15 was too fast — mu_v_new can be ±100s when data
+            # precision dominates, causing 0.15*mu_v_new ≈ ±15 steps
+            # that slam into v_clip every iteration, creating a limit
+            # cycle.  Use moderate alpha and a hard per-element step cap.
+            alpha_max = 0.06
             alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+
+            # Per-element step cap: regardless of alpha, limit how much
+            # each v_{k,j} can change per iteration.  This prevents the
+            # coupled v-theta system from overshooting when mu_v_new is
+            # extreme.  v can still reach ±2.0 in ~40 iterations.
+            max_step = 0.05
+            delta = mu_v_candidate - self.mu_v
+            delta = xp.clip(delta, -max_step, max_step)
+            mu_v_candidate = self.mu_v + delta
 
             # Period-2 oscillation detection and correction
             if self._v_prev_mu is None:
                 self._v_prev_mu = xp.zeros_like(self.mu_v)
                 self._v_raw_prev = xp.zeros_like(self.mu_v)
 
+            # Sign-flip detection (original)
             sign_flip_now = (self.mu_v * mu_v_candidate) < 0
             sign_flip_prev = (self._v_prev_mu * self.mu_v) < 0
             oscillating = sign_flip_now & sign_flip_prev
+
+            # Period-2 cycle detection: if candidate ≈ v_{t-1} the
+            # system is bouncing between two attractors.  Average the
+            # raw proposals to escape the cycle.
+            period2 = xp.abs(mu_v_candidate - self._v_prev_mu) < 0.05 * (xp.abs(self.mu_v) + 1e-6)
+            oscillating = oscillating | period2
 
             avg_raw = 0.5 * (mu_v_new + self._v_raw_prev)
             corrected = (1.0 - alpha) * self.mu_v + alpha * avg_raw
@@ -1119,10 +1137,14 @@ class CAVI:
             self._v_prev_mu = xp.array(self.mu_v)
             self._v_raw_prev = xp.array(mu_v_new)
             self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
+
+            # Floor sigma_v_diag to prevent posterior variance collapse.
+            # With N~7000 cells the data precision can drive sigma→1e-15,
+            # making the posterior degenerate and mu updates erratic.
+            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-4)
             # Laplace prior precision depends on mu_v through omega, so
             # sigma and mu must move in lockstep.  Damping both at the
-            # same rate keeps q(v) coherent.  (Unlike the normal branch
-            # where prior precision is constant and exact sigma is safe.)
+            # same rate keeps q(v) coherent.
             self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
@@ -1143,8 +1165,9 @@ class CAVI:
             else:
                 theta_v[i0:i1] = E_theta_c @ self.mu_v.T
 
-        # Gamma is low-dimensional (p_aux features), no need for K-scaling
-        alpha_max = 0.15
+        # Gamma is low-dimensional (p_aux features), no need for K-scaling.
+        # Match v damping rate to keep the coupled system stable.
+        alpha_max = 0.06
         alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
@@ -1169,6 +1192,10 @@ class CAVI:
             gamma_clip = 5.0
             mu_gamma_new = xp.clip(mu_gamma_new, -gamma_clip, gamma_clip)
             new_mu_k = (1.0 - alpha) * self.mu_gamma[k] + alpha * mu_gamma_new
+            # Per-element step cap (same rationale as v update)
+            delta_k = new_mu_k - self.mu_gamma[k]
+            delta_k = xp.clip(delta_k, -0.05, 0.05)
+            new_mu_k = self.mu_gamma[k] + delta_k
             if USE_JAX:
                 self.mu_gamma = self.mu_gamma.at[k].set(new_mu_k)
             else:
