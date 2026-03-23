@@ -896,18 +896,17 @@ class CAVI:
             b_theta_new = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
 
             # Cap per-iteration E[theta] growth to prevent the theta-v
-            # feedback loop.  The root cause of divergence: a_theta grows
-            # from regression-influenced phi while b_theta is floored, so
-            # E[theta] = a_theta/b_theta grows without bound.  Rather than
-            # damping b_theta (which barely changes), we directly limit how
-            # much E[theta] can grow per iteration by enforcing:
-            #   b_theta_new >= a_theta_new / (growth_cap * E_theta_old)
-            # This ensures E[theta]_new <= growth_cap * E[theta]_old.
-            # Use old a_theta (before this iteration's update) for E_theta_old.
-            E_theta_old = a_theta_old / xp.maximum(b_theta_old, 1e-30)
-            growth_cap = 1.5  # E[theta] can grow at most 50% per iteration
-            b_theta_floor_growth = self.a_theta / xp.maximum(growth_cap * E_theta_old, 1e-30)
-            b_theta_new = xp.maximum(b_theta_new, b_theta_floor_growth)
+            # feedback loop.  Only apply after the warmup period — during
+            # initial convergence E[theta] needs to grow by orders of
+            # magnitude (from ~1e-8 to ~1e-2) and capping would prevent
+            # the Poisson factorization from converging.
+            # The divergence only happens once the regression coupling is
+            # strong (after warmup), so delaying the cap is safe.
+            if iteration >= warmup_iters:
+                E_theta_old = a_theta_old / xp.maximum(b_theta_old, 1e-30)
+                growth_cap = 1.5  # E[theta] can grow at most 50% per iteration
+                b_theta_floor_growth = self.a_theta / xp.maximum(growth_cap * E_theta_old, 1e-30)
+                b_theta_new = xp.maximum(b_theta_new, b_theta_floor_growth)
 
             self.b_theta = b_theta_new
             # Re-apply standard floors after growth cap
