@@ -624,6 +624,34 @@ def main():
               f"mean={genes_per_pathway.mean():.1f}")
         print(f"  Matrix density: {pathway_mask.mean()*100:.2f}%")
 
+        # -----------------------------------------------------------------
+        # Masked-mode gene restriction: keep only pathway genes
+        # -----------------------------------------------------------------
+        # In masked mode, genes outside any pathway have beta forced to ~0,
+        # so they contribute noise to the Poisson likelihood without adding
+        # signal.  Restricting X to pathway genes removes this dilution.
+        # This does NOT apply to combined (free DRGPs need all genes),
+        # pathway_init (genes evolve freely after init), or unmasked.
+        if args.mode == 'masked':
+            pathway_gene_idx = np.where(pathways_per_gene > 0)[0]
+            n_kept = len(pathway_gene_idx)
+            n_dropped = n_genes_expr - n_kept
+            print(f"\n  [MASKED] Restricting to {n_kept} pathway genes "
+                  f"(dropping {n_dropped} non-pathway genes)")
+
+            # Subset sparse X matrices (column selection)
+            X_train = X_train[:, pathway_gene_idx]
+            X_val = X_val[:, pathway_gene_idx]
+            X_test = X_test[:, pathway_gene_idx]
+
+            # Subset pathway_mask and gene_list
+            pathway_mask = pathway_mask[:, pathway_gene_idx]
+            gene_list = [gene_list[i] for i in pathway_gene_idx]
+
+            print(f"  New X shape: {X_train.shape[0]} cells x {X_train.shape[1]} genes")
+            print(f"  New pathway_mask: {pathway_mask.shape[0]} x {pathway_mask.shape[1]}")
+            print(f"  Matrix density: {pathway_mask.mean()*100:.2f}%")
+
         pathway_names = pathway_names_raw
 
         if args.mode == 'combined':
