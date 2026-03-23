@@ -305,7 +305,7 @@ class CAVI:
         # --- theta: Gamma(a_theta, b_theta) ---
         self.a_theta = np.random.uniform(0.5 * self.a, 1.5 * self.a,
                                          (self.n, K))
-        self.b_theta = np.random.uniform(0.5 * bp, 1.5 * bp, (self.n, K))
+        self.b_theta = np.random.uniform(max(0.5 * bp, 0.5e-2), max(1.5 * bp, 1.5e-2), (self.n, K))
 
         # --- eta: Gamma(cp + K*c, b_eta) ---
         self.a_eta = np.full(self.p, self.cp + K * self.c)
@@ -859,6 +859,11 @@ class CAVI:
                     b_theta_c = xp.maximum(b_theta_c, 0.1 * b_poisson_c)
                     # Floor at bp
                     b_theta_c = xp.maximum(b_theta_c, self.bp)
+                    # Absolute floor: in combined mode, beta_sum can be tiny
+                    # for pathway factors (few active genes), making b_poisson
+                    # and bp both near-zero.  Without this floor, b_theta
+                    # collapses → E[theta] explodes → destabilizes everything.
+                    b_theta_c = xp.maximum(b_theta_c, 1e-2)
                     b_theta_chunks.append(b_theta_c)
                     i0 = i1
                 except Exception as exc:
@@ -876,6 +881,7 @@ class CAVI:
             self._update_zeta(X_aux)
         else:
             self.b_theta = self.E_xi[:, None] + beta_sum[None, :]
+            self.b_theta = xp.maximum(self.b_theta, 1e-2)
             self._theta_inner_iters = 0
         self._invalidate_theta_cache()
 
