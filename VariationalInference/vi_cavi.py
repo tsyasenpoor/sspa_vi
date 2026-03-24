@@ -1632,11 +1632,10 @@ class CAVI:
         best_reg_iter = 0
         reg_patience = 10  # stop after this many consecutive checks of Reg degradation
 
-        # HO-LL regression early stopping
-        best_holl_reg = -np.inf
-        best_holl_reg_iter = 0
-        best_holl_reg_params = None
-        holl_reg_patience = 10
+        # HO-LL total early stopping
+        best_holl_iter = 0
+        best_holl_params = None
+        holl_patience = 25
 
         for t in range(max_iter):
             diag = verbose and (t % check_freq == 0)
@@ -1754,13 +1753,9 @@ class CAVI:
                                               holl_reg if holl_reg is not None else 0.0))
                     if holl > best_holl:
                         best_holl = holl
-                        best_params = self._checkpoint()
-
-                    # Track best HO-LL regression for early stopping
-                    if holl_reg is not None and holl_reg > best_holl_reg:
-                        best_holl_reg = holl_reg
-                        best_holl_reg_iter = t
-                        best_holl_reg_params = self._checkpoint()
+                        best_holl_iter = t
+                        best_holl_params = self._checkpoint()
+                        best_params = best_holl_params  # keep alias
 
                 # Track best training regression LL for early stopping
                 if reg_ll > best_reg_ll:
@@ -1797,24 +1792,25 @@ class CAVI:
 
                 # Early stopping checks (gated by early_stopping mode)
                 if early_stopping == 'heldout_ll':
-                    # HO-LL regression early stopping (preferred when validation available)
-                    if X_val is not None and holl_reg is not None:
-                        iters_since_best = t - best_holl_reg_iter
-                        if iters_since_best >= holl_reg_patience and t >= 30:
+                    # HO-LL total early stopping (preferred when validation available)
+                    if X_val is not None and holl is not None:
+                        iters_since_best = t - best_holl_iter
+                        if iters_since_best >= holl_patience and t >= 30:
                             if verbose:
-                                print(f"HO-LL Reg early stop at iter {t}: "
-                                      f"HO-Reg hasn't improved in {iters_since_best} iters "
-                                      f"(best HO-Reg={best_holl_reg:.4e} at iter {best_holl_reg_iter})")
+                                print(f"HO-LL early stop at iter {t}: "
+                                      f"HO-LL hasn't improved in {iters_since_best} iters "
+                                      f"(best HO-LL={best_holl:.4f} at iter {best_holl_iter})")
                             break
 
-                    # Regression early stopping (training)
-                    iters_since_best = t - best_reg_iter
-                    if iters_since_best >= reg_patience and t >= 30:
-                        if verbose:
-                            print(f"Regression early stop at iter {t}: "
-                                  f"Reg hasn't improved in {iters_since_best} iters "
-                                  f"(best Reg={best_reg_ll:.4e} at iter {best_reg_iter})")
-                        break
+                    # Regression early stopping (training, fallback if no validation)
+                    elif X_val is None:
+                        iters_since_best = t - best_reg_iter
+                        if iters_since_best >= reg_patience and t >= 30:
+                            if verbose:
+                                print(f"Regression early stop at iter {t}: "
+                                      f"Reg hasn't improved in {iters_since_best} iters "
+                                      f"(best Reg={best_reg_ll:.4e} at iter {best_reg_iter})")
+                            break
 
                 if early_stopping in ('heldout_ll', 'elbo'):
                     # Convergence check on full ELBO (not just Poisson term)
@@ -1834,15 +1830,11 @@ class CAVI:
 
         # Restore best checkpoint (skip when early stopping is disabled)
         if early_stopping != 'none':
-            if best_holl_reg_params is not None:
+            if best_holl_params is not None:
                 if verbose:
-                    print(f"Restoring best HO-LL regression checkpoint (iter {best_holl_reg_iter}, "
-                          f"HO-Reg={best_holl_reg:.4e})")
-                self._restore(best_holl_reg_params)
-            elif best_params is not None:
-                if verbose:
-                    print(f"Restoring best HO-LL checkpoint (HO-LL={best_holl:.4f})")
-                self._restore(best_params)
+                    print(f"Restoring best HO-LL checkpoint (iter {best_holl_iter}, "
+                          f"HO-LL={best_holl:.4f})")
+                self._restore(best_holl_params)
             elif best_reg_params is not None:
                 if verbose:
                     print(f"Restoring best regression checkpoint (iter {best_reg_iter})")
