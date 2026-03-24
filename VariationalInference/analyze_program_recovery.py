@@ -155,6 +155,74 @@ def load_spectra(exp: str):
     }
 
 
+def load_drgp(exp: str, prior: str = "laplace", mode: str = "combined", seed: str = "seed42"):
+    """Load DRGP full pipeline factors and cell scores."""
+    run_dir = RESULTS / "drgp_full" / prior / mode / exp / seed
+    gp_path = run_dir / "vi_gene_programs.csv.gz"
+
+    if not gp_path.exists():
+        print(f"  [WARN] No DRGP results found in {run_dir}")
+        return None
+
+    gp = pd.read_csv(gp_path)
+    factor_names = gp["Unnamed: 0"].tolist()
+    v_sev = gp["v_weight_severity"].values
+    v_out = gp["v_weight_outcome"].values
+    gene_cols = [c for c in gp.columns if c not in ["Unnamed: 0", "v_weight_outcome", "v_weight_severity"]]
+    gene_scores = gp[gene_cols].values.T  # (K, P) -> transpose to (P, K)
+
+    # Masked mode stores only pathway genes (e.g., 874). Expand to full 2000-gene space
+    # so similarity/recovery uses the same gene basis as ground truth beta_true.
+    if gene_scores.shape[0] != 2000:
+        global_gene_list_path = BASE / "scdesign3_PBMC_10kcells_2kgenes" / "gene_names.txt"
+        if not global_gene_list_path.exists():
+            raise FileNotFoundError(f"Missing global gene name reference: {global_gene_list_path}")
+
+        full_genes = global_gene_list_path.read_text().strip().splitlines()
+        full_gene_to_idx = {g: i for i, g in enumerate(full_genes)}
+
+        expanded = np.zeros((len(full_genes), gene_scores.shape[1]), dtype=gene_scores.dtype)
+        matched = 0
+        for local_idx, gene_name in enumerate(gene_cols):
+            full_idx = full_gene_to_idx.get(gene_name)
+            if full_idx is not None:
+                expanded[full_idx, :] = gene_scores[local_idx, :]
+                matched += 1
+
+        gene_scores = expanded
+        print(
+            f"  [INFO] Expanded DRGP gene_scores to full space: "
+            f"matched {matched}/{len(gene_cols)} genes, shape={gene_scores.shape}"
+        )
+
+    # Load cell scores from theta files
+    meta_cols = ["cell_id", "sex", "severity", "outcome", "comorbidity", "cell_type"]
+    theta_parts = []
+    for split in ["train", "val", "test"]:
+        theta_path = run_dir / f"vi_theta_{split}.csv.gz"
+        if theta_path.exists():
+            try:
+                t = pd.read_csv(theta_path)
+                factor_cols = [c for c in t.columns if c not in meta_cols]
+                theta_parts.append(t[factor_cols].values)
+            except Exception as e:
+                print(f"  [WARN] Skipping corrupted {theta_path.name}: {e}")
+    cell_scores = np.vstack(theta_parts) if theta_parts else np.empty((0, len(factor_names)))
+
+    K = len(factor_names)
+    print(f"  DRGP ({prior}/{mode}/{seed}): K={K}, gene_scores={gene_scores.shape}, cell_scores={cell_scores.shape}")
+
+    return {
+        "name": f"DRGP ({prior}/{mode})",
+        "gene_scores": gene_scores,       # (P, K)
+        "cell_scores": cell_scores,        # (N, K)
+        "K": K,
+        "pathway_names": factor_names,
+        "v_weights": {"severity": v_sev, "outcome": v_out},
+        "factor_names": factor_names,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Step 2: Factor-to-program matching (cosine similarity + Hungarian)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -474,7 +542,8 @@ def plot_cosine_heatmap(sim_matrix, match_results, method_name, program_names, o
 
     plt.colorbar(im, ax=ax, label="Cosine Similarity")
     plt.tight_layout()
-    fig.savefig(out_dir / f"cosine_heatmap_{method_name.lower()}.pdf", dpi=150)
+    safe_name = method_name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
+    fig.savefig(out_dir / f"cosine_heatmap_{safe_name}.pdf", dpi=150)
     plt.close(fig)
 
 
@@ -495,7 +564,8 @@ def plot_factor_correlation(corr, program_names, method_name, out_dir):
 
     plt.colorbar(im, ax=ax, label="Pearson r")
     plt.tight_layout()
-    fig.savefig(out_dir / f"factor_correlation_{method_name.lower()}.pdf", dpi=150)
+    safe_name = method_name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
+    fig.savefig(out_dir / f"factor_correlation_{safe_name}.pdf", dpi=150)
     plt.close(fig)
 
 
@@ -530,7 +600,8 @@ def plot_severity_boxplots(sev_results, method_data, gt, method_name, out_dir):
 
     fig.suptitle(f"{method_name}: Cell Scores by Severity", fontsize=10)
     plt.tight_layout()
-    fig.savefig(out_dir / f"severity_boxplots_{method_name.lower()}.pdf", dpi=150)
+    safe_name = method_name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
+    fig.savefig(out_dir / f"severity_boxplots_{safe_name}.pdf", dpi=150)
     plt.close(fig)
 
 
@@ -714,8 +785,13 @@ def main():
     parser = argparse.ArgumentParser(description="Gene Program Recovery Analysis")
     parser.add_argument("--exp", default="exp0_easy", help="Experiment name")
     parser.add_argument("--methods", nargs="+", default=["schpf", "spectra"],
-                        choices=["schpf", "spectra", "nmf"], help="Methods to analyze")
+                        choices=["schpf", "spectra", "nmf", "drgp"], help="Methods to analyze")
     parser.add_argument("--output-dir", default=None, help="Output directory")
+    parser.add_argument("--prior", default="laplace", choices=["normal", "laplace"],
+                        help="DRGP prior (default: laplace)")
+    parser.add_argument("--mode", default="combined", choices=["combined", "masked", "unmasked"],
+                        help="DRGP mode (default: combined)")
+    parser.add_argument("--seed", default="seed42", help="DRGP seed directory (default: seed42)")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir) if args.output_dir else RESULTS / "program_recovery_figures" / args.exp
@@ -738,7 +814,12 @@ def main():
     all_results = {}
     all_recovery = {}
 
-    loaders = {"schpf": load_schpf, "spectra": load_spectra, "nmf": load_nmf}
+    loaders = {
+        "schpf": lambda exp: load_schpf(exp),
+        "spectra": lambda exp: load_spectra(exp),
+        "nmf": lambda exp: load_nmf(exp),
+        "drgp": lambda exp: load_drgp(exp, args.prior, args.mode, args.seed),
+    }
     for method_name in args.methods:
         print(f"\n[Loading {method_name}...]")
         method_data = loaders[method_name](args.exp)

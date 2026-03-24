@@ -121,7 +121,7 @@ def load_spectra_metrics():
 def load_drgp_bayes_opt_metrics():
     """Load best metrics from pbmc_bayes_opt/{prior}/{mode}/{exp}/best_params_vi_*.json"""
     rows = []
-    priors = ["normal", "laplace"]
+    priors = ["laplace"]
     modes = ["combined", "masked", "unmasked"]
 
     for prior in priors:
@@ -160,37 +160,45 @@ def load_drgp_bayes_opt_metrics():
 
 
 def load_drgp_full_metrics():
-    """Load metrics from drgp_full/{prior}/{mode}/{exp}/seed*/vi_summary.json.gz if available"""
+    """Load metrics from drgp_full/{prior}/{mode}/{exp}/seed*/vi_metrics.csv"""
     rows = []
     full_dir = os.path.join(RESULTS_ROOT, "drgp_full")
     if not os.path.isdir(full_dir):
         return rows
 
-    priors = ["normal", "laplace"]
+    priors = ["laplace"]
     modes = ["combined", "masked", "unmasked"]
 
     for prior in priors:
         for mode in modes:
             for exp in EXPERIMENTS:
-                seed_dirs = glob.glob(os.path.join(full_dir, prior, mode, exp, "seed*"))
+                seed_dirs = sorted(glob.glob(os.path.join(full_dir, prior, mode, exp, "seed*")))
                 for seed_dir in seed_dirs:
-                    summary = os.path.join(seed_dir, "vi_summary.json.gz")
-                    if not os.path.exists(summary):
-                        summary = os.path.join(seed_dir, "vi_summary.json")
-                        if not os.path.exists(summary):
-                            continue
+                    metrics_path = os.path.join(seed_dir, "vi_metrics.csv")
+                    if not os.path.exists(metrics_path):
+                        continue
                     try:
-                        if summary.endswith(".gz"):
-                            import gzip
-                            with gzip.open(summary, "rt") as f:
-                                data = json.load(f)
-                        else:
-                            with open(summary) as f:
-                                data = json.load(f)
-                        # Extract metrics - format depends on implementation
-                        # This will be filled once full pipeline runs exist
+                        df = pd.read_csv(metrics_path)
+                        seed = os.path.basename(seed_dir)
+                        prior_label = prior.capitalize()
+                        mode_label = mode.capitalize()
+                        method_name = f"DRGP-Full {prior_label}/{mode_label}"
+
+                        for label in LABELS:
+                            val_row = df[(df["split"] == "val") & (df["label"] == label)]
+                            test_row = df[(df["split"] == "test") & (df["label"] == label)]
+                            rows.append({
+                                "method": method_name,
+                                "method_type": f"DRGP-Full ({prior}/{mode})",
+                                "experiment": exp,
+                                "label": label,
+                                "val_auc": val_row["auc"].iloc[0] if len(val_row) > 0 else None,
+                                "test_auc": test_row["auc"].iloc[0] if len(test_row) > 0 else None,
+                                "source_file": os.path.relpath(metrics_path, RESULTS_ROOT),
+                                "seed": seed,
+                            })
                     except Exception as e:
-                        print(f"  WARNING: failed to read {summary}: {e}")
+                        print(f"  WARNING: failed to read {metrics_path}: {e}")
     return rows
 
 
@@ -256,6 +264,12 @@ def generate_latex_table(df):
         ("DRGP Laplace/Combined", "DRGP (laplace/combined)"),
         ("DRGP Laplace/Masked", "DRGP (laplace/masked)"),
         ("DRGP Laplace/Unmasked", "DRGP (laplace/unmasked)"),
+        ("DRGP-Full Normal/Combined", "DRGP-Full (normal/combined)"),
+        ("DRGP-Full Normal/Masked", "DRGP-Full (normal/masked)"),
+        ("DRGP-Full Normal/Unmasked", "DRGP-Full (normal/unmasked)"),
+        ("DRGP-Full Laplace/Combined", "DRGP-Full (laplace/combined)"),
+        ("DRGP-Full Laplace/Masked", "DRGP-Full (laplace/masked)"),
+        ("DRGP-Full Laplace/Unmasked", "DRGP-Full (laplace/unmasked)"),
     ]
 
     display_names = {
@@ -276,6 +290,12 @@ def generate_latex_table(df):
         "DRGP Laplace/Combined": "DRGP",
         "DRGP Laplace/Masked": "DRGP",
         "DRGP Laplace/Unmasked": "DRGP",
+        "DRGP-Full Normal/Combined": "DRGP",
+        "DRGP-Full Normal/Masked": "DRGP",
+        "DRGP-Full Normal/Unmasked": "DRGP",
+        "DRGP-Full Laplace/Combined": "DRGP",
+        "DRGP-Full Laplace/Masked": "DRGP",
+        "DRGP-Full Laplace/Unmasked": "DRGP",
     }
 
     type_names = {
@@ -290,6 +310,12 @@ def generate_latex_table(df):
         "DRGP (laplace/combined)": "Laplace + Combined",
         "DRGP (laplace/masked)": "Laplace + Masked",
         "DRGP (laplace/unmasked)": "Laplace + Unmasked",
+        "DRGP-Full (normal/combined)": "Normal + Combined*",
+        "DRGP-Full (normal/masked)": "Normal + Masked*",
+        "DRGP-Full (normal/unmasked)": "Normal + Unmasked*",
+        "DRGP-Full (laplace/combined)": "Laplace + Combined*",
+        "DRGP-Full (laplace/masked)": "Laplace + Masked*",
+        "DRGP-Full (laplace/unmasked)": "Laplace + Unmasked*",
     }
 
     # Build data matrix
