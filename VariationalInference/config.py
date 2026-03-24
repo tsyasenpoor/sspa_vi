@@ -53,19 +53,11 @@ class VIConfig:
         Prior rate for depth correction.
     lambda_eta : float, default=1.5
         Prior rate for gene scaling.
-    sigma_v : float, default=0.2
-        Prior std for classification weights (used when v_prior='normal').
     b_v : float, default=1.0
-        Laplace prior scale for classification weights (used when v_prior='laplace').
+        Laplace prior scale for classification weights (Bayesian Lasso).
         Smaller b_v = stronger sparsity. Var[v] = 2*b_v^2.
-    v_prior : str, default='normal'
-        Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso).
     sigma_gamma : float, default=0.5
         Prior std for auxiliary feature effects.
-    pi_v : float, default=0.9
-        Prior probability of v being active (slab).
-    pi_beta : float, default=0.05
-        Prior probability of beta being active (slab).
 
     Training Parameters
     -------------------
@@ -81,21 +73,6 @@ class VIConfig:
         Minimum iterations before checking convergence.
     patience : int, default=5
         Consecutive small improvements before early stopping.
-
-    Damping Parameters (Advanced)
-    -----------------------------
-    theta_damping : float, default=0.8
-        Damping for theta updates (0=no update, 1=full update).
-    beta_damping : float, default=0.8
-        Damping for beta updates.
-    v_damping : float, default=0.7
-        Damping for v updates.
-    gamma_damping : float, default=0.7
-        Damping for gamma updates.
-    xi_damping : float, default=0.9
-        Damping for xi updates.
-    eta_damping : float, default=0.9
-        Damping for eta updates.
 
     Data Parameters
     ---------------
@@ -132,14 +109,8 @@ class VIConfig:
     alpha_eta: float = 2.0
     lambda_xi: float = 1.5
     lambda_eta: float = 1.5
-    sigma_v: float = 0.2
     b_v: float = 1.0
-    v_prior: str = 'normal'
     sigma_gamma: float = 0.5
-    pi_v: float = 0.9
-    pi_beta: float = 0.05
-    spike_variance_v: float = 1e-6
-    spike_value_beta: float = 1e-6
     regression_weight: float = 1.0
     use_class_weights: bool = True
     use_intercept: bool = True
@@ -151,15 +122,6 @@ class VIConfig:
     elbo_freq: int = 10
     min_iter: int = 50
     patience: int = 5
-
-    # Damping parameters
-    theta_damping: float = 0.8
-    beta_damping: float = 0.8
-    v_damping: float = 0.7
-    gamma_damping: float = 0.7
-    xi_damping: float = 0.9
-    eta_damping: float = 0.9
-    adaptive_damping: bool = True
 
     # Data parameters
     label_column: str = 't2dm'
@@ -205,15 +167,9 @@ class VIConfig:
             'alpha_eta': self.alpha_eta,
             'lambda_xi': self.lambda_xi,
             'lambda_eta': self.lambda_eta,
-            'sigma_v': self.sigma_v,
             'b_v': self.b_v,
-            'v_prior': self.v_prior,
             'sigma_gamma': self.sigma_gamma,
             'random_state': self.random_state,
-            'pi_v': self.pi_v,
-            'pi_beta': self.pi_beta,
-            'spike_variance_v': self.spike_variance_v,
-            'spike_value_beta': self.spike_value_beta,
             'regression_weight': self.regression_weight,
             'use_class_weights': self.use_class_weights,
         }
@@ -234,13 +190,6 @@ class VIConfig:
             'elbo_freq': self.elbo_freq,
             'min_iter': self.min_iter,
             'patience': self.patience,
-            'theta_damping': self.theta_damping,
-            'beta_damping': self.beta_damping,
-            'v_damping': self.v_damping,
-            'gamma_damping': self.gamma_damping,
-            'xi_damping': self.xi_damping,
-            'eta_damping': self.eta_damping,
-            'adaptive_damping': self.adaptive_damping,
             'verbose': self.verbose,
             'debug': self.debug,
         }
@@ -331,14 +280,6 @@ PRESETS = {
         min_iter=100,
     ),
 
-    'conservative': VIConfig(
-        n_factors=50,
-        theta_damping=0.5,
-        beta_damping=0.5,
-        v_damping=0.3,
-        gamma_damping=0.3,
-    ),
-
     'fast': VIConfig(
         n_factors=50,
         max_iter=100,
@@ -369,5 +310,6 @@ def get_preset(name: str) -> VIConfig:
     >>> model = CAVI(**config.model_params())
     """
     if name not in PRESETS:
-        raise ValueError(f"Unknown preset '{name}'. Available: {list(PRESETS.keys())}")
+        available = list(PRESETS.keys())
+        raise ValueError(f"Unknown preset '{name}'. Available: {available}")
     return PRESETS[name].copy()

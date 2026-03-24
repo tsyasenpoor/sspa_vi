@@ -137,24 +137,11 @@ def create_parser() -> argparse.ArgumentParser:
         help='Gamma shape prior for beta (gene loadings). scHPF default 0.3.'
     )
     train_parser.add_argument(
-        '--sigma-v',
-        type=float,
-        default=1.0,
-        help='Gaussian prior std for v (classification weights). Used when --v-prior=normal.'
-    )
-    train_parser.add_argument(
         '--b-v',
         type=float,
         default=1.0,
-        help='Laplace prior scale for v (classification weights). Used when --v-prior=laplace. '
+        help='Laplace prior scale for v (classification weights, Bayesian Lasso). '
              'Smaller b_v = stronger sparsity.'
-    )
-    train_parser.add_argument(
-        '--v-prior',
-        type=str,
-        default='normal',
-        choices=['normal', 'laplace'],
-        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)."
     )
     train_parser.add_argument(
         '--sigma-gamma',
@@ -175,12 +162,6 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.001,
         help='Convergence tolerance (percent change in loss)'
-    )
-    train_parser.add_argument(
-        '--v-warmup',
-        type=int,
-        default=50,
-        help='Iterations before regression (v/gamma) updates begin'
     )
     train_parser.add_argument(
         '--check-freq',
@@ -403,9 +384,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         ap=1.0,
         c=args.c,
         cp=1.0,
-        sigma_v=args.sigma_v,
         b_v=args.b_v,
-        v_prior=args.v_prior,
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
         random_state=args.seed,
@@ -423,7 +402,6 @@ def cmd_train(args: argparse.Namespace) -> int:
         max_iter=args.max_iter,
         check_freq=args.check_freq,
         tol=args.tol,
-        v_warmup=args.v_warmup,
         verbose=args.verbose,
         early_stopping=args.early_stopping,
     )

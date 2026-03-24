@@ -79,20 +79,9 @@ SHARED_SEARCH_SPACE = {
     'alpha_eta': ('float', 0.5, 4.0),
     'lambda_xi': ('float', 0.5, 3.0),
     'lambda_eta': ('float', 0.5, 3.0),
-    'sigma_v': ('log_float', 0.05, 2.0),
     'b_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
     'regression_weight': ('log_float', 0.1, 500.0),
-}
-
-# --- VI (CAVI) damping parameters ---
-VI_SEARCH_SPACE = {
-    'theta_damping': ('float', 0.3, 0.95),
-    'beta_damping': ('float', 0.3, 0.95),
-    'v_damping': ('float', 0.2, 0.9),
-    'gamma_damping': ('float', 0.2, 0.9),
-    'xi_damping': ('float', 0.5, 0.99),
-    'eta_damping': ('float', 0.5, 0.99),
 }
 
 # --- Dataset-specific presets ---
@@ -137,8 +126,7 @@ def _suggest_param(trial: optuna.Trial, name: str, spec: tuple):
         raise ValueError(f"Unknown param type: {ptype}")
 
 
-def build_search_space(dataset_preset: Optional[str] = None,
-                       v_prior: str = 'normal') -> Dict[str, tuple]:
+def build_search_space(dataset_preset: Optional[str] = None) -> Dict[str, tuple]:
     """
     Build the full search space for VI (CAVI).
 
@@ -147,9 +135,6 @@ def build_search_space(dataset_preset: Optional[str] = None,
     dataset_preset : str, optional
         One of 'pbmc', 'simulation', 'emtab', 'covid'. Overrides defaults for
         dataset-specific ranges.
-    v_prior : str, default='normal'
-        Prior for v: 'normal' or 'laplace'. When 'laplace', tunes b_v
-        instead of sigma_v.
 
     Returns
     -------
@@ -157,14 +142,6 @@ def build_search_space(dataset_preset: Optional[str] = None,
         Mapping param_name -> (type, *args) for _suggest_param.
     """
     space = dict(SHARED_SEARCH_SPACE)
-
-    # Only include the relevant v prior parameter
-    if v_prior == 'laplace':
-        space.pop('sigma_v', None)
-    else:
-        space.pop('b_v', None)
-
-    space.update(VI_SEARCH_SPACE)
 
     if dataset_preset and dataset_preset in DATASET_PRESETS:
         space.update(DATASET_PRESETS[dataset_preset])
@@ -370,7 +347,7 @@ class TrialObjective:
             # Filter to only params accepted by the CAVI fit() method
             vi_fit_params = {
                 'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
-                'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
+                'max_iter', 'check_freq', 'tol', 'verbose'
             }
             fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
 
@@ -515,7 +492,6 @@ class HyperparameterOptimizer:
         random_state: Optional[int] = None,
         output_dir: str = './bayes_opt_results',
         study_name: Optional[str] = None,
-        v_prior: str = 'normal',
         max_n_factors: Optional[int] = None,
         convert_to_ensembl: bool = True,
     ):
@@ -542,7 +518,6 @@ class HyperparameterOptimizer:
         self.val_ratio = val_ratio
         self.random_state = random_state
         self.output_dir = Path(output_dir)
-        self.v_prior = v_prior.lower()
         self.max_n_factors = max_n_factors
         self.convert_to_ensembl = convert_to_ensembl
         self.study_name = study_name or f'vi_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
@@ -676,12 +651,8 @@ class HyperparameterOptimizer:
         self.load_pathways()
 
         # Build search space
-        self.search_space = build_search_space(self.dataset_preset, self.v_prior)
+        self.search_space = build_search_space(self.dataset_preset)
         self._apply_search_space_guards()
-
-        # Always pass v_prior as a fixed param so the model knows which prior to use
-        if 'v_prior' not in self.fixed_params:
-            self.fixed_params['v_prior'] = self.v_prior
 
         # For masked / pathway_init: n_factors IS the number of pathways — not searchable.
         if self.mode in ('masked', 'pathway_init') and self.pathway_mask is not None:
@@ -1072,12 +1043,6 @@ def parse_args(argv=None):
     parser.add_argument('--output-dir', default='./bayes_opt_results', help='Output directory')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
 
-    # Prior for v
-    parser.add_argument(
-        '--v-prior', default='normal', choices=['normal', 'laplace'],
-        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)"
-    )
-
     # Gene ID conversion
     parser.add_argument(
         '--convert-to-ensembl', type=lambda x: x.lower() in ('true', '1', 'yes'), 
@@ -1150,7 +1115,6 @@ def main(argv=None):
         val_ratio=args.val_ratio,
         random_state=args.seed,
         output_dir=args.output_dir,
-        v_prior=args.v_prior,
         max_n_factors=args.max_n_factors,
         convert_to_ensembl=args.convert_to_ensembl,
     )

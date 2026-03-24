@@ -49,20 +49,11 @@ def params_to_cli_args(params_data, config_data=None):
     fp = params_data.get("fixed_params", {})
 
     args = []
-    # Prior-specific args
-    v_prior = fp.get("v_prior", "normal")
-    args.append(f"--v-prior {v_prior}")
-
-    if v_prior == "laplace":
-        if "b_v" in bp:
-            args.append(f"--b-v {bp['b_v']}")
-        elif config_data and "b_v" in config_data:
-            args.append(f"--b-v {config_data['b_v']}")
-    else:
-        if "sigma_v" in bp:
-            args.append(f"--sigma-v {bp['sigma_v']}")
-        elif config_data and "sigma_v" in config_data:
-            args.append(f"--sigma-v {config_data['sigma_v']}")
+    # b_v arg
+    if "b_v" in bp:
+        args.append(f"--b-v {bp['b_v']}")
+    elif config_data and "b_v" in config_data:
+        args.append(f"--b-v {config_data['b_v']}")
 
     # Common model params
     param_map = {
@@ -73,12 +64,6 @@ def params_to_cli_args(params_data, config_data=None):
         "lambda_xi": "--lambda-xi",
         "lambda_eta": "--lambda-eta",
         "sigma_gamma": "--sigma-gamma",
-        "theta_damping": "--theta-damping",
-        "beta_damping": "--beta-damping",
-        "v_damping": "--v-damping",
-        "gamma_damping": "--gamma-damping",
-        "xi_damping": "--xi-damping",
-        "eta_damping": "--eta-damping",
     }
 
     # Try config_data first (has exact values), fall back to best_params

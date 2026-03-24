@@ -682,18 +682,12 @@ def main():
     # =========================================================================
     # STEP 3.5: Hyperparameters
     # =========================================================================
-    sigma_v = args.sigma_v
-
     print(f"\nModel Hyperparameters (scHPF):")
     print(f"  a (theta shape): {args.a:.4f}")
     print(f"  c (beta shape):  {args.c:.4f}")
     print(f"  ap, cp:          1.0, 1.0 (fixed)")
     print(f"  bp, dp:          empirical (computed from data)")
-    print(f"  v_prior:         {args.v_prior}")
-    if args.v_prior == 'normal':
-        print(f"  sigma_v:         {sigma_v:.4f}")
-    else:
-        print(f"  b_v:             {args.b_v:.4f}")
+    print(f"  b_v:             {args.b_v:.4f}")
     print(f"  sigma_gamma:     {args.sigma_gamma:.4f}")
     print(f"  regression_wt:   {args.regression_weight:.4f}")
     print(f"  max_iter:        {args.max_iter}")
@@ -730,9 +724,7 @@ def main():
         ap=ap_val,
         c=c_val,
         cp=cp_val,
-        sigma_v=sigma_v,
         b_v=args.b_v,
-        v_prior=args.v_prior,
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
         use_intercept=not args.no_intercept,
@@ -802,9 +794,7 @@ def main():
         'n_factors': model.K,
         'a': float(model.a),
         'c': float(model.c),
-        'sigma_v': float(model.sigma_v),
         'b_v': float(model.b_v),
-        'v_prior': model.v_prior,
         'E_beta': np.array(model.E_beta),
         'E_log_beta': np.array(model.E_log_beta),
         'mu_v': np.array(model.mu_v),
