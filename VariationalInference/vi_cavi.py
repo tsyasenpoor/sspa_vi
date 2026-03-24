@@ -319,6 +319,16 @@ class CAVI:
         # --- Apply pathway mask if needed ---
         self._init_beta_mask()
 
+        # Boolean mask: True where beta_{jk} is an active latent variable.
+        # Used to exclude masked entries from phi normalization, ELBO terms,
+        # and Poisson rate computation.  Shape (p, K).
+        if self.beta_mask is not None:
+            self._active_beta = self.beta_mask > 0.5  # numpy bool
+            self._n_active_beta = int(self._active_beta.sum())
+        else:
+            self._active_beta = None  # means all active
+            self._n_active_beta = self.p * K
+
         # --- v: init small random ---
         self.mu_v = np.random.randn(self.kappa, K) * 0.01
         if self.v_prior == 'normal':
@@ -540,17 +550,19 @@ class CAVI:
             self.beta_mask = None
 
     def _enforce_beta_mask(self):
-        """Re-enforce mask after beta update."""
-        if self.beta_mask is None:
+        """Re-enforce mask after beta update.
+
+        Masked entries are treated as absent from the model: their a_beta
+        and b_beta are pinned to small/large values so E[beta] ≈ 0.
+        The boolean ``_active_beta`` (on device) controls which entries
+        participate in phi normalization, ELBO terms, and rate sums.
+        """
+        if self._active_beta is None:
             return
         small_a = self.c * 0.01
         large_b = 100.0
-        # beta_mask is 1.0 where factor is active, 0.0 where suppressed.
-        # Works for both 'masked' (all columns) and 'combined' (pathway cols
-        # have 0/1, free cols have 1.0).
-        mask = self.beta_mask > 0.5
-        self.a_beta = xp.where(mask, self.a_beta, small_a)
-        self.b_beta = xp.where(mask, self.b_beta, large_b)
+        self.a_beta = xp.where(self._active_beta, self.a_beta, small_a)
+        self.b_beta = xp.where(self._active_beta, self.b_beta, large_b)
 
     # =================================================================
     # Expected values (properties for convenience)
@@ -593,10 +605,20 @@ class CAVI:
         p is typically small.
 
         Digamma values are recomputed on demand in _compute_elbo.
+
+        For masked models, masked entries get E_log_beta = -inf so that
+        they receive exactly zero responsibility in softmax (phi) and
+        contribute zero to logsumexp in the Poisson likelihood.
         """
         _dig_beta = digamma(self.a_beta)
         self._E_log_beta_cache = _dig_beta - xp.log(self.b_beta)
         del _dig_beta
+        # Masked entries: set to -inf so exp(-inf) = 0 in softmax/logsumexp
+        if self._active_beta is not None:
+            self._E_log_beta_cache = xp.where(
+                self._active_beta, self._E_log_beta_cache,
+                xp.asarray(-xp.inf, dtype=self._E_log_beta_cache.dtype)
+            )
 
     @property
     def E_xi(self):
@@ -780,24 +802,46 @@ class CAVI:
     # =================================================================
 
     def _update_beta(self, z_sum_beta):
-        """beta shape and rate (scHPF Eq 8, gene side)."""
-        # a^beta_{jk} = c + Sum_i x_{ij} phi_{ijk}
-        self.a_beta = self.c + z_sum_beta
-        # b^beta_{jk} = E[eta_j] + Sum_i E[theta_{ik}]
+        """beta shape and rate (scHPF Eq 8, gene side).
+
+        For masked models, only active entries are updated.  Masked entries
+        remain pinned at their suppressed values — we never compute the
+        standard Gamma update for them and then overwrite, because that
+        post-hoc projection is not a valid coordinate-ascent step.
+        """
         # Compute theta_sum in chunks to avoid materializing E_theta cache
         # when z_sum_theta may still be alive (saves one (n, K) array).
         theta_sum = xp.zeros(self.K)
         for i0 in range(0, self.n, self._row_chunk):
             i1 = min(i0 + self._row_chunk, self.n)
             theta_sum = theta_sum + (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=0)
-        self.b_beta = self.E_eta[:, None] + theta_sum[None, :]
-        self._enforce_beta_mask()
+
+        new_a = self.c + z_sum_beta
+        new_b = self.E_eta[:, None] + theta_sum[None, :]
+        # Floor: prevent pathologically small shape/rate values
+        new_a = xp.maximum(new_a, 1e-6)
+        new_b = xp.maximum(new_b, 1e-8)
+
+        if self._active_beta is not None:
+            # Only update active entries; masked entries keep their pinned values.
+            self.a_beta = xp.where(self._active_beta, new_a, self.a_beta)
+            self.b_beta = xp.where(self._active_beta, new_b, self.b_beta)
+        else:
+            self.a_beta = new_a
+            self.b_beta = new_b
         self._invalidate_beta_cache()
 
     def _update_eta(self):
-        """eta rate (scHPF): b^eta_j = d' + Sum_k E[beta_{jk}]."""
+        """eta rate (scHPF): b^eta_j = d' + Sum_k E[beta_{jk}].
+
+        Only active beta entries contribute (masked entries are absent).
+        """
         # a^eta is constant = cp + K*c (set in init, never changes)
-        self.b_eta = self.dp + self.E_beta.sum(axis=1)
+        if self._active_beta is not None:
+            self.b_eta = self.dp + xp.where(
+                self._active_beta, self.E_beta, 0.0).sum(axis=1)
+        else:
+            self.b_eta = self.dp + self.E_beta.sum(axis=1)
 
     def _update_theta(self, z_sum_theta, y, X_aux):
         """
@@ -815,7 +859,11 @@ class CAVI:
         self.a_theta = self.a + z_sum_theta
 
         # b_base = E[xi_i] + Sum_j E[beta_{jk}] + regression_weight * R_linear
-        beta_sum = self.E_beta.sum(axis=0)  # (K,)
+        # Active-only beta sums (masked entries are absent from the model)
+        if self._active_beta is not None:
+            beta_sum = xp.where(self._active_beta, self.E_beta, 0.0).sum(axis=0)
+        else:
+            beta_sum = self.E_beta.sum(axis=0)  # (K,)
 
         if self.regression_weight > 0:
             # Pre-compute tiny (kappa, K) quantities for _regression_rate_parts
@@ -1267,7 +1315,12 @@ class CAVI:
         for i0 in range(0, self.n, self._row_chunk):
             i1 = min(i0 + self._row_chunk, self.n)
             theta_col_sum = theta_col_sum + (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=0)
-        poisson_ll -= xp.sum(theta_col_sum * E_beta.sum(axis=0))
+        # Use only active beta entries in the rate term (masked = absent = 0)
+        if self._active_beta is not None:
+            beta_col_sum = xp.where(self._active_beta, E_beta, 0.0).sum(axis=0)
+        else:
+            beta_col_sum = E_beta.sum(axis=0)
+        poisson_ll -= xp.sum(theta_col_sum * beta_col_sum)
         poisson_ll -= self._gammaln_data_sum  # cached at init
         elbo += poisson_ll
 
@@ -1336,11 +1389,18 @@ class CAVI:
         elbo -= self.n * self.K * gammaln_a
         elbo += theta_entropy
 
-        # === Prior: p(beta|eta) ===
-        elbo += xp.sum((self.c - 1) * E_log_beta
-                       + self.c * E_log_eta[:, None]
-                       - E_eta[:, None] * E_beta)
-        elbo -= self.p * self.K * gammaln(self.c)
+        # === Prior: p(beta|eta) — active entries only ===
+        # Masked entries are absent from the model, so they contribute
+        # nothing to the prior or its normalization constant.
+        _beta_prior_terms = ((self.c - 1) * E_log_beta
+                             + self.c * E_log_eta[:, None]
+                             - E_eta[:, None] * E_beta)
+        if self._active_beta is not None:
+            elbo += xp.sum(xp.where(self._active_beta, _beta_prior_terms, 0.0))
+        else:
+            elbo += xp.sum(_beta_prior_terms)
+        del _beta_prior_terms
+        elbo -= self._n_active_beta * gammaln(self.c)
 
         # === Prior: p(xi) ===
         elbo += xp.sum((self.ap - 1) * E_log_xi
@@ -1375,12 +1435,16 @@ class CAVI:
                                         / xp.maximum(lambda_s, 1e-12)))
 
         # === Entropy: -E[log q] ===
-        # q(beta)
+        # q(beta) — active entries only (masked entries are not latent variables)
         psi_a_beta = digamma(self.a_beta)
-        elbo += xp.sum(self.a_beta - xp.log(self.b_beta)
-                       + gammaln(self.a_beta)
-                       + (1 - self.a_beta) * psi_a_beta)
-        del psi_a_beta
+        _beta_entropy = (self.a_beta - xp.log(self.b_beta)
+                         + gammaln(self.a_beta)
+                         + (1 - self.a_beta) * psi_a_beta)
+        if self._active_beta is not None:
+            elbo += xp.sum(xp.where(self._active_beta, _beta_entropy, 0.0))
+        else:
+            elbo += xp.sum(_beta_entropy)
+        del psi_a_beta, _beta_entropy
         # q(xi)
         elbo += xp.sum(self.a_xi - xp.log(self.b_xi)
                        + self._gammaln_a_xi
@@ -1453,7 +1517,12 @@ class CAVI:
             poisson_ll += xp.dot(data_c, log_sum_c)
             del log_rates_c
 
-        poisson_ll -= xp.sum(E_theta_v.sum(axis=0) * E_beta.sum(axis=0))
+        # Use only active beta entries in the rate term (masked = absent = 0)
+        if self._active_beta is not None:
+            _beta_col_sum = xp.where(self._active_beta, E_beta, 0.0).sum(axis=0)
+        else:
+            _beta_col_sum = E_beta.sum(axis=0)
+        poisson_ll -= xp.sum(E_theta_v.sum(axis=0) * _beta_col_sum)
         poisson_ll -= gammaln_term
         poisson_ll_per_sample = float(poisson_ll) / n_val
 
@@ -1831,8 +1900,14 @@ class CAVI:
         a_xi = to_device(np.full(n_new, self.ap + self.K * self.a))
         b_xi = to_device(np.full(n_new, self.bp))
 
-        E_log_beta = self.E_log_beta
-        beta_col_sums = self.E_beta.sum(axis=0)
+        # Use cached E_log_beta (has -inf for masked entries) to ensure
+        # masked components get zero responsibility in phi_chunk_core.
+        E_log_beta = self._E_log_beta_cache
+        # Active-only beta sums for the Poisson rate term
+        if self._active_beta is not None:
+            beta_col_sums = xp.where(self._active_beta, self.E_beta, 0.0).sum(axis=0)
+        else:
+            beta_col_sums = self.E_beta.sum(axis=0)
 
         row = to_device(X_coo.row.astype(np.int32))
         col = to_device(X_coo.col.astype(np.int32))
