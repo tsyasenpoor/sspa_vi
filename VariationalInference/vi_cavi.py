@@ -23,7 +23,8 @@ Key design choices:
 1. bp, dp are SCALARS (scHPF), not per-cell/gene vectors
 2. Random init: U(0.5*prior, 1.5*prior) for both shape AND rate
 3. First iteration uses random Dirichlet phi (scHPF symmetry breaking)
-4. No damping -- pure coordinate ascent
+4. No damping -- pure coordinate ascent with lightweight safeguards
+   (zeta cap, v/gamma clip, b_theta floor, rescale clip)
 5. No diversity noise, no annealing, no warmup phases
 6. All parameters (theta, v, gamma, zeta) learned jointly from iteration 0
 7. Laplace (Bayesian Lasso) prior on v -- no Gaussian option
@@ -190,6 +191,10 @@ class CAVI:
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
         self.use_class_weights = use_class_weights
+        # Cap on JJ auxiliary zeta.  Keeps lambda_JJ(zeta) >= lambda_JJ(zeta_max) > 0,
+        # preventing the quadratic braking on theta from vanishing.
+        # At zeta_max=4: lambda_min ~ 0.060.  The JJ bound remains valid for any zeta.
+        self.zeta_max = 4.0
 
         self.use_intercept = use_intercept
         self.nnz_chunk_size = nnz_chunk_size
@@ -615,6 +620,7 @@ class CAVI:
                 continue
 
             c_k = np.sqrt(mean_theta_k * mean_beta_k) / mean_theta_k
+            c_k = np.clip(c_k, 0.5, 2.0)  # prevent extreme per-iteration rescaling
 
             if USE_JAX:
                 self.b_theta = self.b_theta.at[:, k].set(self.b_theta[:, k] / c_k)
@@ -706,6 +712,7 @@ class CAVI:
                         xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1],
                         0.0))
                     b_theta_c = (b_base_c + disc_c) / 2.0
+                    b_theta_c = xp.maximum(b_theta_c, 1e-6)
 
                     b_theta_chunks.append(b_theta_c)
                     i0 = i1
@@ -765,7 +772,10 @@ class CAVI:
                 # Add E[theta]^2 @ tau^2_v term for full second moment
                 E_A_sq_c = E_A_sq_c + xp.square(E_theta_c) @ self.sigma_v_diag.T
                 zeta_chunks.append(
-                    xp.sqrt(xp.maximum(E_A_sq_c, 1e-8))
+                    xp.minimum(
+                        xp.sqrt(xp.maximum(E_A_sq_c, 1e-8)),
+                        self.zeta_max,
+                    )
                 )
                 i0 = i1
             except Exception as exc:
@@ -840,7 +850,8 @@ class CAVI:
         mean_prec = term1 - term2
 
         self.sigma_v_diag = 1.0 / precision
-        self.mu_v = mean_prec / precision
+        v_clip = min(5.0, 10.0 / np.sqrt(self.K))
+        self.mu_v = xp.clip(mean_prec / precision, -v_clip, v_clip)
 
     def _update_gamma(self, y, X_aux):
         """Gamma posterior (Gaussian, JJ bound). No damping."""
@@ -876,6 +887,8 @@ class CAVI:
             else:
                 self.Sigma_gamma[k] = np.linalg.inv(prec)
             mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
+            gamma_clip = min(5.0, 10.0 / np.sqrt(self.K))
+            mu_gamma_new = xp.clip(mu_gamma_new, -gamma_clip, gamma_clip)
             if USE_JAX:
                 self.mu_gamma = self.mu_gamma.at[k].set(mu_gamma_new)
             else:
