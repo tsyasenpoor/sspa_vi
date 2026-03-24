@@ -117,41 +117,6 @@ def parse_args() -> argparse.Namespace:
         help='Directory for caching preprocessed data (default: /labs/Aguiar/SSPA_BRAY/cache)'
     )
 
-    # Mode selection
-    parser.add_argument(
-        '--mode',
-        type=str,
-        default='unmasked',
-        choices=['unmasked', 'masked', 'pathway_init', 'combined'],
-        help='Model mode: unmasked (standard), masked (beta fixed to pathway structure), '
-             'pathway_init (beta initialized from pathways but free to deviate), '
-             'combined (pathway-constrained + unconstrained DRGPs)'
-    )
-    parser.add_argument(
-        '--pathway-file',
-        type=str,
-        default='/archive/projects/SSPA_BRAY/sspa/c2.cp.v2024.1.Hs.symbols.gmt',
-        help='GMT file for pathway definitions (used in masked/pathway_init/combined modes)'
-    )
-    parser.add_argument(
-        '--pathway-min-genes',
-        type=int,
-        default=0,
-        help='Minimum genes per pathway (for filtering)'
-    )
-    parser.add_argument(
-        '--pathway-max-genes',
-        type=int,
-        default=200000,
-        help='Maximum genes per pathway (for filtering)'
-    )
-    parser.add_argument(
-        '--n-drgps',
-        type=int,
-        default=50,
-        help='Number of unconstrained data-driven gene programs (DRGPs) for combined mode'
-    )
-
     # Training options
     parser.add_argument(
         '--regression-weight',
@@ -180,24 +145,11 @@ def parse_args() -> argparse.Namespace:
         help='Gamma shape prior for beta (gene loadings). scHPF default 0.3.'
     )
     parser.add_argument(
-        '--sigma-v',
-        type=float,
-        default=1.0,
-        help='Gaussian prior std for v (classification weights). Used when --v-prior=normal.'
-    )
-    parser.add_argument(
         '--b-v',
         type=float,
         default=1.0,
-        help='Laplace prior scale for v (classification weights). Used when --v-prior=laplace. '
+        help='Laplace prior scale for v (classification weights). '
              'Smaller b_v = stronger sparsity.'
-    )
-    parser.add_argument(
-        '--v-prior',
-        type=str,
-        default='normal',
-        choices=['normal', 'laplace'],
-        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)."
     )
     parser.add_argument(
         '--sigma-gamma',
@@ -249,56 +201,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Rate multiplier for eta prior.'
     )
-    parser.add_argument(
-        '--pi-v',
-        type=float,
-        default=None,
-        help='Spike-and-slab mixture weight for v.'
-    )
-    parser.add_argument(
-        '--pi-beta',
-        type=float,
-        default=None,
-        help='Spike-and-slab mixture weight for beta.'
-    )
-
-    # Damping parameters
-    parser.add_argument(
-        '--theta-damping',
-        type=float,
-        default=None,
-        help='Damping for theta updates.'
-    )
-    parser.add_argument(
-        '--beta-damping',
-        type=float,
-        default=None,
-        help='Damping for beta updates.'
-    )
-    parser.add_argument(
-        '--v-damping',
-        type=float,
-        default=None,
-        help='Damping for v updates.'
-    )
-    parser.add_argument(
-        '--gamma-damping',
-        type=float,
-        default=None,
-        help='Damping for gamma updates.'
-    )
-    parser.add_argument(
-        '--xi-damping',
-        type=float,
-        default=None,
-        help='Damping for xi updates.'
-    )
-    parser.add_argument(
-        '--eta-damping',
-        type=float,
-        default=None,
-        help='Damping for eta updates.'
-    )
 
     parser.add_argument(
         '--early-stopping',
@@ -322,13 +224,6 @@ def parse_args() -> argparse.Namespace:
         default=0.001,
         help='Convergence tolerance (percent change in loss)'
     )
-    parser.add_argument(
-        '--v-warmup',
-        type=int,
-        default=50,
-        help='Iterations before regression (v/gamma) updates begin'
-    )
-
     # Normalization options
     parser.add_argument(
         '--normalize',
@@ -455,8 +350,7 @@ def main():
     print("=" * 80)
     print(f"\nConfiguration:")
     print(f"  Data:         {args.data}")
-    print(f"  Mode:         {args.mode}")
-    print(f"  n_factors:    {args.n_factors}" + (" (may be overridden by pathway count)" if args.mode != 'unmasked' else ""))
+    print(f"  n_factors:    {args.n_factors}")
     print(f"  max_iter:     {args.max_iter}")
     # Normalise label_column to list internally
     label_columns = args.label_column if isinstance(args.label_column, list) else [args.label_column]
@@ -467,9 +361,6 @@ def main():
     seed_display = args.seed if args.seed else f"auto ({getattr(args, '_auto_seed', 'unknown')})"
     print(f"  random_seed:  {seed_display}")
     print(f"  output_dir:   {args.output_dir}")
-    if args.mode in ['masked', 'pathway_init', 'combined']:
-        print(f"  pathway_file: {args.pathway_file}")
-        print(f"  pathway_size: [{args.pathway_min_genes}, {args.pathway_max_genes}]")
     if args.normalize:
         print(f"  normalize:    True (target_sum={args.normalize_target_sum:.0f}, method={args.normalize_method})")
 
@@ -480,7 +371,7 @@ def main():
     print("[METHOD] Using CAVI (coordinate ascent, full-batch)")
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
-        compute_metrics, save_results, print_model_summary, load_pathways
+        compute_metrics, save_results, print_model_summary
     )
 
     # =========================================================================
@@ -555,129 +446,8 @@ def main():
             print(f"  Label ({lc}) distribution: {dict(zip(*np.unique(y_train[:, k], return_counts=True)))}")
 
 
-    # =========================================================================
-    # STEP 3.25: Load Pathways (for masked/pathway_init modes)
-    # =========================================================================
-    pathway_mask = None
-    pathway_names = None
-    n_factors = args.n_factors  # Default from CLI
-
-    if args.mode in ['masked', 'pathway_init', 'combined']:
-        print("\n" + "=" * 80)
-        print(f"Loading Pathways for {args.mode.upper()} Mode")
-        print("=" * 80)
-
-        valid_gene_list = [g for g in gene_list if isinstance(g, str) and g]
-        n_invalid_genes = len(gene_list) - len(valid_gene_list)
-        if n_invalid_genes > 0:
-            print(f"  Warning: {n_invalid_genes} invalid gene IDs detected (None/non-string/empty); excluding from pathway matching.")
-
-        n_ensg = sum(1 for g in valid_gene_list if g.startswith('ENSG'))
-        genes_are_ensembl = n_ensg > len(valid_gene_list) * 0.5 if len(valid_gene_list) > 0 else False
-        convert_flag = genes_are_ensembl
-        print(f"  Gene ID format: {'Ensembl' if genes_are_ensembl else 'Symbol'} "
-              f"({n_ensg}/{len(valid_gene_list)} ENSG prefix among valid IDs)")
-        print(f"  convert_to_ensembl = {convert_flag}")
-
-        pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
-            gmt_path=args.pathway_file,
-            convert_to_ensembl=convert_flag,
-            species='human',
-            gene_filter=valid_gene_list,
-            min_genes=args.pathway_min_genes,
-            max_genes=args.pathway_max_genes,
-            cache_dir=args.cache_dir,
-            use_cache=True
-        )
-
-        # Align pathway matrix columns to match gene_list order
-        print(f"\nAligning pathway matrix to expression data gene order...")
-
-        gene_to_expr_idx = {g: i for i, g in enumerate(gene_list)}
-        gene_to_pathway_idx = {g: i for i, g in enumerate(pathway_genes)}
-
-        common_genes = set(valid_gene_list) & set(pathway_genes)
-        print(f"  Common genes: {len(common_genes)} / {len(valid_gene_list)} valid expression genes")
-
-        if len(common_genes) < 100:
-            raise ValueError(
-                f"Too few common genes ({len(common_genes)}) between expression data and pathways. "
-                f"Check gene ID format (should be Ensembl) or pathway file."
-            )
-
-        n_pathways = pathway_mat.shape[0]
-        n_genes_expr = len(gene_list)
-        pathway_mask = np.zeros((n_pathways, n_genes_expr), dtype=np.float32)
-
-        for gene in common_genes:
-            expr_idx = gene_to_expr_idx[gene]
-            pathway_idx = gene_to_pathway_idx[gene]
-            pathway_mask[:, expr_idx] = pathway_mat[:, pathway_idx]
-
-        genes_per_pathway = pathway_mask.sum(axis=1)
-        pathways_per_gene = pathway_mask.sum(axis=0)
-        genes_in_pathways = (pathways_per_gene > 0).sum()
-
-        print(f"\nAligned pathway matrix: {n_pathways} pathways x {n_genes_expr} genes")
-        print(f"  Genes covered by pathways: {genes_in_pathways} / {n_genes_expr}")
-        print(f"  Genes/pathway: min={genes_per_pathway.min():.0f}, max={genes_per_pathway.max():.0f}, "
-              f"mean={genes_per_pathway.mean():.1f}")
-        print(f"  Matrix density: {pathway_mask.mean()*100:.2f}%")
-
-        # -----------------------------------------------------------------
-        # Masked-mode gene restriction: keep only pathway genes
-        # -----------------------------------------------------------------
-        # In masked mode, genes outside any pathway have beta forced to ~0,
-        # so they contribute noise to the Poisson likelihood without adding
-        # signal.  Restricting X to pathway genes removes this dilution.
-        # This does NOT apply to combined (free DRGPs need all genes),
-        # pathway_init (genes evolve freely after init), or unmasked.
-        if args.mode == 'masked':
-            pathway_gene_idx = np.where(pathways_per_gene > 0)[0]
-            n_kept = len(pathway_gene_idx)
-            n_dropped = n_genes_expr - n_kept
-            print(f"\n  [MASKED] Restricting to {n_kept} pathway genes "
-                  f"(dropping {n_dropped} non-pathway genes)")
-
-            # Subset sparse X matrices (column selection)
-            X_train = X_train[:, pathway_gene_idx]
-            X_val = X_val[:, pathway_gene_idx]
-            X_test = X_test[:, pathway_gene_idx]
-
-            # Subset pathway_mask and gene_list
-            pathway_mask = pathway_mask[:, pathway_gene_idx]
-            gene_list = [gene_list[i] for i in pathway_gene_idx]
-
-            print(f"  New X shape: {X_train.shape[0]} cells x {X_train.shape[1]} genes")
-            print(f"  New pathway_mask: {pathway_mask.shape[0]} x {pathway_mask.shape[1]}")
-            print(f"  Matrix density: {pathway_mask.mean()*100:.2f}%")
-
-        pathway_names = pathway_names_raw
-
-        if args.mode == 'combined':
-            n_drgps = args.n_drgps
-            n_factors = n_pathways + n_drgps
-
-            drgp_mask = np.ones((n_drgps, n_genes_expr), dtype=np.float32)
-            pathway_mask_combined = np.vstack([pathway_mask, drgp_mask])
-
-            drgp_names = [f"DRGP_{i+1}" for i in range(n_drgps)]
-            pathway_names = pathway_names_raw + drgp_names
-
-            pathway_mask = pathway_mask_combined
-
-            print(f"\n  [COMBINED MODE] n_factors = {n_pathways} pathways + {n_drgps} DRGPs = {n_factors}")
-            print(f"    Pathway factors [0:{n_pathways}]: beta constrained by pathway membership")
-            print(f"    DRGP factors [{n_pathways}:{n_factors}]: beta unconstrained (all genes)")
-        else:
-            n_factors = n_pathways
-            print(f"\n  Setting n_factors = {n_factors} (number of pathways)")
-
-            if args.n_factors != n_pathways:
-                print(f"  NOTE: --n-factors={args.n_factors} overridden by pathway count ({n_pathways})")
-
-    else:
-        print(f"\n[UNMASKED MODE] Using {n_factors} latent factors (no pathway constraint)")
+    n_factors = args.n_factors
+    print(f"\n  Using {n_factors} latent factors")
 
     # =========================================================================
     # STEP 3.5: Hyperparameters
@@ -701,16 +471,7 @@ def main():
     print("=" * 80)
 
     print(f"\nModel Configuration:")
-    print(f"  Mode:         {args.mode}")
     print(f"  n_factors:    {n_factors}")
-    if pathway_names is not None:
-        print(f"  Pathways:     {len(pathway_names)}")
-
-    n_pathway_factors = None
-    if args.mode == 'combined':
-        n_pathway_factors = n_factors - args.n_drgps
-        print(f"  n_pathway_factors: {n_pathway_factors}")
-        print(f"  n_drgps:          {args.n_drgps}")
 
     # Build model kwargs
     a_val = args.alpha_theta if args.alpha_theta is not None else args.a
@@ -729,10 +490,6 @@ def main():
         regression_weight=args.regression_weight,
         use_intercept=not args.no_intercept,
         random_state=args.seed,
-        mode=args.mode,
-        pathway_mask=pathway_mask,
-        pathway_names=pathway_names,
-        n_pathway_factors=n_pathway_factors,
     )
 
     model = ModelClass(**model_kwargs)
@@ -747,7 +504,6 @@ def main():
         max_iter=args.max_iter,
         check_freq=args.check_freq,
         tol=args.tol,
-        v_warmup=args.v_warmup,
         verbose=True,
         early_stopping=args.early_stopping,
     )
@@ -967,8 +723,6 @@ def main():
         prefix=prefix,
         compress=True,
         optimal_threshold=optimal_thresholds,
-        program_names=pathway_names,
-        mode=args.mode,
         label_columns=label_columns,
         aux_columns=aux_column_names,
         val_test_data={
