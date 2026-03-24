@@ -787,7 +787,7 @@ def main():
     parser.add_argument("--methods", nargs="+", default=["schpf", "spectra"],
                         choices=["schpf", "spectra", "nmf", "drgp"], help="Methods to analyze")
     parser.add_argument("--output-dir", default=None, help="Output directory")
-    parser.add_argument("--prior", default="laplace", choices=["normal", "laplace"],
+    parser.add_argument("--prior", default="laplace", choices=["normal", "laplace", "laplace_elbo"],
                         help="DRGP prior (default: laplace)")
     parser.add_argument("--mode", default="combined", choices=["combined", "masked", "unmasked"],
                         help="DRGP mode (default: combined)")
