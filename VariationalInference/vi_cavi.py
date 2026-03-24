@@ -712,7 +712,12 @@ class CAVI:
                         xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1],
                         0.0))
                     b_theta_c = (b_base_c + disc_c) / 2.0
-                    b_theta_c = xp.maximum(b_theta_c, 1e-6)
+                    # Adaptive floor: don't let regression shrink b_theta below
+                    # 1% of the Poisson-only rate.  Keeps E[theta] within ~100×
+                    # of its unsupervised value, preventing the v-oscillation
+                    # trap where E[theta] explodes and regression dominates.
+                    b_floor_c = xp.maximum(b_poisson_c * 0.01, 1e-6)
+                    b_theta_c = xp.maximum(b_theta_c, b_floor_c)
 
                     b_theta_chunks.append(b_theta_c)
                     i0 = i1
