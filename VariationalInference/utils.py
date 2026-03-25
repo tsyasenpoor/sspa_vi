@@ -576,9 +576,13 @@ def save_results(
 
     # Save held-out LL history (with breakdown if available)
     if hasattr(model, 'holl_history_') and model.holl_history_:
-        # Support both old format (iter, holl) and new format (iter, holl, pois, reg)
+        # Support old format (iter, holl), 4-element (iter, holl, pois, reg),
+        # and new 5-element (iter, holl, pois, reg, true_bernoulli)
         first = model.holl_history_[0]
-        if len(first) == 4:
+        if len(first) == 5:
+            columns = ['iteration', 'heldout_ll', 'heldout_pois_ll',
+                        'heldout_reg_ll', 'heldout_true_bernoulli_ll']
+        elif len(first) == 4:
             columns = ['iteration', 'heldout_ll', 'heldout_pois_ll', 'heldout_reg_ll']
         else:
             columns = ['iteration', 'heldout_ll']
