@@ -238,7 +238,7 @@ class CAVI:
         self.bp = self.dp = None
 
     # =================================================================
-    # scHPF empirical hyperparameters
+    # HPF empirical hyperparameters
     # =================================================================
 
     @staticmethod
@@ -254,25 +254,25 @@ class CAVI:
     # Intercept helper
     # =================================================================
 
-    def _prepend_intercept(self, X_aux, n=None):
-        """Prepend a column of ones to X_aux if use_intercept is True."""
-        if not self.use_intercept:
-            return X_aux
-        if X_aux is None or (hasattr(X_aux, 'size') and X_aux.size == 0):
-            if n is None:
-                raise ValueError("n required when X_aux is None with use_intercept=True")
-            return np.ones((n, 1), dtype=np.float32)
-        X_aux = np.asarray(X_aux, dtype=np.float32)
-        ones = np.ones((X_aux.shape[0], 1), dtype=X_aux.dtype)
-        return np.hstack([ones, X_aux])
+    # def _prepend_intercept(self, X_aux, n=None):
+    #     """Prepend a column of ones to X_aux if use_intercept is True."""
+    #     if not self.use_intercept:
+    #         return X_aux
+    #     if X_aux is None or (hasattr(X_aux, 'size') and X_aux.size == 0):
+    #         if n is None:
+    #             raise ValueError("n required when X_aux is None with use_intercept=True")
+    #         return np.ones((n, 1), dtype=np.float32)
+    #     X_aux = np.asarray(X_aux, dtype=np.float32)
+    #     ones = np.ones((X_aux.shape[0], 1), dtype=X_aux.dtype)
+    #     return np.hstack([ones, X_aux])
 
     # =================================================================
-    # Initialization (scHPF pattern)
+    # Initialization (HPF pattern)
     # =================================================================
 
     def _initialize(self, X, y, X_aux):
         """
-        scHPF initialization:
+        HPF initialization:
         1. Empirical bp, dp (scalars)
         2. Random Gamma params: U(0.5*prior, 1.5*prior)
         3. xi.shape, eta.shape set to constants
@@ -2153,8 +2153,9 @@ class CAVI:
     # Diagnostics
     # =================================================================
 
-    def plot_diagnostics(self, save_path=None):
-        """Generate diagnostic plots for model quality assessment.
+    def plot_diagnostics(self, save_dir=None, fname="diagnostics.png"):
+        """
+        Generate diagnostic plots for model quality assessment.
 
         Plots:
         1. Train θ L1 norm distribution over iterations
@@ -2164,12 +2165,15 @@ class CAVI:
 
         Parameters
         ----------
-        save_path : str or Path, optional
-            If provided, save figure to this path instead of showing.
+        save_dir : str or Path, optional
+            Directory to save figure. If None, figure is shown.
+        fname : str
+            Filename for the saved figure.
         """
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        import os
 
         diag = getattr(self, 'diagnostics_', None)
         if diag is None:
@@ -2236,7 +2240,9 @@ class CAVI:
         ax.set_xscale('log')
 
         plt.tight_layout()
-        if save_path is not None:
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, fname)
             fig.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"Diagnostics saved to {save_path}")
         else:
