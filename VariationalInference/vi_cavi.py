@@ -189,8 +189,8 @@ class CAVI:
         b_v: float = 1.0,
         v_prior: str = 'normal',
         sigma_gamma: float = 1.0,
-        regression_weight: float = 1.0,
-        use_class_weights: bool = True,
+        regression_weight=None,
+        use_class_weights=None,
         use_intercept: bool = True,
         random_state: Optional[int] = None,
         mode: str = 'unmasked',
@@ -199,8 +199,30 @@ class CAVI:
         n_pathway_factors: Optional[int] = None,
         nnz_chunk_size: int = 1_000_000,
         test_jj_reg: bool = False,
+        zeta_max=None,
         **_ignored,
     ):
+        # Apply mode-dependent defaults.
+        # None means "not explicitly set" -> use mode-specific default.
+        _UNMASKED_DEFAULTS = {
+            'regression_weight': 10.0,
+            'use_class_weights': False,
+            'zeta_max': 6.0,
+        }
+        _MASKED_DEFAULTS = {
+            'regression_weight': 1.0,
+            'use_class_weights': False,
+            'zeta_max': 8.0,
+        }
+        _defaults = _MASKED_DEFAULTS if mode == 'masked' else _UNMASKED_DEFAULTS
+
+        if regression_weight is None:
+            regression_weight = _defaults['regression_weight']
+        if use_class_weights is None:
+            use_class_weights = _defaults['use_class_weights']
+        if zeta_max is None:
+            zeta_max = _defaults['zeta_max']
+
         self.K = n_factors
         self.a = a
         self.ap = ap
@@ -217,8 +239,8 @@ class CAVI:
         self.test_jj_reg = test_jj_reg
         # Cap on JJ auxiliary zeta.  Keeps lambda_JJ(zeta) >= lambda_JJ(zeta_max) > 0,
         # preventing the quadratic braking on theta from vanishing.
-        # At zeta_max=4: lambda_min ~ 0.060.  The JJ bound remains valid for any zeta.
-        self.zeta_max = 4.0
+        # At zeta_max=6: lambda_min ~ 0.037.  The JJ bound remains valid for any zeta.
+        self.zeta_max = zeta_max
 
         self.use_intercept = use_intercept
         self.nnz_chunk_size = nnz_chunk_size
@@ -1653,7 +1675,9 @@ class CAVI:
             X_val=None, y_val=None, X_aux_val=None,
             max_iter=600, check_freq=5, tol=0.001,
             v_warmup=50, verbose=True,
-            early_stopping='heldout_ll'):
+            early_stopping='heldout_ll',
+            patience_checks=10, min_delta=1e-4,
+            pretrain_pf_iters=0):
         """
         Fit the supervised Poisson factorization model.
 
@@ -1669,9 +1693,18 @@ class CAVI:
         v_warmup : int -- deprecated, kept for CLI compatibility (ignored)
         verbose : bool
         early_stopping : str
-            'heldout_ll' -- stop on held-out LL / regression LL plateau (default).
+            'heldout_ll' -- stop on held-out true Bernoulli LL patience (default).
             'elbo' -- stop only on ELBO convergence.
             'none' -- disable all early stopping, run all iterations.
+        patience_checks : int
+            Stop when held-out true Bernoulli LL has not improved for this many
+            consecutive checks. Each check is every check_freq iterations.
+        min_delta : float
+            Minimum improvement in per-sample true Bernoulli LL to count as
+            an improvement for early stopping.
+        pretrain_pf_iters : int
+            If > 0, run pure Poisson factorization (no regression) for this
+            many iterations before enabling joint training.
         """
         t0 = time.time()
 
@@ -1741,21 +1774,34 @@ class CAVI:
         else:
             _gene_total_counts = np.asarray(X_train.sum(axis=0)).ravel()
 
-        best_holl = -np.inf
+        # Best-so-far patience early stopping on held-out true Bernoulli LL
+        best_ho_bern_ll = -np.inf
+        best_iter = 0
         best_params = None
+        patience_counter = 0  # incremented each check without improvement
 
-        # Regression early stopping: stop if Reg degrades for too long
+        # Fallback: regression early stopping (training, no validation)
         best_reg_ll = -np.inf
         best_reg_params = None
         best_reg_iter = 0
         reg_patience = 10  # stop after this many consecutive checks of Reg degradation
 
-        # HO-LL total early stopping
-        best_holl_iter = 0
-        best_holl_params = None
-        holl_patience = 100
+        # Pretraining state
+        _orig_regression_weight = self.regression_weight
+        _in_pretrain = pretrain_pf_iters > 0
 
         for t in range(max_iter):
+            # --- Pretraining phase transition ---
+            if _in_pretrain and t < pretrain_pf_iters:
+                self.regression_weight = 0.0
+            elif _in_pretrain and t == pretrain_pf_iters:
+                self.regression_weight = _orig_regression_weight
+                _in_pretrain = False
+                if verbose:
+                    print(f"\n=== PF pretraining complete at iter {t}. "
+                          f"Enabling joint training (regression_weight="
+                          f"{self.regression_weight}) ===\n")
+
             diag = verbose and (t % check_freq == 0)
             t_iter_start = time.time()
 
@@ -1906,17 +1952,17 @@ class CAVI:
                         t, holl, holl_pois,
                         holl_reg if holl_reg is not None else 0.0,
                         holl_true_bernoulli if holl_true_bernoulli is not None else 0.0))
-                    # Use total HO-LL (Poisson + classification) for early stopping.
-                    # Using only holl_true_bernoulli causes premature stopping:
-                    # the intercept captures the base rate at iter 0, so Bernoulli LL
-                    # peaks before theta/beta have converged, killing training while
-                    # reconstruction is still improving dramatically.
-                    _es_metric = holl
-                    if _es_metric > best_holl:
-                        best_holl = _es_metric
-                        best_holl_iter = t
-                        best_holl_params = self._checkpoint()
-                        best_params = best_holl_params  # keep alias
+                    # Use held-out true Bernoulli LL as the primary stopping metric.
+                    # Total HO-LL is dominated by the Poisson term and masks
+                    # regression degradation.
+                    _es_metric = holl_true_bernoulli if holl_true_bernoulli is not None else holl
+                    if _es_metric > best_ho_bern_ll + min_delta:
+                        best_ho_bern_ll = _es_metric
+                        best_iter = t
+                        best_params = self._checkpoint()
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
 
                     # Track true vs JJ validation LL for diagnostics
                     if holl_true_bernoulli is not None:
@@ -1927,17 +1973,19 @@ class CAVI:
                             (t, holl_reg))
 
                 # Decomposed prediction diagnostics (covariates-only vs theta-only vs full)
-                if diag and X_val is not None and y_val is not None:
+                # Always compute when validation data exists (not just in verbose mode)
+                if X_val is not None and y_val is not None:
                     _decomp = self._diagnostic_decomposed_metrics(
                         X_val, y_val, X_aux_val)
                     if _decomp is not None:
-                        print(f"  [Decomp t={t}]"
-                              f"  Cov-only: AUC={_decomp['cov_only']['auc']:.4f}"
-                              f" LL={_decomp['cov_only']['log_loss']:.4f}"
-                              f"  Theta-only: AUC={_decomp['theta_only']['auc']:.4f}"
-                              f" LL={_decomp['theta_only']['log_loss']:.4f}"
-                              f"  Full: AUC={_decomp['full']['auc']:.4f}"
-                              f" LL={_decomp['full']['log_loss']:.4f}")
+                        if verbose:
+                            print(f"  [Decomp t={t}]"
+                                  f"  Cov-only: AUC={_decomp['cov_only']['auc']:.4f}"
+                                  f" LL={_decomp['cov_only']['log_loss']:.4f}"
+                                  f"  Theta-only: AUC={_decomp['theta_only']['auc']:.4f}"
+                                  f" LL={_decomp['theta_only']['log_loss']:.4f}"
+                                  f"  Full: AUC={_decomp['full']['auc']:.4f}"
+                                  f" LL={_decomp['full']['log_loss']:.4f}")
                         self.diagnostics_.setdefault(
                             'decomposed_metrics', []).append((t, _decomp))
 
@@ -1978,14 +2026,14 @@ class CAVI:
 
                 # Early stopping checks (gated by early_stopping mode)
                 if early_stopping == 'heldout_ll':
-                    # HO-LL total early stopping (preferred when validation available)
+                    # Best-so-far patience on held-out true Bernoulli LL
                     if X_val is not None and holl is not None:
-                        iters_since_best = t - best_holl_iter
-                        if iters_since_best >= holl_patience and t >= 30:
+                        if patience_counter >= patience_checks and t >= 30:
                             if verbose:
-                                print(f"HO-LL early stop at iter {t}: "
-                                      f"HO-LL hasn't improved in {iters_since_best} iters "
-                                      f"(best HO-LL={best_holl:.4f} at iter {best_holl_iter})")
+                                print(f"Early stop at iter {t}: "
+                                      f"HO Bernoulli LL no improvement for "
+                                      f"{patience_counter} checks "
+                                      f"(best={best_ho_bern_ll:.6f} at iter {best_iter})")
                             break
 
                     # Regression early stopping (training, fallback if no validation)
@@ -1999,7 +2047,7 @@ class CAVI:
                             break
 
                 if early_stopping in ('heldout_ll', 'elbo'):
-                    # Convergence check on full ELBO (not just Poisson term)
+                    # Convergence check on full ELBO (secondary)
                     if len(loss_list) >= 3 and t >= 30:
                         c1 = abs(pct_changes[-1]) < tol
                         c2 = abs(pct_changes[-2]) < tol
@@ -2008,19 +2056,24 @@ class CAVI:
                                 print(f"Converged at iter {t}")
                             break
 
+        # Restore regression_weight if still in pretrain when loop ends
+        if _in_pretrain:
+            self.regression_weight = _orig_regression_weight
+
         elapsed = time.time() - t0
         if verbose:
             print(f"\nTraining complete in {elapsed:.1f}s")
             if best_params is not None:
-                print(f"Best HO-LL: {best_holl:.4f}")
+                print(f"Best HO Bernoulli LL: {best_ho_bern_ll:.6f} "
+                      f"at iter {best_iter}")
 
         # Restore best checkpoint (skip when early stopping is disabled)
         if early_stopping != 'none':
-            if best_holl_params is not None:
+            if best_params is not None:
                 if verbose:
-                    print(f"Restoring best HO-LL checkpoint (iter {best_holl_iter}, "
-                          f"HO-LL={best_holl:.4f})")
-                self._restore(best_holl_params)
+                    print(f"Restoring best checkpoint (iter {best_iter}, "
+                          f"HO Bernoulli LL={best_ho_bern_ll:.6f})")
+                self._restore(best_params)
             elif best_reg_params is not None:
                 if verbose:
                     print(f"Restoring best regression checkpoint (iter {best_reg_iter})")
