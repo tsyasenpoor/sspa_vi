@@ -16,17 +16,23 @@ scHPF update equations (Gopalan et al. 2014, Eqs 7-9):
 Hierarchical priors:
   xi_i ~ Gamma(a', b')     ->  a^xi_i = a' + K*a  (constant)
                                 b^xi_i = b' + Sum_k E[theta_{ik}]
-  eta_j ~ Gamma(c', d')    ->  a^eta_j = c' + K*c  (constant)
+  eta_j ~ Gamma(c', d')    ->  a^eta_j = c' + m_j*c  (constant; m_j = active factors)
                                 b^eta_j = d' + Sum_k E[beta_{jk}]
 
-Key differences from previous vi_cavi.py:
+Key properties:
 1. bp, dp are SCALARS (scHPF), not per-cell/gene vectors
 2. Random init: U(0.5*prior, 1.5*prior) for both shape AND rate
 3. First iteration uses random Dirichlet phi (scHPF symmetry breaking)
-4. No damping -- pure coordinate ascent
-5. No diversity noise, no annealing, no warmup phases
-6. All parameters (theta, v, gamma, zeta) learned jointly from iteration 0
-7. No spike-and-slab
+4. All parameters (theta, v, gamma, zeta) learned jointly from iteration 0
+5. No spike-and-slab, no diversity noise, no annealing
+
+Numerical stabilizers (not pure coordinate ascent):
+- bp/dp floored so implied prior means E[xi], E[eta] <= 1e4
+- b_eta, b_xi floored at 1e-6 to prevent eta-beta collapse loop
+- b_theta floored at max(0.1*b_poisson, bp, 1e-2)
+- v update: K-scaled damping, step caps, period-2 oscillation detection
+- gamma update: step caps and damping
+- zeta capped at 4.0 (keeps lambda_JJ >= 0.060)
 
 GPU/JAX acceleration:
 - When JAX is installed the hot numerical paths (phi, ELBO, updates)
@@ -291,11 +297,34 @@ class CAVI:
         # --- Empirical hyperparameters (scHPF: scalar bp, dp) ---
         self.bp = self.ap * self._mean_var_ratio(X, axis=1)
         self.dp = self.cp * self._mean_var_ratio(X, axis=0)
-        # Clip if bp >> dp (scHPF)
+
+        # Floor bp/dp so that the implied prior means E[xi] = a_xi/bp and
+        # E[eta] = a_eta/dp don't explode.  When the empirical mean/var ratio
+        # yields near-zero bp or dp (common with highly variable count data),
+        # E[eta] can reach 1e9+ at t=0, triggering the eta-beta collapse loop.
+        INV_BUDGET_MEAN_MAX = 1e4
+        a_xi0 = self.ap + K * self.a
+        a_eta0 = self.cp + K * self.c  # worst-case (unmasked); masked is smaller
+        bp_floor = a_xi0 / INV_BUDGET_MEAN_MAX
+        dp_floor = a_eta0 / INV_BUDGET_MEAN_MAX
+        if self.bp < bp_floor:
+            print(f"  [floor] bp: {self.bp:.6f} -> {bp_floor:.6f} "
+                  f"(caps E[xi] prior mean at {INV_BUDGET_MEAN_MAX:.0e})")
+            self.bp = bp_floor
+        if self.dp < dp_floor:
+            print(f"  [floor] dp: {self.dp:.6f} -> {dp_floor:.6f} "
+                  f"(caps E[eta] prior mean at {INV_BUDGET_MEAN_MAX:.0e})")
+            self.dp = dp_floor
+
+        # Bidirectional clipping: prevent extreme bp/dp ratio
         if self.bp > 1000 * self.dp:
             old_dp = self.dp
             self.dp = self.bp / 1000
             print(f"Clipping dp: was {old_dp:.4f} now {self.dp:.4f}")
+        elif self.dp > 1000 * self.bp:
+            old_bp = self.bp
+            self.bp = self.dp / 1000
+            print(f"Clipping bp: was {old_bp:.4f} now {self.bp:.4f}")
 
         bp, dp = self.bp, self.dp
 
@@ -825,7 +854,7 @@ class CAVI:
         new_b = self.E_eta[:, None] + theta_sum[None, :]
         # Floor: prevent pathologically small shape/rate values
         new_a = xp.maximum(new_a, 1e-6)
-        new_b = xp.maximum(new_b, 1e-8)
+        new_b = xp.maximum(new_b, 1e-6)
 
         if self._active_beta is not None:
             # Only update active entries; masked entries keep their pinned values.
@@ -849,6 +878,8 @@ class CAVI:
                 self._active_beta, self.E_beta, 0.0).sum(axis=1)
         else:
             self.b_eta = self.dp + self.E_beta.sum(axis=1)
+        # Floor to prevent E[eta] explosion from tiny dp + tiny E[beta] sums
+        self.b_eta = xp.maximum(self.b_eta, 1e-6)
 
     def _update_theta(self, z_sum_theta, y, X_aux):
         """
@@ -952,6 +983,8 @@ class CAVI:
             )
         theta_row_sum = xp.concatenate(theta_row_sum_chunks) if len(theta_row_sum_chunks) > 1 else theta_row_sum_chunks[0]
         self.b_xi = self.bp + theta_row_sum
+        # Floor to prevent E[xi] explosion from tiny bp + tiny E[theta] sums
+        self.b_xi = xp.maximum(self.b_xi, 1e-6)
 
     def _update_zeta(self, X_aux):
         """JJ auxiliary: zeta_{ik} = min(sqrt(E[A^2_{ik}]), zeta_max).
@@ -1678,7 +1711,12 @@ class CAVI:
             'lambda_stats': [],         # (iter, min, median, max)
             'true_val_ll': [],          # (iter, true Bernoulli LL per sample)
             'jj_val_ll': [],            # (iter, JJ bound LL per sample)
+            'eta_stats': [],            # (iter, min, median, max) of E[η]
+            'beta_stats': [],           # (iter, min, median, max) of E[β]
             'eta_vs_counts': None,      # final: (E[η], gene_total_counts, active_mask)
+            'bp_dp': (float(self.bp), float(self.dp)),
+            'implied_E_xi_prior': float((self.ap + self.K * self.a) / self.bp),
+            'implied_E_eta_prior': float((self.cp + self.K * self.c) / self.dp),
         }
         loss_list = []
         pct_changes = []
@@ -1830,6 +1868,16 @@ class CAVI:
                 self.diagnostics_['lambda_stats'].append(
                     (t, float(_lam_np.min()), float(np.median(_lam_np)),
                      float(_lam_np.max())))
+
+                # E[eta] and E[beta] stats (detect eta-beta collapse)
+                _E_eta_np = to_numpy(self.E_eta)
+                _E_beta_np = to_numpy(self.E_beta)
+                self.diagnostics_['eta_stats'].append(
+                    (t, float(_E_eta_np.min()), float(np.median(_E_eta_np)),
+                     float(_E_eta_np.max())))
+                self.diagnostics_['beta_stats'].append(
+                    (t, float(_E_beta_np.min()), float(np.median(_E_beta_np)),
+                     float(_E_beta_np.max())))
 
                 # Held-out LL (with breakdown)
                 holl = None
@@ -2156,11 +2204,13 @@ class CAVI:
     def plot_diagnostics(self, save_path=None):
         """Generate diagnostic plots for model quality assessment.
 
-        Plots:
+        Plots (3x2 grid):
         1. Train θ L1 norm distribution over iterations
         2. ζ saturation and λ(ζ) over iterations
         3. True validation logistic loss vs JJ bound
         4. η vs gene total counts (mask consistency)
+        5. E[η] range over iterations (eta-beta collapse detector)
+        6. E[β] range over iterations
 
         Parameters
         ----------
@@ -2176,7 +2226,7 @@ class CAVI:
             print("No diagnostics available. Run fit() first.")
             return
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig, axes = plt.subplots(3, 2, figsize=(14, 15))
 
         # --- Plot 1: Train θ L1 norms ---
         ax = axes[0, 0]
@@ -2234,6 +2284,34 @@ class CAVI:
         ax.set_ylabel('E[eta_j]')
         ax.set_title('eta vs gene counts (mask consistency)')
         ax.set_xscale('log')
+
+        # --- Plot 5: E[η] over iterations (eta-beta collapse detector) ---
+        ax = axes[2, 0]
+        if diag.get('eta_stats'):
+            iters, emins, emeds, emaxs = zip(*diag['eta_stats'])
+            ax.semilogy(iters, emeds, 'b-', label='median')
+            ax.fill_between(iters, emins, emaxs, alpha=0.15, color='b')
+            ax.semilogy(iters, emaxs, 'r--', alpha=0.5, label='max')
+        bp_dp = diag.get('bp_dp')
+        if bp_dp:
+            ax.set_title(f'E[eta] over iterations  (bp={bp_dp[0]:.4f}, dp={bp_dp[1]:.4f})')
+        else:
+            ax.set_title('E[eta] over iterations')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('E[eta_j]')
+        ax.legend()
+
+        # --- Plot 6: E[β] over iterations ---
+        ax = axes[2, 1]
+        if diag.get('beta_stats'):
+            iters, bmins, bmeds, bmaxs = zip(*diag['beta_stats'])
+            ax.semilogy(iters, bmeds, 'g-', label='median')
+            ax.fill_between(iters, bmins, bmaxs, alpha=0.15, color='g')
+            ax.semilogy(iters, bmaxs, 'r--', alpha=0.5, label='max')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('E[beta_jk]')
+        ax.set_title('E[beta] over iterations')
+        ax.legend()
 
         plt.tight_layout()
         if save_path is not None:
