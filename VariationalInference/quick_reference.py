@@ -156,8 +156,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--regression-weight',
         type=float,
-        default=1.0,
-        help='Weight for classification objective (higher=more focus on classification)'
+        default=10.0,
+        help='Weight for classification objective (default 10.0)'
     )
     parser.add_argument(
         '--check-freq',
@@ -305,8 +305,37 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=['heldout_ll', 'elbo', 'none'],
         default='heldout_ll',
-        help='Early stopping criterion: heldout_ll (default, stop on held-out LL), '
+        help='Early stopping criterion: heldout_ll (default, stop on held-out '
+             'true Bernoulli LL with patience), '
              'elbo (stop on ELBO convergence), none (disable early stopping)'
+    )
+
+    parser.add_argument(
+        '--patience-checks',
+        type=int,
+        default=10,
+        help='Number of checks without improvement before early stopping (default 10).'
+    )
+
+    parser.add_argument(
+        '--min-delta',
+        type=float,
+        default=1e-4,
+        help='Minimum per-sample Bernoulli LL improvement for early stopping (default 1e-4).'
+    )
+
+    parser.add_argument(
+        '--pretrain-pf-iters',
+        type=int,
+        default=0,
+        help='Number of pure PF pretraining iterations before joint training (default 0).'
+    )
+
+    parser.add_argument(
+        '--zeta-max',
+        type=float,
+        default=6.0,
+        help='Cap on JJ auxiliary zeta (default 6.0).'
     )
 
     # VI (CAVI) training options
@@ -742,6 +771,7 @@ def main():
         pathway_mask=pathway_mask,
         pathway_names=pathway_names,
         n_pathway_factors=n_pathway_factors,
+        zeta_max=args.zeta_max,
     )
 
     model = ModelClass(**model_kwargs)
@@ -759,6 +789,9 @@ def main():
         v_warmup=args.v_warmup,
         verbose=True,
         early_stopping=args.early_stopping,
+        patience_checks=args.patience_checks,
+        min_delta=args.min_delta,
+        pretrain_pf_iters=args.pretrain_pf_iters,
     )
 
     model.fit(**fit_kwargs)

@@ -140,9 +140,10 @@ class VIConfig:
     pi_beta: float = 0.05
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
-    regression_weight: float = 1.0
-    use_class_weights: bool = True
+    regression_weight: float = 10.0
+    use_class_weights: bool = False
     use_intercept: bool = True
+    zeta_max: float = 6.0
 
     # Training parameters
     max_iter: int = 200
@@ -151,6 +152,9 @@ class VIConfig:
     elbo_freq: int = 10
     min_iter: int = 50
     patience: int = 5
+    patience_checks: int = 10
+    min_delta: float = 1e-4
+    pretrain_pf_iters: int = 30
 
     # Damping parameters
     theta_damping: float = 0.8
@@ -216,6 +220,7 @@ class VIConfig:
             'spike_value_beta': self.spike_value_beta,
             'regression_weight': self.regression_weight,
             'use_class_weights': self.use_class_weights,
+            'zeta_max': self.zeta_max,
         }
 
     def training_params(self) -> Dict[str, Any]:
@@ -243,6 +248,9 @@ class VIConfig:
             'adaptive_damping': self.adaptive_damping,
             'verbose': self.verbose,
             'debug': self.debug,
+            'patience_checks': self.patience_checks,
+            'min_delta': self.min_delta,
+            'pretrain_pf_iters': self.pretrain_pf_iters,
         }
 
     def to_dict(self) -> Dict[str, Any]:

@@ -192,8 +192,8 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument(
         '--regression-weight',
         type=float,
-        default=1.0,
-        help='Weight for classification objective (higher=more focus on classification).'
+        default=10.0,
+        help='Weight for classification objective (default 10.0).'
     )
 
     train_parser.add_argument(
@@ -201,8 +201,37 @@ def create_parser() -> argparse.ArgumentParser:
         type=str,
         choices=['heldout_ll', 'elbo', 'none'],
         default='heldout_ll',
-        help='Early stopping criterion: heldout_ll (default, stop on held-out LL), '
+        help='Early stopping criterion: heldout_ll (default, stop on held-out '
+             'true Bernoulli LL with patience), '
              'elbo (stop on ELBO convergence), none (disable early stopping)'
+    )
+
+    train_parser.add_argument(
+        '--patience-checks',
+        type=int,
+        default=10,
+        help='Number of checks without improvement before early stopping (default 10).'
+    )
+
+    train_parser.add_argument(
+        '--min-delta',
+        type=float,
+        default=1e-4,
+        help='Minimum per-sample Bernoulli LL improvement for early stopping (default 1e-4).'
+    )
+
+    train_parser.add_argument(
+        '--pretrain-pf-iters',
+        type=int,
+        default=0,
+        help='Number of pure PF pretraining iterations before joint training (default 0).'
+    )
+
+    train_parser.add_argument(
+        '--zeta-max',
+        type=float,
+        default=6.0,
+        help='Cap on JJ auxiliary zeta (default 6.0).'
     )
 
     # Output options
@@ -409,6 +438,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
         random_state=args.seed,
+        zeta_max=args.zeta_max,
     )
 
     model = ModelClass(**model_kwargs)
@@ -426,6 +456,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         v_warmup=args.v_warmup,
         verbose=args.verbose,
         early_stopping=args.early_stopping,
+        patience_checks=args.patience_checks,
+        min_delta=args.min_delta,
+        pretrain_pf_iters=args.pretrain_pf_iters,
     )
 
     model.fit(**fit_kwargs)
