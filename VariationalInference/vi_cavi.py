@@ -1697,6 +1697,12 @@ class CAVI:
         y = to_device(y)
         X_aux = to_device(X_aux)
 
+        if verbose:
+            if self.use_class_weights:
+                print("Class weights: ENABLED (set use_class_weights=False for ablation)")
+            else:
+                print("Class weights: DISABLED")
+
         # Dense X for ELBO (if small enough) -- otherwise use sparse
         if sp.issparse(X_train):
             X_dense = None  # Will use sparse ELBO
@@ -1920,6 +1926,21 @@ class CAVI:
                         self.diagnostics_['jj_val_ll'].append(
                             (t, holl_reg))
 
+                # Decomposed prediction diagnostics (covariates-only vs theta-only vs full)
+                if diag and X_val is not None and y_val is not None:
+                    _decomp = self._diagnostic_decomposed_metrics(
+                        X_val, y_val, X_aux_val)
+                    if _decomp is not None:
+                        print(f"  [Decomp t={t}]"
+                              f"  Cov-only: AUC={_decomp['cov_only']['auc']:.4f}"
+                              f" LL={_decomp['cov_only']['log_loss']:.4f}"
+                              f"  Theta-only: AUC={_decomp['theta_only']['auc']:.4f}"
+                              f" LL={_decomp['theta_only']['log_loss']:.4f}"
+                              f"  Full: AUC={_decomp['full']['auc']:.4f}"
+                              f" LL={_decomp['full']['log_loss']:.4f}")
+                        self.diagnostics_.setdefault(
+                            'decomposed_metrics', []).append((t, _decomp))
+
                 # Track best training regression LL for early stopping
                 if reg_ll > best_reg_ll:
                     best_reg_ll = reg_ll
@@ -2118,6 +2139,8 @@ class CAVI:
                     theta_v = theta_v + X_aux_new @ self.mu_gamma.T
                 Var_theta = E_theta / b_theta
                 E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
+                # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
+                E_A_sq = E_A_sq + xp.square(E_theta) @ self.sigma_v_diag.T
                 if self.p_aux > 0:
                     _gvar = xp.stack([xp.diag(self.Sigma_gamma[k])
                                       for k in range(self.kappa)])
@@ -2142,6 +2165,56 @@ class CAVI:
             b_xi = self.bp + E_theta.sum(axis=1)
 
         return a_theta, b_theta
+
+    def _diagnostic_decomposed_metrics(self, X_val, y_val, X_aux_val,
+                                          n_iter=20):
+        """Compute AUC/log-loss for covariates-only, theta-only, and full model.
+
+        Returns dict with keys 'cov_only', 'theta_only', 'full', each
+        containing 'auc' and 'log_loss', or None if sklearn unavailable.
+        """
+        try:
+            from sklearn.metrics import roc_auc_score, log_loss as sk_log_loss
+        except ImportError:
+            return None
+
+        X_coo = sp.coo_matrix(X_val) if not sp.issparse(X_val) else X_val.tocoo()
+        n_val = X_val.shape[0]
+        X_aux_v = self._prepend_intercept(
+            np.asarray(X_aux_val if X_aux_val is not None
+                       else np.zeros((n_val, 0)), dtype=np.float32),
+            n=n_val)
+        X_aux_v_dev = to_device(X_aux_v)
+
+        a_theta_v, b_theta_v = self._infer_theta_sparse(
+            X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=False)
+        E_theta_v = a_theta_v / b_theta_v
+
+        y_np = np.asarray(y_val, dtype=np.float32)
+        if y_np.ndim == 1:
+            y_np = y_np[:, None]
+
+        results = {}
+        for name, logits in [
+            ('cov_only',   X_aux_v_dev @ self.mu_gamma.T),
+            ('theta_only', E_theta_v @ self.mu_v.T),
+            ('full',       E_theta_v @ self.mu_v.T + X_aux_v_dev @ self.mu_gamma.T),
+        ]:
+            probs = to_numpy(_expit(logits))
+            if probs.ndim == 1:
+                probs = probs[:, None]
+            aucs, lls = [], []
+            for k in range(probs.shape[1]):
+                y_k = y_np[:, k]
+                p_k = np.clip(probs[:, k], 1e-7, 1 - 1e-7)
+                if len(np.unique(y_k)) > 1:
+                    aucs.append(roc_auc_score(y_k, p_k))
+                lls.append(sk_log_loss(y_k, p_k))
+            results[name] = {
+                'auc': np.mean(aucs) if aucs else float('nan'),
+                'log_loss': np.mean(lls),
+            }
+        return results
 
     def predict_proba(self, X_new, X_aux_new=None, n_iter=20):
         """Predict P(y=1 | X_new).
