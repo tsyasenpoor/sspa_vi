@@ -260,17 +260,17 @@ class CAVI:
     # Intercept helper
     # =================================================================
 
-    # def _prepend_intercept(self, X_aux, n=None):
-    #     """Prepend a column of ones to X_aux if use_intercept is True."""
-    #     if not self.use_intercept:
-    #         return X_aux
-    #     if X_aux is None or (hasattr(X_aux, 'size') and X_aux.size == 0):
-    #         if n is None:
-    #             raise ValueError("n required when X_aux is None with use_intercept=True")
-    #         return np.ones((n, 1), dtype=np.float32)
-    #     X_aux = np.asarray(X_aux, dtype=np.float32)
-    #     ones = np.ones((X_aux.shape[0], 1), dtype=X_aux.dtype)
-    #     return np.hstack([ones, X_aux])
+    def _prepend_intercept(self, X_aux, n=None):
+        """Prepend a column of ones to X_aux if use_intercept is True."""
+        if not self.use_intercept:
+            return X_aux
+        if X_aux is None or (hasattr(X_aux, 'size') and X_aux.size == 0):
+            if n is None:
+                raise ValueError("n required when X_aux is None with use_intercept=True")
+            return np.ones((n, 1), dtype=np.float32)
+        X_aux = np.asarray(X_aux, dtype=np.float32)
+        ones = np.ones((X_aux.shape[0], 1), dtype=X_aux.dtype)
+        return np.hstack([ones, X_aux])
 
     # =================================================================
     # Initialization (HPF pattern)
