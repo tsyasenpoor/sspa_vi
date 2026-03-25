@@ -480,7 +480,8 @@ def main():
     print("[METHOD] Using CAVI (coordinate ascent, full-batch)")
     from VariationalInference.data_loader import DataLoader
     from VariationalInference.utils import (
-        compute_metrics, save_results, print_model_summary, load_pathways
+        compute_metrics, save_results, print_model_summary, load_pathways,
+        plot_diagnostics,
     )
 
     # =========================================================================
@@ -1033,6 +1034,10 @@ def main():
     print("=" * 80)
 
     print_model_summary(model, gene_list)
+
+    # Save diagnostic plots
+    if hasattr(model, 'diagnostics_') and model.diagnostics_ is not None:
+        plot_diagnostics(model.diagnostics_, save_dir=output_dir)
 
     # =========================================================================
     # Profiling Output (if enabled)

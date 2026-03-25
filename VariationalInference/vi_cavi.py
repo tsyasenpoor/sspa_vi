@@ -1739,7 +1739,7 @@ class CAVI:
         # HO-LL total early stopping
         best_holl_iter = 0
         best_holl_params = None
-        holl_patience = 25
+        holl_patience = 100
 
         for t in range(max_iter):
             diag = verbose and (t % check_freq == 0)
@@ -1836,7 +1836,7 @@ class CAVI:
             # 6. Check convergence
             if t % check_freq == 0:
                 elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux)
-                self.elbo_history_.append((t, elbo))
+                self.elbo_history_.append((t, elbo, pois_ll, reg_ll))
 
                 # ELBO monotonicity check
                 if diag and len(self.elbo_history_) >= 2:
@@ -2201,132 +2201,3 @@ class CAVI:
             'b_theta': to_numpy(b_theta),
         }
 
-    # =================================================================
-    # Diagnostics
-    # =================================================================
-
-    def plot_diagnostics(self, save_dir=None, fname="diagnostics.png"):
-        """
-        Generate diagnostic plots for model quality assessment.
-
-        Plots (3x2 grid):
-        1. Train θ L1 norm distribution over iterations
-        2. ζ saturation and λ(ζ) over iterations
-        3. True validation logistic loss vs JJ bound
-        4. η vs gene total counts (mask consistency)
-        5. E[η] range over iterations (eta-beta collapse detector)
-        6. E[β] range over iterations
-
-        Parameters
-        ----------
-        save_dir : str or Path, optional
-            Directory to save figure. If None, figure is shown.
-        fname : str
-            Filename for the saved figure.
-        """
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        import os
-
-        diag = getattr(self, 'diagnostics_', None)
-        if diag is None:
-            print("No diagnostics available. Run fit() first.")
-            return
-
-        fig, axes = plt.subplots(3, 2, figsize=(14, 15))
-
-        # --- Plot 1: Train θ L1 norms ---
-        ax = axes[0, 0]
-        if diag['theta_l1_train']:
-            iters, means, stds, mins, maxs = zip(*diag['theta_l1_train'])
-            means = np.array(means)
-            stds = np.array(stds)
-            ax.plot(iters, means, 'b-', label='train mean')
-            ax.fill_between(iters, means - stds, means + stds, alpha=0.2, color='b')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('||E[theta_i]||_1')
-        ax.set_title('Train theta L1 norms')
-        ax.legend()
-
-        # --- Plot 2: ζ saturation and λ(ζ) ---
-        ax = axes[0, 1]
-        if diag['zeta_stats']:
-            iters, zmins, zmeds, zmaxs, frac_caps = zip(*diag['zeta_stats'])
-            ax.plot(iters, zmeds, 'g-', label='zeta median')
-            ax.fill_between(iters, zmins, zmaxs, alpha=0.15, color='g')
-            ax2 = ax.twinx()
-            ax2.plot(iters, frac_caps, 'r--', label='frac at cap')
-            ax2.set_ylabel('Fraction at zeta_max', color='r')
-            ax2.tick_params(axis='y', labelcolor='r')
-            ax.legend(loc='upper left')
-            ax2.legend(loc='upper right')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('zeta')
-        ax.set_title('zeta saturation')
-
-        # --- Plot 3: True Bernoulli LL vs JJ bound ---
-        ax = axes[1, 0]
-        if diag['true_val_ll'] and diag['jj_val_ll']:
-            iters_t, vals_t = zip(*diag['true_val_ll'])
-            iters_j, vals_j = zip(*diag['jj_val_ll'])
-            ax.plot(iters_t, vals_t, 'b-o', markersize=3, label='True Bernoulli LL')
-            ax.plot(iters_j, vals_j, 'r-s', markersize=3, label='JJ bound LL')
-            ax.legend()
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Validation LL / sample')
-        ax.set_title('True logistic loss vs JJ bound')
-
-        # --- Plot 4: η vs gene total counts (mask consistency) ---
-        ax = axes[1, 1]
-        if diag['eta_vs_counts'] is not None:
-            E_eta, gene_counts, active_mask = diag['eta_vs_counts']
-            if active_mask is not None:
-                n_active = active_mask.sum(axis=1)
-                scatter = ax.scatter(gene_counts, E_eta, c=n_active,
-                                     cmap='viridis', s=3, alpha=0.5)
-                plt.colorbar(scatter, ax=ax, label='n_active_factors')
-            else:
-                ax.scatter(gene_counts, E_eta, s=3, alpha=0.5)
-        ax.set_xlabel('Gene total counts')
-        ax.set_ylabel('E[eta_j]')
-        ax.set_title('eta vs gene counts (mask consistency)')
-        ax.set_xscale('log')
-
-        # --- Plot 5: E[η] over iterations (eta-beta collapse detector) ---
-        ax = axes[2, 0]
-        if diag.get('eta_stats'):
-            iters, emins, emeds, emaxs = zip(*diag['eta_stats'])
-            ax.semilogy(iters, emeds, 'b-', label='median')
-            ax.fill_between(iters, emins, emaxs, alpha=0.15, color='b')
-            ax.semilogy(iters, emaxs, 'r--', alpha=0.5, label='max')
-        bp_dp = diag.get('bp_dp')
-        if bp_dp:
-            ax.set_title(f'E[eta] over iterations  (bp={bp_dp[0]:.4f}, dp={bp_dp[1]:.4f})')
-        else:
-            ax.set_title('E[eta] over iterations')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('E[eta_j]')
-        ax.legend()
-
-        # --- Plot 6: E[β] over iterations ---
-        ax = axes[2, 1]
-        if diag.get('beta_stats'):
-            iters, bmins, bmeds, bmaxs = zip(*diag['beta_stats'])
-            ax.semilogy(iters, bmeds, 'g-', label='median')
-            ax.fill_between(iters, bmins, bmaxs, alpha=0.15, color='g')
-            ax.semilogy(iters, bmaxs, 'r--', alpha=0.5, label='max')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('E[beta_jk]')
-        ax.set_title('E[beta] over iterations')
-        ax.legend()
-
-        plt.tight_layout()
-        if save_dir is not None:
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, fname)
-            fig.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Diagnostics saved to {save_path}")
-        else:
-            plt.show()
-        plt.close(fig)

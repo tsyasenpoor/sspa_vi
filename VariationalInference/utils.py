@@ -566,31 +566,11 @@ def save_results(
     saved_files['summary'] = summary_path
     print(f"Saved summary to {summary_path}")
     
-    # Save ELBO history to CSV for easy plotting
-    if hasattr(model, 'elbo_history_') and model.elbo_history_:
-        elbo_df = pd.DataFrame(model.elbo_history_, columns=['iteration', 'elbo'])
-        elbo_history_path = output_dir / f'{prefix}_elbo_history{ext}'
-        elbo_df.to_csv(elbo_history_path, index=False, compression=compression)
-        saved_files['elbo_history'] = elbo_history_path
-        print(f"Saved ELBO history to {elbo_history_path}")
-
-    # Save held-out LL history (with breakdown if available)
-    if hasattr(model, 'holl_history_') and model.holl_history_:
-        # Support old format (iter, holl), 4-element (iter, holl, pois, reg),
-        # and new 5-element (iter, holl, pois, reg, true_bernoulli)
-        first = model.holl_history_[0]
-        if len(first) == 5:
-            columns = ['iteration', 'heldout_ll', 'heldout_pois_ll',
-                        'heldout_reg_ll', 'heldout_true_bernoulli_ll']
-        elif len(first) == 4:
-            columns = ['iteration', 'heldout_ll', 'heldout_pois_ll', 'heldout_reg_ll']
-        else:
-            columns = ['iteration', 'heldout_ll']
-        holl_df = pd.DataFrame(model.holl_history_, columns=columns)
-        holl_history_path = output_dir / f'{prefix}_holl_history{ext}'
-        holl_df.to_csv(holl_history_path, index=False, compression=compression)
-        saved_files['holl_history'] = holl_history_path
-        print(f"Saved held-out LL history to {holl_history_path}")
+    # Save training curves plot (ELBO + HO-LL with breakdowns)
+    if (hasattr(model, 'elbo_history_') and model.elbo_history_) or \
+       (hasattr(model, 'holl_history_') and model.holl_history_):
+        plot_training_curves(model, save_dir=output_dir)
+        saved_files['training_curves'] = output_dir / 'training_curves.png'
 
     return saved_files
 
@@ -1014,3 +994,215 @@ def load_pathways(
     print(f"  Matrix density: {pathway_mat.mean()*100:.2f}%")
     
     return pathway_mat, pathway_names, gene_names
+
+
+# =============================================================================
+# Diagnostic Plotting
+# =============================================================================
+
+def plot_diagnostics(diagnostics, save_dir, fname="diagnostics.png"):
+    """
+    Generate diagnostic plots for model quality assessment.
+
+    Plots (3x2 grid):
+    1. Train theta L1 norm distribution over iterations
+    2. zeta saturation and lambda(zeta) over iterations
+    3. True validation logistic loss vs JJ bound
+    4. eta vs gene total counts (mask consistency)
+    5. E[eta] range over iterations (eta-beta collapse detector)
+    6. E[beta] range over iterations
+
+    Parameters
+    ----------
+    diagnostics : dict
+        The model's diagnostics_ dictionary.
+    save_dir : str or Path
+        Directory to save figure.
+    fname : str
+        Filename for the saved figure.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    diag = diagnostics
+    if diag is None:
+        print("No diagnostics available. Run fit() first.")
+        return
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
+
+    # --- Plot 1: Train theta L1 norms ---
+    ax = axes[0, 0]
+    if diag['theta_l1_train']:
+        iters, means, stds, mins, maxs = zip(*diag['theta_l1_train'])
+        means = np.array(means)
+        stds = np.array(stds)
+        ax.plot(iters, means, 'b-', label='train mean')
+        ax.fill_between(iters, means - stds, means + stds, alpha=0.2, color='b')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('||E[theta_i]||_1')
+    ax.set_title('Train theta L1 norms')
+    ax.legend()
+
+    # --- Plot 2: zeta saturation and lambda(zeta) ---
+    ax = axes[0, 1]
+    if diag['zeta_stats']:
+        iters, zmins, zmeds, zmaxs, frac_caps = zip(*diag['zeta_stats'])
+        ax.plot(iters, zmeds, 'g-', label='zeta median')
+        ax.fill_between(iters, zmins, zmaxs, alpha=0.15, color='g')
+        ax2 = ax.twinx()
+        ax2.plot(iters, frac_caps, 'r--', label='frac at cap')
+        ax2.set_ylabel('Fraction at zeta_max', color='r')
+        ax2.tick_params(axis='y', labelcolor='r')
+        ax.legend(loc='upper left')
+        ax2.legend(loc='upper right')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('zeta')
+    ax.set_title('zeta saturation')
+
+    # --- Plot 3: True Bernoulli LL vs JJ bound ---
+    ax = axes[1, 0]
+    if diag['true_val_ll'] and diag['jj_val_ll']:
+        iters_t, vals_t = zip(*diag['true_val_ll'])
+        iters_j, vals_j = zip(*diag['jj_val_ll'])
+        ax.plot(iters_t, vals_t, 'b-o', markersize=3, label='True Bernoulli LL')
+        ax.plot(iters_j, vals_j, 'r-s', markersize=3, label='JJ bound LL')
+        ax.legend()
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Validation LL / sample')
+    ax.set_title('True logistic loss vs JJ bound')
+
+    # --- Plot 4: eta vs gene total counts (mask consistency) ---
+    ax = axes[1, 1]
+    if diag['eta_vs_counts'] is not None:
+        E_eta, gene_counts, active_mask = diag['eta_vs_counts']
+        if active_mask is not None:
+            n_active = active_mask.sum(axis=1)
+            scatter = ax.scatter(gene_counts, E_eta, c=n_active,
+                                 cmap='viridis', s=3, alpha=0.5)
+            plt.colorbar(scatter, ax=ax, label='n_active_factors')
+        else:
+            ax.scatter(gene_counts, E_eta, s=3, alpha=0.5)
+    ax.set_xlabel('Gene total counts')
+    ax.set_ylabel('E[eta_j]')
+    ax.set_title('eta vs gene counts (mask consistency)')
+    ax.set_xscale('log')
+
+    # --- Plot 5: E[eta] over iterations (eta-beta collapse detector) ---
+    ax = axes[2, 0]
+    if diag.get('eta_stats'):
+        iters, emins, emeds, emaxs = zip(*diag['eta_stats'])
+        ax.semilogy(iters, emeds, 'b-', label='median')
+        ax.fill_between(iters, emins, emaxs, alpha=0.15, color='b')
+        ax.semilogy(iters, emaxs, 'r--', alpha=0.5, label='max')
+    bp_dp = diag.get('bp_dp')
+    if bp_dp:
+        ax.set_title(f'E[eta] over iterations  (bp={bp_dp[0]:.4f}, dp={bp_dp[1]:.4f})')
+    else:
+        ax.set_title('E[eta] over iterations')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('E[eta_j]')
+    ax.legend()
+
+    # --- Plot 6: E[beta] over iterations ---
+    ax = axes[2, 1]
+    if diag.get('beta_stats'):
+        iters, bmins, bmeds, bmaxs = zip(*diag['beta_stats'])
+        ax.semilogy(iters, bmeds, 'g-', label='median')
+        ax.fill_between(iters, bmins, bmaxs, alpha=0.15, color='g')
+        ax.semilogy(iters, bmaxs, 'r--', alpha=0.5, label='max')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('E[beta_jk]')
+    ax.set_title('E[beta] over iterations')
+    ax.legend()
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(str(save_dir), fname)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Diagnostics saved to {save_path}")
+    plt.close(fig)
+
+
+def plot_training_curves(model, save_dir, fname="training_curves.png"):
+    """
+    Generate ELBO and held-out LL convergence plots with component breakdowns.
+
+    Panel 1: ELBO with Poisson LL and regression LL breakdown
+    Panel 2: Held-out LL with Poisson, JJ regression, and true Bernoulli breakdown
+
+    Parameters
+    ----------
+    model : CAVI
+        Fitted model with elbo_history_ and holl_history_ attributes.
+    save_dir : str or Path
+        Directory to save figure.
+    fname : str
+        Filename for the saved figure.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    has_elbo = hasattr(model, 'elbo_history_') and bool(model.elbo_history_)
+    has_holl = hasattr(model, 'holl_history_') and bool(model.holl_history_)
+    if not has_elbo and not has_holl:
+        print("No training history available. Run fit() first.")
+        return
+
+    n_panels = int(has_elbo) + int(has_holl)
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5), squeeze=False)
+    idx = 0
+
+    if has_elbo:
+        ax = axes[0, idx]
+        first = model.elbo_history_[0]
+        if len(first) >= 4:
+            iters, elbos, pois, regs = zip(*[(e[0], e[1], e[2], e[3])
+                                              for e in model.elbo_history_])
+            ax.plot(iters, elbos, 'k-', lw=1.5, label='ELBO (total)')
+            ax.plot(iters, pois, 'steelblue', lw=1, ls='--', label='Poisson LL')
+            ax.plot(iters, regs, 'coral', lw=1, ls='--', label='Regression LL')
+            ax.legend(fontsize=8)
+        else:
+            iters, elbos = zip(*[(e[0], e[1]) for e in model.elbo_history_])
+            ax.plot(iters, elbos, 'k-', lw=1.5, label='ELBO')
+            ax.legend(fontsize=8)
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('ELBO')
+        ax.set_title('ELBO Convergence')
+        idx += 1
+
+    if has_holl:
+        ax = axes[0, idx]
+        first = model.holl_history_[0]
+        iters = [e[0] for e in model.holl_history_]
+        totals = [e[1] for e in model.holl_history_]
+        ax.plot(iters, totals, 'k-', lw=1.5, label='Total HO-LL')
+
+        if len(first) >= 3:
+            pois = [e[2] for e in model.holl_history_]
+            ax.plot(iters, pois, 'steelblue', lw=1, ls='--', label='HO Poisson')
+        if len(first) >= 4:
+            regs = [e[3] for e in model.holl_history_]
+            ax2 = ax.twinx()
+            ax2.plot(iters, regs, 'coral', lw=1, ls='--', label='HO Reg (JJ)')
+            if len(first) >= 5:
+                berns = [e[4] for e in model.holl_history_]
+                ax2.plot(iters, berns, 'mediumpurple', lw=1, ls=':',
+                         label='HO Bernoulli (true)')
+            ax2.set_ylabel('Regression LL / sample', fontsize=9)
+            ax2.legend(loc='center right', fontsize=8)
+
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('Held-out LL / sample')
+        ax.set_title('Held-out Log-Likelihood')
+        ax.legend(loc='upper left', fontsize=8)
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(str(save_dir), fname)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Training curves saved to {save_path}")
+    plt.close(fig)

@@ -335,7 +335,7 @@ def cmd_train(args: argparse.Namespace) -> int:
     import pstats
     import io
     from .data_loader import DataLoader
-    from .utils import save_results, compute_metrics, print_model_summary
+    from .utils import save_results, compute_metrics, print_model_summary, plot_diagnostics
     from .vi_cavi import CAVI as ModelClass
 
     # Initialize profiler if requested
@@ -486,6 +486,10 @@ def cmd_train(args: argparse.Namespace) -> int:
     # Print model summary
     if args.verbose:
         print_model_summary(model, data['gene_list'])
+
+    # Save diagnostic plots
+    if hasattr(model, 'diagnostics_') and model.diagnostics_ is not None:
+        plot_diagnostics(model.diagnostics_, save_dir=output_dir)
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
