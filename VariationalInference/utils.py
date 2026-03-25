@@ -1129,17 +1129,11 @@ def plot_training_curves(model, save_dir, fname="training_curves.png"):
     """
     Generate ELBO and held-out LL convergence plots with component breakdowns.
 
-    Panel 1: ELBO with Poisson LL and regression LL breakdown
-    Panel 2: Held-out LL with Poisson, JJ regression, and true Bernoulli breakdown
+    Produces a 2x2 grid:
+      Top row:    full range (all iterations) for ELBO and HO-LL
+      Bottom row: zoomed in (skip iter 0 burn-in) to show real dynamics
 
-    Parameters
-    ----------
-    model : CAVI
-        Fitted model with elbo_history_ and holl_history_ attributes.
-    save_dir : str or Path
-        Directory to save figure.
-    fname : str
-        Filename for the saved figure.
+    Each panel shows component breakdowns (Poisson, Regression, Bernoulli).
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -1151,54 +1145,101 @@ def plot_training_curves(model, save_dir, fname="training_curves.png"):
         print("No training history available. Run fit() first.")
         return
 
-    n_panels = int(has_elbo) + int(has_holl)
-    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5), squeeze=False)
-    idx = 0
-
+    # ── Extract data ──
+    elbo_data = {}
     if has_elbo:
-        ax = axes[0, idx]
         first = model.elbo_history_[0]
+        elbo_data['iters'] = [e[0] for e in model.elbo_history_]
+        elbo_data['elbo'] = [e[1] for e in model.elbo_history_]
         if len(first) >= 4:
-            iters, elbos, pois, regs = zip(*[(e[0], e[1], e[2], e[3])
-                                              for e in model.elbo_history_])
-            ax.plot(iters, elbos, 'k-', lw=1.5, label='ELBO (total)')
-            ax.plot(iters, pois, 'steelblue', lw=1, ls='--', label='Poisson LL')
-            ax.plot(iters, regs, 'coral', lw=1, ls='--', label='Regression LL')
-            ax.legend(fontsize=8)
-        else:
-            iters, elbos = zip(*[(e[0], e[1]) for e in model.elbo_history_])
-            ax.plot(iters, elbos, 'k-', lw=1.5, label='ELBO')
-            ax.legend(fontsize=8)
+            elbo_data['pois'] = [e[2] for e in model.elbo_history_]
+            elbo_data['reg'] = [e[3] for e in model.elbo_history_]
+
+    holl_data = {}
+    if has_holl:
+        first = model.holl_history_[0]
+        holl_data['iters'] = [e[0] for e in model.holl_history_]
+        holl_data['total'] = [e[1] for e in model.holl_history_]
+        if len(first) >= 3:
+            holl_data['pois'] = [e[2] for e in model.holl_history_]
+        if len(first) >= 4:
+            holl_data['reg'] = [e[3] for e in model.holl_history_]
+        if len(first) >= 5:
+            holl_data['bern'] = [e[4] for e in model.holl_history_]
+
+    n_cols = int(has_elbo) + int(has_holl)
+    # Two rows: full range + zoomed (skip burn-in)
+    need_zoom = (has_elbo and len(elbo_data['iters']) > 2) or \
+                (has_holl and len(holl_data['iters']) > 2)
+    n_rows = 2 if need_zoom else 1
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows),
+                             squeeze=False)
+
+    def _plot_elbo(ax, iters, data, title_suffix=''):
+        ax.plot(iters, data['elbo'], 'k-', lw=1.5, marker='.', ms=3,
+                label='ELBO (total)')
+        if 'pois' in data:
+            ax.plot(iters, data['pois'], 'steelblue', lw=1, ls='--',
+                    marker='.', ms=2, label='Poisson LL')
+            ax2 = ax.twinx()
+            ax2.plot(iters, data['reg'], 'coral', lw=1, ls='--',
+                     marker='.', ms=2, label='Regression LL')
+            ax2.set_ylabel('Regression LL', fontsize=9, color='coral')
+            ax2.tick_params(axis='y', labelcolor='coral')
+            ax2.legend(loc='center right', fontsize=8)
         ax.set_xlabel('Iteration')
         ax.set_ylabel('ELBO')
-        ax.set_title('ELBO Convergence')
-        idx += 1
+        ax.set_title(f'ELBO{title_suffix}')
+        ax.legend(loc='upper left', fontsize=8)
 
-    if has_holl:
-        ax = axes[0, idx]
-        first = model.holl_history_[0]
-        iters = [e[0] for e in model.holl_history_]
-        totals = [e[1] for e in model.holl_history_]
-        ax.plot(iters, totals, 'k-', lw=1.5, label='Total HO-LL')
-
-        if len(first) >= 3:
-            pois = [e[2] for e in model.holl_history_]
-            ax.plot(iters, pois, 'steelblue', lw=1, ls='--', label='HO Poisson')
-        if len(first) >= 4:
-            regs = [e[3] for e in model.holl_history_]
+    def _plot_holl(ax, iters, data, title_suffix=''):
+        ax.plot(iters, data['total'], 'k-', lw=1.5, marker='.', ms=3,
+                label='Total HO-LL')
+        if 'pois' in data:
+            ax.plot(iters, data['pois'], 'steelblue', lw=1, ls='--',
+                    marker='.', ms=2, label='HO Poisson')
+        if 'reg' in data or 'bern' in data:
             ax2 = ax.twinx()
-            ax2.plot(iters, regs, 'coral', lw=1, ls='--', label='HO Reg (JJ)')
-            if len(first) >= 5:
-                berns = [e[4] for e in model.holl_history_]
-                ax2.plot(iters, berns, 'mediumpurple', lw=1, ls=':',
-                         label='HO Bernoulli (true)')
+            if 'reg' in data:
+                ax2.plot(iters, data['reg'], 'coral', lw=1, ls='--',
+                         marker='.', ms=2, label='HO Reg (JJ)')
+            if 'bern' in data:
+                ax2.plot(iters, data['bern'], 'mediumpurple', lw=1, ls=':',
+                         marker='.', ms=2, label='HO Bernoulli (true)')
             ax2.set_ylabel('Regression LL / sample', fontsize=9)
             ax2.legend(loc='center right', fontsize=8)
-
         ax.set_xlabel('Iteration')
         ax.set_ylabel('Held-out LL / sample')
-        ax.set_title('Held-out Log-Likelihood')
+        ax.set_title(f'Held-out Log-Likelihood{title_suffix}')
         ax.legend(loc='upper left', fontsize=8)
+
+    # ── Row 0: full range ──
+    col = 0
+    if has_elbo:
+        _plot_elbo(axes[0, col], elbo_data['iters'],
+                   {k: elbo_data[k] for k in elbo_data if k != 'iters'},
+                   ' (full range)')
+        col += 1
+    if has_holl:
+        _plot_holl(axes[0, col], holl_data['iters'],
+                   {k: holl_data[k] for k in holl_data if k != 'iters'},
+                   ' (full range)')
+
+    # ── Row 1: skip first point (burn-in) to reveal dynamics ──
+    if need_zoom:
+        col = 0
+        if has_elbo and len(elbo_data['iters']) > 2:
+            zoomed = {k: v[1:] for k, v in elbo_data.items()}
+            _plot_elbo(axes[1, col], zoomed['iters'],
+                       {k: zoomed[k] for k in zoomed if k != 'iters'},
+                       ' (iter 0 excluded)')
+            col += 1
+        if has_holl and len(holl_data['iters']) > 2:
+            zoomed = {k: v[1:] for k, v in holl_data.items()}
+            _plot_holl(axes[1, col], zoomed['iters'],
+                       {k: zoomed[k] for k in zoomed if k != 'iters'},
+                       ' (iter 0 excluded)')
 
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
