@@ -1892,8 +1892,12 @@ class CAVI:
                         t, holl, holl_pois,
                         holl_reg if holl_reg is not None else 0.0,
                         holl_true_bernoulli if holl_true_bernoulli is not None else 0.0))
-                    # Use true Bernoulli LL for early stopping when available
-                    _es_metric = holl_true_bernoulli if holl_true_bernoulli is not None else holl
+                    # Use total HO-LL (Poisson + classification) for early stopping.
+                    # Using only holl_true_bernoulli causes premature stopping:
+                    # the intercept captures the base rate at iter 0, so Bernoulli LL
+                    # peaks before theta/beta have converged, killing training while
+                    # reconstruction is still improving dramatically.
+                    _es_metric = holl
                     if _es_metric > best_holl:
                         best_holl = _es_metric
                         best_holl_iter = t
