@@ -198,7 +198,7 @@ class CAVI:
         pathway_names: Optional[List[str]] = None,
         n_pathway_factors: Optional[int] = None,
         nnz_chunk_size: int = 1_000_000,
-        test_jj_reg: bool = True,
+        test_jj_reg: bool = False,
         **_ignored,
     ):
         self.K = n_factors
@@ -251,10 +251,12 @@ class CAVI:
     def _mean_var_ratio(X, axis):
         """ap * mean / var along axis, as in scHPF."""
         if sp.issparse(X):
-            sums = np.asarray(X.sum(axis=axis)).ravel()
+            sums = np.asarray(X.sum(axis=axis)).ravel().astype(np.float64)
         else:
-            sums = np.asarray(X.sum(axis=axis)).ravel()
-        return float(np.mean(sums) / max(np.var(sums), 1e-10))
+            sums = np.asarray(X.sum(axis=axis)).ravel().astype(np.float64)
+        m = sums.mean()
+        v = sums.var()
+        return float(m / max(v, 1e-10))
 
     # =================================================================
     # Intercept helper
@@ -1017,6 +1019,8 @@ class CAVI:
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
                 E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
+                # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
+                E_A_sq_c = E_A_sq_c + xp.square(E_theta_c) @ self.sigma_v_diag.T
                 if gamma_var is not None:
                     E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
                 zeta_chunks.append(
@@ -1405,6 +1409,8 @@ class CAVI:
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
                 E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T       # (chunk, kappa)
+                # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
+                E_A_sq_c = E_A_sq_c + xp.square(E_theta_c) @ self.sigma_v_diag.T
                 if gamma_var is not None:
                     E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
                 lam_c = lam[i0:i1]
@@ -1560,7 +1566,7 @@ class CAVI:
         X_aux_v_dev = to_device(X_aux_val)
 
         a_theta_v, b_theta_v = self._infer_theta_sparse(
-            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev)
+            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=False)
 
         E_log_beta = self._E_log_beta_cache
         E_beta = self.E_beta
@@ -1609,6 +1615,8 @@ class CAVI:
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
             Var_theta_v = a_theta_v / (b_theta_v ** 2)
             E_A_sq = E_A ** 2 + Var_theta_v @ E_v_sq.T
+            # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
+            E_A_sq = E_A_sq + xp.square(E_theta_v) @ self.sigma_v_diag.T
             if self.p_aux > 0:
                 gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
                                       for k in range(self.kappa)])
