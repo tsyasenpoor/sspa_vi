@@ -192,6 +192,7 @@ class CAVI:
         pathway_names: Optional[List[str]] = None,
         n_pathway_factors: Optional[int] = None,
         nnz_chunk_size: int = 1_000_000,
+        test_jj_reg: bool = True,
         **_ignored,
     ):
         self.K = n_factors
@@ -207,6 +208,7 @@ class CAVI:
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
         self.use_class_weights = use_class_weights
+        self.test_jj_reg = test_jj_reg
         # Cap on JJ auxiliary zeta.  Keeps lambda_JJ(zeta) >= lambda_JJ(zeta_max) > 0,
         # preventing the quadratic braking on theta from vanishing.
         # At zeta_max=4: lambda_min ~ 0.060.  The JJ bound remains valid for any zeta.
@@ -325,6 +327,9 @@ class CAVI:
         if self.beta_mask is not None:
             self._active_beta = self.beta_mask > 0.5  # numpy bool
             self._n_active_beta = int(self._active_beta.sum())
+            # Fix a_eta: only count active factors per gene (hard mask semantics)
+            m_j = self._active_beta.sum(axis=1)  # (p,) number of active factors
+            self.a_eta = self.cp + m_j * self.c
         else:
             self._active_beta = None  # means all active
             self._n_active_beta = self.p * K
@@ -835,8 +840,10 @@ class CAVI:
         """eta rate (scHPF): b^eta_j = d' + Sum_k E[beta_{jk}].
 
         Only active beta entries contribute (masked entries are absent).
+        a^eta_j = c' + m_j * c where m_j is the number of active factors
+        for gene j (= K when no mask is applied).
         """
-        # a^eta is constant = cp + K*c (set in init, never changes)
+        # a^eta is constant (set in init, never changes)
         if self._active_beta is not None:
             self.b_eta = self.dp + xp.where(
                 self._active_beta, self.E_beta, 0.0).sum(axis=1)
@@ -957,6 +964,12 @@ class CAVI:
         Row-chunked with adaptive OOM guard.
         """
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K) -- tiny
+        # Pre-compute gamma variance for E[A^2] correction
+        if self.p_aux > 0:
+            gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
+                                  for k in range(self.kappa)])  # (kappa, p_aux)
+        else:
+            gamma_var = None
         min_chunk = max(1024, self.n // 256)
 
         zeta_chunks = []
@@ -971,6 +984,8 @@ class CAVI:
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
                 E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
+                if gamma_var is not None:
+                    E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
                 zeta_chunks.append(
                     xp.minimum(xp.sqrt(xp.maximum(E_A_sq_c, 1e-8)), self.zeta_max)
                 )
@@ -1335,6 +1350,13 @@ class CAVI:
         theta_entropy = 0.0
         gammaln_a = gammaln(self.a)
 
+        # Pre-compute gamma variance for E[A^2] correction (tiny, computed once)
+        if self.p_aux > 0:
+            gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
+                                  for k in range(self.kappa)])  # (kappa, p_aux)
+        else:
+            gamma_var = None
+
         i0 = 0
         while i0 < self.n:
             i1 = min(i0 + self._row_chunk, self.n)
@@ -1350,6 +1372,8 @@ class CAVI:
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
                 E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T       # (chunk, kappa)
+                if gamma_var is not None:
+                    E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
                 lam_c = lam[i0:i1]
                 W_c = W[i0:i1]
                 zeta_c = self.zeta[i0:i1]
@@ -1434,6 +1458,14 @@ class CAVI:
             elbo += 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
                                         / xp.maximum(lambda_s, 1e-12)))
 
+        # === Prior: p(gamma) — Gaussian N(0, sigma_gamma^2 I) ===
+        if self.p_aux > 0:
+            sigma_gamma_sq = self.sigma_gamma ** 2
+            for k in range(self.kappa):
+                elbo -= 0.5 * self.p_aux * float(xp.log(2 * xp.pi * sigma_gamma_sq))
+                elbo -= 0.5 * float(xp.sum(self.mu_gamma[k] ** 2)
+                                    + xp.trace(self.Sigma_gamma[k])) / sigma_gamma_sq
+
         # === Entropy: -E[log q] ===
         # q(beta) — active entries only (masked entries are not latent variables)
         psi_a_beta = digamma(self.a_beta)
@@ -1455,6 +1487,11 @@ class CAVI:
                        + (1 - self.a_eta) * self._digamma_a_eta)
         # q(v) Gaussian entropy
         elbo += 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * self.sigma_v_diag))
+        # q(gamma) Gaussian entropy
+        if self.p_aux > 0:
+            for k in range(self.kappa):
+                sign, logdet = xp.linalg.slogdet(self.Sigma_gamma[k])
+                elbo += 0.5 * float(self.p_aux * xp.log(2 * xp.pi * xp.e) + logdet)
 
         return float(elbo), float(poisson_ll), float(regression_ll)
 
@@ -1539,6 +1576,10 @@ class CAVI:
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
             Var_theta_v = a_theta_v / (b_theta_v ** 2)
             E_A_sq = E_A ** 2 + Var_theta_v @ E_v_sq.T
+            if self.p_aux > 0:
+                gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
+                                      for k in range(self.kappa)])
+                E_A_sq = E_A_sq + xp.square(X_aux_v_dev) @ gamma_var.T
 
             zeta_val = xp.sqrt(xp.maximum(E_A_sq, 1e-8))
             lam = lambda_jj(zeta_val)
@@ -1548,11 +1589,20 @@ class CAVI:
                              + log_expit(zeta_val))
             regression_ll_per_sample = float(reg_ll / n_val)
 
+            # True Bernoulli log-likelihood (for model selection, not training)
+            true_bernoulli_ll = xp.sum(
+                y_v * log_expit(E_A) + (1 - y_v) * log_expit(-E_A)
+            )
+            true_bernoulli_ll_per_sample = float(true_bernoulli_ll / n_val)
+        else:
+            true_bernoulli_ll_per_sample = None
+
         total_ll = poisson_ll_per_sample
         if regression_ll_per_sample is not None:
             total_ll += self.regression_weight * regression_ll_per_sample
 
-        return float(total_ll), float(poisson_ll_per_sample), regression_ll_per_sample
+        return (float(total_ll), float(poisson_ll_per_sample),
+                regression_ll_per_sample, true_bernoulli_ll_per_sample)
 
     # =================================================================
     # fit()
@@ -1620,8 +1670,24 @@ class CAVI:
 
         self.elbo_history_ = []
         self.holl_history_ = []
+        self.diagnostics_ = {
+            'theta_l1_train': [],       # (iter, mean, std, min, max) of ||E[θ_i]||_1
+            'theta_l1_val': [],         # (iter, mean, std, min, max) of ||E[θ_i]||_1 (val)
+            'theta_l1_val_no_jj': [],   # (iter, mean, std, min, max) pure Poisson θ
+            'zeta_stats': [],           # (iter, min, median, max, frac_at_cap)
+            'lambda_stats': [],         # (iter, min, median, max)
+            'true_val_ll': [],          # (iter, true Bernoulli LL per sample)
+            'jj_val_ll': [],            # (iter, JJ bound LL per sample)
+            'eta_vs_counts': None,      # final: (E[η], gene_total_counts, active_mask)
+        }
         loss_list = []
         pct_changes = []
+
+        # Cache gene total counts for mask consistency diagnostic
+        if sp.issparse(X_train):
+            _gene_total_counts = np.asarray(X_train.sum(axis=0)).ravel()
+        else:
+            _gene_total_counts = np.asarray(X_train.sum(axis=0)).ravel()
 
         best_holl = -np.inf
         best_params = None
@@ -1742,20 +1808,57 @@ class CAVI:
                         print(f"  [WARN t={t}] ELBO DECREASED by {delta:.4e} "
                               f"({prev_elbo:.4e} -> {elbo:.4e})")
 
+                # --- Diagnostics: θ train norms, ζ saturation ---
+                _theta_l1_chunks = []
+                for _i0 in range(0, self.n, self._row_chunk):
+                    _i1 = min(_i0 + self._row_chunk, self.n)
+                    _etc = self.a_theta[_i0:_i1] / self.b_theta[_i0:_i1]
+                    _theta_l1_chunks.append(to_numpy(_etc.sum(axis=1)))
+                _theta_l1_train = np.concatenate(_theta_l1_chunks)
+                self.diagnostics_['theta_l1_train'].append(
+                    (t, float(_theta_l1_train.mean()),
+                     float(_theta_l1_train.std()),
+                     float(_theta_l1_train.min()),
+                     float(_theta_l1_train.max())))
+
+                _zeta_np = to_numpy(self.zeta)
+                _lam_np = to_numpy(lambda_jj(self.zeta))
+                _frac_cap = float((_zeta_np >= self.zeta_max - 1e-4).mean())
+                self.diagnostics_['zeta_stats'].append(
+                    (t, float(_zeta_np.min()), float(np.median(_zeta_np)),
+                     float(_zeta_np.max()), _frac_cap))
+                self.diagnostics_['lambda_stats'].append(
+                    (t, float(_lam_np.min()), float(np.median(_lam_np)),
+                     float(_lam_np.max())))
+
                 # Held-out LL (with breakdown)
                 holl = None
                 holl_pois = None
                 holl_reg = None
+                holl_true_bernoulli = None
                 if X_val is not None:
-                    holl, holl_pois, holl_reg = self.compute_heldout_ll(
-                        X_val, y_val=y_val, X_aux_val=X_aux_val)
-                    self.holl_history_.append((t, holl, holl_pois,
-                                              holl_reg if holl_reg is not None else 0.0))
-                    if holl > best_holl:
-                        best_holl = holl
+                    holl, holl_pois, holl_reg, holl_true_bernoulli = \
+                        self.compute_heldout_ll(
+                            X_val, y_val=y_val, X_aux_val=X_aux_val)
+                    self.holl_history_.append((
+                        t, holl, holl_pois,
+                        holl_reg if holl_reg is not None else 0.0,
+                        holl_true_bernoulli if holl_true_bernoulli is not None else 0.0))
+                    # Use true Bernoulli LL for early stopping when available
+                    _es_metric = holl_true_bernoulli if holl_true_bernoulli is not None else holl
+                    if _es_metric > best_holl:
+                        best_holl = _es_metric
                         best_holl_iter = t
                         best_holl_params = self._checkpoint()
                         best_params = best_holl_params  # keep alias
+
+                    # Track true vs JJ validation LL for diagnostics
+                    if holl_true_bernoulli is not None:
+                        self.diagnostics_['true_val_ll'].append(
+                            (t, holl_true_bernoulli))
+                    if holl_reg is not None:
+                        self.diagnostics_['jj_val_ll'].append(
+                            (t, holl_reg))
 
                 # Track best training regression LL for early stopping
                 if reg_ll > best_reg_ll:
@@ -1779,7 +1882,9 @@ class CAVI:
                         holl_parts = [f"  HO-LL={holl:.2f}"]
                         holl_parts.append(f"  HO-Pois={holl_pois:.2f}")
                         if holl_reg is not None:
-                            holl_parts.append(f"  HO-Reg={holl_reg:.4e}")
+                            holl_parts.append(f"  HO-Reg(JJ)={holl_reg:.4e}")
+                        if holl_true_bernoulli is not None:
+                            holl_parts.append(f"  HO-Bern={holl_true_bernoulli:.4e}")
                         holl_str = "".join(holl_parts)
                     else:
                         holl_str = ""
@@ -1842,6 +1947,13 @@ class CAVI:
         elif verbose:
             print("Early stopping disabled -- keeping final parameters.")
 
+        # Store final mask consistency diagnostic
+        self.diagnostics_['eta_vs_counts'] = (
+            to_numpy(self.E_eta),
+            _gene_total_counts,
+            to_numpy(self._active_beta) if self._active_beta is not None else None
+        )
+
         return self
 
     # =================================================================
@@ -1876,17 +1988,21 @@ class CAVI:
     # predict / transform (API compat)
     # =================================================================
 
-    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None):
+    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None,
+                            use_jj_reg=None):
         """Infer theta for new data using chunked sparse phi.
 
-        Includes the label-independent quadratic regularization from the JJ
-        bound (R_quad = 2 * lambda(zeta) @ E[v^2]) to match the training
-        regime where theta is updated with the full regression correction.
-        Without this, test-time theta is purely Poisson, creating a train-test
-        distribution shift.
+        Parameters
+        ----------
+        use_jj_reg : bool or None
+            If True, include JJ quadratic regularization in theta rate
+            (matches training regime). If False, use pure Poisson+Gamma
+            inference for theta. If None, uses self.test_jj_reg.
 
         Returns a_theta, b_theta.
         """
+        if use_jj_reg is None:
+            use_jj_reg = self.test_jj_reg
         a_theta = to_device(np.random.uniform(0.5 * self.a, 1.5 * self.a, (n_new, self.K)))
         b_theta = to_device(np.full((n_new, self.K), self.bp))
         a_xi = to_device(np.full(n_new, self.ap + self.K * self.a))
@@ -1935,13 +2051,17 @@ class CAVI:
             a_theta = self.a + z_sum
             b_poisson = E_xi[:, None] + beta_col_sums[None, :]
 
-            if has_regression:
+            if has_regression and use_jj_reg:
                 # Compute zeta for new data to get lambda(zeta)
                 theta_v = E_theta @ E_v.T                    # (n_new, kappa)
                 if X_aux_new is not None and self.p_aux > 0:
                     theta_v = theta_v + X_aux_new @ self.mu_gamma.T
                 Var_theta = E_theta / b_theta
                 E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
+                if self.p_aux > 0:
+                    _gvar = xp.stack([xp.diag(self.Sigma_gamma[k])
+                                      for k in range(self.kappa)])
+                    E_A_sq = E_A_sq + xp.square(X_aux_new) @ _gvar.T
                 zeta_new = xp.minimum(
                     xp.sqrt(xp.maximum(E_A_sq, 1e-8)), self.zeta_max
                 )
@@ -2028,3 +2148,97 @@ class CAVI:
             'a_theta': to_numpy(a_theta),
             'b_theta': to_numpy(b_theta),
         }
+
+    # =================================================================
+    # Diagnostics
+    # =================================================================
+
+    def plot_diagnostics(self, save_path=None):
+        """Generate diagnostic plots for model quality assessment.
+
+        Plots:
+        1. Train θ L1 norm distribution over iterations
+        2. ζ saturation and λ(ζ) over iterations
+        3. True validation logistic loss vs JJ bound
+        4. η vs gene total counts (mask consistency)
+
+        Parameters
+        ----------
+        save_path : str or Path, optional
+            If provided, save figure to this path instead of showing.
+        """
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        diag = getattr(self, 'diagnostics_', None)
+        if diag is None:
+            print("No diagnostics available. Run fit() first.")
+            return
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # --- Plot 1: Train θ L1 norms ---
+        ax = axes[0, 0]
+        if diag['theta_l1_train']:
+            iters, means, stds, mins, maxs = zip(*diag['theta_l1_train'])
+            means = np.array(means)
+            stds = np.array(stds)
+            ax.plot(iters, means, 'b-', label='train mean')
+            ax.fill_between(iters, means - stds, means + stds, alpha=0.2, color='b')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('||E[theta_i]||_1')
+        ax.set_title('Train theta L1 norms')
+        ax.legend()
+
+        # --- Plot 2: ζ saturation and λ(ζ) ---
+        ax = axes[0, 1]
+        if diag['zeta_stats']:
+            iters, zmins, zmeds, zmaxs, frac_caps = zip(*diag['zeta_stats'])
+            ax.plot(iters, zmeds, 'g-', label='zeta median')
+            ax.fill_between(iters, zmins, zmaxs, alpha=0.15, color='g')
+            ax2 = ax.twinx()
+            ax2.plot(iters, frac_caps, 'r--', label='frac at cap')
+            ax2.set_ylabel('Fraction at zeta_max', color='r')
+            ax2.tick_params(axis='y', labelcolor='r')
+            ax.legend(loc='upper left')
+            ax2.legend(loc='upper right')
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('zeta')
+        ax.set_title('zeta saturation')
+
+        # --- Plot 3: True Bernoulli LL vs JJ bound ---
+        ax = axes[1, 0]
+        if diag['true_val_ll'] and diag['jj_val_ll']:
+            iters_t, vals_t = zip(*diag['true_val_ll'])
+            iters_j, vals_j = zip(*diag['jj_val_ll'])
+            ax.plot(iters_t, vals_t, 'b-o', markersize=3, label='True Bernoulli LL')
+            ax.plot(iters_j, vals_j, 'r-s', markersize=3, label='JJ bound LL')
+            ax.legend()
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel('Validation LL / sample')
+        ax.set_title('True logistic loss vs JJ bound')
+
+        # --- Plot 4: η vs gene total counts (mask consistency) ---
+        ax = axes[1, 1]
+        if diag['eta_vs_counts'] is not None:
+            E_eta, gene_counts, active_mask = diag['eta_vs_counts']
+            if active_mask is not None:
+                n_active = active_mask.sum(axis=1)
+                scatter = ax.scatter(gene_counts, E_eta, c=n_active,
+                                     cmap='viridis', s=3, alpha=0.5)
+                plt.colorbar(scatter, ax=ax, label='n_active_factors')
+            else:
+                ax.scatter(gene_counts, E_eta, s=3, alpha=0.5)
+        ax.set_xlabel('Gene total counts')
+        ax.set_ylabel('E[eta_j]')
+        ax.set_title('eta vs gene counts (mask consistency)')
+        ax.set_xscale('log')
+
+        plt.tight_layout()
+        if save_path is not None:
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Diagnostics saved to {save_path}")
+        else:
+            plt.show()
+        plt.close(fig)
