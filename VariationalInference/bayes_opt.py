@@ -82,7 +82,7 @@ SHARED_SEARCH_SPACE = {
     'sigma_v': ('log_float', 0.05, 2.0),
     'b_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
-    'regression_weight': ('log_float', 1.0, 100.0),
+    'regression_weight': ('log_float', 0.1, 500.0),
 }
 
 # --- VI (CAVI) damping parameters ---
@@ -99,7 +99,7 @@ VI_SEARCH_SPACE = {
 DATASET_PRESETS = {
     'pbmc': {
         'n_factors': ('int', 20, 500, 5),
-        'regression_weight': ('log_float', 1.0, 100.0),
+        'regression_weight': ('log_float', 10.0, 500.0),
         'alpha_theta': ('float', 1.5, 4.0),
         'alpha_beta': ('float', 1.5, 4.0),
     },
@@ -111,11 +111,11 @@ DATASET_PRESETS = {
     },
     'emtab': {
         'n_factors': ('int', 100, 2000, 100),
-        'regression_weight': ('log_float', 1.0, 100.0),
+        'regression_weight': ('log_float', 1.0, 200.0),
     },
     'covid': {
         'n_factors': ('int', 500, 5000, 100),
-        'regression_weight': ('log_float', 1.0, 100.0),
+        'regression_weight': ('log_float', 1.0, 500.0),
     },
 }
 
