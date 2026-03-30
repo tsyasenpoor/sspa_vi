@@ -561,11 +561,13 @@ def main():
     print(f"  Training cells: {len(splits['train'])}")
     print(f"  Validation:     {len(splits['val'])}")
     print(f"  Test:           {len(splits['test'])}")
+    n_train_patients = None
     if patient_split is not None:
         from collections import Counter
         _ps_counts = Counter(patient_split.values())
+        n_train_patients = _ps_counts.get('train', 0)
         print(f"  Split mode:     PATIENT-GROUPED (no donor leakage)")
-        print(f"  Train patients: {_ps_counts.get('train', 0)}")
+        print(f"  Train patients: {n_train_patients}")
         print(f"  Val patients:   {_ps_counts.get('val', 0)}")
         print(f"  Test patients:  {_ps_counts.get('test', 0)}")
     print(f"  Aux features:   {X_aux_train.shape[1]}")
@@ -779,6 +781,7 @@ def main():
         v_warmup=args.v_warmup,
         verbose=True,
         early_stopping=args.early_stopping,
+        n_patients=n_train_patients,
     )
 
     model.fit(**fit_kwargs)
