@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """
-Create stratified subsamples of the COVID-19 h5ad for scalability benchmarking.
-===============================================================================
+Create balanced subsamples of the COVID-19 h5ad for scalability benchmarking.
+=============================================================================
 
 Samples at the PATIENT level (sampleID) to preserve within-patient cell
-composition. Stratification is on severity x outcome at the patient level.
+composition. Uses greedy balanced selection to keep all binary variables
+(severity, outcome, sex, asthma/COPD, cardio, diabetes) as close to 50/50
+as possible — even at small sample sizes like 15 patients.
 
 Usage:
     python create_subsamples.py \
@@ -25,8 +27,6 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from scipy.io import mmwrite
-from sklearn.model_selection import train_test_split
-
 
 # Exact label values in the dataset
 SEVERITY_POS = "severe/critical"   # -> 1
@@ -80,6 +80,10 @@ def _build_metadata(obs: pd.DataFrame) -> pd.DataFrame:
     else:
         md["cell_type"] = "unknown"
 
+    # Patient/donor ID (for patient-grouped splitting)
+    if "sampleID" in obs.columns:
+        md["sampleID"] = obs["sampleID"].astype(str).values
+
     return md
 
 
@@ -118,6 +122,107 @@ def _get_patient_labels(adata: ad.AnnData) -> pd.DataFrame:
     return patient_df
 
 
+def _get_patient_profiles(adata: ad.AnnData) -> pd.DataFrame:
+    """Get per-patient binary profile across all aux variables for balanced selection.
+
+    Returns DataFrame indexed by sampleID with columns:
+        severity_bin, outcome_bin, sex_bin, asthma_bin, cardio_bin, diabetes_bin
+    """
+    obs = adata.obs.copy()
+    first = obs.groupby("sampleID").first()
+    patient_df = pd.DataFrame(index=first.index)
+
+    # Labels
+    patient_df["severity_bin"] = (
+        first["CoVID-19 severity"].astype(str).str.strip() == SEVERITY_POS
+    ).astype(int)
+    patient_df["outcome_bin"] = (
+        first["Outcome"].astype(str).str.strip() == OUTCOME_POS
+    ).astype(int)
+
+    # Aux variables
+    if "Sex" in first.columns:
+        patient_df["sex_bin"] = (
+            first["Sex"].astype(str).str.strip() == SEX_MALE
+        ).astype(int)
+    else:
+        patient_df["sex_bin"] = 0
+
+    for cm_col, col_name in [
+        ("cm_asthma_copd", "asthma_bin"),
+        ("cm_cardio", "cardio_bin"),
+        ("cm_diabetes", "diabetes_bin"),
+    ]:
+        if cm_col in first.columns:
+            patient_df[col_name] = (
+                first[cm_col].astype(str).str.strip() == "1"
+            ).astype(int)
+        else:
+            patient_df[col_name] = 0
+
+    return patient_df
+
+
+def _balanced_select(
+    patient_profiles: pd.DataFrame,
+    n_target: int,
+    seed: int,
+) -> np.ndarray:
+    """Greedily select patients to balance all binary profile columns toward 50/50.
+
+    At each step, pick the candidate whose addition minimises the sum of
+    squared deviations of each variable's proportion from 0.5.  Ties are
+    broken by the random shuffle order.
+
+    Parameters
+    ----------
+    patient_profiles : DataFrame
+        Rows = patients, columns = binary (0/1) variables to balance.
+    n_target : int
+        Number of patients to select.
+    seed : int
+        RNG seed for deterministic tie-breaking.
+
+    Returns
+    -------
+    ndarray of patient IDs (index values from *patient_profiles*).
+    """
+    rng = np.random.default_rng(seed)
+    ids = patient_profiles.index.values.copy()
+    mat = patient_profiles.values.astype(np.float64)  # (N, D)
+
+    # Shuffle so ties are broken randomly but deterministically
+    order = rng.permutation(len(ids))
+    ids = ids[order]
+    mat = mat[order]
+
+    n_total, n_vars = mat.shape
+    n_target = min(n_target, n_total)
+
+    selected_mask = np.zeros(n_total, dtype=bool)
+    current_sums = np.zeros(n_vars, dtype=np.float64)
+
+    for step in range(n_target):
+        n_sel = step + 1  # count after adding one more
+        best_score = np.inf
+        best_idx = -1
+
+        for i in range(n_total):
+            if selected_mask[i]:
+                continue
+            new_sums = current_sums + mat[i]
+            props = new_sums / n_sel
+            score = np.sum((props - 0.5) ** 2)
+            if score < best_score:
+                best_score = score
+                best_idx = i
+
+        selected_mask[best_idx] = True
+        current_sums += mat[best_idx]
+
+    return ids[selected_mask]
+
+
 def subsample_adata(
     adata: ad.AnnData,
     ratio: float = None,
@@ -151,23 +256,25 @@ def subsample_adata(
     if ratio is None and n_patients is None:
         raise ValueError("Must provide either ratio or n_patients")
 
-    patient_df = _get_patient_labels(adata)
-    all_patients = patient_df.index.values
+    profiles = _get_patient_profiles(adata)
+    all_patients = profiles.index.values
     total_patients = len(all_patients)
 
-    # Convert n_patients to ratio
+    # Convert n_patients to ratio (still used for the early-exit check)
     if n_patients is not None:
         if n_patients >= total_patients:
             if verbose:
                 print(f"[subsample] n_patients={n_patients} >= total "
                       f"({total_patients}) -> returning full dataset")
             return adata
-        ratio = n_patients / total_patients
+        target = n_patients
     elif ratio >= 1.0:
         if verbose:
             print(f"[subsample] ratio={ratio} -> returning full dataset "
                   f"({adata.n_obs} cells)")
         return adata
+    else:
+        target = max(1, int(total_patients * ratio))
 
     # Map sampleID -> cell indices
     sample_ids = adata.obs["sampleID"].astype(str).values
@@ -175,22 +282,8 @@ def subsample_adata(
     for i, sid in enumerate(sample_ids):
         patient_to_cells.setdefault(sid, []).append(i)
 
-    strata = patient_df.loc[all_patients, "stratum"].values
-    try:
-        _, sub_patients = train_test_split(
-            all_patients,
-            test_size=ratio,
-            stratify=strata,
-            random_state=subsample_seed,
-        )
-    except ValueError:
-        strata_fallback = patient_df.loc[all_patients, "severity_bin"].values
-        _, sub_patients = train_test_split(
-            all_patients,
-            test_size=ratio,
-            stratify=strata_fallback,
-            random_state=subsample_seed,
-        )
+    # Balanced greedy selection across all aux variables
+    sub_patients = _balanced_select(profiles, target, subsample_seed)
 
     cell_indices = np.concatenate(
         [np.array(patient_to_cells[pid]) for pid in sub_patients]
@@ -201,6 +294,12 @@ def subsample_adata(
     if verbose:
         print(f"[subsample] {len(sub_patients)}/{total_patients} "
               f"patients, {adata_sub.n_obs} cells")
+        # Report per-variable balance
+        sub_profiles = profiles.loc[sub_patients]
+        for col in sub_profiles.columns:
+            frac = sub_profiles[col].mean()
+            print(f"  {col}: {sub_profiles[col].sum()}/{len(sub_patients)} "
+                  f"({frac:.1%} positive)")
 
     return adata_sub
 
@@ -229,12 +328,15 @@ def main() -> None:
     n_total_cells = adata.n_obs
     print(f"  Total cells: {n_total_cells}")
 
-    # Get per-patient labels for stratification
-    patient_df = _get_patient_labels(adata)
-    all_patients = patient_df.index.values
+    # Get per-patient profiles for balanced selection
+    profiles = _get_patient_profiles(adata)
+    all_patients = profiles.index.values
     n_patients = len(all_patients)
     print(f"  Total patients: {n_patients}")
-    print(f"  Patient strata (severity_outcome): {patient_df['stratum'].value_counts().to_dict()}")
+    print(f"  Patient profiles:")
+    for col in profiles.columns:
+        print(f"    {col}: {profiles[col].sum()}/{n_patients} "
+              f"({profiles[col].mean():.1%} positive)")
 
     # Map sampleID -> cell indices for fast subsetting
     sample_ids = adata.obs["sampleID"].astype(str).values
@@ -250,7 +352,9 @@ def main() -> None:
         "total_cells": n_total_cells,
         "total_patients": n_patients,
         "subsample_seed": args.subsample_seed,
-        "patient_strata": patient_df["stratum"].value_counts().to_dict(),
+        "population_balance": {
+            col: float(profiles[col].mean()) for col in profiles.columns
+        },
         "subsamples": {},
     }
 
@@ -274,24 +378,8 @@ def main() -> None:
             print(f"Ratio {ratio} -> target ~{n_target_patients} of {n_patients} patients")
             print(f"{'='*60}")
 
-            # Stratified patient-level subsample
-            strata = patient_df.loc[all_patients, "stratum"].values
-            try:
-                _, sub_patients = train_test_split(
-                    all_patients,
-                    test_size=ratio,
-                    stratify=strata,
-                    random_state=args.subsample_seed,
-                )
-            except ValueError as e:
-                print(f"  WARNING: Stratified split failed ({e}), falling back to severity-only")
-                strata_fallback = patient_df.loc[all_patients, "severity_bin"].values
-                _, sub_patients = train_test_split(
-                    all_patients,
-                    test_size=ratio,
-                    stratify=strata_fallback,
-                    random_state=args.subsample_seed,
-                )
+            # Balanced greedy selection across all aux variables
+            sub_patients = _balanced_select(profiles, n_target_patients, args.subsample_seed)
 
             # Gather all cell indices for selected patients
             cell_indices = np.concatenate([patient_to_cells[pid] for pid in sub_patients])
@@ -309,10 +397,14 @@ def main() -> None:
 
         print(f"  Selected {len(sub_patients)} patients, {adata_sub.n_obs} cells")
 
-        # Report strata
-        sub_patient_df = patient_df.loc[sub_patients]
-        sub_strata = sub_patient_df["stratum"].value_counts().to_dict()
-        print(f"  Patient strata: {sub_strata}")
+        # Report per-variable balance
+        sub_profiles = profiles.loc[sub_patients]
+        balance_report = {}
+        for col in sub_profiles.columns:
+            frac = sub_profiles[col].mean()
+            print(f"    {col}: {sub_profiles[col].sum()}/{len(sub_patients)} "
+                  f"({frac:.1%} positive)")
+            balance_report[col] = float(frac)
 
         # Cell type distribution
         meta_sub = _build_metadata(adata_sub.obs.copy())
@@ -332,7 +424,7 @@ def main() -> None:
             "n_patients": int(len(sub_patients)),
             "n_cells": int(adata_sub.n_obs),
             "n_genes": int(adata_sub.n_vars),
-            "patient_strata": sub_strata,
+            "variable_balance": balance_report,
             "cell_type_dist": ct_dist,
         }
 

@@ -1129,10 +1129,7 @@ def plot_training_curves(model, save_dir, fname="training_curves.png"):
     """
     Generate ELBO and held-out LL convergence plots with component breakdowns.
 
-    Produces a 2x2 grid:
-      Top row:    full range (all iterations) for ELBO and HO-LL
-      Bottom row: zoomed in (skip iter 0 burn-in) to show real dynamics
-
+    Produces a 1×N row (iter 0 excluded to show real dynamics).
     Each panel shows component breakdowns (Poisson, Regression, Bernoulli).
     """
     import matplotlib
@@ -1168,12 +1165,8 @@ def plot_training_curves(model, save_dir, fname="training_curves.png"):
             holl_data['bern'] = [e[4] for e in model.holl_history_]
 
     n_cols = int(has_elbo) + int(has_holl)
-    # Two rows: full range + zoomed (skip burn-in)
-    need_zoom = (has_elbo and len(elbo_data['iters']) > 2) or \
-                (has_holl and len(holl_data['iters']) > 2)
-    n_rows = 2 if need_zoom else 1
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(7 * n_cols, 5 * n_rows),
+    fig, axes = plt.subplots(1, n_cols, figsize=(7 * n_cols, 5),
                              squeeze=False)
 
     def _plot_elbo(ax, iters, data, title_suffix=''):
@@ -1214,32 +1207,21 @@ def plot_training_curves(model, save_dir, fname="training_curves.png"):
         ax.set_title(f'Held-out Log-Likelihood{title_suffix}')
         ax.legend(loc='upper left', fontsize=8)
 
-    # ── Row 0: full range ──
+    # ── Skip first point (burn-in) to reveal dynamics ──
     col = 0
     if has_elbo:
-        _plot_elbo(axes[0, col], elbo_data['iters'],
-                   {k: elbo_data[k] for k in elbo_data if k != 'iters'},
-                   ' (full range)')
+        zoomed = {k: v[1:] for k, v in elbo_data.items()} \
+                 if len(elbo_data['iters']) > 2 else elbo_data
+        _plot_elbo(axes[0, col], zoomed['iters'],
+                   {k: zoomed[k] for k in zoomed if k != 'iters'},
+                   ' (iter 0 excluded)')
         col += 1
     if has_holl:
-        _plot_holl(axes[0, col], holl_data['iters'],
-                   {k: holl_data[k] for k in holl_data if k != 'iters'},
-                   ' (full range)')
-
-    # ── Row 1: skip first point (burn-in) to reveal dynamics ──
-    if need_zoom:
-        col = 0
-        if has_elbo and len(elbo_data['iters']) > 2:
-            zoomed = {k: v[1:] for k, v in elbo_data.items()}
-            _plot_elbo(axes[1, col], zoomed['iters'],
-                       {k: zoomed[k] for k in zoomed if k != 'iters'},
-                       ' (iter 0 excluded)')
-            col += 1
-        if has_holl and len(holl_data['iters']) > 2:
-            zoomed = {k: v[1:] for k, v in holl_data.items()}
-            _plot_holl(axes[1, col], zoomed['iters'],
-                       {k: zoomed[k] for k in zoomed if k != 'iters'},
-                       ' (iter 0 excluded)')
+        zoomed = {k: v[1:] for k, v in holl_data.items()} \
+                 if len(holl_data['iters']) > 2 else holl_data
+        _plot_holl(axes[0, col], zoomed['iters'],
+                   {k: zoomed[k] for k in zoomed if k != 'iters'},
+                   ' (iter 0 excluded)')
 
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)

@@ -74,6 +74,9 @@ def parse_args():
                         help='Subsample dataset to exactly this many patients')
     parser.add_argument('--subsample-seed', type=int, default=0,
                         help='Seed for patient-level subsampling')
+    parser.add_argument('--patient-column', type=str, default=None,
+                        help='Column in adata.obs identifying patients/donors (e.g., sampleID). '
+                             'When set, splits at patient level to prevent donor leakage.')
 
     return parser.parse_args()
 
@@ -153,7 +156,8 @@ def main():
         normalize=args.normalize,
         normalize_target_sum=args.normalize_target_sum,
         normalize_method=args.normalize_method,
-        return_sparse=False  # comp_methods expects dense arrays
+        return_sparse=False,  # comp_methods expects dense arrays
+        patient_column=args.patient_column,
     )
     
     # Unpack data

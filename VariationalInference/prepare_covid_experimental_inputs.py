@@ -85,6 +85,10 @@ def _build_metadata(obs: pd.DataFrame) -> pd.DataFrame:
     else:
         md["cell_type"] = "unknown"
 
+    # Patient/donor ID (for patient-grouped splitting)
+    if "sampleID" in obs.columns:
+        md["sampleID"] = obs["sampleID"].astype(str).values
+
     return md
 
 

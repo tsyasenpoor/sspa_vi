@@ -413,6 +413,17 @@ def parse_args() -> argparse.Namespace:
         help='Seed for patient-level subsampling (deterministic).'
     )
 
+    # Patient-level splitting (prevents donor leakage in single-cell data)
+    parser.add_argument(
+        '--patient-column',
+        type=str,
+        default=None,
+        help='Column in adata.obs identifying patients/donors (e.g., sampleID). '
+             'When set, train/val/test splits are performed at the patient level '
+             'so no patient appears in more than one split. Also enables '
+             'patient-level evaluation metrics via mean-pooled cell predictions.'
+    )
+
     return parser.parse_args()
 
 
@@ -532,7 +543,8 @@ def main():
         random_state=args.seed,
         normalize=args.normalize,
         normalize_target_sum=args.normalize_target_sum,
-        normalize_method=args.normalize_method
+        normalize_method=args.normalize_method,
+        patient_column=args.patient_column,
     )
 
     # Unpack data
@@ -541,6 +553,7 @@ def main():
     X_test, X_aux_test, y_test = data['test']
     gene_list = data['gene_list']
     splits = data['splits']
+    patient_split = splits.get('patient_split', None)
     aux_column_names = data.get('aux_column_names', None)
 
     print(f"\nData Summary:")
@@ -548,6 +561,13 @@ def main():
     print(f"  Training cells: {len(splits['train'])}")
     print(f"  Validation:     {len(splits['val'])}")
     print(f"  Test:           {len(splits['test'])}")
+    if patient_split is not None:
+        from collections import Counter
+        _ps_counts = Counter(patient_split.values())
+        print(f"  Split mode:     PATIENT-GROUPED (no donor leakage)")
+        print(f"  Train patients: {_ps_counts.get('train', 0)}")
+        print(f"  Val patients:   {_ps_counts.get('val', 0)}")
+        print(f"  Test patients:  {_ps_counts.get('test', 0)}")
     print(f"  Aux features:   {X_aux_train.shape[1]}")
     if y_train.ndim == 1:
         print(f"  Label ({label_columns[0]}) distribution: {dict(zip(*np.unique(y_train, return_counts=True)))}")
@@ -1010,6 +1030,80 @@ def main():
     test_pred_df.to_csv(output_dir / f'{prefix}_test_predictions.csv.gz', compression='gzip', index=False)
     print(f"Saved predictions to {output_dir}")
 
+    # =========================================================================
+    # STEP 7b: Patient-Level Evaluation (when --patient-column is set)
+    # =========================================================================
+    patient_metrics_all = {}  # {split_name: {label: metrics_dict}}
+    if patient_split is not None and args.patient_column is not None:
+        print("\n" + "=" * 80)
+        print("Patient-Level Evaluation (mean-pooled cell predictions)")
+        print("=" * 80)
+
+        cell_metadata = data.get('cell_metadata')
+        pcol = args.patient_column
+
+        def _patient_level_metrics(cell_ids, y_2d, proba_2d, thresholds_dict, split_name):
+            """Aggregate cell predictions to patient level and compute metrics."""
+            # Map cell_id -> patient_id
+            pid_series = cell_metadata.loc[cell_ids, pcol].astype(str)
+            results = {}
+            patient_pred_rows = []
+
+            for k, lc in enumerate(label_columns):
+                thr = thresholds_dict.get(lc, 0.5)
+                df = pd.DataFrame({
+                    'cell_id': cell_ids,
+                    'patient_id': pid_series.values,
+                    'y_true': y_2d[:, k],
+                    'prob': proba_2d[:, k],
+                })
+                # Pool: mean probability per patient
+                patient_df = df.groupby('patient_id').agg(
+                    y_true=('y_true', 'first'),  # same for all cells
+                    prob_mean=('prob', 'mean'),
+                    n_cells=('cell_id', 'count'),
+                ).reset_index()
+
+                y_pat = patient_df['y_true'].values
+                prob_pat = patient_df['prob_mean'].values
+                pred_pat = (prob_pat > thr).astype(int)
+
+                m = compute_metrics(y_pat, pred_pat, prob_pat)
+                results[lc] = m
+
+                n_pat = len(patient_df)
+                print(f"\n  [{split_name}] Patient-level [{lc}] ({n_pat} patients):")
+                print(f"    Accuracy:  {m['accuracy']:.4f}")
+                if 'auc' in m:
+                    print(f"    AUC:       {m['auc']:.4f}")
+                print(f"    F1:        {m['f1']:.4f}")
+                print(f"    Precision: {m['precision']:.4f}")
+                print(f"    Recall:    {m['recall']:.4f}")
+                print(f"    Cells/patient: mean={patient_df['n_cells'].mean():.1f}, "
+                      f"min={patient_df['n_cells'].min()}, max={patient_df['n_cells'].max()}")
+
+                patient_df['label'] = lc
+                patient_df['split'] = split_name
+                patient_pred_rows.append(patient_df)
+
+            return results, patient_pred_rows
+
+        all_patient_pred_rows = []
+        for split_name, cell_ids, y_2d, proba_2d, thresholds in [
+            ('train', splits['train'], _y_train_2d, _proba_train_2d, {lc: 0.5 for lc in label_columns}),
+            ('val', splits['val'], _y_val_2d, _proba_val_2d, optimal_thresholds),
+            ('test', splits['test'], _y_test_2d, _proba_test_2d, optimal_thresholds),
+        ]:
+            pm, pred_rows = _patient_level_metrics(cell_ids, y_2d, proba_2d, thresholds, split_name)
+            patient_metrics_all[split_name] = pm
+            all_patient_pred_rows.extend(pred_rows)
+
+        # Save patient-level predictions
+        patient_pred_df = pd.concat(all_patient_pred_rows, ignore_index=True)
+        patient_pred_path = output_dir / f'{prefix}_patient_predictions.csv.gz'
+        patient_pred_df.to_csv(patient_pred_path, compression='gzip', index=False)
+        print(f"\nSaved patient-level predictions to {patient_pred_path}")
+
     # Save consolidated metrics CSV (replaces separate pkl files)
     metrics_rows = []
     for split_name, metrics_dict, thresholds in [
@@ -1018,9 +1112,24 @@ def main():
         ('test', test_metrics_all, optimal_thresholds),
     ]:
         for lc, m in metrics_dict.items():
-            row = {'split': split_name, 'label': lc, 'threshold': thresholds.get(lc, 0.5)}
+            row = {'split': split_name, 'label': lc, 'threshold': thresholds.get(lc, 0.5),
+                   'level': 'cell'}
             row.update(m)
             metrics_rows.append(row)
+
+    # Add patient-level metrics rows
+    for split_name, thresholds in [
+        ('train', {lc: 0.5 for lc in label_columns}),
+        ('val', optimal_thresholds),
+        ('test', optimal_thresholds),
+    ]:
+        if split_name in patient_metrics_all:
+            for lc, m in patient_metrics_all[split_name].items():
+                row = {'split': split_name, 'label': lc, 'threshold': thresholds.get(lc, 0.5),
+                       'level': 'patient'}
+                row.update(m)
+                metrics_rows.append(row)
+
     metrics_df = pd.DataFrame(metrics_rows)
     metrics_path = output_dir / f'{prefix}_metrics.csv'
     metrics_df.to_csv(metrics_path, index=False)

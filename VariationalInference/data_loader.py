@@ -214,6 +214,19 @@ class DataLoader:
         # Simulated CSV: metadata stored in sim_metadata, not adata
         if hasattr(self, 'sim_metadata') and self.sim_metadata is not None:
             return self.sim_metadata
+        # EMTAB data: build obs from responses + aux DataFrames
+        if self.is_emtab:
+            obs_parts = []
+            if self.responses_df is not None:
+                obs_parts.append(self.responses_df.drop(columns=['Sample_ID'], errors='ignore'))
+            if self.aux_data_df is not None:
+                obs_parts.append(self.aux_data_df.drop(columns=['Sample_ID'], errors='ignore'))
+            if obs_parts:
+                obs = pd.concat(obs_parts, axis=1)
+                obs.index = self.cell_ids if hasattr(self, 'cell_ids') and self.cell_ids else obs.index
+                self._cached_obs = obs
+                return self._cached_obs
+            return None
         if self.adata is not None:
             return self.adata.obs
         # Load only obs metadata (not expression data) to avoid full h5ad reload
@@ -1035,7 +1048,8 @@ class DataLoader:
         val_ratio: float = 0.15,
         stratify_by: Optional[str] = None,
         random_state: Optional[int] = None,
-        train_subsample_ratio: Optional[float] = None
+        train_subsample_ratio: Optional[float] = None,
+        patient_column: Optional[str] = None
     ) -> Dict[str, List[str]]:
         """
         Create random train/val/test splits.
@@ -1056,16 +1070,35 @@ class DataLoader:
         train_subsample_ratio : float, optional
             If set in (0, 1), subsample the training split to this fraction
             before extracting matrices. Validation/test splits are unchanged.
+        patient_column : str, optional
+            Column in adata.obs identifying patients/donors (e.g. 'sampleID').
+            When set, splits at the **patient level** so no patient appears in
+            more than one split, preventing donor leakage.
 
         Returns
         -------
         dict
             Dictionary with 'train', 'val', 'test' keys containing cell ID lists.
+            When *patient_column* is set, also includes 'patient_split' mapping
+            each patient ID to its assigned split.
         """
         if self.cell_ids is None:
             raise ValueError("Must preprocess data first")
 
         test_ratio = 1 - train_ratio - val_ratio
+
+        # ---- Patient-grouped splitting (no donor leakage) ----
+        if patient_column is not None:
+            return self._split_by_patient(
+                patient_column=patient_column,
+                train_ratio=train_ratio,
+                val_ratio=val_ratio,
+                stratify_by=stratify_by,
+                random_state=random_state,
+                train_subsample_ratio=train_subsample_ratio,
+            )
+
+        # ---- Legacy cell-level splitting ----
 
         # Get stratification labels if specified
         stratify = None
@@ -1168,6 +1201,114 @@ class DataLoader:
                 f"Effective split sizes after train subsampling: "
                 f"train={len(splits['train'])}, val={len(val_ids)}, test={len(test_ids)}"
             )
+
+        return splits
+
+    def _split_by_patient(
+        self,
+        patient_column: str,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        stratify_by: Optional[str] = None,
+        random_state: Optional[int] = None,
+        train_subsample_ratio: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Split at the patient level so no patient spans train/val/test.
+
+        All cells from a given patient are assigned to the same split.
+        Stratification (when requested) uses the *patient-level* label
+        (first cell per patient), so class balance is preserved across
+        patients rather than cells.
+        """
+        obs = self._get_obs()
+        if obs is None or patient_column not in obs.columns:
+            raise ValueError(
+                f"patient_column='{patient_column}' not found in obs. "
+                f"Available columns: {list(obs.columns) if obs is not None else []}"
+            )
+
+        # Build patient -> cell_ids mapping (only for active cell_ids)
+        cell_set = set(self.cell_ids)
+        obs_active = obs.loc[obs.index.isin(cell_set)]
+        patient_col = obs_active[patient_column].astype(str)
+        patient_to_cells: Dict[str, List[str]] = {}
+        for cid, pid in patient_col.items():
+            patient_to_cells.setdefault(pid, []).append(cid)
+
+        patients = np.array(sorted(patient_to_cells.keys()))
+        n_patients = len(patients)
+        self._log(f"Patient-grouped split: {n_patients} patients from "
+                  f"{len(self.cell_ids)} cells (column='{patient_column}')")
+
+        # Patient-level stratification label (first cell per patient)
+        patient_stratify = None
+        if stratify_by is not None:
+            if patient_column in obs.columns and stratify_by in obs.columns:
+                first_per_patient = obs_active.groupby(patient_column).first()
+                patient_stratify = first_per_patient.loc[patients, stratify_by].values
+            else:
+                self._log(f"WARNING: Cannot stratify by '{stratify_by}' at patient level, "
+                          f"falling back to unstratified split")
+
+        test_ratio = 1 - train_ratio - val_ratio
+
+        # First split: train patients vs (val+test) patients
+        train_patients, temp_patients = train_test_split(
+            patients,
+            test_size=(val_ratio + test_ratio),
+            stratify=patient_stratify,
+            random_state=random_state
+        )
+
+        # Second split: val patients vs test patients
+        val_proportion = val_ratio / (val_ratio + test_ratio)
+        temp_stratify = None
+        if patient_stratify is not None:
+            pat_to_idx = {p: i for i, p in enumerate(patients)}
+            temp_stratify = patient_stratify[[pat_to_idx[p] for p in temp_patients]]
+
+        val_patients, test_patients = train_test_split(
+            temp_patients,
+            test_size=(1 - val_proportion),
+            stratify=temp_stratify,
+            random_state=random_state
+        )
+
+        # Map patients -> cell IDs
+        train_ids = [cid for p in train_patients for cid in patient_to_cells[p]]
+        val_ids = [cid for p in val_patients for cid in patient_to_cells[p]]
+        test_ids = [cid for p in test_patients for cid in patient_to_cells[p]]
+
+        # Build patient_split map for downstream patient-level evaluation
+        patient_split = {}
+        for p in train_patients:
+            patient_split[p] = 'train'
+        for p in val_patients:
+            patient_split[p] = 'val'
+        for p in test_patients:
+            patient_split[p] = 'test'
+
+        splits = {
+            'train': train_ids,
+            'val': val_ids,
+            'test': test_ids,
+            'patient_split': patient_split,
+        }
+
+        self._log(
+            f"Patient split: train={len(train_patients)} patients ({len(train_ids)} cells), "
+            f"val={len(val_patients)} patients ({len(val_ids)} cells), "
+            f"test={len(test_patients)} patients ({len(test_ids)} cells)"
+        )
+
+        # Optional train-only subsampling (at patient level)
+        if train_subsample_ratio is not None and 0.0 < train_subsample_ratio < 1.0:
+            n_sub_patients = max(1, int(len(train_patients) * train_subsample_ratio))
+            rng = np.random.default_rng(random_state)
+            sub_patients = rng.choice(train_patients, size=n_sub_patients, replace=False)
+            splits['train'] = [cid for p in sub_patients for cid in patient_to_cells[p]]
+            self._log(f"Subsampled training: {len(train_patients)} -> {n_sub_patients} patients "
+                      f"({len(splits['train'])} cells)")
 
         return splits
 
@@ -1317,7 +1458,8 @@ class DataLoader:
         normalize: bool = False,
         normalize_target_sum: float = 1e4,
         normalize_method: str = 'library_size',
-        return_sparse: bool = True
+        return_sparse: bool = True,
+        patient_column: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Complete data loading and preprocessing pipeline.
@@ -1334,6 +1476,9 @@ class DataLoader:
             Proportion for validation set.
         stratify_by : str, optional
             Column for stratified splitting.
+        patient_column : str, optional
+            Column in adata.obs identifying patients/donors. When set, splits
+            at the patient level to prevent donor leakage.
         min_cells_expressing : float, default=0.001
             Minimum fraction of cells expressing each gene.
         layer : str, default='raw'
@@ -1402,6 +1547,7 @@ class DataLoader:
             stratify_by=_stratify_col,
             random_state=random_state,
             train_subsample_ratio=train_subsample_ratio,
+            patient_column=patient_column,
         )
 
         # Get matrices for each split (sparse by default for memory efficiency)

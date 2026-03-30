@@ -46,7 +46,7 @@ def parse_args():
     p.add_argument("--labels", nargs="+", default=["severity", "outcome"],
                    help="Label columns to predict")
     p.add_argument("--meta-cols", nargs="+",
-                   default=["sex", "comorbidity", "severity", "outcome", "cell_type"],
+                   default=["sex", "comorbidity", "severity", "outcome", "cell_type", "sampleID"],
                    help="Columns that are metadata (not genes)")
     p.add_argument("--output-dir", "-o", default="./results/schpf_baselines",
                    help="Output directory")
@@ -137,21 +137,40 @@ def main():
         )
 
     # ------------------------------------------------------------------
-    # 3. Split indices (same seed → reproducible across experiments)
+    # 3. Split indices — patient-grouped if sampleID available
     # ------------------------------------------------------------------
     print("[3] Splitting data...")
     indices = np.arange(n_cells_model)
     test_ratio = 1.0 - args.train_ratio - args.val_ratio
 
-    train_idx, temp_idx = train_test_split(
-        indices, test_size=(args.val_ratio + test_ratio),
-        random_state=args.seed
-    )
-    val_proportion = args.val_ratio / (args.val_ratio + test_ratio)
-    val_idx, test_idx = train_test_split(
-        temp_idx, test_size=(1 - val_proportion),
-        random_state=args.seed
-    )
+    if "sampleID" in df.columns:
+        # Patient-grouped split: no donor leakage
+        patient_ids = df["sampleID"].values.astype(str)
+        unique_patients = np.unique(patient_ids)
+        train_pat, temp_pat = train_test_split(
+            unique_patients, test_size=(args.val_ratio + test_ratio),
+            random_state=args.seed
+        )
+        val_proportion = args.val_ratio / (args.val_ratio + test_ratio)
+        val_pat, test_pat = train_test_split(
+            temp_pat, test_size=(1 - val_proportion),
+            random_state=args.seed
+        )
+        train_set, val_set, test_set = set(train_pat), set(val_pat), set(test_pat)
+        train_idx = np.where([p in train_set for p in patient_ids])[0]
+        val_idx = np.where([p in val_set for p in patient_ids])[0]
+        test_idx = np.where([p in test_set for p in patient_ids])[0]
+        print(f"    Patient-grouped split: {len(train_pat)} / {len(val_pat)} / {len(test_pat)} patients")
+    else:
+        train_idx, temp_idx = train_test_split(
+            indices, test_size=(args.val_ratio + test_ratio),
+            random_state=args.seed
+        )
+        val_proportion = args.val_ratio / (args.val_ratio + test_ratio)
+        val_idx, test_idx = train_test_split(
+            temp_idx, test_size=(1 - val_proportion),
+            random_state=args.seed
+        )
 
     X_train = cell_scores[train_idx]
     X_val = cell_scores[val_idx]

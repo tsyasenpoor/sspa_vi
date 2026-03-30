@@ -33,7 +33,7 @@ SEEDS = [42, 123, 456, 789, 1024]
 
 H5AD = "/labs/Aguiar/SSPA_BRAY/BRay/BRAY_FileTransfer/Covid19/covid19_filtered_fullgenes_clean.h5ad"
 GMT_FILE = "/archive/projects/SSPA_BRAY/sspa/c2.cp.v2024.1.Hs.symbols.gmt"
-RESULTS_ROOT = "/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark"
+RESULTS_ROOT = "/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level"
 METHODS_ROOT = f"{RESULTS_ROOT}/methods"
 
 VI_DIR = "/labs/Aguiar/SSPA_BRAY/BRay/VariationalInference"
@@ -48,37 +48,48 @@ DRGP_COMMON = (
     '--sigma-v 2.0 --v-prior laplace '
     '--sigma-gamma 0.5 '
     '--regression-weight 1.0 '
-    '--max-iter 1000 --tol 0.001 '
+    '--max-iter 2000 --tol 0.001 '
     '--v-warmup 50 --check-freq 10 '
-    '--early-stopping elbo '
+    '--early-stopping none '
     '--label-column "CoVID-19 severity" Outcome '
     '--aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes '
+    '--patient-column sampleID '
     f'--pathway-file {GMT_FILE}'
 )
 
 # Resource profiles keyed by n_patients: (mem_gb, time_hours, partition, qos, cpus, gpu)
+# Updated based on scalability_benchmark log analysis (2026-03-30):
+#   - baselines 15/30/50p: all OOM during SVM → doubled memory
+#   - baselines 148p: 2/5 cancelled still running at 11h → bumped to 48h
+#   - scHPF 15p: 3/5 timed out at 12h (2/5 finished in ~11h) → bumped to 24h
+#   - scHPF 30p: all OOM at 250GB → bumped to 400GB on himem
+#   - drgp 30p: pathway_init timed out at 670 iters/12h (~64s/iter) → 48h for full 2000 iters
+#   - drgp 50p: pathway_init only at iter 270 → estimated ~72h for 2000 iters → 96h
+#   - drgp 148p: masked ~654s/check-freq=10 (~65s/iter) → ~36h for 2000 iters → 48h w/ buffer
+#   - drgp_combined 30p: still running at 12h → bumped to 48h (same as drgp 30p)
+#   - spectra_sup 50p: ~108s/iter, needs ~300h at 10k epochs → bumped to 96h
 RESOURCE_PROFILES = {
     15: {
-        "drgp":       (64,  8,  "general", "general", 4, 1),
+        "drgp":       (64,  12, "general", "general", 4, 1),
         "spectra":    (160, 12, "general", "general", 4, 1),
-        "schpf":      (160, 12, "general", "general", 8, 0),
-        "baselines":  (64,  4,  "general", "general", 8, 0),
+        "schpf":      (160, 24, "general", "general", 8, 0),
+        "baselines":  (128, 4,  "general", "general", 8, 0),
     },
     30: {
-        "drgp":       (100, 12, "general", "general", 4, 1),
+        "drgp":       (100, 48, "general", "general", 4, 1),
         "spectra":    (250, 24, "general", "general", 4, 1),
-        "schpf":      (250, 24, "general", "general", 8, 0),
-        "baselines":  (100, 6,  "general", "general", 8, 0),
+        "schpf":      (400, 48, "himem",   "himem",   8, 0),
+        "baselines":  (200, 12, "general", "general", 8, 0),
     },
     50: {
-        "drgp":       (200, 24, "general", "general", 4, 1),
-        "spectra":    (500, 48, "himem",   "himem",   8, 1),
+        "drgp":       (200, 96, "general", "general", 4, 1),
+        "spectra":    (500, 96, "himem",   "himem",   8, 1),
         "schpf":      (600, 48, "himem",   "himem",   8, 0),
-        "baselines":  (128, 8,  "general", "general", 8, 0),
+        "baselines":  (300, 16, "himem",   "himem",   8, 0),
     },
     148: {
         "drgp":       (300, 48, "general", "general", 8, 1),
-        "baselines":  (300, 24, "general", "general", 8, 0),
+        "baselines":  (300, 48, "general", "general", 8, 0),
     },
 }
 
@@ -149,9 +160,29 @@ def _benchmark_footer(output_dir_var: str = "$OUTPUT") -> str:
         echo "Job finished at: $(date)"
         echo "Total elapsed: ${{ELAPSED}}s"
 
-        # Peak RSS memory from /proc (in kB -> MB)
-        PEAK_RSS_KB=$(grep "VmHWM" /proc/$$/status 2>/dev/null | awk '{{print $2}}' || echo "0")
-        PEAK_RSS_MB=$((PEAK_RSS_KB / 1024))
+        # Peak RSS: check cgroup (SLURM), then fall back to /proc for this
+        # process tree.  SLURM cgroup tracks ALL processes in the job step,
+        # so it captures the Python child correctly.
+        PEAK_RSS_MB=0
+        # Try cgroup v1 (common on HPC)
+        if [[ -f /sys/fs/cgroup/memory/slurm/uid_$(id -u)/job_${{SLURM_JOB_ID}}/memory.max_usage_in_bytes ]]; then
+            PEAK_RSS_BYTES=$(cat /sys/fs/cgroup/memory/slurm/uid_$(id -u)/job_${{SLURM_JOB_ID}}/memory.max_usage_in_bytes 2>/dev/null || echo 0)
+            PEAK_RSS_MB=$((PEAK_RSS_BYTES / 1048576))
+        # Try cgroup v2
+        elif [[ -f /sys/fs/cgroup/memory.peak ]]; then
+            PEAK_RSS_BYTES=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0)
+            PEAK_RSS_MB=$((PEAK_RSS_BYTES / 1048576))
+        # Try SLURM sstat (works for running job steps)
+        elif command -v sstat &>/dev/null; then
+            PEAK_RSS_MB=$(sstat -j ${{SLURM_JOB_ID}}.batch --format=MaxRSS -n 2>/dev/null | tr -d ' K' | head -1 || echo 0)
+            PEAK_RSS_MB=$((PEAK_RSS_MB / 1024))  # KB -> MB
+        fi
+        # Fallback: shell process /proc (underestimates child memory)
+        if [[ "$PEAK_RSS_MB" -eq 0 ]]; then
+            PEAK_RSS_KB=$(grep "VmHWM" /proc/$$/status 2>/dev/null | awk '{{print $2}}' || echo "0")
+            PEAK_RSS_MB=$((PEAK_RSS_KB / 1024))
+        fi
+        echo "Peak memory: ${{PEAK_RSS_MB}} MB"
 
         # Save benchmark metrics
         python3 -c "
@@ -403,6 +434,7 @@ def gen_baselines_script(n_patients: int, res: tuple) -> str:
                 --data {H5AD} \\
                 --label-column "$LABEL" \\
                 --aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes \\
+                --patient-column sampleID \\
                 {subsample} \\
                 --output-dir "$RUN_OUT" \\
                 --latent-dim 50 \\
