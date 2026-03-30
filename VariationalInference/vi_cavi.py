@@ -380,6 +380,7 @@ class CAVI:
             # Following Park & Casella (2008), the optimal Lasso penalty scales as
             # sqrt(N).  We apply:  b_v_eff = b_v * sqrt(K) / sqrt(N)
             # so that b_v=1.0 gives sensible shrinkage regardless of dataset size.
+            self._b_v_orig = self.b_v  # Save before auto-scaling for fit()-time recompute
             b_v_eff = self.b_v * np.sqrt(K) / np.sqrt(self.n)
             print(f"  [Laplace] b_v auto-scaled: {self.b_v:.4f} -> {b_v_eff:.6f} "
                   f"(N={self.n}, K={K})")
@@ -1653,7 +1654,8 @@ class CAVI:
             X_val=None, y_val=None, X_aux_val=None,
             max_iter=600, check_freq=5, tol=0.001,
             v_warmup=50, verbose=True,
-            early_stopping='heldout_ll'):
+            early_stopping='heldout_ll',
+            n_patients=None):
         """
         Fit the supervised Poisson factorization model.
 
@@ -1672,6 +1674,12 @@ class CAVI:
             'heldout_ll' -- stop on held-out LL / regression LL plateau (default).
             'elbo' -- stop only on ELBO convergence.
             'none' -- disable all early stopping, run all iterations.
+        n_patients : int or None
+            Number of unique patients in the training set.  When provided
+            (patient-grouped scRNA-seq), the Laplace b_v prior is re-scaled
+            using n_patients instead of n_cells, giving appropriate
+            regularization when cells share patient-level labels.
+            None (default) keeps the existing cell-count scaling.
         """
         t0 = time.time()
 
@@ -1692,6 +1700,21 @@ class CAVI:
 
         # Initialize (creates numpy arrays, then transfers to device)
         self._initialize(X_train, y, X_aux)
+
+        # Re-scale Laplace b_v using patient count instead of cell count.
+        # When labels are patient-level (shared across cells from the same
+        # donor), the effective sample size for regression is n_patients, not
+        # n_cells.  Without this, the prior is ~sqrt(n_cells/n_patients) times
+        # too weak, causing v to saturate at its clip bounds.
+        if n_patients is not None and self.v_prior == 'laplace':
+            b_v_old = self.b_v
+            b_v_eff = self._b_v_orig * np.sqrt(self.K) / np.sqrt(n_patients)
+            if verbose:
+                print(f"  [Laplace] b_v re-scaled for n_patients={n_patients}: "
+                      f"{b_v_old:.6f} -> {b_v_eff:.6f}")
+            self.b_v = b_v_eff
+            self.sigma_v_diag = np.full(
+                (self.kappa, self.K), 2.0 * self.b_v ** 2)
 
         # Transfer training labels / aux to device for hot-path computations
         y = to_device(y)
