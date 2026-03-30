@@ -1109,12 +1109,14 @@ class CAVI:
             omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
             # Laplace (Bayesian Lasso) prior precision from the inverse-
             # Gaussian scale mixture.  For large |v| (omega >> 1) this
-            # vanishes as 1/(b_v*omega), removing all regularization and
-            # letting v explode.  Floor at 1.0 to ensure sigma2_v never
-            # exceeds 1.0 per component, providing meaningful shrinkage
-            # comparable to a unit-variance Gaussian prior.
+            # vanishes as 1/(b_v*omega), relaxing regularization on
+            # disease-relevant factors.  Use a low floor (0.01) so the
+            # adaptive E[1/s] shrinkage can actually differentiate factors:
+            # small |v| → heavy shrinkage, large |v| → relaxed penalty.
+            # A floor of 1.0 defeated this mechanism by over-regularizing
+            # all factors equally, causing v to saturate at the hard clip.
             prior_precision_raw = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
-            prior_precision = xp.maximum(prior_precision_raw, 1.0)
+            prior_precision = xp.maximum(prior_precision_raw, 0.01)
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
         # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
@@ -1195,16 +1197,16 @@ class CAVI:
             self.sigma_v_diag = sigma_v_diag_new
         else:
             # Laplace: the adaptive E[1/s] shrinkage already regularises v,
-            # so the clip can be much looser than for the normal prior.
-            # The normal branch uses 10/sqrt(K) assuming all K factors are
-            # active; Laplace drives most weights to ~0, so only a handful
-            # are large and the effective sum is << K.
-            # However, in combined mode the pathway factors are mask-
-            # constrained (not sparsified), keeping effective K ≈ full K.
-            # Use K-dependent bounds so that the total logit change per
-            # iteration (≈ K * max_step) stays bounded regardless of K.
-            v_clip = min(5.0, 10.0 / np.sqrt(self.K))
-            mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
+            # so the absolute clip can be much wider than for the normal
+            # prior.  The previous 10/sqrt(K) clip (=1.414 for K=50)
+            # caused all factors to saturate at the boundary, defeating
+            # the Laplace prior's ability to differentiate disease-relevant
+            # factors (large |v|) from irrelevant ones (small |v|).
+            # Use a wider absolute bound (30/sqrt(K)) so the Laplace
+            # E[1/s] mechanism — not a hard clip — controls sparsity.
+            # Per-step stability is separately ensured by max_step below.
+            v_abs_clip = min(10.0, 30.0 / np.sqrt(self.K))
+            mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
             # Damping: K-scale alpha_max so combined mode (K=403) doesn't
             # diverge while small-K models still converge quickly.
@@ -1243,12 +1245,14 @@ class CAVI:
 
             self._v_prev_mu = xp.array(self.mu_v)
             self._v_raw_prev = xp.array(mu_v_new)
-            self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
+            self.mu_v = xp.clip(mu_v_candidate, -v_abs_clip, v_abs_clip)
 
             # Floor sigma_v_diag to prevent posterior variance collapse.
             # With N~7000 cells the data precision can drive sigma→1e-15,
             # making the posterior degenerate and mu updates erratic.
-            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-4)
+            # Use 1e-2 (not 1e-4) to maintain meaningful posterior uncertainty
+            # and keep the Laplace E[1/s] computation well-conditioned.
+            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-2)
             # Laplace prior precision depends on mu_v through omega, so
             # sigma and mu must move in lockstep.  Damping both at the
             # same rate keeps q(v) coherent.
@@ -1272,9 +1276,12 @@ class CAVI:
             else:
                 theta_v[i0:i1] = E_theta_c @ self.mu_v.T
 
-        # Match v damping rate to keep the coupled system stable.
-        alpha_max = min(0.06, 3.0 / self.K)
-        alpha = min(alpha_max, 0.05 * alpha_max / 0.06 + (alpha_max - 0.05 * alpha_max / 0.06) * (iteration / max(200, iteration)))
+        # Gamma has p_aux parameters (typically 5), not K factors (typically 50).
+        # Scale damping with p_aux so gamma converges at its natural rate
+        # instead of being artificially slowed by K-dependent bounds.
+        p = max(self.p_aux, 1)
+        alpha_max = min(0.3, 3.0 / p)
+        alpha = min(alpha_max, 0.05 * alpha_max / 0.3 + (alpha_max - 0.05 * alpha_max / 0.3) * (iteration / max(200, iteration)))
 
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
@@ -1294,12 +1301,14 @@ class CAVI:
             else:
                 self.Sigma_gamma[k] = np.linalg.inv(prec)
             mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
-            # Clip gamma to prevent explosion (K-scaled like v_clip)
-            gamma_clip = min(5.0, 10.0 / np.sqrt(self.K))
+            # Clip gamma proportional to p_aux (not K).  With p_aux=5 the
+            # total logit contribution is p_aux*gamma_clip, which should be
+            # bounded but not over-constrained.  30/sqrt(5) ≈ 13.4, capped at 10.
+            gamma_clip = min(10.0, 30.0 / np.sqrt(p))
             mu_gamma_new = xp.clip(mu_gamma_new, -gamma_clip, gamma_clip)
             new_mu_k = (1.0 - alpha) * self.mu_gamma[k] + alpha * mu_gamma_new
-            # Per-element step cap (same K-scaling as v update)
-            gamma_step = min(0.05, 2.5 / self.K)
+            # Per-element step cap scaled with p_aux, not K.
+            gamma_step = min(0.2, 2.5 / p)
             delta_k = new_mu_k - self.mu_gamma[k]
             delta_k = xp.clip(delta_k, -gamma_step, gamma_step)
             new_mu_k = self.mu_gamma[k] + delta_k
@@ -2232,7 +2241,7 @@ class CAVI:
                 p_k = np.clip(probs[:, k], 1e-7, 1 - 1e-7)
                 if len(np.unique(y_k)) > 1:
                     aucs.append(roc_auc_score(y_k, p_k))
-                lls.append(sk_log_loss(y_k, p_k))
+                lls.append(sk_log_loss(y_k, p_k, labels=[0, 1]))
             results[name] = {
                 'auc': np.mean(aucs) if aucs else float('nan'),
                 'log_loss': np.mean(lls),

@@ -927,10 +927,19 @@ def main():
     val_metrics_all = {}
     for k in range(n_outcomes):
         lname = label_columns[k]
-        prec_k, rec_k, thr_k = precision_recall_curve(_y_val_2d[:, k], _proba_val_2d[:, k])
-        f1_k = 2 * prec_k * rec_k / (prec_k + rec_k + 1e-8)
-        opt_idx = np.argmax(f1_k[:-1])
-        opt_thr = thr_k[opt_idx] if len(thr_k) > 0 else 0.5
+        n_pos = int(_y_val_2d[:, k].sum())
+        n_neg = len(_y_val_2d[:, k]) - n_pos
+        if n_pos == 0 or n_neg == 0 or len(np.unique(_y_val_2d[:, k])) < 2:
+            # Degenerate validation set (single class) — F1-based threshold
+            # optimization is undefined.  Fall back to 0.5.
+            opt_thr = 0.5
+            print(f"  WARNING: validation set for [{lname}] has only one class "
+                  f"(pos={n_pos}, neg={n_neg}). Using default threshold 0.5.")
+        else:
+            prec_k, rec_k, thr_k = precision_recall_curve(_y_val_2d[:, k], _proba_val_2d[:, k])
+            f1_k = 2 * prec_k * rec_k / (prec_k + rec_k + 1e-8)
+            opt_idx = np.argmax(f1_k[:-1])
+            opt_thr = thr_k[opt_idx] if len(thr_k) > 0 else 0.5
         optimal_thresholds[lname] = opt_thr
         print(f"Optimal threshold [{lname}] (validation F1): {opt_thr:.4f}")
 

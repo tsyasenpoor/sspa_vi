@@ -50,7 +50,7 @@ DRGP_COMMON = (
     '--regression-weight 1.0 '
     '--max-iter 2000 --tol 0.001 '
     '--v-warmup 50 --check-freq 10 '
-    '--early-stopping none '
+    '--early-stopping heldout_ll '
     '--label-column "CoVID-19 severity" Outcome '
     '--aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes '
     '--patient-column sampleID '
@@ -442,6 +442,25 @@ def gen_baselines_script(n_patients: int, res: tuple) -> str:
                 --verbose
 
             echo "$LABEL_TAG finished at: $(date)"
+
+            # Patient-level evaluation from saved pickles (no retraining)
+            PAT_OUT="$OUT_ROOT/${{LABEL_TAG}}_patient"
+            mkdir -p "$PAT_OUT"
+            echo "Running patient-level eval for $LABEL_TAG (seed=$SEED)..."
+
+            python -u {VI_DIR}/run_baselines_patient_eval.py \
+                --data {H5AD} \
+                --model-dir "$RUN_OUT" \
+                --label-column "$LABEL" \
+                --aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes \
+                --patient-column sampleID \
+                {subsample} \
+                --output-dir "$PAT_OUT" \
+                --latent-dim 50 \
+                --seed $SEED \
+                --verbose
+
+            echo "$LABEL_TAG patient-level eval finished at: $(date)"
         done
     """)
 
