@@ -148,53 +148,73 @@ def _parse_spectra_or_schpf_baselines(
     return rows
 
 
-def _parse_baselines(baselines_dir: Path, ratio: float, seed: int) -> list[dict]:
-    """Parse run_baselines.py results from summary.json per label subdirectory."""
+def _parse_baselines_summary(summary: dict, label_tag: str, bm: dict,
+                              ratio, seed: int) -> list[dict]:
+    """Parse a single baselines summary.json into rows."""
     rows = []
-    bm = _load_benchmark(baselines_dir)
-
-    for label_dir in baselines_dir.iterdir():
-        if not label_dir.is_dir():
-            continue
-        label_tag = label_dir.name  # "severity" or "outcome"
-
-        summary_path = label_dir / "summary.json"
-        if not summary_path.exists():
-            continue
-
-        with open(summary_path) as f:
-            summary = json.load(f)
-
-        results = summary.get("results", {})
-        for alg_name, res in results.items():
-            if res.get("status") != "success":
-                rows.append({
-                    "ratio": ratio,
-                    "seed": seed,
-                    "method": f"baselines/{alg_name}",
-                    "label": label_tag,
-                    "split": "failed",
-                    "accuracy": None, "f1": None, "auc": None,
-                    "precision": None, "recall": None,
-                    "wall_time_s": bm.get("wall_time_seconds"),
-                    "peak_rss_mb": bm.get("peak_rss_mb"),
-                })
-                continue
-
+    results = summary.get("results", {})
+    for alg_name, res in results.items():
+        if res.get("status") != "success":
             rows.append({
                 "ratio": ratio,
                 "seed": seed,
                 "method": f"baselines/{alg_name}",
                 "label": label_tag,
-                "split": "val",
-                "accuracy": res.get("val_accuracy"),
-                "f1": res.get("val_f1"),
-                "auc": res.get("val_auc"),
-                "precision": None,
-                "recall": None,
+                "split": "failed",
+                "accuracy": None, "f1": None, "auc": None,
+                "precision": None, "recall": None,
                 "wall_time_s": bm.get("wall_time_seconds"),
                 "peak_rss_mb": bm.get("peak_rss_mb"),
             })
+            continue
+
+        rows.append({
+            "ratio": ratio,
+            "seed": seed,
+            "method": f"baselines/{alg_name}",
+            "label": label_tag,
+            "split": "val",
+            "accuracy": res.get("val_accuracy"),
+            "f1": res.get("val_f1"),
+            "auc": res.get("val_auc"),
+            "precision": None,
+            "recall": None,
+            "wall_time_s": bm.get("wall_time_seconds"),
+            "peak_rss_mb": bm.get("peak_rss_mb"),
+        })
+    return rows
+
+
+def _parse_baselines(baselines_dir: Path, ratio, seed: int) -> list[dict]:
+    """Parse run_baselines.py results.
+
+    Supports two layouts:
+      1. baselines/label_dir/summary.json  (multi-label, e.g. COVID scalability)
+      2. baselines/summary.json            (single-label, e.g. IBD)
+    """
+    rows = []
+    bm = _load_benchmark(baselines_dir)
+
+    # Layout 1: label subdirectories
+    for label_dir in baselines_dir.iterdir():
+        if not label_dir.is_dir():
+            continue
+        summary_path = label_dir / "summary.json"
+        if not summary_path.exists():
+            continue
+        with open(summary_path) as f:
+            summary = json.load(f)
+        rows.extend(_parse_baselines_summary(summary, label_dir.name, bm, ratio, seed))
+
+    # Layout 2: flat summary.json at baselines root
+    if not rows:
+        summary_path = baselines_dir / "summary.json"
+        if summary_path.exists():
+            with open(summary_path) as f:
+                summary = json.load(f)
+            # Get label from config if available
+            label_tag = summary.get("config", {}).get("label_column", "unknown")
+            rows.extend(_parse_baselines_summary(summary, label_tag, bm, ratio, seed))
 
     return rows
 
@@ -220,48 +240,73 @@ def main():
 
     all_rows = []
 
-    for ratio_dir in sorted(results_root.iterdir()):
-        if not ratio_dir.is_dir():
-            continue
-        # Support "ratio_0.15", "15p" (patient count), and bare number dirs
-        rname = ratio_dir.name
-        if rname.startswith("ratio_"):
-            ratio = float(rname.replace("ratio_", ""))
-        elif rname.endswith("p"):
-            try:
-                ratio = int(rname[:-1])  # treat as patient count directly
-            except ValueError:
-                continue
-        else:
-            continue
+    def _collect_seed_dir(seed_dir: Path, ratio, seed: int):
+        """Parse all method results under a single seed directory."""
+        cell_counts = _load_cell_counts(seed_dir)
+        rows_before = len(all_rows)
 
-        for seed_dir in sorted(ratio_dir.iterdir()):
-            if not seed_dir.is_dir() or not seed_dir.name.startswith("seed_"):
+        for method_dir in sorted(seed_dir.iterdir()):
+            if not method_dir.is_dir():
+                continue
+            name = method_dir.name
+
+            if name.startswith("drgp_"):
+                all_rows.extend(_parse_drgp(method_dir, name, ratio, seed))
+            elif name == "spectra_sup_baselines":
+                all_rows.extend(_parse_spectra_or_schpf_baselines(
+                    method_dir, "spectra_sup", "spectra_sup", ratio, seed))
+            elif name == "schpf_baselines":
+                all_rows.extend(_parse_spectra_or_schpf_baselines(
+                    method_dir, "schpf", "schpf", ratio, seed))
+            elif name == "baselines":
+                all_rows.extend(_parse_baselines(method_dir, ratio, seed))
+
+        # Attach cell counts to all rows from this seed_dir
+        if cell_counts:
+            for row in all_rows[rows_before:]:
+                row.update(cell_counts)
+
+    # Detect directory layout:
+    #   - Scalability: results_root/ratio_dir/seed_dir/method_dir/
+    #   - Flat:        results_root/seed_dir/method_dir/
+    subdirs = [d for d in sorted(results_root.iterdir()) if d.is_dir()]
+    has_seed_dirs = any(d.name.startswith("seed_") for d in subdirs)
+    has_ratio_dirs = any(
+        d.name.startswith("ratio_") or d.name.endswith("p") for d in subdirs
+    )
+
+    if has_ratio_dirs and not has_seed_dirs:
+        # Scalability layout: ratio_dir / seed_dir / method_dir
+        for ratio_dir in subdirs:
+            rname = ratio_dir.name
+            if rname.startswith("ratio_"):
+                ratio = float(rname.replace("ratio_", ""))
+            elif rname.endswith("p"):
+                try:
+                    ratio = int(rname[:-1])
+                except ValueError:
+                    continue
+            else:
+                continue
+
+            for seed_dir in sorted(ratio_dir.iterdir()):
+                if not seed_dir.is_dir() or not seed_dir.name.startswith("seed_"):
+                    continue
+                seed = int(seed_dir.name.replace("seed_", ""))
+                _collect_seed_dir(seed_dir, ratio, seed)
+
+    elif has_seed_dirs:
+        # Flat layout: seed_dir / method_dir  (no ratio level)
+        for seed_dir in subdirs:
+            if not seed_dir.name.startswith("seed_"):
                 continue
             seed = int(seed_dir.name.replace("seed_", ""))
-            cell_counts = _load_cell_counts(seed_dir)
-            rows_before = len(all_rows)
+            _collect_seed_dir(seed_dir, ratio=None, seed=seed)
 
-            for method_dir in sorted(seed_dir.iterdir()):
-                if not method_dir.is_dir():
-                    continue
-                name = method_dir.name
-
-                if name.startswith("drgp_"):
-                    all_rows.extend(_parse_drgp(method_dir, name, ratio, seed))
-                elif name == "spectra_sup_baselines":
-                    all_rows.extend(_parse_spectra_or_schpf_baselines(
-                        method_dir, "spectra_sup", "spectra_sup", ratio, seed))
-                elif name == "schpf_baselines":
-                    all_rows.extend(_parse_spectra_or_schpf_baselines(
-                        method_dir, "schpf", "schpf", ratio, seed))
-                elif name == "baselines":
-                    all_rows.extend(_parse_baselines(method_dir, ratio, seed))
-
-            # Attach cell counts to all rows from this seed_dir
-            if cell_counts:
-                for row in all_rows[rows_before:]:
-                    row.update(cell_counts)
+    else:
+        print(f"Unrecognized directory layout under {results_root}")
+        print(f"  Found: {[d.name for d in subdirs[:10]]}")
+        return
 
     if not all_rows:
         print("No results found.")

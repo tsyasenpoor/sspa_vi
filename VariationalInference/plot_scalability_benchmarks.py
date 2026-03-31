@@ -281,6 +281,153 @@ def _plot_metric(
 
 
 # ---------------------------------------------------------------------------
+# Bar charts for single-dataset benchmarks (no ratio/scalability dimension)
+# ---------------------------------------------------------------------------
+
+BENCH_DISPLAY = {
+    "drgp_unmasked": "DRGP",
+    "drgp_unmasked_fix": "DRGP (fix)",
+    "schpf": "scHPF",
+    "spectra_sup": "Spectra",
+    "baselines": "Baselines",
+}
+BENCH_COLORS = {
+    "drgp_unmasked": "#d62728",
+    "drgp_unmasked_fix": "#e377c2",
+    "schpf": "#2ca02c",
+    "spectra_sup": "#9467bd",
+    "baselines": "#1f77b4",
+}
+
+
+def _bench_group(m: str) -> str:
+    if m.startswith("drgp"):
+        return m
+    elif m.startswith("schpf"):
+        return "schpf"
+    elif m.startswith("spectra"):
+        return "spectra_sup"
+    elif m.startswith("baselines"):
+        return "baselines"
+    return m
+
+
+def plot_benchmark_bars(df: pd.DataFrame, out_dir: Path):
+    """Bar chart comparing wall time and peak memory across methods."""
+    cols = ["seed", "method", "wall_time_s", "peak_rss_mb"]
+    bm = df[df["wall_time_s"].notna()][[c for c in cols if c in df.columns]].drop_duplicates()
+    if bm.empty:
+        print("  No benchmark data to plot.")
+        return
+
+    bm = bm.copy()
+    bm["group"] = bm["method"].apply(_bench_group)
+
+    # One entry per (seed, group)
+    grouped = (
+        bm.groupby(["seed", "group"])
+        .agg({"wall_time_s": "first", "peak_rss_mb": "first"})
+        .reset_index()
+    )
+    stats = (
+        grouped.groupby("group")
+        .agg(
+            time_mean=("wall_time_s", "mean"),
+            time_std=("wall_time_s", "std"),
+            mem_mean=("peak_rss_mb", "mean"),
+            mem_std=("peak_rss_mb", "std"),
+        )
+        .reset_index()
+    )
+    stats["time_std"] = stats["time_std"].fillna(0)
+    stats["mem_std"] = stats["mem_std"].fillna(0)
+    stats = stats.sort_values("time_mean")
+
+    groups = stats["group"].tolist()
+    labels = [BENCH_DISPLAY.get(g, g) for g in groups]
+    colors = [BENCH_COLORS.get(g, "#7f7f7f") for g in groups]
+    x = np.arange(len(groups))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Wall time in minutes
+    ax1.bar(x, stats["time_mean"] / 60, yerr=stats["time_std"] / 60,
+            color=colors, capsize=5, edgecolor="black", linewidth=0.5)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, fontsize=11)
+    ax1.set_ylabel("Wall Time (minutes)", fontsize=12)
+    ax1.set_title("Wall Time", fontsize=13, fontweight="bold")
+    ax1.grid(True, axis="y", alpha=0.3)
+    # Add value labels on bars
+    for i, (mean, std) in enumerate(zip(stats["time_mean"] / 60, stats["time_std"] / 60)):
+        ax1.text(i, mean + std + 0.5, f"{mean:.1f}", ha="center", va="bottom", fontsize=10)
+
+    # Peak memory in GB
+    ax2.bar(x, stats["mem_mean"] / 1024, yerr=stats["mem_std"] / 1024,
+            color=colors, capsize=5, edgecolor="black", linewidth=0.5)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(labels, fontsize=11)
+    ax2.set_ylabel("Peak Memory (GB)", fontsize=12)
+    ax2.set_title("Peak Memory", fontsize=13, fontweight="bold")
+    ax2.grid(True, axis="y", alpha=0.3)
+    for i, (mean, std) in enumerate(zip(stats["mem_mean"] / 1024, stats["mem_std"] / 1024)):
+        ax2.text(i, mean + std + 0.1, f"{mean:.1f}", ha="center", va="bottom", fontsize=10)
+
+    fig.suptitle("Benchmark Comparison", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(out_dir / "benchmark_bars.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / "benchmark_bars.pdf", bbox_inches="tight")
+    plt.close(fig)
+    print("  Saved benchmark_bars.png/pdf")
+
+
+def _plot_metric_bars(df: pd.DataFrame, metric: str, out_dir: Path):
+    """Bar chart of test <metric> by method, one subplot per label."""
+    test = df[(df["split"] == "test") & df[metric].notna()].copy()
+    if test.empty:
+        print(f"  No test {metric.upper()} data to plot.")
+        return
+
+    labels = sorted(test["label"].unique())
+    n_labels = len(labels)
+    fig, axes = plt.subplots(1, n_labels, figsize=(6 * n_labels, 5), squeeze=False)
+
+    for idx, label_name in enumerate(labels):
+        ax = axes[0, idx]
+        sub = test[test["label"] == label_name]
+        stats = (
+            sub.groupby("method")[metric]
+            .agg(["mean", "std"])
+            .reset_index()
+            .sort_values("mean", ascending=False)
+        )
+        stats["std"] = stats["std"].fillna(0)
+
+        methods = stats["method"].tolist()
+        disp_labels = [_display(m) for m in methods]
+        families = [METHOD_FAMILY.get(m, "Other") for m in methods]
+        colors = [FAMILY_COLORS.get(f, "#7f7f7f") for f in families]
+        x = np.arange(len(methods))
+
+        ax.bar(x, stats["mean"].values, yerr=stats["std"].values,
+               color=colors, capsize=4, edgecolor="black", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(disp_labels, fontsize=8, rotation=35, ha="right")
+        ax.set_ylabel(f"Test {metric.upper()}", fontsize=12)
+        ax.set_title(f"{label_name}", fontsize=13, fontweight="bold")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle(f"Test {metric.upper()} by Method", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    fname = f"test_{metric}_bars"
+    fig.savefig(out_dir / f"{fname}.png", dpi=200, bbox_inches="tight")
+    fig.savefig(out_dir / f"{fname}.pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {fname}.png/pdf")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -311,26 +458,39 @@ def main():
     }
     df["label"] = df["label"].str.lower().map(lambda x: label_map.get(x, x))
 
-    # Build patient-count -> cell-count mapping for dual x-axis
-    p2c = _build_patient_to_cells(df)
+    # Detect mode: scalability (multiple ratios) vs single-dataset (no ratio)
+    valid_ratios = df["ratio"].dropna().unique()
+    is_scalability = len(valid_ratios) > 1
 
     print(f"Loaded {len(df)} rows from {args.input}")
     print(f"Methods: {sorted(df['method'].unique())}")
-    print(f"Patients: {sorted(df['ratio'].unique())}")
     print(f"Seeds: {sorted(df['seed'].unique())}")
     print(f"Labels: {sorted(df['label'].unique())}")
-    if p2c:
-        print(f"Patient -> Cell mapping: { {int(k): v for k, v in sorted(p2c.items())} }")
+    print(f"Mode: {'scalability' if is_scalability else 'single-dataset (bar charts)'}")
     print()
 
-    print("Plotting benchmark (time + memory) ...")
-    plot_benchmark_panel(df, out_dir, p2c)
+    if is_scalability:
+        p2c = _build_patient_to_cells(df)
+        if p2c:
+            print(f"Patient -> Cell mapping: { {int(k): v for k, v in sorted(p2c.items())} }")
 
-    print("Plotting test AUC ...")
-    _plot_metric(df, "auc", out_dir, p2c, ylim=(0.4, 1.0))
+        print("Plotting benchmark (time + memory) ...")
+        plot_benchmark_panel(df, out_dir, p2c)
 
-    print("Plotting test F1 ...")
-    _plot_metric(df, "f1", out_dir, p2c, ylim=(0.0, 1.0))
+        print("Plotting test AUC ...")
+        _plot_metric(df, "auc", out_dir, p2c, ylim=(0.4, 1.0))
+
+        print("Plotting test F1 ...")
+        _plot_metric(df, "f1", out_dir, p2c, ylim=(0.0, 1.0))
+    else:
+        print("Plotting benchmark bars ...")
+        plot_benchmark_bars(df, out_dir)
+
+        print("Plotting test AUC bars ...")
+        _plot_metric_bars(df, "auc", out_dir)
+
+        print("Plotting test F1 bars ...")
+        _plot_metric_bars(df, "f1", out_dir)
 
     print(f"\nAll plots saved to {out_dir}/")
 

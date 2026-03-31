@@ -1783,7 +1783,7 @@ class CAVI:
                     class_w = np.where(y[:, k] > 0.5, w_pos, w_neg)
                 else:
                     class_w = np.ones(self.n, dtype=np.float32)
-                self._sample_weights[:, k] = class_w * w_cell
+                self._sample_weights = self._sample_weights.at[:, k].set(class_w * w_cell)
             if verbose:
                 for k in range(self.kappa):
                     n_pos_pat = sum(1 for pl in pat_labels.values()
