@@ -1205,20 +1205,22 @@ class CAVI:
             # Use a wider absolute bound (30/sqrt(K)) so the Laplace
             # E[1/s] mechanism — not a hard clip — controls sparsity.
             # Per-step stability is separately ensured by max_step below.
-            v_abs_clip = min(10.0, 30.0 / np.sqrt(self.K))
+            v_abs_clip = min(10.0, max(3.0, 30.0 / np.sqrt(self.K)))
             mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
-            # Damping: K-scale alpha_max so combined mode (K=403) doesn't
-            # diverge while small-K models still converge quickly.
-            # K=50 → 0.06; K=348 → 0.009; K=403 → 0.007.
-            alpha_max = min(0.06, 3.0 / self.K)
+            # Damping: sqrt(K)-scale alpha_max.  The total logit is sum_k
+            # theta_ik * v_k; under independent-factor assumptions the std-dev
+            # of the logit change scales as sqrt(K)*dv, so bounding it at a
+            # constant requires dv ~ 1/sqrt(K), not 1/K.
+            # K=50 → 0.06 (cap); K=500 → 0.06 (cap); K=50000 → 0.013.
+            alpha_max = min(0.06, 3.0 / np.sqrt(self.K))
             alpha = min(alpha_max, 0.05 * alpha_max / 0.06 + (alpha_max - 0.05 * alpha_max / 0.06) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
-            # Per-element step cap: scale with K so total logit change
-            # (K * max_step) stays bounded at ~2.5 regardless of K.
-            # K=50 → 0.05; K=348 → 0.0072; K=403 → 0.0062.
-            max_step = min(0.05, 2.5 / self.K)
+            # Per-element step cap: scale with sqrt(K) so the std-dev of
+            # total logit change (sqrt(K) * max_step) stays bounded at ~2.5.
+            # K=50 → 0.05 (cap); K=500 → 0.05 (cap); K=50000 → 0.011.
+            max_step = min(0.05, 2.5 / np.sqrt(self.K))
             delta = mu_v_candidate - self.mu_v
             delta = xp.clip(delta, -max_step, max_step)
             mu_v_candidate = self.mu_v + delta
@@ -1576,7 +1578,7 @@ class CAVI:
         X_aux_v_dev = to_device(X_aux_val)
 
         a_theta_v, b_theta_v = self._infer_theta_sparse(
-            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=False)
+            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=True)
 
         E_log_beta = self._E_log_beta_cache
         E_beta = self.E_beta
@@ -1635,16 +1637,28 @@ class CAVI:
             zeta_val = xp.sqrt(xp.maximum(E_A_sq, 1e-8))
             lam = lambda_jj(zeta_val)
 
-            reg_ll = xp.sum((y_v - 0.5) * E_A - lam * E_A_sq)
-            reg_ll += xp.sum(lam * zeta_val ** 2 - 0.5 * zeta_val
-                             + log_expit(zeta_val))
+            # Mask out degenerate (single-class) label columns so they
+            # don't bias the held-out regression LL used for early stopping.
+            y_v_np = to_numpy(y_v)
+            valid_mask = np.array([len(np.unique(y_v_np[:, k])) > 1
+                                   for k in range(y_v_np.shape[1])])
+            if valid_mask.any():
+                vm = to_device(valid_mask.astype(np.float32)[None, :])
+                reg_ll = xp.sum(((y_v - 0.5) * E_A - lam * E_A_sq) * vm)
+                reg_ll += xp.sum((lam * zeta_val ** 2 - 0.5 * zeta_val
+                                  + log_expit(zeta_val)) * vm)
+            else:
+                reg_ll = 0.0
             regression_ll_per_sample = float(reg_ll / n_val)
 
             # True Bernoulli log-likelihood (for model selection, not training)
-            true_bernoulli_ll = xp.sum(
-                y_v * log_expit(E_A) + (1 - y_v) * log_expit(-E_A)
-            )
-            true_bernoulli_ll_per_sample = float(true_bernoulli_ll / n_val)
+            if valid_mask.any():
+                true_bernoulli_ll = xp.sum(
+                    (y_v * log_expit(E_A) + (1 - y_v) * log_expit(-E_A)) * vm
+                )
+                true_bernoulli_ll_per_sample = float(true_bernoulli_ll / n_val)
+            else:
+                true_bernoulli_ll_per_sample = 0.0
         else:
             true_bernoulli_ll_per_sample = None
 
@@ -1664,7 +1678,7 @@ class CAVI:
             max_iter=600, check_freq=5, tol=0.001,
             v_warmup=50, verbose=True,
             early_stopping='heldout_ll',
-            n_patients=None):
+            n_patients=None, patient_ids=None):
         """
         Fit the supervised Poisson factorization model.
 
@@ -1689,6 +1703,12 @@ class CAVI:
             using n_patients instead of n_cells, giving appropriate
             regularization when cells share patient-level labels.
             None (default) keeps the existing cell-count scaling.
+        patient_ids : array-like of shape (n_cells,) or None
+            Maps each training cell to its patient/donor ID.  When provided,
+            class weights are recomputed at the patient level (counting
+            patients per class, not cells) and each cell is down-weighted by
+            the inverse of its donor's cell count, so large-cell donors do
+            not dominate the regression loss.
         """
         t0 = time.time()
 
@@ -1710,6 +1730,16 @@ class CAVI:
         # Initialize (creates numpy arrays, then transfers to device)
         self._initialize(X_train, y, X_aux)
 
+        # Auto-scale regression_weight to n_genes when left at default (1.0).
+        # Poisson LL sums ~O(nnz) terms while regression LL sums ~O(N*kappa);
+        # the ratio can be 10^5:1, making regression_weight=1.0 effectively
+        # invisible.  Scaling by n_genes (p) roughly equalises the per-factor
+        # gradient magnitudes of the two objectives.
+        if self.regression_weight == 1.0 and self.kappa > 0:
+            self.regression_weight = float(self.p)
+            if verbose:
+                print(f"  regression_weight auto-scaled to n_genes={self.p}")
+
         # Re-scale Laplace b_v using patient count instead of cell count.
         # When labels are patient-level (shared across cells from the same
         # donor), the effective sample size for regression is n_patients, not
@@ -1724,6 +1754,45 @@ class CAVI:
             self.b_v = b_v_eff
             self.sigma_v_diag = np.full(
                 (self.kappa, self.K), 2.0 * self.b_v ** 2)
+
+        # Recompute class weights at patient level when patient_ids given
+        if patient_ids is not None and self.use_class_weights:
+            patient_ids_arr = np.asarray(patient_ids)
+            unique_patients, cells_per_patient = np.unique(
+                patient_ids_arr, return_counts=True)
+            n_pat = len(unique_patients)
+            # Per-cell inverse-frequency: cells from large-cell patients
+            # get lower weight so each patient contributes equally
+            patient_cell_count = dict(zip(unique_patients, cells_per_patient))
+            w_cell = np.array([1.0 / patient_cell_count[pid]
+                               for pid in patient_ids_arr], dtype=np.float32)
+            w_cell *= len(w_cell) / w_cell.sum()  # normalize to mean 1
+
+            # Patient-level class weights (count patients, not cells)
+            pat_labels = {}  # patient -> label vector (first cell)
+            for i, pid in enumerate(patient_ids_arr):
+                if pid not in pat_labels:
+                    pat_labels[pid] = y[i]
+            for k in range(self.kappa):
+                n_pos_pat = sum(1 for pl in pat_labels.values()
+                                if pl[k] > 0.5)
+                n_neg_pat = n_pat - n_pos_pat
+                if n_pos_pat > 0 and n_neg_pat > 0:
+                    w_pos = n_pat / (2.0 * n_pos_pat)
+                    w_neg = n_pat / (2.0 * n_neg_pat)
+                    class_w = np.where(y[:, k] > 0.5, w_pos, w_neg)
+                else:
+                    class_w = np.ones(self.n, dtype=np.float32)
+                self._sample_weights[:, k] = class_w * w_cell
+            if verbose:
+                for k in range(self.kappa):
+                    n_pos_pat = sum(1 for pl in pat_labels.values()
+                                    if pl[k] > 0.5)
+                    n_neg_pat = n_pat - n_pos_pat
+                    print(f"  patient_class_weights[{k}]: "
+                          f"pos_patients={n_pos_pat} neg_patients={n_neg_pat}")
+                print(f"  Class weights recomputed at patient level "
+                      f"(n_patients={n_pat})")
 
         # Transfer training labels / aux to device for hot-path computations
         y = to_device(y)
@@ -2249,7 +2318,7 @@ class CAVI:
         X_aux_v_dev = to_device(X_aux_v)
 
         a_theta_v, b_theta_v = self._infer_theta_sparse(
-            X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=False)
+            X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=True)
         E_theta_v = a_theta_v / b_theta_v
 
         y_np = np.asarray(y_val, dtype=np.float32)

@@ -370,7 +370,8 @@ class TrialObjective:
             # Filter to only params accepted by the CAVI fit() method
             vi_fit_params = {
                 'X_train', 'y_train', 'X_aux_train', 'X_val', 'y_val', 'X_aux_val',
-                'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose'
+                'max_iter', 'check_freq', 'tol', 'v_warmup', 'verbose',
+                'n_patients', 'patient_ids', 'early_stopping',
             }
             fit_kwargs = {k: v for k, v in fit_kwargs.items() if k in vi_fit_params}
 
