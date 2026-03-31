@@ -556,6 +556,13 @@ def main():
     patient_split = splits.get('patient_split', None)
     aux_column_names = data.get('aux_column_names', None)
 
+    # Build per-cell patient ID array for patient-level class weights
+    train_patient_ids = None
+    if patient_split is not None and args.patient_column:
+        cell_meta = data['cell_metadata']
+        train_cells = splits['train']
+        train_patient_ids = cell_meta.loc[train_cells, args.patient_column].values
+
     print(f"\nData Summary:")
     print(f"  Genes:          {len(gene_list)}")
     print(f"  Training cells: {len(splits['train'])}")
@@ -782,6 +789,7 @@ def main():
         verbose=True,
         early_stopping=args.early_stopping,
         n_patients=n_train_patients,
+        patient_ids=train_patient_ids,
     )
 
     model.fit(**fit_kwargs)

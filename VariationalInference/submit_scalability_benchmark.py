@@ -47,7 +47,6 @@ DRGP_COMMON = (
     '--a 0.3 --c 0.3 '
     '--sigma-v 2.0 --v-prior laplace '
     '--sigma-gamma 0.5 '
-    '--regression-weight 1.0 '
     '--max-iter 2000 --tol 0.001 '
     '--v-warmup 50 --check-freq 10 '
     '--early-stopping heldout_ll '
