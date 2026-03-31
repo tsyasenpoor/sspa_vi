@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 from pathlib import Path
 
@@ -30,6 +31,28 @@ def _load_benchmark(method_dir: Path) -> dict:
     if bm_path.exists():
         with open(bm_path) as f:
             return json.load(f)
+    return {}
+
+
+def _load_cell_counts(seed_dir: Path) -> dict:
+    """Extract cell counts from vi_summary.json.gz in any DRGP dir under seed_dir."""
+    for method_dir in seed_dir.iterdir():
+        if not method_dir.is_dir():
+            continue
+        summary_path = method_dir / "vi_summary.json.gz"
+        if summary_path.exists():
+            with gzip.open(summary_path, "rt") as f:
+                d = json.load(f)
+            shapes = d.get("data_shapes", {})
+            if shapes:
+                return {
+                    "n_cells_train": shapes.get("n_train"),
+                    "n_cells_val": shapes.get("n_val"),
+                    "n_cells_test": shapes.get("n_test"),
+                    "n_cells_total": sum(
+                        shapes.get(k, 0) for k in ("n_train", "n_val", "n_test")
+                    ),
+                }
     return {}
 
 
@@ -198,14 +221,26 @@ def main():
     all_rows = []
 
     for ratio_dir in sorted(results_root.iterdir()):
-        if not ratio_dir.is_dir() or not ratio_dir.name.startswith("ratio_"):
+        if not ratio_dir.is_dir():
             continue
-        ratio = float(ratio_dir.name.replace("ratio_", ""))
+        # Support "ratio_0.15", "15p" (patient count), and bare number dirs
+        rname = ratio_dir.name
+        if rname.startswith("ratio_"):
+            ratio = float(rname.replace("ratio_", ""))
+        elif rname.endswith("p"):
+            try:
+                ratio = int(rname[:-1])  # treat as patient count directly
+            except ValueError:
+                continue
+        else:
+            continue
 
         for seed_dir in sorted(ratio_dir.iterdir()):
             if not seed_dir.is_dir() or not seed_dir.name.startswith("seed_"):
                 continue
             seed = int(seed_dir.name.replace("seed_", ""))
+            cell_counts = _load_cell_counts(seed_dir)
+            rows_before = len(all_rows)
 
             for method_dir in sorted(seed_dir.iterdir()):
                 if not method_dir.is_dir():
@@ -222,6 +257,11 @@ def main():
                         method_dir, "schpf", "schpf", ratio, seed))
                 elif name == "baselines":
                     all_rows.extend(_parse_baselines(method_dir, ratio, seed))
+
+            # Attach cell counts to all rows from this seed_dir
+            if cell_counts:
+                for row in all_rows[rows_before:]:
+                    row.update(cell_counts)
 
     if not all_rows:
         print("No results found.")
