@@ -1116,6 +1116,119 @@ def main():
         patient_pred_df.to_csv(patient_pred_path, compression='gzip', index=False)
         print(f"\nSaved patient-level predictions to {patient_pred_path}")
 
+    # =========================================================================
+    # STEP 7c: Decomposed Diagnostics — cov-only vs factor vs full
+    # =========================================================================
+    if patient_split is not None and args.patient_column is not None:
+        from scipy.special import expit as _sigmoid
+        cell_metadata = data.get('cell_metadata')
+        pcol = args.patient_column
+
+        print("\n" + "=" * 80)
+        print("DIAGNOSTIC: Logit Decomposition & Patient-Level Ranking Analysis")
+        print("=" * 80)
+
+        for split_name, cell_ids, X_gex, X_aux, y_2d, proba_2d in [
+            ('train', splits['train'], X_train, X_aux_train, _y_train_2d, _proba_train_2d),
+            ('val', splits['val'], X_val, X_aux_val, _y_val_2d, _proba_val_2d),
+            ('test', splits['test'], X_test, X_aux_test, _y_test_2d, _proba_test_2d),
+        ]:
+            print(f"\n--- {split_name.upper()} ({len(cell_ids)} cells) ---")
+
+            # Compute E[theta] for this split
+            E_theta_split = model.transform(X_gex, X_aux_new=X_aux)['E_theta']
+            X_aux_prep = model._prepend_intercept(
+                np.asarray(X_aux, dtype=np.float32), n=len(cell_ids))
+
+            # Logit decomposition
+            logit_cov = np.array(X_aux_prep @ model.mu_gamma.T)      # (n, kappa)
+            logit_theta = np.array(E_theta_split @ model.mu_v.T)     # (n, kappa)
+            logit_full = logit_cov + logit_theta
+
+            for k in range(n_outcomes):
+                lname = label_columns[k]
+                lc = logit_cov[:, k] if logit_cov.ndim > 1 else logit_cov
+                lt = logit_theta[:, k] if logit_theta.ndim > 1 else logit_theta
+                lf = logit_full[:, k] if logit_full.ndim > 1 else logit_full
+                y_k = y_2d[:, k] if y_2d.ndim > 1 else y_2d
+                p_full = proba_2d[:, k] if proba_2d.ndim > 1 else proba_2d
+
+                # --- Logit magnitude comparison ---
+                print(f"\n  [{lname}] Logit Decomposition:")
+                print(f"    logit_cov:   mean={lc.mean():.4f}  SD={lc.std():.4f}  "
+                      f"range=[{lc.min():.4f}, {lc.max():.4f}]  "
+                      f"p5/p50/p95=[{np.percentile(lc,5):.4f}, {np.percentile(lc,50):.4f}, {np.percentile(lc,95):.4f}]")
+                print(f"    logit_theta: mean={lt.mean():.4f}  SD={lt.std():.4f}  "
+                      f"range=[{lt.min():.4f}, {lt.max():.4f}]  "
+                      f"p5/p50/p95=[{np.percentile(lt,5):.4f}, {np.percentile(lt,50):.4f}, {np.percentile(lt,95):.4f}]")
+                print(f"    logit_full:  mean={lf.mean():.4f}  SD={lf.std():.4f}  "
+                      f"range=[{lf.min():.4f}, {lf.max():.4f}]")
+                sd_ratio = lt.std() / max(lc.std(), 1e-8)
+                print(f"    SD ratio (theta/cov): {sd_ratio:.4f}"
+                      + ("  *** FACTOR BLOCK DOMINATES ***" if sd_ratio > 1.0 else ""))
+
+                # --- AUC inversion test ---
+                n_unique = len(np.unique(y_k))
+                if n_unique > 1:
+                    from sklearn.metrics import roc_auc_score
+                    p_cov = _sigmoid(lc)
+                    p_theta = _sigmoid(lt)
+                    p_f = _sigmoid(lf)
+                    auc_full = roc_auc_score(y_k, p_full)
+                    auc_inv = roc_auc_score(y_k, 1.0 - p_full)
+                    auc_cov = roc_auc_score(y_k, p_cov)
+                    auc_theta = roc_auc_score(y_k, p_theta)
+                    print(f"    Cell AUC(p):   {auc_full:.4f}   AUC(1-p): {auc_inv:.4f}"
+                          + ("  *** INVERSION DETECTED ***" if auc_inv > 0.9 and auc_full < 0.1 else ""))
+                    print(f"    Cell AUC cov-only: {auc_cov:.4f}   theta-only: {auc_theta:.4f}")
+
+                # --- Patient-level decomposed table ---
+                pid_series = cell_metadata.loc[cell_ids, pcol].astype(str)
+                pdf = pd.DataFrame({
+                    'patient': pid_series.values,
+                    'y_true': y_k,
+                    'logit_cov': lc,
+                    'logit_theta': lt,
+                    'logit_full': lf,
+                    'prob_full': p_full,
+                })
+                pat = pdf.groupby('patient').agg(
+                    y_true=('y_true', 'first'),
+                    n_cells=('patient', 'count'),
+                    logit_cov=('logit_cov', 'mean'),
+                    logit_theta=('logit_theta', 'mean'),
+                    logit_full=('logit_full', 'mean'),
+                    prob_full=('prob_full', 'mean'),
+                ).reset_index()
+                pat['prob_cov'] = _sigmoid(pat['logit_cov'].values)
+                pat['delta_logit'] = pat['logit_theta']
+                pat['rank_cov'] = pat['prob_cov'].rank(ascending=False).astype(int)
+                pat['rank_full'] = pat['prob_full'].rank(ascending=False).astype(int)
+
+                n_pat = len(pat)
+                print(f"\n    Patient-level table ({n_pat} patients):")
+                print(f"    {'patient':<15} {'y':>2} {'cells':>6} {'logit_cov':>10} {'logit_θ':>10} "
+                      f"{'logit_full':>10} {'p(cov)':>7} {'p(full)':>7} {'Δlogit':>8} "
+                      f"{'rk_cov':>6} {'rk_full':>7}")
+                for _, r in pat.sort_values('rank_full').iterrows():
+                    flipped = (r['rank_cov'] != r['rank_full'])
+                    marker = " ←FLIP" if flipped else ""
+                    print(f"    {r['patient']:<15} {int(r['y_true']):>2} {int(r['n_cells']):>6} "
+                          f"{r['logit_cov']:>10.4f} {r['logit_theta']:>10.4f} "
+                          f"{r['logit_full']:>10.4f} {r['prob_cov']:>7.4f} {r['prob_full']:>7.4f} "
+                          f"{r['delta_logit']:>8.4f} {int(r['rank_cov']):>6} {int(r['rank_full']):>7}{marker}")
+
+                # Patient-level AUC: cov-only vs full
+                if n_pat > 1 and len(np.unique(pat['y_true'])) > 1:
+                    pat_auc_cov = roc_auc_score(pat['y_true'], pat['prob_cov'])
+                    pat_auc_full = roc_auc_score(pat['y_true'], pat['prob_full'])
+                    pat_auc_inv = roc_auc_score(pat['y_true'], 1.0 - pat['prob_full'])
+                    print(f"\n    Patient AUC  cov-only: {pat_auc_cov:.4f}  "
+                          f"full: {pat_auc_full:.4f}  full(1-p): {pat_auc_inv:.4f}")
+                    if pat_auc_full < pat_auc_cov - 0.05:
+                        print(f"    *** FACTOR BLOCK HURTS patient AUC by "
+                              f"{pat_auc_cov - pat_auc_full:.4f} ***")
+
     # Save consolidated metrics CSV (replaces separate pkl files)
     metrics_rows = []
     for split_name, metrics_dict, thresholds in [

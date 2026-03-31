@@ -1877,6 +1877,36 @@ class CAVI:
                     print(f"  [diag t={t}] after v:   "
                           f"mu_v=[{float(self.mu_v.min()):.4e},{float(self.mu_v.max()):.4e}] "
                           f"sigma2_v=[{float(self.sigma_v_diag.min()):.4e},{float(self.sigma_v_diag.max()):.4e}]")
+
+                # v saturation monitoring
+                _v_clip = min(10.0, 30.0 / np.sqrt(self.K)) if self.v_prior == 'laplace' \
+                    else min(5.0, 10.0 / np.sqrt(self.K))
+                _mu_v_np = np.asarray(self.mu_v)
+                _abs_v = np.abs(_mu_v_np)
+                _n_at_bound = int(np.sum(_abs_v >= _v_clip - 0.01))
+                _n_near_bound = int(np.sum(_abs_v >= 0.95 * _v_clip))
+                _n_total = _mu_v_np.size
+                _pct_bound = 100.0 * _n_at_bound / _n_total
+                _pct_near = 100.0 * _n_near_bound / _n_total
+                _interior = _abs_v[_abs_v < _v_clip - 0.01]
+                _int_mean = float(np.mean(_interior)) if len(_interior) > 0 else 0.0
+                _sv_floor_pct = 100.0 * float(np.sum(np.asarray(self.sigma_v_diag) <= 0.011)) / _n_total
+                print(f"  [v-sat t={t}] clip={_v_clip:.2f}  "
+                      f"at_bound={_n_at_bound}/{_n_total} ({_pct_bound:.1f}%)  "
+                      f"near_bound(95%)={_n_near_bound}/{_n_total} ({_pct_near:.1f}%)  "
+                      f"interior_mean|v|={_int_mean:.4f}  "
+                      f"sig2_v_at_floor={_sv_floor_pct:.1f}%")
+                if self.kappa > 1:
+                    for _k_label in range(self.kappa):
+                        _v_k = _mu_v_np[_k_label]
+                        _n_pos = int(np.sum(_v_k >= _v_clip - 0.01))
+                        _n_neg = int(np.sum(_v_k <= -_v_clip + 0.01))
+                        _n_int = len(_v_k) - _n_pos - _n_neg
+                        print(f"    label[{_k_label}]: +bound={_n_pos} -bound={_n_neg} "
+                              f"interior={_n_int}")
+                if _pct_bound > 50:
+                    print(f"  [v-sat t={t}] *** WARNING: >50% of v at boundary ***")
+
                 print(f"  [timing t={t}] updates: {t_updates:.1f}s")
 
             # 6. Check convergence
