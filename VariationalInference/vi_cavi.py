@@ -373,7 +373,11 @@ class CAVI:
 
         # --- spike-and-slab on beta (optional) ---
         if self.use_spike_slab_beta:
-            self.beta_pi = self._beta_pi_scale if self._beta_pi_scale is not None else float(K)
+            # Default: E[pi_j] = alpha_pi / (alpha_pi + beta_pi) targets ~10
+            # programs per gene.  K/10 scales sensibly: K=50 -> beta_pi=4,
+            # K=500 -> beta_pi=49.  Manual override via beta_pi_scale.
+            self.beta_pi = (self._beta_pi_scale if self._beta_pi_scale is not None
+                            else max(1.0, float(K) / 10.0 - self.alpha_pi))
             self.r_beta = np.ones((self.p, K), dtype=np.float32) * 0.5
             if self._active_beta is not None:
                 # Masked entries are structurally zero — not latent variables
@@ -2008,7 +2012,9 @@ class CAVI:
             self._update_beta(z_sum_beta)
             self._update_eta()
             # 2c. Spike-and-slab inclusion update (needs z_sum_beta)
-            if self.use_spike_slab_beta:
+            # Skip on t=0: phi is random Dirichlet, z_sums are meaningless noise.
+            # Updating r_beta from noise kills most entries immediately.
+            if self.use_spike_slab_beta and t > 0:
                 _theta_col_sum = xp.zeros(self.K)
                 for i0 in range(0, self.n, self._row_chunk):
                     i1 = min(i0 + self._row_chunk, self.n)
@@ -2494,12 +2500,15 @@ class CAVI:
             for k in range(probs.shape[1]):
                 y_k = y_np[:, k]
                 p_k = np.clip(probs[:, k], 1e-7, 1 - 1e-7)
+                if np.any(np.isnan(p_k)):
+                    aucs.append(float('nan'))
+                    continue
                 if len(np.unique(y_k)) > 1:
                     aucs.append(roc_auc_score(y_k, p_k))
                 lls.append(sk_log_loss(y_k, p_k, labels=[0, 1]))
             results[name] = {
                 'auc': np.mean(aucs) if aucs else float('nan'),
-                'log_loss': np.mean(lls),
+                'log_loss': np.mean(lls) if lls else float('nan'),
             }
         return results
 
