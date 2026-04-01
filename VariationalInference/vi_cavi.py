@@ -923,7 +923,16 @@ class CAVI:
         a^eta_j = c' + m_j * c where m_j is the number of active factors
         for gene j (= K when no mask is applied).
         """
-        # a^eta is constant (set in init, never changes)
+        # When spike-and-slab is active, a_eta must track the effective
+        # number of active factors per gene: a_eta_j = cp + sum_k r_{jk} * c.
+        # Without this, a_eta stays at cp + K*c even when most factors are
+        # killed, causing E[eta] = a_eta/b_eta to explode (eta death spiral).
+        if self.use_spike_slab_beta:
+            self.a_eta = self.cp + self.r_beta.sum(axis=1) * self.c
+            # Refresh cached digamma/gammaln since a_eta changed
+            self._digamma_a_eta = digamma(self.a_eta)
+            self._gammaln_a_eta = gammaln(self.a_eta)
+        # else: a^eta is constant (set in init, never changes)
         if self._active_beta is not None:
             self.b_eta = self.dp + xp.where(
                 self._active_beta, self.E_beta, 0.0).sum(axis=1)
