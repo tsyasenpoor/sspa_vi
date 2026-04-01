@@ -373,7 +373,11 @@ class CAVI:
 
         # --- spike-and-slab on beta (optional) ---
         if self.use_spike_slab_beta:
-            self.beta_pi = self._beta_pi_scale if self._beta_pi_scale is not None else float(K)
+            # Default: E[pi_j] = alpha_pi / (alpha_pi + beta_pi) targets ~10
+            # programs per gene.  K/10 scales sensibly: K=50 -> beta_pi=4,
+            # K=500 -> beta_pi=49.  Manual override via beta_pi_scale.
+            self.beta_pi = (self._beta_pi_scale if self._beta_pi_scale is not None
+                            else max(1.0, float(K) / 10.0 - self.alpha_pi))
             self.r_beta = np.ones((self.p, K), dtype=np.float32) * 0.5
             if self._active_beta is not None:
                 # Masked entries are structurally zero — not latent variables
