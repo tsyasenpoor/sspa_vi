@@ -2008,7 +2008,9 @@ class CAVI:
             self._update_beta(z_sum_beta)
             self._update_eta()
             # 2c. Spike-and-slab inclusion update (needs z_sum_beta)
-            if self.use_spike_slab_beta:
+            # Skip on t=0: phi is random Dirichlet, z_sums are meaningless noise.
+            # Updating r_beta from noise kills most entries immediately.
+            if self.use_spike_slab_beta and t > 0:
                 _theta_col_sum = xp.zeros(self.K)
                 for i0 in range(0, self.n, self._row_chunk):
                     i1 = min(i0 + self._row_chunk, self.n)
@@ -2494,12 +2496,15 @@ class CAVI:
             for k in range(probs.shape[1]):
                 y_k = y_np[:, k]
                 p_k = np.clip(probs[:, k], 1e-7, 1 - 1e-7)
+                if np.any(np.isnan(p_k)):
+                    aucs.append(float('nan'))
+                    continue
                 if len(np.unique(y_k)) > 1:
                     aucs.append(roc_auc_score(y_k, p_k))
                 lls.append(sk_log_loss(y_k, p_k, labels=[0, 1]))
             results[name] = {
                 'auc': np.mean(aucs) if aucs else float('nan'),
-                'log_loss': np.mean(lls),
+                'log_loss': np.mean(lls) if lls else float('nan'),
             }
         return results
 
