@@ -678,13 +678,14 @@ class CAVI:
         _dig_beta = digamma(self.a_beta)
         self._E_log_beta_cache = _dig_beta - xp.log(self.b_beta)
         del _dig_beta
-        # Spike-and-slab: weight by log(r), suppress inactive components
+        # Spike-and-slab: weight by log(r).  Use a soft floor (1e-10)
+        # instead of hard -inf to keep phi numerically stable even when all
+        # K components are killed for a gene (-inf - (-inf) = NaN in softmax).
+        # At r=1e-10, log(r)≈-23, so softmax gives ~exp(-23)≈1e-10 weight.
         if self.use_spike_slab_beta:
-            _ss_thresh = 0.01
-            self._E_log_beta_cache = xp.where(
-                self.r_beta > _ss_thresh,
-                self._E_log_beta_cache + xp.log(xp.maximum(self.r_beta, _ss_thresh)),
-                xp.asarray(-xp.inf, dtype=self._E_log_beta_cache.dtype)
+            self._E_log_beta_cache = (
+                self._E_log_beta_cache
+                + xp.log(xp.maximum(self.r_beta, 1e-10))
             )
         # Masked entries: set to -inf so exp(-inf) = 0 in softmax/logsumexp
         if self._active_beta is not None:
@@ -2021,9 +2022,11 @@ class CAVI:
             self._update_beta(z_sum_beta)
             self._update_eta()
             # 2c. Spike-and-slab inclusion update (needs z_sum_beta)
-            # Skip on t=0: phi is random Dirichlet, z_sums are meaningless noise.
-            # Updating r_beta from noise kills most entries immediately.
-            if self.use_spike_slab_beta and t > 0:
+            # Warmup: skip first 5 iterations so factors differentiate before
+            # sparsity kicks in.  At t=0 phi is random noise; at t=1..4 the
+            # standard scHPF updates establish meaningful factor structure.
+            _ss_warmup = 5
+            if self.use_spike_slab_beta and t >= _ss_warmup:
                 _theta_col_sum = xp.zeros(self.K)
                 for i0 in range(0, self.n, self._row_chunk):
                     i1 = min(i0 + self._row_chunk, self.n)
