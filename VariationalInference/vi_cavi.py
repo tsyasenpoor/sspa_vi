@@ -199,6 +199,9 @@ class CAVI:
         n_pathway_factors: Optional[int] = None,
         nnz_chunk_size: int = 1_000_000,
         test_jj_reg: bool = False,
+        use_spike_slab_beta: bool = False,
+        alpha_pi: float = 1.0,
+        beta_pi_scale: Optional[float] = None,
         **_ignored,
     ):
         self.K = n_factors
@@ -226,6 +229,9 @@ class CAVI:
         self.pathway_mask = pathway_mask
         self.pathway_names = pathway_names
         self.n_pathway_factors = n_pathway_factors
+        self.use_spike_slab_beta = use_spike_slab_beta
+        self.alpha_pi = alpha_pi
+        self._beta_pi_scale = beta_pi_scale  # resolved to K in _initialize
 
         if mode in ['masked', 'pathway_init'] and pathway_mask is None:
             raise ValueError(f"pathway_mask required for mode='{mode}'")
@@ -364,6 +370,20 @@ class CAVI:
         else:
             self._active_beta = None  # means all active
             self._n_active_beta = self.p * K
+
+        # --- spike-and-slab on beta (optional) ---
+        if self.use_spike_slab_beta:
+            self.beta_pi = self._beta_pi_scale if self._beta_pi_scale is not None else float(K)
+            self.r_beta = np.ones((self.p, K), dtype=np.float32) * 0.5
+            if self._active_beta is not None:
+                # Masked entries are structurally zero — not latent variables
+                self.r_beta = np.where(self._active_beta, self.r_beta, 0.0)
+                n_active_per_gene = self._active_beta.sum(axis=1).astype(np.float32)
+                self.a_pi = (self.alpha_pi + n_active_per_gene * 0.5).astype(np.float32)
+                self.b_pi = (self.beta_pi + n_active_per_gene * 0.5).astype(np.float32)
+            else:
+                self.a_pi = np.full(self.p, self.alpha_pi + K * 0.5, dtype=np.float32)
+                self.b_pi = np.full(self.p, self.beta_pi + K * 0.5, dtype=np.float32)
 
         # --- v: init small random ---
         self.mu_v = np.random.randn(self.kappa, K) * 0.01
@@ -618,7 +638,11 @@ class CAVI:
     @property
     def E_beta(self):
         if self._E_beta_cache is None:
-            self._E_beta_cache = self.a_beta / self.b_beta
+            raw = self.a_beta / self.b_beta
+            if self.use_spike_slab_beta:
+                self._E_beta_cache = self.r_beta * raw
+            else:
+                self._E_beta_cache = raw
         return self._E_beta_cache
 
     @property
@@ -650,6 +674,14 @@ class CAVI:
         _dig_beta = digamma(self.a_beta)
         self._E_log_beta_cache = _dig_beta - xp.log(self.b_beta)
         del _dig_beta
+        # Spike-and-slab: weight by log(r), suppress inactive components
+        if self.use_spike_slab_beta:
+            _ss_thresh = 0.01
+            self._E_log_beta_cache = xp.where(
+                self.r_beta > _ss_thresh,
+                self._E_log_beta_cache + xp.log(xp.maximum(self.r_beta, _ss_thresh)),
+                xp.asarray(-xp.inf, dtype=self._E_log_beta_cache.dtype)
+            )
         # Masked entries: set to -inf so exp(-inf) = 0 in softmax/logsumexp
         if self._active_beta is not None:
             self._E_log_beta_cache = xp.where(
@@ -859,7 +891,19 @@ class CAVI:
         new_a = xp.maximum(new_a, 1e-6)
         new_b = xp.maximum(new_b, 1e-6)
 
-        if self._active_beta is not None:
+        if self.use_spike_slab_beta:
+            # Only update entries where r_beta > threshold (slab-active);
+            # pin excluded entries to near-zero values.
+            ss_active = self.r_beta > 0.01
+            if self._active_beta is not None:
+                ss_active = ss_active & self._active_beta
+            self.a_beta = xp.where(ss_active, new_a, self.c * 0.01)
+            self.b_beta = xp.where(ss_active, new_b, 100.0)
+            # Re-pin pathway-masked entries (structurally zero)
+            if self._active_beta is not None:
+                self.a_beta = xp.where(self._active_beta, self.a_beta, self.c * 0.01)
+                self.b_beta = xp.where(self._active_beta, self.b_beta, 100.0)
+        elif self._active_beta is not None:
             # Only update active entries; masked entries keep their pinned values.
             self.a_beta = xp.where(self._active_beta, new_a, self.a_beta)
             self.b_beta = xp.where(self._active_beta, new_b, self.b_beta)
@@ -883,6 +927,51 @@ class CAVI:
             self.b_eta = self.dp + self.E_beta.sum(axis=1)
         # Floor to prevent E[eta] explosion from tiny dp + tiny E[beta] sums
         self.b_eta = xp.maximum(self.b_eta, 1e-6)
+
+    def _update_r_beta(self, z_sum_beta, theta_col_sum):
+        """Update spike-and-slab inclusion probabilities r_{jk}."""
+        if not self.use_spike_slab_beta:
+            return
+
+        E_log_beta = digamma(self.a_beta) - xp.log(self.b_beta)
+        E_beta_raw = self.a_beta / self.b_beta
+        E_log_eta = self._digamma_a_eta - xp.log(self.b_eta)
+        E_eta = self.a_eta / self.b_eta
+
+        # Slab log-likelihood: data fit + Gamma prior + q(beta) entropy
+        log_lik_on = (z_sum_beta * E_log_beta
+                      - E_beta_raw * theta_col_sum[None, :]
+                      + (self.c - 1) * E_log_beta
+                      + self.c * E_log_eta[:, None]
+                      - E_eta[:, None] * E_beta_raw
+                      - gammaln(self.c)
+                      + self.a_beta - xp.log(self.b_beta)
+                      + gammaln(self.a_beta)
+                      + (1 - self.a_beta) * digamma(self.a_beta))
+
+        # Prior odds from pi_j
+        E_log_pi = digamma(self.a_pi) - digamma(self.a_pi + self.b_pi)
+        E_log_1mpi = digamma(self.b_pi) - digamma(self.a_pi + self.b_pi)
+
+        log_odds = E_log_pi[:, None] - E_log_1mpi[:, None] + log_lik_on
+        log_odds = xp.clip(log_odds, -20.0, 20.0)
+        self.r_beta = _expit(log_odds)
+
+        # Masked entries: structurally zero, not latent variables
+        if self._active_beta is not None:
+            self.r_beta = xp.where(self._active_beta, self.r_beta, 0.0)
+
+        # Update pi_j posterior — only count maskable factors per gene
+        r_sum = self.r_beta.sum(axis=1)
+        if self._active_beta is not None:
+            n_maskable = self._active_beta.sum(axis=1)
+            self.a_pi = self.alpha_pi + r_sum
+            self.b_pi = self.beta_pi + (n_maskable - r_sum)
+        else:
+            self.a_pi = self.alpha_pi + r_sum
+            self.b_pi = self.beta_pi + (float(self.K) - r_sum)
+
+        self._invalidate_beta_cache()
 
     def _update_theta(self, z_sum_theta, y, X_aux):
         """
@@ -1467,15 +1556,59 @@ class CAVI:
         # === Prior: p(beta|eta) — active entries only ===
         # Masked entries are absent from the model, so they contribute
         # nothing to the prior or its normalization constant.
-        _beta_prior_terms = ((self.c - 1) * E_log_beta
-                             + self.c * E_log_eta[:, None]
-                             - E_eta[:, None] * E_beta)
-        if self._active_beta is not None:
-            elbo += xp.sum(xp.where(self._active_beta, _beta_prior_terms, 0.0))
+        if self.use_spike_slab_beta:
+            # Raw (non-r-weighted) expected values for prior/entropy terms
+            _E_log_beta_raw = digamma(self.a_beta) - xp.log(self.b_beta)
+            _E_beta_raw = self.a_beta / self.b_beta
+
+            # Gamma prior (weighted by r_beta; masked entries have r=0)
+            _beta_prior_terms = ((self.c - 1) * _E_log_beta_raw
+                                 + self.c * E_log_eta[:, None]
+                                 - E_eta[:, None] * _E_beta_raw)
+            elbo += xp.sum(self.r_beta * _beta_prior_terms)
+            elbo -= xp.sum(self.r_beta) * gammaln(self.c)
+            del _beta_prior_terms
+
+            # Beta prior on pi_j: E[log p(pi_j | alpha_pi, beta_pi)]
+            _E_log_pi = digamma(self.a_pi) - digamma(self.a_pi + self.b_pi)
+            _E_log_1mpi = digamma(self.b_pi) - digamma(self.a_pi + self.b_pi)
+            elbo += xp.sum((self.alpha_pi - 1) * _E_log_pi
+                           + (self.beta_pi - 1) * _E_log_1mpi)
+            elbo -= xp.sum(gammaln(self.alpha_pi) + gammaln(self.beta_pi)
+                           - gammaln(self.alpha_pi + self.beta_pi))
+
+            # Entropy of q(z_{jk}) = Bernoulli(r_{jk})
+            _r_clip = xp.clip(self.r_beta, 1e-7, 1 - 1e-7)
+            elbo -= xp.sum(_r_clip * xp.log(_r_clip)
+                           + (1 - _r_clip) * xp.log(1 - _r_clip))
+            del _r_clip
+
+            # Entropy of q(pi_j) = Beta(a_pi, b_pi)
+            _H_pi = (gammaln(self.a_pi) + gammaln(self.b_pi)
+                      - gammaln(self.a_pi + self.b_pi)
+                      - (self.a_pi - 1) * digamma(self.a_pi)
+                      - (self.b_pi - 1) * digamma(self.b_pi)
+                      + (self.a_pi + self.b_pi - 2) * digamma(self.a_pi + self.b_pi))
+            elbo += xp.sum(_H_pi)
+            del _H_pi
+
+            # Entropy of q(beta_{jk}) — weighted by r_beta (inactive = no entropy)
+            _psi_a_beta = digamma(self.a_beta)
+            _beta_entropy = (self.a_beta - xp.log(self.b_beta)
+                             + gammaln(self.a_beta)
+                             + (1 - self.a_beta) * _psi_a_beta)
+            elbo += xp.sum(self.r_beta * _beta_entropy)
+            del _psi_a_beta, _beta_entropy, _E_log_beta_raw, _E_beta_raw
         else:
-            elbo += xp.sum(_beta_prior_terms)
-        del _beta_prior_terms
-        elbo -= self._n_active_beta * gammaln(self.c)
+            _beta_prior_terms = ((self.c - 1) * E_log_beta
+                                 + self.c * E_log_eta[:, None]
+                                 - E_eta[:, None] * E_beta)
+            if self._active_beta is not None:
+                elbo += xp.sum(xp.where(self._active_beta, _beta_prior_terms, 0.0))
+            else:
+                elbo += xp.sum(_beta_prior_terms)
+            del _beta_prior_terms
+            elbo -= self._n_active_beta * gammaln(self.c)
 
         # === Prior: p(xi) ===
         elbo += xp.sum((self.ap - 1) * E_log_xi
@@ -1518,16 +1651,18 @@ class CAVI:
                                     + xp.trace(self.Sigma_gamma[k])) / sigma_gamma_sq
 
         # === Entropy: -E[log q] ===
-        # q(beta) — active entries only (masked entries are not latent variables)
-        psi_a_beta = digamma(self.a_beta)
-        _beta_entropy = (self.a_beta - xp.log(self.b_beta)
-                         + gammaln(self.a_beta)
-                         + (1 - self.a_beta) * psi_a_beta)
-        if self._active_beta is not None:
-            elbo += xp.sum(xp.where(self._active_beta, _beta_entropy, 0.0))
-        else:
-            elbo += xp.sum(_beta_entropy)
-        del psi_a_beta, _beta_entropy
+        # q(beta) — spike-slab entropy already handled above in prior block
+        if not self.use_spike_slab_beta:
+            # q(beta) — active entries only (masked entries are not latent variables)
+            psi_a_beta = digamma(self.a_beta)
+            _beta_entropy = (self.a_beta - xp.log(self.b_beta)
+                             + gammaln(self.a_beta)
+                             + (1 - self.a_beta) * psi_a_beta)
+            if self._active_beta is not None:
+                elbo += xp.sum(xp.where(self._active_beta, _beta_entropy, 0.0))
+            else:
+                elbo += xp.sum(_beta_entropy)
+            del psi_a_beta, _beta_entropy
         # q(xi)
         elbo += xp.sum(self.a_xi - xp.log(self.b_xi)
                        + self._gammaln_a_xi
@@ -1871,12 +2006,28 @@ class CAVI:
 
             # 2. Update beta, eta (gene side first -- scHPF order)
             self._update_beta(z_sum_beta)
-            del z_sum_beta
             self._update_eta()
+            # 2c. Spike-and-slab inclusion update (needs z_sum_beta)
+            if self.use_spike_slab_beta:
+                _theta_col_sum = xp.zeros(self.K)
+                for i0 in range(0, self.n, self._row_chunk):
+                    i1 = min(i0 + self._row_chunk, self.n)
+                    _theta_col_sum += (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=0)
+                self._update_r_beta(z_sum_beta, _theta_col_sum)
+            del z_sum_beta
             if diag:
                 print(f"  [diag t={t}] after beta,eta: "
                       f"E[beta]=[{float(self.E_beta.min()):.4e},{float(self.E_beta.max()):.4e}] "
                       f"E[eta]=[{float(self.E_eta.min()):.4e},{float(self.E_eta.max()):.4e}]")
+                if self.use_spike_slab_beta:
+                    r_np = to_numpy(self.r_beta)
+                    n_active = int((r_np > 0.5).sum())
+                    n_total = r_np.size
+                    mean_r = float(r_np.mean())
+                    genes_multi = int(((r_np > 0.5).sum(axis=1) > 1).sum())
+                    print(f"  [spike-slab t={t}] active={n_active}/{n_total} "
+                          f"({100*n_active/n_total:.1f}%) mean_r={mean_r:.4f} "
+                          f"genes_in_>1_prog={genes_multi}")
 
             # 2b. Rescale factors — DISABLED.
             # _rescale_factors() is not a valid CAVI coordinate-ascent step:
@@ -2173,7 +2324,7 @@ class CAVI:
     # =================================================================
 
     def _checkpoint(self):
-        return {
+        cp = {
             'a_beta': to_numpy(self.a_beta).copy(),
             'b_beta': to_numpy(self.b_beta).copy(),
             'a_eta': to_numpy(self.a_eta).copy(),
@@ -2188,6 +2339,11 @@ class CAVI:
             'Sigma_gamma': to_numpy(self.Sigma_gamma).copy(),
             'zeta': to_numpy(self.zeta).copy(),
         }
+        if self.use_spike_slab_beta:
+            cp['r_beta'] = to_numpy(self.r_beta).copy()
+            cp['a_pi'] = to_numpy(self.a_pi).copy()
+            cp['b_pi'] = to_numpy(self.b_pi).copy()
+        return cp
 
     def _restore(self, cp):
         for k, v in cp.items():

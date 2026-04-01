@@ -261,6 +261,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Spike-and-slab mixture weight for beta.'
     )
+    parser.add_argument(
+        '--spike-slab-beta',
+        action='store_true',
+        default=False,
+        help='Enable spike-and-slab prior on beta for exact-zero gene programs.'
+    )
+    parser.add_argument(
+        '--alpha-pi',
+        type=float,
+        default=1.0,
+        help='Beta prior shape alpha for gene inclusion probability (default=1.0).'
+    )
+    parser.add_argument(
+        '--beta-pi-scale',
+        type=float,
+        default=None,
+        help='Beta prior shape beta for gene inclusion probability (default=K).'
+    )
 
     # Damping parameters
     parser.add_argument(
@@ -771,6 +789,9 @@ def main():
         pathway_mask=pathway_mask,
         pathway_names=pathway_names,
         n_pathway_factors=n_pathway_factors,
+        use_spike_slab_beta=args.spike_slab_beta,
+        alpha_pi=args.alpha_pi,
+        beta_pi_scale=args.beta_pi_scale,
     )
 
     model = ModelClass(**model_kwargs)
