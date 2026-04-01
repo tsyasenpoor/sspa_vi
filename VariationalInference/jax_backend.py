@@ -127,9 +127,15 @@ if USE_JAX:
     def phi_chunk_core(E_log_theta_rows, E_log_beta_cols, data_c):
         """Fused log-rates -> softmax -> scale by data."""
         work = E_log_theta_rows + E_log_beta_cols
-        shifted = work - work.max(axis=1, keepdims=True)
+        row_max = work.max(axis=1, keepdims=True)
+        shifted = work - row_max
         e = jnp.exp(shifted)
-        phi = e / e.sum(axis=1, keepdims=True)
+        row_sum = e.sum(axis=1, keepdims=True)
+        # When all factors are -inf (spike-slab killed everything for a gene),
+        # row_max is -inf -> shifted is NaN -> phi is NaN.
+        # Fall back to uniform 1/K so the observation count is spread equally.
+        phi = jnp.where(jnp.isfinite(row_max), e / row_sum,
+                        1.0 / work.shape[1])
         return phi * data_c[:, None]
 
 else:
@@ -180,8 +186,12 @@ else:
     def phi_chunk_core(E_log_theta_rows, E_log_beta_cols, data_c):
         """log-rates -> in-place softmax -> scale by data."""
         work = E_log_theta_rows + E_log_beta_cols
-        work -= work.max(axis=1, keepdims=True)
+        row_max = work.max(axis=1, keepdims=True)
+        bad_rows = ~np.isfinite(row_max)
+        work -= row_max
         np.exp(work, out=work)
         work /= work.sum(axis=1, keepdims=True)
+        if bad_rows.any():
+            work[bad_rows.squeeze(axis=1)] = 1.0 / work.shape[1]
         work *= data_c[:, None]
         return work

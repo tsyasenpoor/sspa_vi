@@ -83,6 +83,8 @@ SHARED_SEARCH_SPACE = {
     'b_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
     'regression_weight': ('log_float', 0.1, 500.0),
+    'alpha_pi': ('log_float', 0.1, 5.0),
+    'beta_pi_scale': ('log_float', 1.0, 50.0),
 }
 
 # --- VI (CAVI) damping parameters ---
@@ -138,7 +140,8 @@ def _suggest_param(trial: optuna.Trial, name: str, spec: tuple):
 
 
 def build_search_space(dataset_preset: Optional[str] = None,
-                       v_prior: str = 'normal') -> Dict[str, tuple]:
+                       v_prior: str = 'normal',
+                       use_spike_slab_beta: bool = False) -> Dict[str, tuple]:
     """
     Build the full search space for VI (CAVI).
 
@@ -163,6 +166,11 @@ def build_search_space(dataset_preset: Optional[str] = None,
         space.pop('sigma_v', None)
     else:
         space.pop('b_v', None)
+
+    # Spike-slab params only relevant when enabled
+    if not use_spike_slab_beta:
+        space.pop('alpha_pi', None)
+        space.pop('beta_pi_scale', None)
 
     space.update(VI_SEARCH_SPACE)
 
@@ -677,7 +685,10 @@ class HyperparameterOptimizer:
         self.load_pathways()
 
         # Build search space
-        self.search_space = build_search_space(self.dataset_preset, self.v_prior)
+        _spike_slab = self.fixed_params.get('use_spike_slab_beta', False)
+        self.search_space = build_search_space(
+            self.dataset_preset, self.v_prior,
+            use_spike_slab_beta=_spike_slab)
         self._apply_search_space_guards()
 
         # Always pass v_prior as a fixed param so the model knows which prior to use
@@ -1108,13 +1119,17 @@ def _parse_fixed_params(raw: list) -> dict:
         k, v = item.split('=', 1)
         k = k.replace('-', '_')  # normalise CLI-style hyphens to underscores
         # Auto-cast to int / float when possible
-        try:
-            v = int(v)
-        except ValueError:
+        # Auto-cast: bool -> int -> float -> str
+        if v.lower() in ('true', 'false'):
+            v = v.lower() == 'true'
+        else:
             try:
-                v = float(v)
+                v = int(v)
             except ValueError:
-                pass  # keep as str
+                try:
+                    v = float(v)
+                except ValueError:
+                    pass  # keep as str
         out[k] = v
     return out
 

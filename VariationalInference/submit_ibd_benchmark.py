@@ -326,9 +326,7 @@ def gen_spectra_sup_script(res: tuple) -> str:
         FIT_ELAPSED=$((FIT_END - FIT_START))
         echo "Spectra sup fit completed in ${{FIT_ELAPSED}}s"
 
-        # Generate metadata CSV for downstream classifiers
-        # _build_metadata maps CoVID-19 severity → severity, Outcome → outcome
-        # (these are really the IBD "disease" label via column mapping in the h5ad)
+
         python3 -c "
 import sys; sys.path.insert(0, '{VI_DIR}/..')
 import anndata as ad
@@ -340,11 +338,10 @@ print(f'Wrote metadata: {{len(meta)}} samples')
 "
 
         # Downstream classifiers
-        # "severity" and "outcome" both map to IBD "disease" via the h5ad column mapping
         python -u {VI_DIR}/run_spectra_baselines.py \\
             --cell-scores "$SPECTRA_OUT/spectra_cell_scores.npy" \\
             --data "$SPECTRA_OUT/metadata_ibd.csv" \\
-            --labels severity outcome \\
+            --labels disease \\
             --output-dir "$BASELINE_OUT" \\
             --seed $SEED
     """)
@@ -444,7 +441,7 @@ print(f'Wrote scHPF inputs to {{tmpdir}}: {{src.n_obs}} samples x {{src.n_vars}}
         python -u {VI_DIR}/run_schpf_baselines.py \\
             --model {model_file} \\
             --data "$TMPDIR_SCHPF/metadata_ibd.csv" \\
-            --labels severity outcome \\
+            --labels disease \\
             --output-dir "$BASELINE_OUT" \\
             --seed $SEED \\
             --verbose

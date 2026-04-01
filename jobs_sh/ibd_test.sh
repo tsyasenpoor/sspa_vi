@@ -74,18 +74,20 @@ python -u /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/quick_reference.py \
     --label-column disease \
     --aux-columns age sex_female \
     --mode unmasked \
-    --output-dir ./results/ibd_vi/unmasked50k_ptfilter \
-    --n-factors 500 \
+    --output-dir ./results/ibd_vi/unmaskedlaplacespike\
+    --n-factors 100 \
     --a 0.3 \
     --c 0.3 \
     --sigma-v 2.0 \
     --sigma-gamma 0.5 \
     --regression-weight 1.0 \
-    --max-iter 50000 \
+    --max-iter 10000 \
     --tol 0.001 \
     --v-warmup 50 \
+    --v-prior laplace \
     --check-freq 5 \
-    --early-stopping none \
+    --early-stopping heldout_ll \
+    --spike-slab-beta   \
     --verbose
 
 echo "Job finished at: $(date)"

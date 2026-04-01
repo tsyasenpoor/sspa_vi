@@ -390,3 +390,5 @@ jobs_sh/covid_schpf.sh
 jobs_sh/covid_baselines.sh
 VariationalInference/run_spectra.py
 jobs_sh/submit_sim_drgp_full.sh
+jobs_sh/ibd_test.sh
+jobs_sh/ibd_test.sh

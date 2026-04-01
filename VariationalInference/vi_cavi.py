@@ -940,9 +940,21 @@ class CAVI:
             self.b_eta = self.dp + self.E_beta.sum(axis=1)
         # Floor to prevent E[eta] explosion from tiny dp + tiny E[beta] sums
         self.b_eta = xp.maximum(self.b_eta, 1e-6)
+        # Cap E[eta] = a_eta/b_eta at 100 to prevent death spiral when
+        # spike-slab kills most factors (a_eta ~ cp, b_eta ~ dp -> E[eta] huge)
+        if self.use_spike_slab_beta:
+            self.b_eta = xp.maximum(self.b_eta, self.a_eta / 100.0)
 
-    def _update_r_beta(self, z_sum_beta, theta_col_sum):
-        """Update spike-and-slab inclusion probabilities r_{jk}."""
+    def _update_r_beta(self, z_sum_beta, theta_col_sum, tau=1.0):
+        """Update spike-and-slab inclusion probabilities r_{jk}.
+
+        Parameters
+        ----------
+        tau : float in [0, 1]
+            Annealing temperature.  At tau=0 the log-odds are determined
+            only by the prior (keeping r_beta near its prior mean).  At
+            tau=1 the full data likelihood is used.
+        """
         if not self.use_spike_slab_beta:
             return
 
@@ -966,9 +978,24 @@ class CAVI:
         E_log_pi = digamma(self.a_pi) - digamma(self.a_pi + self.b_pi)
         E_log_1mpi = digamma(self.b_pi) - digamma(self.a_pi + self.b_pi)
 
-        log_odds = E_log_pi[:, None] - E_log_1mpi[:, None] + log_lik_on
+        # Anneal: at tau<1 the data likelihood is down-weighted so r_beta
+        # stays closer to the prior and doesn't make drastic early decisions.
+        log_odds = E_log_pi[:, None] - E_log_1mpi[:, None] + tau * log_lik_on
         log_odds = xp.clip(log_odds, -20.0, 20.0)
-        self.r_beta = _expit(log_odds)
+        r_target = _expit(log_odds)
+
+        # Damp: blend old r with new target so pruning happens gradually.
+        # This prevents the spike-slab from making large jumps that the
+        # other parameters (beta, eta, theta) can't keep up with, which
+        # would cause ELBO drops.  Damping factor = tau during annealing
+        # (so r barely moves early on), then 0.3 at steady state.
+        _ss_damp = max(0.3, tau)
+        self.r_beta = (1 - _ss_damp) * self.r_beta + _ss_damp * r_target
+
+        # Tiny floor so entries can recover if data supports reactivation.
+        # At 1e-4 the ELBO cost is negligible: r*entropy ≈ 1e-4*(-332) = -0.03
+        # per entry, vs 0.05*(-332) = -16.6 with the old floor.
+        self.r_beta = xp.maximum(self.r_beta, 1e-4)
 
         # Masked entries: structurally zero, not latent variables
         if self._active_beta is not None:
@@ -1473,6 +1500,11 @@ class CAVI:
             data_c = self._X_data[start:end]
             log_rates_c = E_log_theta[row_c] + E_log_beta[col_c]  # (chunk, K)
             log_sum_c = logsumexp_rows(log_rates_c).ravel()
+            # Floor -inf to a large negative value so dead genes don't
+            # make the entire ELBO = -inf.  A gene with all factors killed
+            # (E_log_beta = -inf) gives logsumexp = -inf; flooring to -30
+            # means exp(-30) ≈ 1e-13 rate, a steep but finite penalty.
+            log_sum_c = xp.maximum(log_sum_c, -30.0)
             poisson_ll += xp.dot(data_c, log_sum_c)
             del log_rates_c
 
@@ -1750,6 +1782,7 @@ class CAVI:
             data_c = data[start:end]
             log_rates_c = E_log_theta_v[row_c] + E_log_beta[col_c]
             log_sum_c = logsumexp_rows(log_rates_c).ravel()
+            log_sum_c = xp.maximum(log_sum_c, -30.0)
             poisson_ll += xp.dot(data_c, log_sum_c)
             del log_rates_c
 
@@ -1826,7 +1859,8 @@ class CAVI:
             max_iter=600, check_freq=5, tol=0.001,
             v_warmup=50, verbose=True,
             early_stopping='heldout_ll',
-            n_patients=None, patient_ids=None):
+            n_patients=None, patient_ids=None,
+            ss_warmup=10, ss_anneal_iters=50):
         """
         Fit the supervised Poisson factorization model.
 
@@ -2021,14 +2055,21 @@ class CAVI:
             self._update_beta(z_sum_beta)
             self._update_eta()
             # 2c. Spike-and-slab inclusion update (needs z_sum_beta)
-            # Skip on t=0: phi is random Dirichlet, z_sums are meaningless noise.
-            # Updating r_beta from noise kills most entries immediately.
-            if self.use_spike_slab_beta and t > 0:
+            # Skip early iterations: phi starts random, z_sums are noise.
+            # After warmup, anneal tau from 0→1 so data likelihood is
+            # gradually introduced and r_beta doesn't make drastic decisions.
+            if self.use_spike_slab_beta and t > ss_warmup:
+                _tau = min(1.0, (t - ss_warmup) / max(1, ss_anneal_iters))
                 _theta_col_sum = xp.zeros(self.K)
                 for i0 in range(0, self.n, self._row_chunk):
                     i1 = min(i0 + self._row_chunk, self.n)
                     _theta_col_sum += (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=0)
-                self._update_r_beta(z_sum_beta, _theta_col_sum)
+                self._update_r_beta(z_sum_beta, _theta_col_sum, tau=_tau)
+                # Re-sync eta with new r_beta so a_eta, b_eta are consistent
+                # when the ELBO is evaluated.  Without this, the ELBO sees
+                # stale a_eta (from old r) with new r_beta, causing a period-2
+                # oscillation that grows as sparsity decisions get sharper.
+                self._update_eta()
             del z_sum_beta
             if diag:
                 print(f"  [diag t={t}] after beta,eta: "

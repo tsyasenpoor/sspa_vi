@@ -143,6 +143,9 @@ class VIConfig:
     regression_weight: float = 1.0
     use_class_weights: bool = True
     use_intercept: bool = True
+    use_spike_slab_beta: bool = False
+    alpha_pi: float = 1.0
+    beta_pi_scale: Optional[float] = None
 
     # Training parameters
     max_iter: int = 200
@@ -216,6 +219,9 @@ class VIConfig:
             'spike_value_beta': self.spike_value_beta,
             'regression_weight': self.regression_weight,
             'use_class_weights': self.use_class_weights,
+            'use_spike_slab_beta': self.use_spike_slab_beta,
+            'alpha_pi': self.alpha_pi,
+            'beta_pi_scale': self.beta_pi_scale,
         }
 
     def training_params(self) -> Dict[str, Any]:
