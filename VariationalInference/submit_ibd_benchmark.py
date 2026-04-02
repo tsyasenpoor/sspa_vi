@@ -238,6 +238,20 @@ def gen_drgp_script(mode: str, res: tuple) -> str:
     # pathway_file only needed for masked/pathway_init/combined
     pathway_flag = f"--pathway-file {GMT_FILE}" if mode != "unmasked" else ""
 
+    tuned_unmasked_args = ""
+    if mode == "unmasked":
+        tuned_unmasked_args = textwrap.dedent("""\
+            --alpha-theta 2.2346624826836234 \\
+            --alpha-beta 2.923276954893561 \\
+            --alpha-xi 2.894187744774477 \\
+            --alpha-eta 2.0968778579403313 \\
+            --b-v 0.10291201492104285 \\
+            --sigma-gamma 0.1383067648727466 \\
+            --regression-weight 1.7777516006642433 \\
+            --alpha-pi 0.5098212762286258 \\
+            --beta-pi-scale 2.2003828796521834 \\
+        """)
+
     cmd = textwrap.dedent(f"""\
         OUTPUT="{out_tmpl}"
         mkdir -p "$OUTPUT"
@@ -246,12 +260,12 @@ def gen_drgp_script(mode: str, res: tuple) -> str:
             --data {DATA_DIR} \\
             --gene-annotation {GENE_ANNOT} \\
             --mode {mode} \\
-            --n-factors 500 \\
+            --n-factors {130 if mode == 'unmasked' else 500} \\
             --a 0.3 --c 0.3 \\
             --sigma-v 2.0 \\
             --sigma-gamma 0.5 \\
             --regression-weight 1.0 \\
-            --max-iter 50000 --tol 0.001 \\
+            {tuned_unmasked_args}            --max-iter 50000 --tol 0.001 \\
             --v-warmup 50 --check-freq 5 \\
             --early-stopping none \\
             --label-column disease \\

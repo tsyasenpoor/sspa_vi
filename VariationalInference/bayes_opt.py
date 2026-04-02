@@ -77,24 +77,12 @@ SHARED_SEARCH_SPACE = {
     'alpha_beta': ('float', 0.5, 4.0),
     'alpha_xi': ('float', 0.5, 4.0),
     'alpha_eta': ('float', 0.5, 4.0),
-    'lambda_xi': ('float', 0.5, 3.0),
-    'lambda_eta': ('float', 0.5, 3.0),
     'sigma_v': ('log_float', 0.05, 2.0),
     'b_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
     'regression_weight': ('log_float', 0.1, 500.0),
     'alpha_pi': ('log_float', 0.1, 5.0),
     'beta_pi_scale': ('log_float', 1.0, 50.0),
-}
-
-# --- VI (CAVI) damping parameters ---
-VI_SEARCH_SPACE = {
-    'theta_damping': ('float', 0.3, 0.95),
-    'beta_damping': ('float', 0.3, 0.95),
-    'v_damping': ('float', 0.2, 0.9),
-    'gamma_damping': ('float', 0.2, 0.9),
-    'xi_damping': ('float', 0.5, 0.99),
-    'eta_damping': ('float', 0.5, 0.99),
 }
 
 # --- Dataset-specific presets ---
@@ -112,7 +100,7 @@ DATASET_PRESETS = {
         'alpha_beta': ('float', 1.5, 4.0),
     },
     'emtab': {
-        'n_factors': ('int', 100, 2000, 100),
+        'n_factors': ('int', 20, 200, 10),
         'regression_weight': ('log_float', 1.0, 200.0),
     },
     'covid': {
@@ -171,8 +159,6 @@ def build_search_space(dataset_preset: Optional[str] = None,
     if not use_spike_slab_beta:
         space.pop('alpha_pi', None)
         space.pop('beta_pi_scale', None)
-
-    space.update(VI_SEARCH_SPACE)
 
     if dataset_preset and dataset_preset in DATASET_PRESETS:
         space.update(DATASET_PRESETS[dataset_preset])
@@ -586,6 +572,19 @@ class HyperparameterOptimizer:
             and self.subsample_ratio <= 0.1
         ):
             effective_cap = 1500
+
+        # Auto-cap based on training set size: K should be << N_train.
+        # With N_train cells, K > N_train/2 is massively overparameterised and
+        # causes coordination failure between undamped theta/beta and damped v.
+        if effective_cap is None and self.data is not None:
+            N_train = self.data['train'][0].shape[0]
+            data_cap = max(low, N_train // 2)
+            if data_cap < high:
+                effective_cap = data_cap
+                logger.warning(
+                    "Auto-capping n_factors at N_train/2 = %d (N_train=%d)",
+                    data_cap, N_train,
+                )
 
         if effective_cap is None:
             return

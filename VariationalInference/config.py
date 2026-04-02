@@ -49,11 +49,7 @@ class VIConfig:
         Prior shape for depth correction.
     alpha_eta : float, default=2.0
         Prior shape for gene scaling.
-    lambda_xi : float, default=1.5
-        Prior rate for depth correction.
-    lambda_eta : float, default=1.5
-        Prior rate for gene scaling.
-    sigma_v : float, default=0.2
+sigma_v : float, default=0.2
         Prior std for classification weights (used when v_prior='normal').
     b_v : float, default=1.0
         Laplace prior scale for classification weights (used when v_prior='laplace').
@@ -81,21 +77,6 @@ class VIConfig:
         Minimum iterations before checking convergence.
     patience : int, default=5
         Consecutive small improvements before early stopping.
-
-    Damping Parameters (Advanced)
-    -----------------------------
-    theta_damping : float, default=0.8
-        Damping for theta updates (0=no update, 1=full update).
-    beta_damping : float, default=0.8
-        Damping for beta updates.
-    v_damping : float, default=0.7
-        Damping for v updates.
-    gamma_damping : float, default=0.7
-        Damping for gamma updates.
-    xi_damping : float, default=0.9
-        Damping for xi updates.
-    eta_damping : float, default=0.9
-        Damping for eta updates.
 
     Data Parameters
     ---------------
@@ -130,8 +111,6 @@ class VIConfig:
     alpha_beta: float = 2.0
     alpha_xi: float = 2.0
     alpha_eta: float = 2.0
-    lambda_xi: float = 1.5
-    lambda_eta: float = 1.5
     sigma_v: float = 0.2
     b_v: float = 1.0
     v_prior: str = 'normal'
@@ -154,15 +133,6 @@ class VIConfig:
     elbo_freq: int = 10
     min_iter: int = 50
     patience: int = 5
-
-    # Damping parameters
-    theta_damping: float = 0.8
-    beta_damping: float = 0.8
-    v_damping: float = 0.7
-    gamma_damping: float = 0.7
-    xi_damping: float = 0.9
-    eta_damping: float = 0.9
-    adaptive_damping: bool = True
 
     # Data parameters
     label_column: str = 't2dm'
@@ -206,8 +176,6 @@ class VIConfig:
             'alpha_beta': self.alpha_beta,
             'alpha_xi': self.alpha_xi,
             'alpha_eta': self.alpha_eta,
-            'lambda_xi': self.lambda_xi,
-            'lambda_eta': self.lambda_eta,
             'sigma_v': self.sigma_v,
             'b_v': self.b_v,
             'v_prior': self.v_prior,
@@ -240,13 +208,6 @@ class VIConfig:
             'elbo_freq': self.elbo_freq,
             'min_iter': self.min_iter,
             'patience': self.patience,
-            'theta_damping': self.theta_damping,
-            'beta_damping': self.beta_damping,
-            'v_damping': self.v_damping,
-            'gamma_damping': self.gamma_damping,
-            'xi_damping': self.xi_damping,
-            'eta_damping': self.eta_damping,
-            'adaptive_damping': self.adaptive_damping,
             'verbose': self.verbose,
             'debug': self.debug,
         }
@@ -337,14 +298,6 @@ PRESETS = {
         min_iter=100,
     ),
 
-    'conservative': VIConfig(
-        n_factors=50,
-        theta_damping=0.5,
-        beta_damping=0.5,
-        v_damping=0.3,
-        gamma_damping=0.3,
-    ),
-
     'fast': VIConfig(
         n_factors=50,
         max_iter=100,
@@ -362,7 +315,7 @@ def get_preset(name: str) -> VIConfig:
     Parameters
     ----------
     name : str
-        Preset name. One of: 'default', 'small', 'large', 'conservative', 'fast'
+        Preset name. One of: 'default', 'small', 'large', 'fast'
 
     Returns
     -------

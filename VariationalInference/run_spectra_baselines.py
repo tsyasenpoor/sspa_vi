@@ -27,7 +27,7 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
 import json
 from datetime import datetime
 
-META_COLS = ["sex", "comorbidity", "severity", "outcome", "cell_type", "sampleID"]
+META_COLS = ["sex", "comorbidity", "severity", "outcome", "cell_type", "sampleID", "disease"]
 
 
 def parse_args():

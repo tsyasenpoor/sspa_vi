@@ -70,15 +70,7 @@ def params_to_cli_args(params_data, config_data=None):
         "alpha_beta": "--alpha-beta",
         "alpha_xi": "--alpha-xi",
         "alpha_eta": "--alpha-eta",
-        "lambda_xi": "--lambda-xi",
-        "lambda_eta": "--lambda-eta",
         "sigma_gamma": "--sigma-gamma",
-        "theta_damping": "--theta-damping",
-        "beta_damping": "--beta-damping",
-        "v_damping": "--v-damping",
-        "gamma_damping": "--gamma-damping",
-        "xi_damping": "--xi-damping",
-        "eta_damping": "--eta-damping",
     }
 
     # Try config_data first (has exact values), fall back to best_params

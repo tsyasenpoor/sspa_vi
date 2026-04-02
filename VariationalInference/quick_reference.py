@@ -238,18 +238,6 @@ def parse_args() -> argparse.Namespace:
         help='Gamma shape prior for eta (=cp in scHPF). Default 1.0.'
     )
     parser.add_argument(
-        '--lambda-xi',
-        type=float,
-        default=None,
-        help='Rate multiplier for xi prior.'
-    )
-    parser.add_argument(
-        '--lambda-eta',
-        type=float,
-        default=None,
-        help='Rate multiplier for eta prior.'
-    )
-    parser.add_argument(
         '--pi-v',
         type=float,
         default=None,
@@ -278,44 +266,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help='Beta prior shape beta for gene inclusion probability (default=K).'
-    )
-
-    # Damping parameters
-    parser.add_argument(
-        '--theta-damping',
-        type=float,
-        default=None,
-        help='Damping for theta updates.'
-    )
-    parser.add_argument(
-        '--beta-damping',
-        type=float,
-        default=None,
-        help='Damping for beta updates.'
-    )
-    parser.add_argument(
-        '--v-damping',
-        type=float,
-        default=None,
-        help='Damping for v updates.'
-    )
-    parser.add_argument(
-        '--gamma-damping',
-        type=float,
-        default=None,
-        help='Damping for gamma updates.'
-    )
-    parser.add_argument(
-        '--xi-damping',
-        type=float,
-        default=None,
-        help='Damping for xi updates.'
-    )
-    parser.add_argument(
-        '--eta-damping',
-        type=float,
-        default=None,
-        help='Damping for eta updates.'
     )
 
     parser.add_argument(

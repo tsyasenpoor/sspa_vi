@@ -341,6 +341,15 @@ class DataLoader:
         self.responses_df = pd.read_csv(responses_path, compression='gzip')
         self.aux_data_df = pd.read_csv(aux_path, compression='gzip')
 
+        # Create unified 'disease' column if individual disease columns exist
+        disease_cols = [c for c in self.responses_df.columns
+                        if c.lower() in ("crohn's disease", "ulcerative colitis")]
+        if disease_cols and 'disease' not in self.responses_df.columns:
+            self.responses_df['disease'] = (
+                self.responses_df[disease_cols].max(axis=1).astype(int)
+            )
+            self._log(f"  Created 'disease' column from {disease_cols}")
+
         self._log(f"  Gene expression: {gene_expression.shape}")
         self._log(f"  Responses: {self.responses_df.shape}")
         self._log(f"  Auxiliary: {self.aux_data_df.shape}")
