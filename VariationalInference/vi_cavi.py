@@ -1322,13 +1322,28 @@ class CAVI:
                     continue
                 raise
 
-        # Scale data terms by regression_weight: the ELBO is
-        # Poisson_LL + rw * Regression_LL, so the Hessian for v
-        # includes rw * (second derivative of Regression_LL).
-        rw = self.regression_weight
-        precision = prior_precision + rw * 2 * prec_sum               # (kappa, K)
-        term1 = rw * term1_sum
-        term2 = rw * 2.0 * (parta_sum - E_v * partb_sum)
+        # Scale data terms by a MODERATED regression weight for v.
+        # The full rw (=p=12499) exists to balance Poisson LL against
+        # regression LL for theta updates.  But v ONLY appears in the
+        # regression term.  Applying full rw gives v an effective sample
+        # size of N*rw ≈ 5M, which overwhelms the Laplace prior and
+        # pushes ALL factors to the clip boundary (defeating sparsity).
+        #
+        # With normalized theta, each factor's data information is
+        #   rw_v * 2 * N * lambda * theta_norm_k^2 ≈ rw_v * 2*N*0.1/K^2
+        # The Laplace prior precision at |v|=v0 is ~ 1/(b_v*v0).
+        # For sparsity, the crossover (data=prior) should be at v0 ≈ 3-5
+        # so that only strongly discriminative factors escape shrinkage.
+        # This gives rw_v ≈ K * prior(v0) / (2*N*lambda/K^2)
+        #          ≈ K^2 * b_v^{-1} * v0^{-1} / (2*N*lambda)
+        # For K=130, b_v=0.058, v0=4, N=412, lambda=0.1:
+        #   rw_v ≈ 16900 * 17.2 * 0.25 / 82.4 ≈ 882
+        # We use rw_v = rw * K / p = rw * K / p ≈ rw/96 for K=130,p=12499.
+        # Equivalently, rw_v = K (one "vote" per factor per cell).
+        rw_v = float(self.K)  # K=130, vs full rw=12499
+        precision = prior_precision + rw_v * 2 * prec_sum               # (kappa, K)
+        term1 = rw_v * term1_sum
+        term2 = rw_v * 2.0 * (parta_sum - E_v * partb_sum)
         mean_prec = term1 - term2
 
         sigma_v_diag_new = 1.0 / precision
@@ -1457,18 +1472,20 @@ class CAVI:
         alpha_max = min(0.3, 3.0 / p)
         alpha = min(alpha_max, 0.05 * alpha_max / 0.3 + (alpha_max - 0.05 * alpha_max / 0.3) * (iteration / max(200, iteration)))
 
-        rw = self.regression_weight
+        # Use same moderated rw_v for gamma as for v — gamma also only
+        # appears in the regression term and shares the same amplification issue.
+        rw_v = float(self.K)
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            # Precision: 1/sigma^2 I + rw * 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
+            # Precision: 1/sigma^2 I + rw_v * 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
             W_lam_k = W[:, k] * lam[:, k]  # (n,) -- class-weighted lambda
-            weighted_X = X_aux * (rw * 2 * W_lam_k)[:, None]
+            weighted_X = X_aux * (rw_v * 2 * W_lam_k)[:, None]
             prec_lik = weighted_X.T @ X_aux
             prec = prec_prior + prec_lik
 
-            # Residual: rw * (W*(y - 0.5) - 2*W*lambda(zeta) theta*v)
+            # Residual: rw_v * (W*(y - 0.5) - 2*W*lambda(zeta) theta*v)
             theta_v_k = theta_v[:, k]
-            residual = rw * (W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k)
+            residual = rw_v * (W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k)
             mean_prec = X_aux.T @ residual
 
             if USE_JAX:
