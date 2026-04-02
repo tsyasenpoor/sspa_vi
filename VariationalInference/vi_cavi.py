@@ -884,6 +884,51 @@ class CAVI:
         row_sums = E_theta_c.sum(axis=1, keepdims=True)
         return E_theta_c / xp.maximum(row_sums, 1e-8)
 
+    def _calibrate_b_v(self, y, X_aux, v_crossover=2.0):
+        """Auto-calibrate Laplace b_v so prior matches data at |v|=v_crossover.
+
+        With the full regression_weight applied to v (for CAVI consistency),
+        the data precision for v can be very large, overwhelming the Laplace
+        prior and defeating sparsity.  This method sets b_v so that the
+        prior-data crossover occurs at |v|=v_crossover: factors with
+        |v| < v_crossover get shrunk toward zero, while those above survive.
+
+        The Laplace prior precision at |v|=v0 is ~1/(b_v * v0).
+        The data precision is rw * 2 * sum_i lambda_i * E[theta_norm^2].
+        Setting them equal: b_v = 1 / (v0 * median_data_prec_per_factor).
+        """
+        lam = lambda_jj(self.zeta)
+        W = self._sample_weights
+        W_lam = W * lam  # (n, kappa)
+
+        # Compute median data precision across factors
+        prec_per_factor = xp.zeros(self.K)
+        for i0 in range(0, self.n, self._row_chunk):
+            i1 = min(i0 + self._row_chunk, self.n)
+            E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
+            theta_norm_c = self._normalize_theta_chunk(E_theta_c)
+            row_sums_c = xp.maximum(
+                E_theta_c.sum(axis=1, keepdims=True), 1e-8)
+            Var_tn_c = (E_theta_c / self.b_theta[i0:i1]) / xp.square(row_sums_c)
+            theta_norm_sq_c = xp.square(theta_norm_c) + Var_tn_c
+            # Accumulate (kappa,) @ (chunk, K) → (K,)  per-factor precision
+            prec_per_factor += (W_lam[i0:i1].T @ theta_norm_sq_c).sum(axis=0)
+
+        rw = self.regression_weight
+        data_prec = rw * 2.0 * prec_per_factor  # (K,)
+        median_dp = float(xp.median(data_prec))
+
+        if median_dp > 0:
+            b_v_new = 1.0 / (v_crossover * median_dp)
+            # Floor: don't make prior absurdly strong
+            b_v_new = max(b_v_new, 1e-6)
+            # Ceiling: don't make prior weaker than current value
+            b_v_new = min(b_v_new, self.b_v)
+            print(f"  [Laplace] b_v auto-calibrated: {self.b_v:.6f} -> "
+                  f"{b_v_new:.6f}  (median_data_prec={median_dp:.1f}, "
+                  f"v_cross={v_crossover})")
+            self.b_v = b_v_new
+
     def _update_beta(self, z_sum_beta):
         """beta shape and rate (scHPF Eq 8, gene side).
 
@@ -983,6 +1028,21 @@ class CAVI:
                       + self.a_beta - xp.log(self.b_beta)
                       + gammaln(self.a_beta)
                       + (1 - self.a_beta) * digamma(self.a_beta))
+
+        # Regression contribution: keep factors alive that are discriminative.
+        # Without this, the spike-slab evaluates factors solely on Poisson
+        # reconstruction, killing factors that are crucial for classification
+        # but mediocre for count reconstruction.  This is the primary cause
+        # of seed sensitivity (different seeds kill different factors).
+        if self.regression_weight > 0 and hasattr(self, 'mu_v'):
+            # v_importance[k] = sum_kappa E[v_kl^2] — how much factor k
+            # contributes to the regression linear predictor variance.
+            v_importance = xp.sum(
+                self.mu_v ** 2 + self.sigma_v_diag, axis=0)  # (K,)
+            mean_lam = float(xp.mean(lambda_jj(self.zeta)))
+            reg_bonus = self.regression_weight * mean_lam * v_importance  # (K,)
+            # Broadcast (K,) -> (p, K) and anneal with tau
+            log_lik_on = log_lik_on + tau * reg_bonus[None, :]
 
         # Prior odds from pi_j
         E_log_pi = digamma(self.a_pi) - digamma(self.a_pi + self.b_pi)
@@ -1322,25 +1382,13 @@ class CAVI:
                     continue
                 raise
 
-        # Scale data terms by a MODERATED regression weight for v.
-        # The full rw (=p=12499) exists to balance Poisson LL against
-        # regression LL for theta updates.  But v ONLY appears in the
-        # regression term.  Applying full rw gives v an effective sample
-        # size of N*rw ≈ 5M, which overwhelms the Laplace prior and
-        # pushes ALL factors to the clip boundary (defeating sparsity).
-        #
-        # With normalized theta, each factor's data information is
-        #   rw_v * 2 * N * lambda * theta_norm_k^2 ≈ rw_v * 2*N*0.1/K^2
-        # The Laplace prior precision at |v|=v0 is ~ 1/(b_v*v0).
-        # For sparsity, the crossover (data=prior) should be at v0 ≈ 3-5
-        # so that only strongly discriminative factors escape shrinkage.
-        # This gives rw_v ≈ K * prior(v0) / (2*N*lambda/K^2)
-        #          ≈ K^2 * b_v^{-1} * v0^{-1} / (2*N*lambda)
-        # For K=130, b_v=0.058, v0=4, N=412, lambda=0.1:
-        #   rw_v ≈ 16900 * 17.2 * 0.25 / 82.4 ≈ 882
-        # We use rw_v = rw * K / p = rw * K / p ≈ rw/96 for K=130,p=12499.
-        # Equivalently, rw_v = K (one "vote" per factor per cell).
-        rw_v = float(self.K)  # K=130, vs full rw=12499
+        # Use the SAME regression weight as the ELBO for CAVI consistency.
+        # All coordinate updates must optimise the same objective; using a
+        # different rw for v broke CAVI guarantees and caused ELBO non-
+        # monotonicity.  The Laplace prior b_v is auto-calibrated (see
+        # _calibrate_b_v) so that data precision and prior precision cross
+        # over at a meaningful |v|, preserving sparsity despite the large rw.
+        rw_v = self.regression_weight
         precision = prior_precision + rw_v * 2 * prec_sum               # (kappa, K)
         term1 = rw_v * term1_sum
         term2 = rw_v * 2.0 * (parta_sum - E_v * partb_sum)
@@ -1381,34 +1429,23 @@ class CAVI:
             # because the data precision only grows as theta scales up.
             self.sigma_v_diag = sigma_v_diag_new
         else:
-            # Laplace: the adaptive E[1/s] shrinkage already regularises v,
-            # so the absolute clip can be much wider than for the normal
-            # prior.  With normalized theta (L1-norm=1), each factor's
-            # logit contribution is theta_norm_k * v_k.  Dominant factors
-            # have theta_norm ~ 0.05-0.15, so v needs to reach ±10-30
-            # for meaningful logit contributions (±1 to ±3).  A tight
-            # clip (e.g., ±3) forces ALL factors to the boundary,
-            # defeating the Laplace's ability to differentiate relevant
-            # from irrelevant factors.  Use a wide clip and let the
-            # Laplace E[1/s] mechanism control sparsity.
-            v_abs_clip = min(50.0, max(10.0, 100.0 / np.sqrt(self.K)))
-            # K=130 → 10.0; K=50 → 14.1; K=10 → 31.6
+            # With auto-calibrated b_v and consistent rw, the Laplace prior
+            # properly regularises v — no need for tight hard clips.  The
+            # clip is a safety net only, not a regularisation mechanism.
+            v_abs_clip = 50.0
             mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
-            # Damping: sqrt(K)-scale alpha_max.  With theta normalization
-            # the data precision is bounded (theta_norm in [0,1]), so the
-            # previous ultra-conservative alpha=0.06 is no longer needed.
-            # K=50 → 0.15 (cap); K=500 → 0.15 (cap); K=50000 → 0.034.
-            alpha_max = min(0.15, 7.5 / np.sqrt(self.K))
-            alpha = min(alpha_max, 0.05 * alpha_max / 0.15 + (alpha_max - 0.05 * alpha_max / 0.15) * (iteration / max(200, iteration)))
+            # Relaxed damping: with consistent rw the update direction is
+            # correct (same objective as ELBO), so we only need to prevent
+            # overshooting, not compensate for rw mismatch.
+            alpha_max = min(0.3, 15.0 / np.sqrt(self.K))
+            # K=130 → 0.3; K=50 → 0.3; K=500 → 0.3 (cap)
+            alpha = min(alpha_max, 0.1 + (alpha_max - 0.1) * (iteration / max(100, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
-            # Per-element step cap: with normalized theta, the total logit
-            # change per iteration is bounded by sum_k theta_norm_k * step
-            # = 1 * max_step.  So max_step=0.25 gives at most 0.25 logit
-            # shift per iteration — conservative for sigmoid stability.
-            max_step = min(0.25, 12.5 / np.sqrt(self.K))
-            # K=130 → 0.25; K=50 → 0.25; K=500 → 0.25
+            # Per-element step cap — wider now that rw is consistent.
+            max_step = min(1.0, 50.0 / np.sqrt(self.K))
+            # K=130 → 1.0
             delta = mu_v_candidate - self.mu_v
             delta = xp.clip(delta, -max_step, max_step)
             mu_v_candidate = self.mu_v + delta
@@ -1440,7 +1477,7 @@ class CAVI:
             # Floor sigma_v_diag to prevent posterior variance collapse.
             # With theta normalization, data precision is bounded (~N*lambda
             # instead of N*lambda*E[theta]^2), so 1e-3 suffices.
-            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-3)
+            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-4)
             # Laplace prior precision depends on mu_v through omega, so
             # sigma and mu must move in lockstep.  Damping both at the
             # same rate keeps q(v) coherent.
@@ -1472,9 +1509,8 @@ class CAVI:
         alpha_max = min(0.3, 3.0 / p)
         alpha = min(alpha_max, 0.05 * alpha_max / 0.3 + (alpha_max - 0.05 * alpha_max / 0.3) * (iteration / max(200, iteration)))
 
-        # Use same moderated rw_v for gamma as for v — gamma also only
-        # appears in the regression term and shares the same amplification issue.
-        rw_v = float(self.K)
+        # Use the same regression weight as the ELBO for CAVI consistency.
+        rw_v = self.regression_weight
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
             # Precision: 1/sigma^2 I + rw_v * 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
@@ -2203,6 +2239,12 @@ class CAVI:
             self._refresh_log_caches()
 
             # 5. Update v, gamma
+            # On first iteration, auto-calibrate Laplace b_v now that theta
+            # and zeta have been initialised from data.  This ensures the
+            # Laplace prior is strong enough to create sparsity despite the
+            # full regression_weight being applied to v (CAVI consistency).
+            if t == 0 and self.v_prior == 'laplace' and self.kappa > 0:
+                self._calibrate_b_v(y, X_aux)
             self._update_v(y, X_aux, iteration=t)
             self._update_gamma(y, X_aux, iteration=t)
 
