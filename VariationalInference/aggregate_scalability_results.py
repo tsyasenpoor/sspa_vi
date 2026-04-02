@@ -10,9 +10,9 @@ Walks the results directory tree and collects:
 Outputs a unified CSV for analysis.
 
 Usage:
-    python aggregate_scalability_results.py \
-        --results-root /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark/methods \
-        --output /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark/summary/all_metrics.csv
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/aggregate_scalability_results.py \
+        --results-root /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/methods \
+        --output /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/all_metrics.csv
 """
 from __future__ import annotations
 

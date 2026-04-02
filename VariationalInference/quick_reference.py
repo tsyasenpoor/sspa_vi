@@ -942,17 +942,40 @@ def main():
     # Validation metrics printed above; predictions saved in CSV below.
 
     # =========================================================================
+    # STEP 6b: Fit Platt calibrators on validation set
+    # =========================================================================
+    calibrators = {}
+    for k in range(n_outcomes):
+        lname = label_columns[k]
+        cal = model.fit_calibrator(
+            X_val, _y_val_2d[:, k], X_aux_val, method='platt')
+        calibrators[lname] = cal
+        print(f"Platt calibrator [{lname}]: a={cal['a']:.4f}, b={cal['b']:.4f}")
+
+    # =========================================================================
     # STEP 7: Evaluate on Test Set
     # =========================================================================
     print("\n" + "=" * 80)
     print("Test Set Evaluation")
     print("=" * 80)
 
-    y_test_proba = model.predict_proba(X_test, X_aux_test, n_iter=20)
+    # Get raw test probabilities, then apply per-outcome Platt calibration
+    y_test_proba_raw = model.predict_proba(X_test, X_aux_test, n_iter=20)
     E_theta_test = model.transform(X_test, X_aux_new=X_aux_test)['E_theta']
 
     _y_test_2d = y_test if y_test.ndim == 2 else y_test[:, np.newaxis]
-    _proba_test_2d = y_test_proba if y_test_proba.ndim == 2 else y_test_proba[:, np.newaxis]
+    _proba_raw_2d = y_test_proba_raw if y_test_proba_raw.ndim == 2 else y_test_proba_raw[:, np.newaxis]
+
+    # Apply Platt calibration per outcome
+    from scipy.special import expit as _expit_np
+    _proba_test_2d = np.empty_like(_proba_raw_2d)
+    for k in range(n_outcomes):
+        lname = label_columns[k]
+        cal = calibrators[lname]
+        raw_k = np.clip(_proba_raw_2d[:, k], 1e-7, 1 - 1e-7)
+        logits_k = np.log(raw_k / (1 - raw_k))
+        _proba_test_2d[:, k] = _expit_np(cal['a'] * logits_k + cal['b'])
+    y_test_proba = _proba_test_2d.squeeze()
 
     test_metrics_all = {}
     for k in range(n_outcomes):
@@ -1022,6 +1045,13 @@ def main():
     test_pred_df = _build_pred_df(splits['test'], _y_test_2d, _proba_test_2d, optimal_thresholds)
     test_pred_df.to_csv(output_dir / f'{prefix}_test_predictions.csv.gz', compression='gzip', index=False)
     print(f"Saved predictions to {output_dir}")
+
+    # Save Platt calibrators
+    import json as _json
+    cal_path = output_dir / f'{prefix}_calibrators.json'
+    with open(cal_path, 'w') as f:
+        _json.dump(calibrators, f, indent=2)
+    print(f"Saved calibrators to {cal_path}")
 
     # =========================================================================
     # STEP 7b: Patient-Level Evaluation (when --patient-column is set)

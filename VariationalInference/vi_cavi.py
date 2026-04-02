@@ -922,12 +922,21 @@ class CAVI:
             b_v_new = 1.0 / (v_crossover * median_dp)
             # Floor: don't make prior absurdly strong
             b_v_new = max(b_v_new, 1e-6)
-            # Ceiling: don't make prior weaker than current value
-            b_v_new = min(b_v_new, self.b_v)
+            # Set b_v directly to the data-driven value.  The formula places
+            # the prior-data crossover at |v|=v_crossover: factors with
+            # |v| < v_crossover get shrunk toward zero (prior dominates),
+            # those above can grow (data dominates).  Previous versions used
+            # a one-way ceiling or 2x damping clamp, which prevented b_v
+            # from reaching the correct (often much smaller) value, leaving
+            # the prior too weak and causing all v's to saturate at the clip.
             print(f"  [Laplace] b_v auto-calibrated: {self.b_v:.6f} -> "
                   f"{b_v_new:.6f}  (median_data_prec={median_dp:.1f}, "
                   f"v_cross={v_crossover})")
             self.b_v = b_v_new
+            # Re-initialize sigma_v_diag from the new b_v so the posterior
+            # variance is consistent with the recalibrated prior.
+            self.sigma_v_diag = xp.full(
+                (self.kappa, self.K), 2.0 * self.b_v ** 2)
 
     def _update_beta(self, z_sum_beta):
         """beta shape and rate (scHPF Eq 8, gene side).
@@ -1034,13 +1043,26 @@ class CAVI:
         # reconstruction, killing factors that are crucial for classification
         # but mediocre for count reconstruction.  This is the primary cause
         # of seed sensitivity (different seeds kill different factors).
+        #
+        # IMPORTANT: the bonus must be scale-invariant.  The old formula
+        # (regression_weight * mean_lam * v_importance) scaled with |v|^2,
+        # creating a positive feedback loop: large |v| -> huge bonus ->
+        # r_beta -> 1 for everything -> no sparsity -> v diverges further.
+        # Fix: normalize v_importance to [0, 1] and cap the bonus at a
+        # fixed number of nats so it stays comparable to the prior log-odds.
         if self.regression_weight > 0 and hasattr(self, 'mu_v'):
             # v_importance[k] = sum_kappa E[v_kl^2] — how much factor k
             # contributes to the regression linear predictor variance.
             v_importance = xp.sum(
                 self.mu_v ** 2 + self.sigma_v_diag, axis=0)  # (K,)
-            mean_lam = float(xp.mean(lambda_jj(self.zeta)))
-            reg_bonus = self.regression_weight * mean_lam * v_importance  # (K,)
+            # Normalize to [0, 1]: preserves relative ranking without
+            # letting absolute magnitude blow up the log-odds.
+            v_importance = v_importance / (xp.max(v_importance) + 1e-8)
+            # Cap at 5 nats: the most discriminative factor gets +5 in
+            # log-odds (strong bias toward inclusion), unimportant factors
+            # get ~0.  This is comparable to prior log-odds O(1).
+            max_bonus = 5.0
+            reg_bonus = max_bonus * v_importance  # (K,)
             # Broadcast (K,) -> (p, K) and anneal with tau
             log_lik_on = log_lik_on + tau * reg_bonus[None, :]
 
@@ -1429,18 +1451,20 @@ class CAVI:
             # because the data precision only grows as theta scales up.
             self.sigma_v_diag = sigma_v_diag_new
         else:
-            # With auto-calibrated b_v and consistent rw, the Laplace prior
-            # properly regularises v — no need for tight hard clips.  The
-            # clip is a safety net only, not a regularisation mechanism.
-            v_abs_clip = 50.0
+            # Tighter clip: 50.0 allowed v to diverge to ±50 with K=130,
+            # overwhelming the Laplace prior (b_v auto-calibrated to 0.006)
+            # and inflating the spike-slab regression bonus.  Scale with K
+            # so the total logit contribution stays bounded.
+            v_abs_clip = min(15.0, 150.0 / np.sqrt(self.K))
+            # K=130 → 13.2; K=50 → 15.0; K=500 → 6.7
             mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
-            # Relaxed damping: with consistent rw the update direction is
-            # correct (same objective as ELBO), so we only need to prevent
-            # overshooting, not compensate for rw mismatch.
-            alpha_max = min(0.3, 15.0 / np.sqrt(self.K))
-            # K=130 → 0.3; K=50 → 0.3; K=500 → 0.3 (cap)
-            alpha = min(alpha_max, 0.1 + (alpha_max - 0.1) * (iteration / max(100, iteration)))
+            # Conservative damping: slower v movement gives the Laplace
+            # prior more iterations to enforce sparsity before v escapes
+            # to the clip bound.  Matches the normal-prior branch scaling.
+            alpha_max = min(0.15, 10.0 / np.sqrt(self.K))
+            # K=130 → 0.15; K=50 → 0.15; K=500 → 0.15 (cap)
+            alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
             # Per-element step cap — wider now that rw is consistent.
@@ -2239,11 +2263,12 @@ class CAVI:
             self._refresh_log_caches()
 
             # 5. Update v, gamma
-            # On first iteration, auto-calibrate Laplace b_v now that theta
-            # and zeta have been initialised from data.  This ensures the
-            # Laplace prior is strong enough to create sparsity despite the
-            # full regression_weight being applied to v (CAVI consistency).
-            if t == 0 and self.v_prior == 'laplace' and self.kappa > 0:
+            # Auto-calibrate Laplace b_v so the prior-data crossover sits at
+            # |v|=v_crossover.  Run at t=0 (after first theta/zeta init) and
+            # again at t=50 (once theta has differentiated factors from data).
+            # The second pass refines the estimate since t=0 theta is still
+            # near random init and gives a noisy data-precision estimate.
+            if t in (0, 50) and self.v_prior == 'laplace' and self.kappa > 0:
                 self._calibrate_b_v(y, X_aux)
             self._update_v(y, X_aux, iteration=t)
             self._update_gamma(y, X_aux, iteration=t)
@@ -2264,7 +2289,7 @@ class CAVI:
                           f"sigma2_v=[{float(self.sigma_v_diag.min()):.4e},{float(self.sigma_v_diag.max()):.4e}]")
 
                 # v saturation monitoring
-                _v_clip = min(50.0, max(10.0, 100.0 / np.sqrt(self.K))) if self.v_prior == 'laplace' \
+                _v_clip = min(15.0, 150.0 / np.sqrt(self.K)) if self.v_prior == 'laplace' \
                     else min(5.0, 10.0 / np.sqrt(self.K))
                 _mu_v_np = np.asarray(self.mu_v)
                 _abs_v = np.abs(_mu_v_np)
@@ -2719,6 +2744,92 @@ class CAVI:
         logits_calibrated = logits / scale
 
         return to_numpy(_expit(logits_calibrated)).squeeze()
+
+    def fit_calibrator(self, X_val, y_val, X_aux_val=None, n_iter=20,
+                       method='platt'):
+        """Fit post-hoc probability calibrator on validation data.
+
+        Parameters
+        ----------
+        X_val : sparse or dense (n_val, p)
+        y_val : (n_val,) binary labels for a single outcome
+        X_aux_val : (n_val, p_aux) or None
+        n_iter : int
+            Iterations for theta inference on new data.
+        method : str
+            'platt' (sigmoid recalibration, 2 params) or
+            'temperature' (single temperature T).
+
+        Returns
+        -------
+        dict
+            Calibrator with keys 'method' and method-specific parameters.
+        """
+        from sklearn.linear_model import LogisticRegression
+        from scipy.special import expit as _expit_np
+
+        raw_proba = self.predict_proba(X_val, X_aux_val, n_iter=n_iter)
+        if raw_proba.ndim > 1:
+            raw_proba = raw_proba.ravel()
+        y_val = np.asarray(y_val).ravel()
+        raw_proba_clipped = np.clip(raw_proba, 1e-7, 1 - 1e-7)
+        raw_logits = np.log(raw_proba_clipped / (1 - raw_proba_clipped))
+
+        if method == 'platt':
+            lr = LogisticRegression(C=1e10, solver='lbfgs', max_iter=1000)
+            lr.fit(raw_logits.reshape(-1, 1), y_val)
+            return {
+                'method': 'platt',
+                'a': float(lr.coef_[0, 0]),
+                'b': float(lr.intercept_[0]),
+            }
+        elif method == 'temperature':
+            from scipy.optimize import minimize_scalar
+            def nll(T):
+                p = _expit_np(raw_logits / T)
+                p = np.clip(p, 1e-7, 1 - 1e-7)
+                return -np.mean(y_val * np.log(p)
+                                + (1 - y_val) * np.log(1 - p))
+            result = minimize_scalar(nll, bounds=(0.1, 10.0),
+                                     method='bounded')
+            return {'method': 'temperature', 'T': float(result.x)}
+        else:
+            raise ValueError(f"Unknown calibration method: {method}")
+
+    def predict_proba_calibrated(self, X_new, calibrator, X_aux_new=None,
+                                 n_iter=20):
+        """Predict calibrated P(y=1 | X_new) using a fitted calibrator.
+
+        Parameters
+        ----------
+        X_new : sparse or dense (n, p)
+        calibrator : dict
+            Output of fit_calibrator().
+        X_aux_new : (n, p_aux) or None
+        n_iter : int
+
+        Returns
+        -------
+        np.ndarray of shape (n,) or (n, kappa)
+        """
+        from scipy.special import expit as _expit_np
+
+        raw_proba = self.predict_proba(X_new, X_aux_new, n_iter=n_iter)
+        original_shape = raw_proba.shape
+        flat = raw_proba.ravel()
+        flat_clipped = np.clip(flat, 1e-7, 1 - 1e-7)
+        raw_logits = np.log(flat_clipped / (1 - flat_clipped))
+
+        if calibrator['method'] == 'platt':
+            calibrated = _expit_np(
+                calibrator['a'] * raw_logits + calibrator['b'])
+        elif calibrator['method'] == 'temperature':
+            calibrated = _expit_np(raw_logits / calibrator['T'])
+        else:
+            raise ValueError(
+                f"Unknown calibrator method: {calibrator['method']}")
+
+        return calibrated.reshape(original_shape)
 
     def transform(self, X_new, y_new=None, X_aux_new=None, n_iter=20, **kwargs):
         """Infer theta for new data. Returns dict with E_theta, a_theta, b_theta."""

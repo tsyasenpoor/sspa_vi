@@ -245,7 +245,7 @@ def gen_drgp_script(mode: str, res: tuple) -> str:
             --alpha-beta 2.923276954893561 \\
             --alpha-xi 2.894187744774477 \\
             --alpha-eta 2.0968778579403313 \\
-            --b-v 0.10291201492104285 \\
+            --b-v 1.187 \\
             --sigma-gamma 0.1383067648727466 \\
             --regression-weight 1.7777516006642433 \\
             --alpha-pi 0.5098212762286258 \\

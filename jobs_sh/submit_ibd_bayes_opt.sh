@@ -39,7 +39,7 @@ python -u ${VI_DIR}/bayes_opt.py \
     --max-iter 500 \
     --seed 42 \
     --output-dir "$OUTPUT_DIR" \
-    --fixed-params use_spike_slab_beta=True \
+    --fixed-params use_spike_slab_beta=True regression_weight=1.0 \
     --evaluate-best \
     --verbose
 
