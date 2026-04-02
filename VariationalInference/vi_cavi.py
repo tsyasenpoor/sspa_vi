@@ -1368,14 +1368,16 @@ class CAVI:
         else:
             # Laplace: the adaptive E[1/s] shrinkage already regularises v,
             # so the absolute clip can be much wider than for the normal
-            # prior.  The previous 10/sqrt(K) clip (=1.414 for K=50)
-            # caused all factors to saturate at the boundary, defeating
-            # the Laplace prior's ability to differentiate disease-relevant
-            # factors (large |v|) from irrelevant ones (small |v|).
-            # Use a wider absolute bound (30/sqrt(K)) so the Laplace
-            # E[1/s] mechanism — not a hard clip — controls sparsity.
-            # Per-step stability is separately ensured by max_step below.
-            v_abs_clip = min(10.0, max(3.0, 30.0 / np.sqrt(self.K)))
+            # prior.  With normalized theta (L1-norm=1), each factor's
+            # logit contribution is theta_norm_k * v_k.  Dominant factors
+            # have theta_norm ~ 0.05-0.15, so v needs to reach ±10-30
+            # for meaningful logit contributions (±1 to ±3).  A tight
+            # clip (e.g., ±3) forces ALL factors to the boundary,
+            # defeating the Laplace's ability to differentiate relevant
+            # from irrelevant factors.  Use a wide clip and let the
+            # Laplace E[1/s] mechanism control sparsity.
+            v_abs_clip = min(50.0, max(10.0, 100.0 / np.sqrt(self.K)))
+            # K=130 → 10.0; K=50 → 14.1; K=10 → 31.6
             mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
             # Damping: sqrt(K)-scale alpha_max.  With theta normalization
@@ -1386,10 +1388,12 @@ class CAVI:
             alpha = min(alpha_max, 0.05 * alpha_max / 0.15 + (alpha_max - 0.05 * alpha_max / 0.15) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
-            # Per-element step cap: with normalized theta, logit variance
-            # is bounded so we can allow larger per-step changes.
-            # K=50 → 0.10 (cap); K=500 → 0.10 (cap); K=50000 → 0.022.
-            max_step = min(0.10, 5.0 / np.sqrt(self.K))
+            # Per-element step cap: with normalized theta, the total logit
+            # change per iteration is bounded by sum_k theta_norm_k * step
+            # = 1 * max_step.  So max_step=0.25 gives at most 0.25 logit
+            # shift per iteration — conservative for sigmoid stability.
+            max_step = min(0.25, 12.5 / np.sqrt(self.K))
+            # K=130 → 0.25; K=50 → 0.25; K=500 → 0.25
             delta = mu_v_candidate - self.mu_v
             delta = xp.clip(delta, -max_step, max_step)
             mu_v_candidate = self.mu_v + delta
@@ -2201,7 +2205,7 @@ class CAVI:
                           f"sigma2_v=[{float(self.sigma_v_diag.min()):.4e},{float(self.sigma_v_diag.max()):.4e}]")
 
                 # v saturation monitoring
-                _v_clip = min(10.0, 30.0 / np.sqrt(self.K)) if self.v_prior == 'laplace' \
+                _v_clip = min(50.0, max(10.0, 100.0 / np.sqrt(self.K))) if self.v_prior == 'laplace' \
                     else min(5.0, 10.0 / np.sqrt(self.K))
                 _mu_v_np = np.asarray(self.mu_v)
                 _abs_v = np.abs(_mu_v_np)
