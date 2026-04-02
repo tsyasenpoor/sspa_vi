@@ -1322,9 +1322,13 @@ class CAVI:
                     continue
                 raise
 
-        precision = prior_precision + 2 * prec_sum                  # (kappa, K)
-        term1 = term1_sum
-        term2 = 2.0 * (parta_sum - E_v * partb_sum)
+        # Scale data terms by regression_weight: the ELBO is
+        # Poisson_LL + rw * Regression_LL, so the Hessian for v
+        # includes rw * (second derivative of Regression_LL).
+        rw = self.regression_weight
+        precision = prior_precision + rw * 2 * prec_sum               # (kappa, K)
+        term1 = rw * term1_sum
+        term2 = rw * 2.0 * (parta_sum - E_v * partb_sum)
         mean_prec = term1 - term2
 
         sigma_v_diag_new = 1.0 / precision
@@ -1449,17 +1453,18 @@ class CAVI:
         alpha_max = min(0.3, 3.0 / p)
         alpha = min(alpha_max, 0.05 * alpha_max / 0.3 + (alpha_max - 0.05 * alpha_max / 0.3) * (iteration / max(200, iteration)))
 
+        rw = self.regression_weight
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            # Precision: 1/sigma^2 I + 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
+            # Precision: 1/sigma^2 I + rw * 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
             W_lam_k = W[:, k] * lam[:, k]  # (n,) -- class-weighted lambda
-            weighted_X = X_aux * (2 * W_lam_k)[:, None]
+            weighted_X = X_aux * (rw * 2 * W_lam_k)[:, None]
             prec_lik = weighted_X.T @ X_aux
             prec = prec_prior + prec_lik
 
-            # Residual: W*(y - 0.5) - 2*W*lambda(zeta) theta*v
+            # Residual: rw * (W*(y - 0.5) - 2*W*lambda(zeta) theta*v)
             theta_v_k = theta_v[:, k]
-            residual = W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k
+            residual = rw * (W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k)
             mean_prec = X_aux.T @ residual
 
             if USE_JAX:
