@@ -840,8 +840,10 @@ def main():
     _y_train_2d = y_train if y_train.ndim == 2 else y_train[:, np.newaxis]
     _proba_train_2d = y_train_proba if y_train_proba.ndim == 2 else y_train_proba[:, np.newaxis]
 
-    # DEBUG: Compute logits and correlation with labels
-    train_logits = E_theta_train @ np.array(model.mu_v).T
+    # DEBUG: Compute logits and correlation with labels (use normalized theta)
+    _theta_sums = E_theta_train.sum(axis=1, keepdims=True)
+    _theta_norm_train = E_theta_train / np.maximum(_theta_sums, 1e-8)
+    train_logits = _theta_norm_train @ np.array(model.mu_v).T
     if model.p_aux > 0 and model.mu_gamma is not None:
         _X_aux_debug = model._prepend_intercept(X_aux_train, n=X_aux_train.shape[0])
         train_logits = train_logits + _X_aux_debug @ model.mu_gamma.T
@@ -1119,9 +1121,11 @@ def main():
             X_aux_prep = model._prepend_intercept(
                 np.asarray(X_aux, dtype=np.float32), n=len(cell_ids))
 
-            # Logit decomposition
+            # Logit decomposition (use normalized theta)
             logit_cov = np.array(X_aux_prep @ model.mu_gamma.T)      # (n, kappa)
-            logit_theta = np.array(E_theta_split @ model.mu_v.T)     # (n, kappa)
+            _ts = E_theta_split.sum(axis=1, keepdims=True)
+            _tn = E_theta_split / np.maximum(_ts, 1e-8)
+            logit_theta = np.array(_tn @ model.mu_v.T)               # (n, kappa)
             logit_full = logit_cov + logit_theta
 
             for k in range(n_outcomes):

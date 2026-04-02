@@ -874,6 +874,16 @@ class CAVI:
     # CAVI Updates
     # =================================================================
 
+    @staticmethod
+    def _normalize_theta_chunk(E_theta_c):
+        """L1-normalize theta per cell for regression (topic proportions).
+
+        Decouples the regression linear predictor from the Poisson scale of
+        theta, preventing v from being crushed when E[theta] explodes.
+        """
+        row_sums = E_theta_c.sum(axis=1, keepdims=True)
+        return E_theta_c / xp.maximum(row_sums, 1e-8)
+
     def _update_beta(self, z_sum_beta):
         """beta shape and rate (scHPF Eq 8, gene side).
 
@@ -994,13 +1004,17 @@ class CAVI:
         # 1.0 at steady state (full replacement), so r_beta crashed from
         # 0.5 to 0.002 in ~3 cycles, concentrating all counts into a
         # handful of factors and triggering theta explosion.
-        _ss_damp = min(0.1, tau)
+        # Slower pruning: max 5% per step (was 10%) to prevent over-pruning
+        # that concentrates all count mass into a few surviving factors.
+        _ss_damp = min(0.05, 0.5 * tau)
         self.r_beta = (1 - _ss_damp) * self.r_beta + _ss_damp * r_target
 
-        # Tiny floor so entries can recover if data supports reactivation.
-        # At 1e-4 the ELBO cost is negligible: r*entropy ≈ 1e-4*(-332) = -0.03
-        # per entry, vs 0.05*(-332) = -16.6 with the old floor.
-        self.r_beta = xp.maximum(self.r_beta, 1e-4)
+        # Floor r_beta: start higher (0.01) to prevent premature pruning,
+        # then decay to 1e-4 as training stabilises.  This prevents the
+        # spike-slab from making irreversible pruning decisions early
+        # when phi/z_sums are still noisy.
+        r_floor = max(1e-4, 0.01 * max(0.0, 1.0 - tau))
+        self.r_beta = xp.maximum(self.r_beta, r_floor)
 
         # Masked entries: structurally zero, not latent variables
         if self._active_beta is not None:
@@ -1060,15 +1074,18 @@ class CAVI:
                 try:
                     # --- inline _regression_rate_parts for this chunk ---
                     E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
+                    # Use L1-normalized theta for regression to decouple
+                    # from Poisson scale (prevents v from being crushed).
+                    theta_norm_c = self._normalize_theta_chunk(E_theta_c)
                     W_c = W[i0:i1]
                     W_lam_c = W_c * lam[i0:i1]
-                    theta_v_c = E_theta_c @ E_v.T                             # (chunk, kappa)
+                    theta_v_c = theta_norm_c @ E_v.T                          # (chunk, kappa)
                     if self.p_aux > 0:
                         theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
                     R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
                     R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
-                    R_lin_c = R_lin_c - 2.0 * E_theta_c * (W_lam_c @ E_v_sq_col)
+                    R_lin_c = R_lin_c - 2.0 * theta_norm_c * (W_lam_c @ E_v_sq_col)
                     R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
 
                     # --- solve quadratic for b_theta ---
@@ -1155,13 +1172,16 @@ class CAVI:
             try:
                 b_theta_c = self.b_theta[i0:i1]
                 E_theta_c = self.a_theta[i0:i1] / b_theta_c
-                Var_theta_c = E_theta_c / b_theta_c      # a/(b^2) = (a/b)/b
-                E_A_c = E_theta_c @ self.mu_v.T
+                # Use normalized theta for regression (A = theta_norm @ v)
+                theta_norm_c = self._normalize_theta_chunk(E_theta_c)
+                row_sums_c = xp.maximum(E_theta_c.sum(axis=1, keepdims=True), 1e-8)
+                Var_theta_norm_c = (E_theta_c / b_theta_c) / xp.square(row_sums_c)
+                E_A_c = theta_norm_c @ self.mu_v.T
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
-                E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
-                # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
-                E_A_sq_c = E_A_sq_c + xp.square(E_theta_c) @ self.sigma_v_diag.T
+                E_A_sq_c = xp.square(E_A_c) + Var_theta_norm_c @ E_v_sq.T
+                # E[theta_norm]^2 * Var(v) cross-term
+                E_A_sq_c = E_A_sq_c + xp.square(theta_norm_c) @ self.sigma_v_diag.T
                 if gamma_var is not None:
                     E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
                 zeta_chunks.append(
@@ -1198,11 +1218,13 @@ class CAVI:
         lam = lambda_jj(self.zeta)                 # (n, kappa)
         W = self._sample_weights                    # (n, kappa)
         E_theta = self.E_theta                      # (n, K)
+        # Use L1-normalized theta to decouple regression from Poisson scale
+        theta_norm = self._normalize_theta_chunk(E_theta)
         E_v = self.mu_v                             # (kappa, K)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
 
         # Full linear predictor: (n, kappa) -- BLAS
-        theta_v = E_theta @ E_v.T
+        theta_v = theta_norm @ E_v.T
         if self.p_aux > 0:
             theta_v = theta_v + X_aux @ self.mu_gamma.T
 
@@ -1212,7 +1234,7 @@ class CAVI:
         E_v_sq_col = xp.square(E_v)                             # (kappa, K) -- tiny
         R_linear = -(W * (y_exp - 0.5)) @ E_v                   # (n, K)
         R_linear = R_linear + 2.0 * ((W_lam * theta_v) @ E_v)   # fuse add
-        R_linear = R_linear - 2.0 * E_theta * (W_lam @ E_v_sq_col)  # fuse subtract
+        R_linear = R_linear - 2.0 * theta_norm * (W_lam @ E_v_sq_col)  # fuse subtract
 
         # R_quad via single BLAS matmul
         R_quad_coeff = (2.0 * W_lam) @ E_v_sq                   # (n, K)
@@ -1273,21 +1295,25 @@ class CAVI:
             try:
                 b_theta_c = self.b_theta[i0:i1]
                 E_theta_c = self.a_theta[i0:i1] / b_theta_c            # (chunk, K)
-                E_theta_psq_c = xp.square(E_theta_c)                   # (chunk, K)
-                Var_theta_c = E_theta_c / b_theta_c                    # a/b^2 = (a/b)/b
-                E_theta_sq_c = E_theta_psq_c + Var_theta_c             # (chunk, K)
+                # Use L1-normalized theta for regression sufficient stats
+                theta_norm_c = self._normalize_theta_chunk(E_theta_c)
+                theta_norm_psq_c = xp.square(theta_norm_c)             # (chunk, K)
+                # Approximate normalized variance: Var_norm ≈ Var_raw / row_sum^2
+                row_sums_c = xp.maximum(E_theta_c.sum(axis=1, keepdims=True), 1e-8)
+                Var_theta_norm_c = (E_theta_c / b_theta_c) / xp.square(row_sums_c)
+                theta_norm_sq_c = theta_norm_psq_c + Var_theta_norm_c  # E[theta_norm^2]
 
-                theta_v_c = E_theta_c @ E_v.T                          # (chunk, kappa)
+                theta_v_c = theta_norm_c @ E_v.T                       # (chunk, kappa)
                 if self.p_aux > 0:
                     theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
                 W_lam_c = W[i0:i1] * lam[i0:i1]                       # (chunk, kappa)
                 W_y_c = W[i0:i1] * (y_exp[i0:i1] - 0.5)              # (chunk, kappa)
 
-                prec_sum = prec_sum + W_lam_c.T @ E_theta_sq_c
-                term1_sum = term1_sum + W_y_c.T @ E_theta_c
-                parta_sum = parta_sum + (W_lam_c * theta_v_c).T @ E_theta_c
-                partb_sum = partb_sum + W_lam_c.T @ E_theta_psq_c
+                prec_sum = prec_sum + W_lam_c.T @ theta_norm_sq_c
+                term1_sum = term1_sum + W_y_c.T @ theta_norm_c
+                parta_sum = parta_sum + (W_lam_c * theta_v_c).T @ theta_norm_c
+                partb_sum = partb_sum + W_lam_c.T @ theta_norm_psq_c
                 i0 = i1
             except Exception as exc:
                 if _is_oom_error(exc) and self._row_chunk > min_chunk:
@@ -1348,19 +1374,18 @@ class CAVI:
             v_abs_clip = min(10.0, max(3.0, 30.0 / np.sqrt(self.K)))
             mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
-            # Damping: sqrt(K)-scale alpha_max.  The total logit is sum_k
-            # theta_ik * v_k; under independent-factor assumptions the std-dev
-            # of the logit change scales as sqrt(K)*dv, so bounding it at a
-            # constant requires dv ~ 1/sqrt(K), not 1/K.
-            # K=50 → 0.06 (cap); K=500 → 0.06 (cap); K=50000 → 0.013.
-            alpha_max = min(0.06, 3.0 / np.sqrt(self.K))
-            alpha = min(alpha_max, 0.05 * alpha_max / 0.06 + (alpha_max - 0.05 * alpha_max / 0.06) * (iteration / max(200, iteration)))
+            # Damping: sqrt(K)-scale alpha_max.  With theta normalization
+            # the data precision is bounded (theta_norm in [0,1]), so the
+            # previous ultra-conservative alpha=0.06 is no longer needed.
+            # K=50 → 0.15 (cap); K=500 → 0.15 (cap); K=50000 → 0.034.
+            alpha_max = min(0.15, 7.5 / np.sqrt(self.K))
+            alpha = min(alpha_max, 0.05 * alpha_max / 0.15 + (alpha_max - 0.05 * alpha_max / 0.15) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
-            # Per-element step cap: scale with sqrt(K) so the std-dev of
-            # total logit change (sqrt(K) * max_step) stays bounded at ~2.5.
-            # K=50 → 0.05 (cap); K=500 → 0.05 (cap); K=50000 → 0.011.
-            max_step = min(0.05, 2.5 / np.sqrt(self.K))
+            # Per-element step cap: with normalized theta, logit variance
+            # is bounded so we can allow larger per-step changes.
+            # K=50 → 0.10 (cap); K=500 → 0.10 (cap); K=50000 → 0.022.
+            max_step = min(0.10, 5.0 / np.sqrt(self.K))
             delta = mu_v_candidate - self.mu_v
             delta = xp.clip(delta, -max_step, max_step)
             mu_v_candidate = self.mu_v + delta
@@ -1390,11 +1415,9 @@ class CAVI:
             self.mu_v = xp.clip(mu_v_candidate, -v_abs_clip, v_abs_clip)
 
             # Floor sigma_v_diag to prevent posterior variance collapse.
-            # With N~7000 cells the data precision can drive sigma→1e-15,
-            # making the posterior degenerate and mu updates erratic.
-            # Use 1e-2 (not 1e-4) to maintain meaningful posterior uncertainty
-            # and keep the Laplace E[1/s] computation well-conditioned.
-            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-2)
+            # With theta normalization, data precision is bounded (~N*lambda
+            # instead of N*lambda*E[theta]^2), so 1e-3 suffices.
+            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-3)
             # Laplace prior precision depends on mu_v through omega, so
             # sigma and mu must move in lockstep.  Damping both at the
             # same rate keeps q(v) coherent.
@@ -1408,15 +1431,16 @@ class CAVI:
         lam = lambda_jj(self.zeta)
         W = self._sample_weights                    # (n, kappa)
 
-        # Pre-compute theta @ mu_v.T in chunks to avoid caching full E_theta
+        # Pre-compute theta_norm @ mu_v.T in chunks (normalized for regression)
         theta_v = xp.zeros((self.n, self.kappa))
         for i0 in range(0, self.n, self._row_chunk):
             i1 = min(i0 + self._row_chunk, self.n)
             E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
+            theta_norm_c = self._normalize_theta_chunk(E_theta_c)
             if USE_JAX:
-                theta_v = theta_v.at[i0:i1].set(E_theta_c @ self.mu_v.T)
+                theta_v = theta_v.at[i0:i1].set(theta_norm_c @ self.mu_v.T)
             else:
-                theta_v[i0:i1] = E_theta_c @ self.mu_v.T
+                theta_v[i0:i1] = theta_norm_c @ self.mu_v.T
 
         # Gamma has p_aux parameters (typically 5), not K factors (typically 50).
         # Scale damping with p_aux so gamma converges at its natural rate
@@ -1560,14 +1584,16 @@ class CAVI:
                 E_theta_c = a_theta_c / b_theta_c
                 E_log_theta_c = E_log_theta[i0:i1]
 
-                # --- JJ regression likelihood ---
-                Var_theta_c = E_theta_c / b_theta_c                  # a/b^2 = (a/b)/b
-                E_A_c = E_theta_c @ self.mu_v.T                      # (chunk, kappa)
+                # --- JJ regression likelihood (uses normalized theta) ---
+                theta_norm_c = self._normalize_theta_chunk(E_theta_c)
+                row_sums_c = xp.maximum(E_theta_c.sum(axis=1, keepdims=True), 1e-8)
+                Var_theta_norm_c = (E_theta_c / b_theta_c) / xp.square(row_sums_c)
+                E_A_c = theta_norm_c @ self.mu_v.T                    # (chunk, kappa)
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
-                E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T       # (chunk, kappa)
-                # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
-                E_A_sq_c = E_A_sq_c + xp.square(E_theta_c) @ self.sigma_v_diag.T
+                E_A_sq_c = E_A_c ** 2 + Var_theta_norm_c @ E_v_sq.T  # (chunk, kappa)
+                # E[theta_norm]^2 * Var(v) cross-term
+                E_A_sq_c = E_A_sq_c + xp.square(theta_norm_c) @ self.sigma_v_diag.T
                 if gamma_var is not None:
                     E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
                 lam_c = lam[i0:i1]
@@ -1812,15 +1838,17 @@ class CAVI:
             y_v = to_device(np.asarray(y_val, dtype=np.float32))
             if y_v.ndim == 1:
                 y_v = y_v[:, None]
-            E_A = E_theta_v @ self.mu_v.T
+            # Use normalized theta for regression
+            theta_norm_v = self._normalize_theta_chunk(E_theta_v)
+            row_sums_v = xp.maximum(E_theta_v.sum(axis=1, keepdims=True), 1e-8)
+            Var_theta_norm_v = (a_theta_v / (b_theta_v ** 2)) / xp.square(row_sums_v)
+            E_A = theta_norm_v @ self.mu_v.T
             if self.p_aux > 0:
                 E_A = E_A + X_aux_v_dev @ self.mu_gamma.T
 
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
-            Var_theta_v = a_theta_v / (b_theta_v ** 2)
-            E_A_sq = E_A ** 2 + Var_theta_v @ E_v_sq.T
-            # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
-            E_A_sq = E_A_sq + xp.square(E_theta_v) @ self.sigma_v_diag.T
+            E_A_sq = E_A ** 2 + Var_theta_norm_v @ E_v_sq.T
+            E_A_sq = E_A_sq + xp.square(theta_norm_v) @ self.sigma_v_diag.T
             if self.p_aux > 0:
                 gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
                                       for k in range(self.kappa)])
@@ -1923,15 +1951,17 @@ class CAVI:
         # Initialize (creates numpy arrays, then transfers to device)
         self._initialize(X_train, y, X_aux)
 
-        # Auto-scale regression_weight to n_genes when left at default (1.0).
-        # Poisson LL sums ~O(nnz) terms while regression LL sums ~O(N*kappa);
-        # the ratio can be 10^5:1, making regression_weight=1.0 effectively
-        # invisible.  Scaling by n_genes (p) roughly equalises the per-factor
-        # gradient magnitudes of the two objectives.
-        if self.regression_weight == 1.0 and self.kappa > 0:
-            self.regression_weight = float(self.p)
+        # Auto-scale regression_weight by n_genes so Poisson and regression
+        # gradient magnitudes are comparable.  Poisson LL sums ~O(nnz) terms
+        # while regression LL sums ~O(N*kappa); scaling by p roughly
+        # equalises the per-factor gradients.  The user-supplied value acts
+        # as a relative preference multiplier (1.0 = balanced).
+        if self.kappa > 0:
+            rw_old = self.regression_weight
+            self.regression_weight = self.regression_weight * float(self.p)
             if verbose:
-                print(f"  regression_weight auto-scaled to n_genes={self.p}")
+                print(f"  regression_weight auto-scaled: {rw_old:.4f} * "
+                      f"n_genes={self.p} = {self.regression_weight:.1f}")
 
         # Re-scale Laplace b_v using patient count instead of cell count.
         # When labels are patient-level (shared across cells from the same
@@ -2487,14 +2517,15 @@ class CAVI:
             b_poisson = E_xi[:, None] + beta_col_sums[None, :]
 
             if has_regression and use_jj_reg:
-                # Compute zeta for new data to get lambda(zeta)
-                theta_v = E_theta @ E_v.T                    # (n_new, kappa)
+                # Use normalized theta for regression (matches training)
+                theta_norm = self._normalize_theta_chunk(E_theta)
+                row_sums = xp.maximum(E_theta.sum(axis=1, keepdims=True), 1e-8)
+                Var_theta_norm = (E_theta / b_theta) / xp.square(row_sums)
+                theta_v = theta_norm @ E_v.T                  # (n_new, kappa)
                 if X_aux_new is not None and self.p_aux > 0:
                     theta_v = theta_v + X_aux_new @ self.mu_gamma.T
-                Var_theta = E_theta / b_theta
-                E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
-                # Add missing E[theta]^2 * Var(v) cross-term for correct second moment
-                E_A_sq = E_A_sq + xp.square(E_theta) @ self.sigma_v_diag.T
+                E_A_sq = xp.square(theta_v) + Var_theta_norm @ E_v_sq.T
+                E_A_sq = E_A_sq + xp.square(theta_norm) @ self.sigma_v_diag.T
                 if self.p_aux > 0:
                     _gvar = xp.stack([xp.diag(self.Sigma_gamma[k])
                                       for k in range(self.kappa)])
@@ -2543,6 +2574,8 @@ class CAVI:
         a_theta_v, b_theta_v = self._infer_theta_sparse(
             X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=True)
         E_theta_v = a_theta_v / b_theta_v
+        # Normalize theta for regression (matches training)
+        theta_norm_v = self._normalize_theta_chunk(E_theta_v)
 
         y_np = np.asarray(y_val, dtype=np.float32)
         if y_np.ndim == 1:
@@ -2551,8 +2584,8 @@ class CAVI:
         results = {}
         for name, logits in [
             ('cov_only',   X_aux_v_dev @ self.mu_gamma.T),
-            ('theta_only', E_theta_v @ self.mu_v.T),
-            ('full',       E_theta_v @ self.mu_v.T + X_aux_v_dev @ self.mu_gamma.T),
+            ('theta_only', theta_norm_v @ self.mu_v.T),
+            ('full',       theta_norm_v @ self.mu_v.T + X_aux_v_dev @ self.mu_gamma.T),
         ]:
             probs = to_numpy(_expit(logits))
             if probs.ndim == 1:
@@ -2596,16 +2629,18 @@ class CAVI:
             X_coo, n_new, n_iter, X_aux_new=X_aux_new)
 
         E_theta = a_theta / b_theta
-        logits = E_theta @ self.mu_v.T
+        # Use normalized theta for regression predictions
+        theta_norm = self._normalize_theta_chunk(E_theta)
+        logits = theta_norm @ self.mu_v.T
         if self.p_aux > 0:
             logits = logits + X_aux_new @ self.mu_gamma.T
 
         # Probit approximation: shrink logits by posterior variance of the
-        # linear predictor A = theta @ v.  Var[A] ≈ Var[theta] @ E[v^2] +
-        # E[theta]^2 @ Var[v] (independent posteriors).
-        Var_theta = E_theta / b_theta                          # a/b^2 = (a/b)/b
+        # linear predictor A = theta_norm @ v.
+        row_sums = xp.maximum(E_theta.sum(axis=1, keepdims=True), 1e-8)
+        Var_theta_norm = (E_theta / b_theta) / xp.square(row_sums)
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag            # (kappa, K)
-        var_logits = Var_theta @ E_v_sq.T + xp.square(E_theta) @ self.sigma_v_diag.T
+        var_logits = Var_theta_norm @ E_v_sq.T + xp.square(theta_norm) @ self.sigma_v_diag.T
         if self.p_aux > 0:
             # Add gamma variance contribution (diagonal of Sigma_gamma)
             gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
