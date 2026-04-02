@@ -987,9 +987,14 @@ class CAVI:
         # Damp: blend old r with new target so pruning happens gradually.
         # This prevents the spike-slab from making large jumps that the
         # other parameters (beta, eta, theta) can't keep up with, which
-        # would cause ELBO drops.  Damping factor = tau during annealing
-        # (so r barely moves early on), then 0.3 at steady state.
-        _ss_damp = max(0.3, tau)
+        # would cause ELBO drops.  Cap at 0.1: never move r_beta more
+        # than 10% per step, even at steady state.  During early annealing
+        # (tau < 0.1), move even slower (damping = tau).
+        # max(0.3, tau) was wrong — it gave 0.3 minimum but then rose to
+        # 1.0 at steady state (full replacement), so r_beta crashed from
+        # 0.5 to 0.002 in ~3 cycles, concentrating all counts into a
+        # handful of factors and triggering theta explosion.
+        _ss_damp = min(0.1, tau)
         self.r_beta = (1 - _ss_damp) * self.r_beta + _ss_damp * r_target
 
         # Tiny floor so entries can recover if data supports reactivation.
@@ -1082,6 +1087,12 @@ class CAVI:
                     # and bp both near-zero.  Without this floor, b_theta
                     # collapses → E[theta] explodes → destabilizes everything.
                     b_theta_c = xp.maximum(b_theta_c, 1e-2)
+                    # Adaptive floor: cap E[theta] = a/b at 1e4 to prevent
+                    # explosion when spike-slab concentrates all counts into
+                    # a few surviving factors (a_theta can reach millions
+                    # while b_poisson collapses, making the fixed bp floor
+                    # useless).  1e4 is ~2x the healthy-regime max E[theta].
+                    b_theta_c = xp.maximum(b_theta_c, self.a_theta[i0:i1] / 1e4)
                     b_theta_chunks.append(b_theta_c)
                     i0 = i1
                 except Exception as exc:
