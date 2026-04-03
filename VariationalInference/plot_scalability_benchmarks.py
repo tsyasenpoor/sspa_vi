@@ -6,13 +6,13 @@ performance vs dataset size (patients and cells).
 
 Reads the aggregated CSV from aggregate_scalability_results.py and produces:
   1. Wall time + peak memory vs dataset size (dual x-axis: patients & cells)
-  2. Test AUC vs dataset size by method and label
-  3. Test F1  vs dataset size by method and label
+  2. Val AUC vs dataset size by method and label
+  3. Val F1  vs dataset size by method and label
 
 Usage:
-    python plot_scalability_benchmarks.py \
-        --input  .../summary/all_metrics.csv \
-        --output-dir .../summary/plots
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/plot_scalability_benchmarks.py \
+        --input  /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/all_metrics.csv \
+        --output-dir /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/plots
 """
 from __future__ import annotations
 
@@ -62,11 +62,11 @@ for _m in METHOD_DISPLAY:
         METHOD_FAMILY[_m] = "Spectra"
 
 FAMILY_COLORS = {
-    "DRGP": "#d62728",
-    "Raw Classifier": "#1f77b4",
-    "MF+Classifier": "#ff7f0e",
-    "scHPF": "#2ca02c",
-    "Spectra": "#9467bd",
+    "DRGP": "#E69F00",           # Okabe-Ito orange
+    "Raw Classifier": "#56B4E9", # Okabe-Ito sky blue
+    "MF+Classifier": "#009E73",  # Okabe-Ito bluish green
+    "scHPF": "#CC79A7",          # Okabe-Ito reddish purple
+    "Spectra": "#0072B2",        # Okabe-Ito blue
 }
 FAMILY_MARKERS = {
     "DRGP": "D",
@@ -172,11 +172,11 @@ def plot_benchmark_panel(df: pd.DataFrame, out_dir: Path, p2c: dict):
         "baselines": "Baselines (raw)",
     }
     bench_colors = {
-        "drgp_unmasked": "#d62728",
-        "drgp_unmasked_fix": "#e377c2",
-        "schpf": "#2ca02c",
-        "spectra_sup": "#9467bd",
-        "baselines": "#1f77b4",
+        "drgp_unmasked": "#E69F00",      # Okabe-Ito orange
+        "drgp_unmasked_fix": "#F0E442",  # Okabe-Ito yellow
+        "schpf": "#CC79A7",              # Okabe-Ito reddish purple
+        "spectra_sup": "#0072B2",        # Okabe-Ito blue
+        "baselines": "#56B4E9",          # Okabe-Ito sky blue
     }
     bench_markers = {
         "drgp_unmasked": "D",
@@ -234,19 +234,19 @@ def _plot_metric(
     df: pd.DataFrame, metric: str, out_dir: Path, p2c: dict,
     ylim: tuple = (0.0, 1.0),
 ):
-    """Generic: test <metric> vs number of patients, one subplot per label."""
-    test = df[(df["split"] == "test") & df[metric].notna()].copy()
-    if test.empty:
-        print(f"  No test {metric.upper()} data to plot.")
+    """Generic: val <metric> vs number of patients, one subplot per label."""
+    val = df[(df["split"] == "val") & df[metric].notna()].copy()
+    if val.empty:
+        print(f"  No val {metric.upper()} data to plot.")
         return
 
-    labels = sorted(test["label"].unique())
+    labels = sorted(val["label"].unique())
     n_labels = len(labels)
     fig, axes = plt.subplots(1, n_labels, figsize=(7 * n_labels, 6), squeeze=False)
 
     for idx, label_name in enumerate(labels):
         ax = axes[0, idx]
-        sub = test[test["label"] == label_name]
+        sub = val[val["label"] == label_name]
         stats = (
             sub.groupby(["method", "ratio"])[metric]
             .agg(["mean", "std"])
@@ -265,15 +265,15 @@ def _plot_metric(
             )
 
         ax.set_xlabel("Number of Patients", fontsize=12)
-        ax.set_ylabel(f"Test {metric.upper()}", fontsize=12)
-        ax.set_title(f"Test {metric.upper()} — {label_name}", fontsize=13, fontweight="bold")
+        ax.set_ylabel(f"Val {metric.upper()}", fontsize=12)
+        ax.set_title(f"Val {metric.upper()} — {label_name}", fontsize=13, fontweight="bold")
         ax.set_ylim(*ylim)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=7, ncol=2, loc="lower right")
         _add_cell_axis(ax, p2c)
 
     fig.tight_layout()
-    fname = f"test_{metric}_vs_size"
+    fname = f"val_{metric}_vs_size"
     fig.savefig(out_dir / f"{fname}.png", dpi=200, bbox_inches="tight")
     fig.savefig(out_dir / f"{fname}.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -292,11 +292,11 @@ BENCH_DISPLAY = {
     "baselines": "Baselines",
 }
 BENCH_COLORS = {
-    "drgp_unmasked": "#d62728",
-    "drgp_unmasked_fix": "#e377c2",
-    "schpf": "#2ca02c",
-    "spectra_sup": "#9467bd",
-    "baselines": "#1f77b4",
+    "drgp_unmasked": "#E69F00",      # Okabe-Ito orange
+    "drgp_unmasked_fix": "#F0E442",  # Okabe-Ito yellow
+    "schpf": "#CC79A7",              # Okabe-Ito reddish purple
+    "spectra_sup": "#0072B2",        # Okabe-Ito blue
+    "baselines": "#56B4E9",          # Okabe-Ito sky blue
 }
 
 
@@ -382,19 +382,19 @@ def plot_benchmark_bars(df: pd.DataFrame, out_dir: Path):
 
 
 def _plot_metric_bars(df: pd.DataFrame, metric: str, out_dir: Path):
-    """Bar chart of test <metric> by method, one subplot per label."""
-    test = df[(df["split"] == "test") & df[metric].notna()].copy()
-    if test.empty:
-        print(f"  No test {metric.upper()} data to plot.")
+    """Bar chart of val <metric> by method, one subplot per label."""
+    val = df[(df["split"] == "val") & df[metric].notna()].copy()
+    if val.empty:
+        print(f"  No val {metric.upper()} data to plot.")
         return
 
-    labels = sorted(test["label"].unique())
+    labels = sorted(val["label"].unique())
     n_labels = len(labels)
     fig, axes = plt.subplots(1, n_labels, figsize=(6 * n_labels, 5), squeeze=False)
 
     for idx, label_name in enumerate(labels):
         ax = axes[0, idx]
-        sub = test[test["label"] == label_name]
+        sub = val[val["label"] == label_name]
         stats = (
             sub.groupby("method")[metric]
             .agg(["mean", "std"])
@@ -413,14 +413,14 @@ def _plot_metric_bars(df: pd.DataFrame, metric: str, out_dir: Path):
                color=colors, capsize=4, edgecolor="black", linewidth=0.5)
         ax.set_xticks(x)
         ax.set_xticklabels(disp_labels, fontsize=8, rotation=35, ha="right")
-        ax.set_ylabel(f"Test {metric.upper()}", fontsize=12)
+        ax.set_ylabel(f"Val {metric.upper()}", fontsize=12)
         ax.set_title(f"{label_name}", fontsize=13, fontweight="bold")
         ax.set_ylim(0, 1.05)
         ax.grid(True, axis="y", alpha=0.3)
 
-    fig.suptitle(f"Test {metric.upper()} by Method", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Val {metric.upper()} by Method", fontsize=14, fontweight="bold")
     fig.tight_layout()
-    fname = f"test_{metric}_bars"
+    fname = f"val_{metric}_bars"
     fig.savefig(out_dir / f"{fname}.png", dpi=200, bbox_inches="tight")
     fig.savefig(out_dir / f"{fname}.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -477,19 +477,19 @@ def main():
         print("Plotting benchmark (time + memory) ...")
         plot_benchmark_panel(df, out_dir, p2c)
 
-        print("Plotting test AUC ...")
+        print("Plotting val AUC ...")
         _plot_metric(df, "auc", out_dir, p2c, ylim=(0.4, 1.0))
 
-        print("Plotting test F1 ...")
+        print("Plotting val F1 ...")
         _plot_metric(df, "f1", out_dir, p2c, ylim=(0.0, 1.0))
     else:
         print("Plotting benchmark bars ...")
         plot_benchmark_bars(df, out_dir)
 
-        print("Plotting test AUC bars ...")
+        print("Plotting val AUC bars ...")
         _plot_metric_bars(df, "auc", out_dir)
 
-        print("Plotting test F1 bars ...")
+        print("Plotting val F1 bars ...")
         _plot_metric_bars(df, "f1", out_dir)
 
     print(f"\nAll plots saved to {out_dir}/")

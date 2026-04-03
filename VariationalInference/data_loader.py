@@ -991,6 +991,7 @@ class DataLoader:
             if missing:
                 raise ValueError(f"Auxiliary columns not found: {missing}. Available: {list(self.aux_data_df.columns)}")
 
+            self._aux_column_names = list(aux_columns)
             return self.aux_data_df[aux_columns].values.astype(float)
 
         obs = self._get_obs()

@@ -1,51 +1,3 @@
-"""
-Coordinate Ascent VI for Supervised Poisson Factorization (DRGP)
-================================================================
-
-Poisson factorization core follows scHPF (Levitin et al., MSB 2019)
-exactly. Supervision via Jaakkola-Jordan logistic regression bound
-from the DRGP manuscript appendix.
-
-scHPF update equations (Gopalan et al. 2014, Eqs 7-9):
-  phi_{ij} ~ exp{ psi(a^theta_{ik}) - log(b^theta_{ik}) + psi(a^beta_{jk}) - log(b^beta_{jk}) }
-  a^beta_{jk} = c + Sum_i x_{ij} phi_{ijk}
-  b^beta_{jk} = E[eta_j] + Sum_i E[theta_{ik}]
-  a^theta_{ik} = a + Sum_j x_{ij} phi_{ijk}
-  b^theta_{ik} = E[xi_i] + Sum_j E[beta_{jk}]  (+ JJ regression correction)
-
-Hierarchical priors:
-  xi_i ~ Gamma(a', b')     ->  a^xi_i = a' + K*a  (constant)
-                                b^xi_i = b' + Sum_k E[theta_{ik}]
-  eta_j ~ Gamma(c', d')    ->  a^eta_j = c' + m_j*c  (constant; m_j = active factors)
-                                b^eta_j = d' + Sum_k E[beta_{jk}]
-
-Key properties:
-1. bp, dp are SCALARS (scHPF), not per-cell/gene vectors
-2. Random init: U(0.5*prior, 1.5*prior) for both shape AND rate
-3. First iteration uses random Dirichlet phi (scHPF symmetry breaking)
-4. All parameters (theta, v, gamma, zeta) learned jointly from iteration 0
-5. No spike-and-slab, no diversity noise, no annealing
-
-Numerical stabilizers (not pure coordinate ascent):
-- bp/dp floored so implied prior means E[xi], E[eta] <= 1e4
-- b_eta, b_xi floored at 1e-6 to prevent eta-beta collapse loop
-- b_theta floored at max(0.1*b_poisson, bp, 1e-2)
-- v update: K-scaled damping, step caps, period-2 oscillation detection
-- gamma update: step caps and damping
-- zeta capped at 4.0 (keeps lambda_JJ >= 0.060)
-
-GPU/JAX acceleration:
-- When JAX is installed the hot numerical paths (phi, ELBO, updates)
-  run on GPU if available, otherwise on CPU via XLA.
-- Falls back transparently to NumPy/SciPy when JAX is absent.
-
-References:
-- Gopalan, Hofman, Blei (2014) "Scalable Recommendation with HPF"
-- Levitin et al. (2019) "scHPF", Molecular Systems Biology
-- Jaakkola & Jordan (2000) variational logistic bound
-- Hoffman et al. (2013) "Stochastic Variational Inference"
-"""
-
 import numpy as np
 import scipy.sparse as sp
 from typing import Tuple, Optional, Dict, Any, List
@@ -914,7 +866,11 @@ class CAVI:
             # Accumulate (kappa,) @ (chunk, K) → (K,)  per-factor precision
             prec_per_factor += (W_lam[i0:i1].T @ theta_norm_sq_c).sum(axis=0)
 
-        rw = self.regression_weight
+        # Use the unscaled rw (before *p multiplication) because the
+        # prior is also scaled by p.  The crossover condition is:
+        #   prior_prec = rw_user * 2 * data_prec_per_factor
+        # (the p factors cancel between prior and data).
+        rw = getattr(self, '_rw_user', self.regression_weight)
         data_prec = rw * 2.0 * prec_per_factor  # (K,)
         median_dp = float(xp.median(data_prec))
 
@@ -922,21 +878,11 @@ class CAVI:
             b_v_new = 1.0 / (v_crossover * median_dp)
             # Floor: don't make prior absurdly strong
             b_v_new = max(b_v_new, 1e-6)
-            # Set b_v directly to the data-driven value.  The formula places
-            # the prior-data crossover at |v|=v_crossover: factors with
-            # |v| < v_crossover get shrunk toward zero (prior dominates),
-            # those above can grow (data dominates).  Previous versions used
-            # a one-way ceiling or 2x damping clamp, which prevented b_v
-            # from reaching the correct (often much smaller) value, leaving
-            # the prior too weak and causing all v's to saturate at the clip.
+            # No ceiling: b_v must be free to increase or decrease.
             print(f"  [Laplace] b_v auto-calibrated: {self.b_v:.6f} -> "
                   f"{b_v_new:.6f}  (median_data_prec={median_dp:.1f}, "
                   f"v_cross={v_crossover})")
             self.b_v = b_v_new
-            # Re-initialize sigma_v_diag from the new b_v so the posterior
-            # variance is consistent with the recalibrated prior.
-            self.sigma_v_diag = xp.full(
-                (self.kappa, self.K), 2.0 * self.b_v ** 2)
 
     def _update_beta(self, z_sum_beta):
         """beta shape and rate (scHPF Eq 8, gene side).
@@ -1345,22 +1291,19 @@ class CAVI:
         W = self._sample_weights                    # (n, kappa)
         E_v = self.mu_v
 
+        # Scale prior precision by p (n_genes) so it matches the p-scaled
+        # regression_weight.  The p factors cancel in the posterior mean,
+        # making v independent of the number of genes.
         if self.v_prior == 'normal':
             sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
-            prior_precision = 1.0 / sigma_v_eff_sq
+            prior_precision = self.p / sigma_v_eff_sq
         else:
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
             omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
             # Laplace (Bayesian Lasso) prior precision from the inverse-
-            # Gaussian scale mixture.  For large |v| (omega >> 1) this
-            # vanishes as 1/(b_v*omega), relaxing regularization on
-            # disease-relevant factors.  Use a low floor (0.01) so the
-            # adaptive E[1/s] shrinkage can actually differentiate factors:
-            # small |v| → heavy shrinkage, large |v| → relaxed penalty.
-            # A floor of 1.0 defeated this mechanism by over-regularizing
-            # all factors equally, causing v to saturate at the hard clip.
+            # Gaussian scale mixture, scaled by p.
             prior_precision_raw = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
-            prior_precision = xp.maximum(prior_precision_raw, 0.01)
+            prior_precision = self.p * xp.maximum(prior_precision_raw, 0.01)
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
         # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
@@ -1377,10 +1320,10 @@ class CAVI:
             try:
                 b_theta_c = self.b_theta[i0:i1]
                 E_theta_c = self.a_theta[i0:i1] / b_theta_c            # (chunk, K)
-                # Use L1-normalized theta for regression sufficient stats
+                # Use sqrt(K)-scaled normalized theta for regression sufficient stats
                 theta_norm_c = self._normalize_theta_chunk(E_theta_c)
                 theta_norm_psq_c = xp.square(theta_norm_c)             # (chunk, K)
-                # Approximate normalized variance: Var_norm ≈ Var_raw / row_sum^2
+                # Approximate normalized variance: Var_norm ≈ Var_raw * K / row_sum^2
                 row_sums_c = xp.maximum(E_theta_c.sum(axis=1, keepdims=True), 1e-8)
                 Var_theta_norm_c = (E_theta_c / b_theta_c) / xp.square(row_sums_c)
                 theta_norm_sq_c = theta_norm_psq_c + Var_theta_norm_c  # E[theta_norm^2]
@@ -1451,23 +1394,21 @@ class CAVI:
             # because the data precision only grows as theta scales up.
             self.sigma_v_diag = sigma_v_diag_new
         else:
-            # Tighter clip: 50.0 allowed v to diverge to ±50 with K=130,
-            # overwhelming the Laplace prior (b_v auto-calibrated to 0.006)
-            # and inflating the spike-slab regression bonus.  Scale with K
-            # so the total logit contribution stays bounded.
-            v_abs_clip = min(15.0, 150.0 / np.sqrt(self.K))
-            # K=130 → 13.2; K=50 → 15.0; K=500 → 6.7
+            # Safety clip — with p-scaled prior the Laplace naturally
+            # constrains v, so this is a safety net only.
+            v_abs_clip = min(50.0, 500.0 / np.sqrt(self.K))
+            # K=130 → 43.9; K=50 → 50.0; K=500 → 22.4
             mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
-            # Conservative damping: slower v movement gives the Laplace
-            # prior more iterations to enforce sparsity before v escapes
-            # to the clip bound.  Matches the normal-prior branch scaling.
-            alpha_max = min(0.15, 10.0 / np.sqrt(self.K))
+            # Moderate damping: with p-scaled prior, the prior-data balance
+            # is well-conditioned (independent of p), so standard damping
+            # suffices for convergence stability.
+            alpha_max = min(0.15, 7.5 / np.sqrt(self.K))
             # K=130 → 0.15; K=50 → 0.15; K=500 → 0.15 (cap)
             alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
             mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
-            # Per-element step cap — wider now that rw is consistent.
+            # Per-element step cap.
             max_step = min(1.0, 50.0 / np.sqrt(self.K))
             # K=130 → 1.0
             delta = mu_v_candidate - self.mu_v
@@ -1536,7 +1477,8 @@ class CAVI:
         # Use the same regression weight as the ELBO for CAVI consistency.
         rw_v = self.regression_weight
         for k in range(self.kappa):
-            prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
+            # Scale gamma prior by p to match p-scaled regression_weight.
+            prec_prior = self.p * xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
             # Precision: 1/sigma^2 I + rw_v * 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
             W_lam_k = W[:, k] * lam[:, k]  # (n,) -- class-weighted lambda
             weighted_X = X_aux * (rw_v * 2 * W_lam_k)[:, None]
@@ -1670,7 +1612,7 @@ class CAVI:
                 E_theta_c = a_theta_c / b_theta_c
                 E_log_theta_c = E_log_theta[i0:i1]
 
-                # --- JJ regression likelihood (uses normalized theta) ---
+                # --- JJ regression likelihood (uses sqrt(K)-scaled normalized theta) ---
                 theta_norm_c = self._normalize_theta_chunk(E_theta_c)
                 row_sums_c = xp.maximum(E_theta_c.sum(axis=1, keepdims=True), 1e-8)
                 Var_theta_norm_c = (E_theta_c / b_theta_c) / xp.square(row_sums_c)
@@ -1788,11 +1730,14 @@ class CAVI:
                        + self.cp * xp.log(self.dp) - self.dp * E_eta)
         elbo -= self.p * gammaln(self.cp)
 
-        # === Prior: p(v) ===
+        # === Prior: p(v) — scaled by p to match p-scaled regression_weight ===
+        # The p factor makes the prior-data balance independent of n_genes.
+        # q(v) entropy (below) is NOT scaled — it's about q, not p.
+        _p = float(self.p)
         if self.v_prior == 'normal':
             sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
-            elbo -= 0.5 * xp.sum(self.mu_v ** 2 + self.sigma_v_diag) / sigma_v_eff_sq
-            elbo -= 0.5 * self.kappa * self.K * xp.log(2 * xp.pi * sigma_v_eff_sq)
+            elbo -= _p * 0.5 * xp.sum(self.mu_v ** 2 + self.sigma_v_diag) / sigma_v_eff_sq
+            elbo -= _p * 0.5 * self.kappa * self.K * xp.log(2 * xp.pi * sigma_v_eff_sq)
         else:
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
             omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
@@ -1800,23 +1745,23 @@ class CAVI:
 
             mu_s = self.b_v / omega
             E_log_s = xp.log(xp.maximum(mu_s, 1e-12))
-            elbo += xp.sum(-0.5 * xp.log(2 * xp.pi) - 0.5 * E_log_s
-                           - 0.5 * E_v_sq * E_inv_s)
+            elbo += _p * xp.sum(-0.5 * xp.log(2 * xp.pi) - 0.5 * E_log_s
+                                - 0.5 * E_v_sq * E_inv_s)
 
             rate_s = 1.0 / (2.0 * self.b_v ** 2)
-            elbo += xp.sum(xp.log(rate_s) - mu_s * rate_s)
+            elbo += _p * xp.sum(xp.log(rate_s) - mu_s * rate_s)
 
             lambda_s = 1.0 / (self.b_v ** 2)
-            elbo += 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
-                                        / xp.maximum(lambda_s, 1e-12)))
+            elbo += _p * 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
+                                              / xp.maximum(lambda_s, 1e-12)))
 
-        # === Prior: p(gamma) — Gaussian N(0, sigma_gamma^2 I) ===
+        # === Prior: p(gamma) — scaled by p to match p-scaled regression_weight ===
         if self.p_aux > 0:
             sigma_gamma_sq = self.sigma_gamma ** 2
             for k in range(self.kappa):
-                elbo -= 0.5 * self.p_aux * float(xp.log(2 * xp.pi * sigma_gamma_sq))
-                elbo -= 0.5 * float(xp.sum(self.mu_gamma[k] ** 2)
-                                    + xp.trace(self.Sigma_gamma[k])) / sigma_gamma_sq
+                elbo -= _p * 0.5 * self.p_aux * float(xp.log(2 * xp.pi * sigma_gamma_sq))
+                elbo -= _p * 0.5 * float(xp.sum(self.mu_gamma[k] ** 2)
+                                         + xp.trace(self.Sigma_gamma[k])) / sigma_gamma_sq
 
         # === Entropy: -E[log q] ===
         # q(beta) — spike-slab entropy already handled above in prior block
@@ -2037,13 +1982,16 @@ class CAVI:
         # Initialize (creates numpy arrays, then transfers to device)
         self._initialize(X_train, y, X_aux)
 
-        # Auto-scale regression_weight by n_genes so Poisson and regression
-        # gradient magnitudes are comparable.  Poisson LL sums ~O(nnz) terms
-        # while regression LL sums ~O(N*kappa); scaling by p roughly
-        # equalises the per-factor gradients.  The user-supplied value acts
-        # as a relative preference multiplier (1.0 = balanced).
+        # Auto-scale regression_weight by p (n_genes).  Poisson LL sums
+        # O(N*p) terms while regression LL sums O(N*kappa).  For regression
+        # to influence theta, rw must be O(p).  To prevent this from
+        # overwhelming the v/gamma priors, we ALSO scale those priors by p
+        # (see _update_v, _update_gamma, _compute_elbo).  The p factors
+        # cancel in the posterior mean of v and gamma, making the model
+        # behavior independent of the number of genes.
         if self.kappa > 0:
             rw_old = self.regression_weight
+            self._rw_user = rw_old  # Store pre-scaling value for calibration
             self.regression_weight = self.regression_weight * float(self.p)
             if verbose:
                 print(f"  regression_weight auto-scaled: {rw_old:.4f} * "
@@ -2263,13 +2211,20 @@ class CAVI:
             self._refresh_log_caches()
 
             # 5. Update v, gamma
-            # Auto-calibrate Laplace b_v so the prior-data crossover sits at
-            # |v|=v_crossover.  Run at t=0 (after first theta/zeta init) and
-            # again at t=50 (once theta has differentiated factors from data).
-            # The second pass refines the estimate since t=0 theta is still
-            # near random init and gives a noisy data-precision estimate.
-            if t in (0, 50) and self.v_prior == 'laplace' and self.kappa > 0:
+            # Auto-calibrate Laplace b_v at t=0 (after first theta/zeta init).
+            # Only at t=0: by t>0 theta has concentrated so the median data
+            # precision across factors drops to ~0, making the calibration
+            # formula produce absurdly large b_v.
+            if t == 0 and self.v_prior == 'laplace' and self.kappa > 0:
                 self._calibrate_b_v(y, X_aux)
+                # Re-init sigma_v_diag to match the calibrated b_v.
+                # At t=0 there is no accumulated posterior info.  Without
+                # this, sigma_v stays at 2*(b_v_old)^2 from init.  When
+                # calibration increases b_v (e.g., 0.058 → 77.8), omega
+                # remains at sqrt(sigma_v_old) ≈ 0.08 instead of ~110,
+                # making 1/omega^2 dominate and trapping v at zero.
+                self.sigma_v_diag = xp.full(
+                    (self.kappa, self.K), 2.0 * self.b_v ** 2)
             self._update_v(y, X_aux, iteration=t)
             self._update_gamma(y, X_aux, iteration=t)
 
@@ -2289,7 +2244,7 @@ class CAVI:
                           f"sigma2_v=[{float(self.sigma_v_diag.min()):.4e},{float(self.sigma_v_diag.max()):.4e}]")
 
                 # v saturation monitoring
-                _v_clip = min(15.0, 150.0 / np.sqrt(self.K)) if self.v_prior == 'laplace' \
+                _v_clip = min(50.0, 500.0 / np.sqrt(self.K)) if self.v_prior == 'laplace' \
                     else min(5.0, 10.0 / np.sqrt(self.K))
                 _mu_v_np = np.asarray(self.mu_v)
                 _abs_v = np.abs(_mu_v_np)
@@ -2610,7 +2565,7 @@ class CAVI:
             b_poisson = E_xi[:, None] + beta_col_sums[None, :]
 
             if has_regression and use_jj_reg:
-                # Use normalized theta for regression (matches training)
+                # Use sqrt(K)-scaled normalized theta for regression (matches training)
                 theta_norm = self._normalize_theta_chunk(E_theta)
                 row_sums = xp.maximum(E_theta.sum(axis=1, keepdims=True), 1e-8)
                 Var_theta_norm = (E_theta / b_theta) / xp.square(row_sums)

@@ -452,11 +452,23 @@ def save_results(
 
     # Save gamma (auxiliary feature weights) if available
     if hasattr(model, 'mu_gamma') and model.mu_gamma.size > 0:
-        # mu_gamma shape: (kappa, p_aux)
-        if aux_columns is not None and len(aux_columns) == model.mu_gamma.shape[1]:
-            gamma_col_names = aux_columns
+        # mu_gamma shape: (kappa, p_aux) where p_aux may include a
+        # prepended intercept column (col 0) added by _prepend_intercept.
+        # Build column names: "intercept" + real aux column names.
+        has_intercept = getattr(model, 'use_intercept', False)
+        n_gamma_cols = model.mu_gamma.shape[1]
+
+        if aux_columns is not None:
+            if has_intercept and len(aux_columns) == n_gamma_cols - 1:
+                gamma_col_names = ['intercept'] + list(aux_columns)
+            elif len(aux_columns) == n_gamma_cols:
+                gamma_col_names = list(aux_columns)
+            else:
+                gamma_col_names = (['intercept'] if has_intercept else []) + \
+                    [f'aux_{j}' for j in range(n_gamma_cols - (1 if has_intercept else 0))]
         else:
-            gamma_col_names = [f'aux_{j}' for j in range(model.mu_gamma.shape[1])]
+            gamma_col_names = (['intercept'] if has_intercept else []) + \
+                [f'aux_{j}' for j in range(n_gamma_cols - (1 if has_intercept else 0))]
 
         if label_columns is not None and len(label_columns) == model.mu_gamma.shape[0]:
             gamma_row_names = label_columns
