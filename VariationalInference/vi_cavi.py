@@ -109,17 +109,11 @@ class CAVI:
         Gamma shape prior for beta (gene loadings). Default 0.3 (scHPF).
     cp : float
         Gamma shape prior for eta (gene capacity). Default 1.0.
-    sigma_v : float
-        Gaussian prior std for v (regression weights). Used when v_prior='normal'.
     b_v : float
-        Laplace prior scale for v (regression weights). Used when v_prior='laplace'.
+        Laplace prior scale for v (Bayesian Lasso regression weights).
         Smaller b_v = stronger sparsity. Var[v] = 2*b_v^2.
-    v_prior : str
-        Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso).
     sigma_gamma : float
         Gaussian prior std for gamma (auxiliary covariate weights).
-    regression_weight : float
-        Scalar weight for the classification term.
     use_class_weights : bool
         If True, apply balanced class weights per label to the Bernoulli
         regression loss.  Positive samples for label k are weighted by
@@ -137,11 +131,8 @@ class CAVI:
         ap: float = 1.0,
         c: float = 0.3,
         cp: float = 1.0,
-        sigma_v: float = 1.0,
         b_v: float = 1.0,
-        v_prior: str = 'normal',
         sigma_gamma: float = 1.0,
-        regression_weight: float = 1.0,
         use_class_weights: bool = True,
         use_intercept: bool = True,
         random_state: Optional[int] = None,
@@ -151,7 +142,6 @@ class CAVI:
         n_pathway_factors: Optional[int] = None,
         nnz_chunk_size: int = 1_000_000,
         test_jj_reg: bool = False,
-        use_spike_slab_beta: bool = False,
         alpha_pi: float = 1.0,
         beta_pi_scale: Optional[float] = None,
         **_ignored,
@@ -161,13 +151,8 @@ class CAVI:
         self.ap = ap
         self.c = c
         self.cp = cp
-        self.sigma_v = sigma_v
         self.b_v = b_v
-        self.v_prior = v_prior.lower()
-        if self.v_prior not in ('normal', 'laplace'):
-            raise ValueError(f"v_prior must be 'normal' or 'laplace', got '{v_prior}'")
         self.sigma_gamma = sigma_gamma
-        self.regression_weight = regression_weight
         self.use_class_weights = use_class_weights
         self.test_jj_reg = test_jj_reg
         # Cap on JJ auxiliary zeta.  Keeps lambda_JJ(zeta) >= lambda_JJ(zeta_max) > 0,
@@ -181,7 +166,6 @@ class CAVI:
         self.pathway_mask = pathway_mask
         self.pathway_names = pathway_names
         self.n_pathway_factors = n_pathway_factors
-        self.use_spike_slab_beta = use_spike_slab_beta
         self.alpha_pi = alpha_pi
         self._beta_pi_scale = beta_pi_scale  # resolved to K in _initialize
 
@@ -323,46 +307,36 @@ class CAVI:
             self._active_beta = None  # means all active
             self._n_active_beta = self.p * K
 
-        # --- spike-and-slab on beta (optional) ---
-        if self.use_spike_slab_beta:
-            # Default: E[pi_j] = alpha_pi / (alpha_pi + beta_pi) targets ~10
-            # programs per gene.  K/10 scales sensibly: K=50 -> beta_pi=4,
-            # K=500 -> beta_pi=49.  Manual override via beta_pi_scale.
-            self.beta_pi = (self._beta_pi_scale if self._beta_pi_scale is not None
-                            else max(1.0, float(K) / 10.0 - self.alpha_pi))
-            self.r_beta = np.ones((self.p, K), dtype=np.float32) * 0.5
-            if self._active_beta is not None:
-                # Masked entries are structurally zero — not latent variables
-                self.r_beta = np.where(self._active_beta, self.r_beta, 0.0)
-                n_active_per_gene = self._active_beta.sum(axis=1).astype(np.float32)
-                self.a_pi = (self.alpha_pi + n_active_per_gene * 0.5).astype(np.float32)
-                self.b_pi = (self.beta_pi + n_active_per_gene * 0.5).astype(np.float32)
-            else:
-                self.a_pi = np.full(self.p, self.alpha_pi + K * 0.5, dtype=np.float32)
-                self.b_pi = np.full(self.p, self.beta_pi + K * 0.5, dtype=np.float32)
-
-        # --- v: init small random ---
-        self.mu_v = np.random.randn(self.kappa, K) * 0.01
-        if self.v_prior == 'normal':
-            # N(0, sigma_v^2/K) prior -- K-scaled so total logit theta*v has variance ~ sigma_v^2
-            self.sigma_v_diag = np.full((self.kappa, K), (self.sigma_v ** 2) / K)
+        # --- spike-and-slab on beta ---
+        # Default: E[pi_j] = alpha_pi / (alpha_pi + beta_pi) targets ~10
+        # programs per gene.  K/10 scales sensibly: K=50 -> beta_pi=4,
+        # K=500 -> beta_pi=49.  Manual override via beta_pi_scale.
+        self.beta_pi = (self._beta_pi_scale if self._beta_pi_scale is not None
+                        else max(1.0, float(K) / 10.0 - self.alpha_pi))
+        self.r_beta = np.ones((self.p, K), dtype=np.float32) * 0.5
+        if self._active_beta is not None:
+            # Masked entries are structurally zero — not latent variables
+            self.r_beta = np.where(self._active_beta, self.r_beta, 0.0)
+            n_active_per_gene = self._active_beta.sum(axis=1).astype(np.float32)
+            self.a_pi = (self.alpha_pi + n_active_per_gene * 0.5).astype(np.float32)
+            self.b_pi = (self.beta_pi + n_active_per_gene * 0.5).astype(np.float32)
         else:
-            # Laplace (Bayesian Lasso): scale b_v so the prior precision is
-            # meaningful relative to the data precision.  The data contributes
-            # O(N * lambda * E[theta^2]) to the v precision; the prior contributes
-            # O(1/(b_v * |v|)).  Without scaling, b_v=1 is overwhelmed for large N
-            # (prior < 1% of total precision for N > 100K).
-            #
-            # Following Park & Casella (2008), the optimal Lasso penalty scales as
-            # sqrt(N).  We apply:  b_v_eff = b_v * sqrt(K) / sqrt(N)
-            # so that b_v=1.0 gives sensible shrinkage regardless of dataset size.
-            self._b_v_orig = self.b_v  # Save before auto-scaling for fit()-time recompute
-            b_v_eff = self.b_v * np.sqrt(K) / np.sqrt(self.n)
-            print(f"  [Laplace] b_v auto-scaled: {self.b_v:.4f} -> {b_v_eff:.6f} "
-                  f"(N={self.n}, K={K})")
-            self.b_v = b_v_eff
-            # Init sigma_v_diag from Laplace variance = 2*b_v^2
-            self.sigma_v_diag = np.full((self.kappa, K), 2.0 * self.b_v ** 2)
+            self.a_pi = np.full(self.p, self.alpha_pi + K * 0.5, dtype=np.float32)
+            self.b_pi = np.full(self.p, self.beta_pi + K * 0.5, dtype=np.float32)
+
+        # --- v: Laplace (Bayesian Lasso) init ---
+        self.mu_v = np.random.randn(self.kappa, K) * 0.01
+        # Scale b_v so the prior precision is meaningful relative to the data
+        # precision.  Following Park & Casella (2008), the optimal Lasso penalty
+        # scales as sqrt(N).  We apply:  b_v_eff = b_v * sqrt(K) / sqrt(N)
+        # so that b_v=1.0 gives sensible shrinkage regardless of dataset size.
+        self._b_v_orig = self.b_v  # Save before auto-scaling for fit()-time recompute
+        b_v_eff = self.b_v * np.sqrt(K) / np.sqrt(self.n)
+        print(f"  [Laplace] b_v auto-scaled: {self.b_v:.4f} -> {b_v_eff:.6f} "
+              f"(N={self.n}, K={K})")
+        self.b_v = b_v_eff
+        # Init sigma_v_diag from Laplace variance = 2*b_v^2
+        self.sigma_v_diag = np.full((self.kappa, K), 2.0 * self.b_v ** 2)
 
         # --- gamma: N(0, sigma_gamma^2) ---
         if self.p_aux > 0:
@@ -595,10 +569,7 @@ class CAVI:
     def E_beta(self):
         if self._E_beta_cache is None:
             raw = self.a_beta / self.b_beta
-            if self.use_spike_slab_beta:
-                self._E_beta_cache = self.r_beta * raw
-            else:
-                self._E_beta_cache = raw
+            self._E_beta_cache = self.r_beta * raw
         return self._E_beta_cache
 
     @property
@@ -631,9 +602,8 @@ class CAVI:
         self._E_log_beta_cache = _dig_beta - xp.log(self.b_beta)
         del _dig_beta
         # Spike-and-slab: weight by log(r), suppress inactive components
-        if self.use_spike_slab_beta:
-            _ss_thresh = 0.01
-            self._E_log_beta_cache = xp.where(
+        _ss_thresh = 0.01
+        self._E_log_beta_cache = xp.where(
                 self.r_beta > _ss_thresh,
                 self._E_log_beta_cache + xp.log(xp.maximum(self.r_beta, _ss_thresh)),
                 xp.asarray(-xp.inf, dtype=self._E_log_beta_cache.dtype)
@@ -839,10 +809,8 @@ class CAVI:
     def _calibrate_b_v(self, y, X_aux, v_crossover=2.0):
         """Auto-calibrate Laplace b_v so prior matches data at |v|=v_crossover.
 
-        With the full regression_weight applied to v (for CAVI consistency),
-        the data precision for v can be very large, overwhelming the Laplace
-        prior and defeating sparsity.  This method sets b_v so that the
-        prior-data crossover occurs at |v|=v_crossover: factors with
+        This method sets b_v so that the prior-data crossover occurs at
+        |v|=v_crossover: factors with
         |v| < v_crossover get shrunk toward zero, while those above survive.
 
         The Laplace prior precision at |v|=v0 is ~1/(b_v * v0).
@@ -870,8 +838,7 @@ class CAVI:
         # prior is also scaled by p.  The crossover condition is:
         #   prior_prec = rw_user * 2 * data_prec_per_factor
         # (the p factors cancel between prior and data).
-        rw = getattr(self, '_rw_user', self.regression_weight)
-        data_prec = rw * 2.0 * prec_per_factor  # (K,)
+        data_prec = 2.0 * prec_per_factor  # (K,)
         median_dp = float(xp.median(data_prec))
 
         if median_dp > 0:
@@ -905,25 +872,17 @@ class CAVI:
         new_a = xp.maximum(new_a, 1e-6)
         new_b = xp.maximum(new_b, 1e-6)
 
-        if self.use_spike_slab_beta:
-            # Only update entries where r_beta > threshold (slab-active);
-            # pin excluded entries to near-zero values.
-            ss_active = self.r_beta > 0.01
-            if self._active_beta is not None:
-                ss_active = ss_active & self._active_beta
-            self.a_beta = xp.where(ss_active, new_a, self.c * 0.01)
-            self.b_beta = xp.where(ss_active, new_b, 100.0)
-            # Re-pin pathway-masked entries (structurally zero)
-            if self._active_beta is not None:
-                self.a_beta = xp.where(self._active_beta, self.a_beta, self.c * 0.01)
-                self.b_beta = xp.where(self._active_beta, self.b_beta, 100.0)
-        elif self._active_beta is not None:
-            # Only update active entries; masked entries keep their pinned values.
-            self.a_beta = xp.where(self._active_beta, new_a, self.a_beta)
-            self.b_beta = xp.where(self._active_beta, new_b, self.b_beta)
-        else:
-            self.a_beta = new_a
-            self.b_beta = new_b
+        # Spike-and-slab: only update entries where r_beta > threshold (slab-active);
+        # pin excluded entries to near-zero values.
+        ss_active = self.r_beta > 0.01
+        if self._active_beta is not None:
+            ss_active = ss_active & self._active_beta
+        self.a_beta = xp.where(ss_active, new_a, self.c * 0.01)
+        self.b_beta = xp.where(ss_active, new_b, 100.0)
+        # Re-pin pathway-masked entries (structurally zero)
+        if self._active_beta is not None:
+            self.a_beta = xp.where(self._active_beta, self.a_beta, self.c * 0.01)
+            self.b_beta = xp.where(self._active_beta, self.b_beta, 100.0)
         self._invalidate_beta_cache()
 
     def _update_eta(self):
@@ -937,12 +896,10 @@ class CAVI:
         # number of active factors per gene: a_eta_j = cp + sum_k r_{jk} * c.
         # Without this, a_eta stays at cp + K*c even when most factors are
         # killed, causing E[eta] = a_eta/b_eta to explode (eta death spiral).
-        if self.use_spike_slab_beta:
-            self.a_eta = self.cp + self.r_beta.sum(axis=1) * self.c
-            # Refresh cached digamma/gammaln since a_eta changed
-            self._digamma_a_eta = digamma(self.a_eta)
-            self._gammaln_a_eta = gammaln(self.a_eta)
-        # else: a^eta is constant (set in init, never changes)
+        self.a_eta = self.cp + self.r_beta.sum(axis=1) * self.c
+        # Refresh cached digamma/gammaln since a_eta changed
+        self._digamma_a_eta = digamma(self.a_eta)
+        self._gammaln_a_eta = gammaln(self.a_eta)
         if self._active_beta is not None:
             self.b_eta = self.dp + xp.where(
                 self._active_beta, self.E_beta, 0.0).sum(axis=1)
@@ -952,8 +909,7 @@ class CAVI:
         self.b_eta = xp.maximum(self.b_eta, 1e-6)
         # Cap E[eta] = a_eta/b_eta at 100 to prevent death spiral when
         # spike-slab kills most factors (a_eta ~ cp, b_eta ~ dp -> E[eta] huge)
-        if self.use_spike_slab_beta:
-            self.b_eta = xp.maximum(self.b_eta, self.a_eta / 100.0)
+        self.b_eta = xp.maximum(self.b_eta, self.a_eta / 100.0)
 
     def _update_r_beta(self, z_sum_beta, theta_col_sum, tau=1.0):
         """Update spike-and-slab inclusion probabilities r_{jk}.
@@ -965,9 +921,6 @@ class CAVI:
             only by the prior (keeping r_beta near its prior mean).  At
             tau=1 the full data likelihood is used.
         """
-        if not self.use_spike_slab_beta:
-            return
-
         E_log_beta = digamma(self.a_beta) - xp.log(self.b_beta)
         E_beta_raw = self.a_beta / self.b_beta
         E_log_eta = self._digamma_a_eta - xp.log(self.b_eta)
@@ -990,13 +943,9 @@ class CAVI:
         # but mediocre for count reconstruction.  This is the primary cause
         # of seed sensitivity (different seeds kill different factors).
         #
-        # IMPORTANT: the bonus must be scale-invariant.  The old formula
-        # (regression_weight * mean_lam * v_importance) scaled with |v|^2,
-        # creating a positive feedback loop: large |v| -> huge bonus ->
-        # r_beta -> 1 for everything -> no sparsity -> v diverges further.
-        # Fix: normalize v_importance to [0, 1] and cap the bonus at a
-        # fixed number of nats so it stays comparable to the prior log-odds.
-        if self.regression_weight > 0 and hasattr(self, 'mu_v'):
+        # The bonus must be scale-invariant: normalize v_importance to [0, 1]
+        # and cap at a fixed number of nats so it stays comparable to prior log-odds.
+        if hasattr(self, 'mu_v'):
             # v_importance[k] = sum_kappa E[v_kl^2] — how much factor k
             # contributes to the regression linear predictor variance.
             v_importance = xp.sum(
@@ -1075,88 +1024,75 @@ class CAVI:
         # a^theta_{ik} = a + Sum_j x_{ij} phi_{ijk}
         self.a_theta = self.a + z_sum_theta
 
-        # b_base = E[xi_i] + Sum_j E[beta_{jk}] + regression_weight * R_linear
+        # b_base = E[xi_i] + Sum_j E[beta_{jk}] + R_linear
         # Active-only beta sums (masked entries are absent from the model)
         if self._active_beta is not None:
             beta_sum = xp.where(self._active_beta, self.E_beta, 0.0).sum(axis=0)
         else:
             beta_sum = self.E_beta.sum(axis=0)  # (K,)
 
-        if self.regression_weight > 0:
-            # Pre-compute tiny (kappa, K) quantities for _regression_rate_parts
-            y_exp = y if y.ndim > 1 else y[:, None]        # (n, kappa)
-            lam = lambda_jj(self.zeta)                       # (n, kappa)
-            W = self._sample_weights                         # (n, kappa)
-            # NOTE: do NOT use self.E_theta here — it materializes the full
-            # (n, K) cache.  Row slices are computed on-the-fly below.
-            E_v = self.mu_v                                  # (kappa, K)
-            E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
-            E_v_sq_col = xp.square(E_v)                      # (kappa, K)
-            rw = self.regression_weight
+        # Pre-compute tiny (kappa, K) quantities for regression rate parts
+        y_exp = y if y.ndim > 1 else y[:, None]        # (n, kappa)
+        lam = lambda_jj(self.zeta)                       # (n, kappa)
+        W = self._sample_weights                         # (n, kappa)
+        # NOTE: do NOT use self.E_theta here — it materializes the full
+        # (n, K) cache.  Row slices are computed on-the-fly below.
+        E_v = self.mu_v                                  # (kappa, K)
+        E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
+        E_v_sq_col = xp.square(E_v)                      # (kappa, K)
 
-            min_chunk = max(1024, self.n // 256)
-            b_theta_chunks = []
-            i0 = 0
-            while i0 < self.n:
-                i1 = min(i0 + self._row_chunk, self.n)
-                try:
-                    # --- inline _regression_rate_parts for this chunk ---
-                    E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
-                    # Use L1-normalized theta for regression to decouple
-                    # from Poisson scale (prevents v from being crushed).
-                    theta_norm_c = self._normalize_theta_chunk(E_theta_c)
-                    W_c = W[i0:i1]
-                    W_lam_c = W_c * lam[i0:i1]
-                    theta_v_c = theta_norm_c @ E_v.T                          # (chunk, kappa)
-                    if self.p_aux > 0:
-                        theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
+        min_chunk = max(1024, self.n // 256)
+        b_theta_chunks = []
+        i0 = 0
+        while i0 < self.n:
+            i1 = min(i0 + self._row_chunk, self.n)
+            try:
+                # --- inline _regression_rate_parts for this chunk ---
+                E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
+                # Use L1-normalized theta for regression to decouple
+                # from Poisson scale (prevents v from being crushed).
+                theta_norm_c = self._normalize_theta_chunk(E_theta_c)
+                W_c = W[i0:i1]
+                W_lam_c = W_c * lam[i0:i1]
+                theta_v_c = theta_norm_c @ E_v.T                          # (chunk, kappa)
+                if self.p_aux > 0:
+                    theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
-                    R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
-                    R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
-                    R_lin_c = R_lin_c - 2.0 * theta_norm_c * (W_lam_c @ E_v_sq_col)
-                    R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
+                R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
+                R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
+                R_lin_c = R_lin_c - 2.0 * theta_norm_c * (W_lam_c @ E_v_sq_col)
+                R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
 
-                    # --- solve quadratic for b_theta ---
-                    b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
-                    b_base_c = b_poisson_c + rw * R_lin_c
-                    c_quad_c = rw * R_quad_c
-                    disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1])
-                    b_theta_c = (b_base_c + disc_c) / 2.0
+                # --- solve quadratic for b_theta ---
+                b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
+                b_base_c = b_poisson_c + R_lin_c
+                c_quad_c = R_quad_c
+                disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1])
+                b_theta_c = (b_base_c + disc_c) / 2.0
 
-                    # Floor at 10% of b_poisson
-                    b_theta_c = xp.maximum(b_theta_c, 0.1 * b_poisson_c)
-                    # Floor at bp
-                    b_theta_c = xp.maximum(b_theta_c, self.bp)
-                    # Absolute floor: in combined mode, beta_sum can be tiny
-                    # for pathway factors (few active genes), making b_poisson
-                    # and bp both near-zero.  Without this floor, b_theta
-                    # collapses → E[theta] explodes → destabilizes everything.
-                    b_theta_c = xp.maximum(b_theta_c, 1e-2)
-                    # Adaptive floor: cap E[theta] = a/b at 1e4 to prevent
-                    # explosion when spike-slab concentrates all counts into
-                    # a few surviving factors (a_theta can reach millions
-                    # while b_poisson collapses, making the fixed bp floor
-                    # useless).  1e4 is ~2x the healthy-regime max E[theta].
-                    b_theta_c = xp.maximum(b_theta_c, self.a_theta[i0:i1] / 1e4)
-                    b_theta_chunks.append(b_theta_c)
-                    i0 = i1
-                except Exception as exc:
-                    if _is_oom_error(exc) and self._row_chunk > min_chunk:
-                        self._row_chunk = max(min_chunk, self._row_chunk // 2)
-                        print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
-                        continue
-                    raise
+                # Floor at 10% of b_poisson
+                b_theta_c = xp.maximum(b_theta_c, 0.1 * b_poisson_c)
+                # Floor at bp
+                b_theta_c = xp.maximum(b_theta_c, self.bp)
+                # Absolute floor
+                b_theta_c = xp.maximum(b_theta_c, 1e-2)
+                # Adaptive floor: cap E[theta] = a/b at 1e4
+                b_theta_c = xp.maximum(b_theta_c, self.a_theta[i0:i1] / 1e4)
+                b_theta_chunks.append(b_theta_c)
+                i0 = i1
+            except Exception as exc:
+                if _is_oom_error(exc) and self._row_chunk > min_chunk:
+                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
+                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
+                    continue
+                raise
 
-            self.b_theta = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
-            self._theta_inner_iters = 1
+        self.b_theta = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
+        self._theta_inner_iters = 1
 
-            # Re-tighten zeta for updated theta
-            self._invalidate_theta_cache()
-            self._update_zeta(X_aux)
-        else:
-            self.b_theta = self.E_xi[:, None] + beta_sum[None, :]
-            self.b_theta = xp.maximum(self.b_theta, 1e-2)
-            self._theta_inner_iters = 0
+        # Re-tighten zeta for updated theta
+        self._invalidate_theta_cache()
+        self._update_zeta(X_aux)
         self._invalidate_theta_cache()
 
     def _update_xi(self):
@@ -1271,16 +1207,9 @@ class CAVI:
 
     def _update_v(self, y, X_aux, iteration=0):
         """
-        v posterior (diagonal Gaussian, JJ bound).
+        v posterior (diagonal Gaussian, JJ bound, Laplace/Bayesian Lasso prior).
 
-        For v_prior='normal':
-            precision_{kl} = 1/sigma^2_eff + 2 Sum_i lambda(zeta_{ik}) E[theta^2_{il}]
-            sigma^2_eff = sigma^2_v / K
-
-        For v_prior='laplace' (Bayesian Lasso):
             precision_{kl} = E_q[1/s_{kl}] + 2 Sum_i lambda(zeta_{ik}) E[theta^2_{il}]
-            where E_q[1/s_{kl}] is computed from the inverse Gaussian
-            variational posterior on the scale mixture variable s_{kl}.
 
         Memory-efficient: row-chunked to avoid full (n, K) temporaries
         (E_theta_sq, Var_theta) while accumulating (kappa, K) sufficient
@@ -1291,19 +1220,12 @@ class CAVI:
         W = self._sample_weights                    # (n, kappa)
         E_v = self.mu_v
 
-        # Scale prior precision by p (n_genes) so it matches the p-scaled
-        # regression_weight.  The p factors cancel in the posterior mean,
-        # making v independent of the number of genes.
-        if self.v_prior == 'normal':
-            sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
-            prior_precision = self.p / sigma_v_eff_sq
-        else:
-            E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
-            omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-            # Laplace (Bayesian Lasso) prior precision from the inverse-
-            # Gaussian scale mixture, scaled by p.
-            prior_precision_raw = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
-            prior_precision = self.p * xp.maximum(prior_precision_raw, 0.01)
+        # Laplace prior precision: use 1/(b_v*omega) only (MAP of the
+        # inverse-Gaussian, not the mean).
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
+        omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
+        prior_precision_raw = 1.0 / (self.b_v * omega)
+        prior_precision = self.p * xp.maximum(prior_precision_raw, 0.01)
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
         # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
@@ -1347,106 +1269,54 @@ class CAVI:
                     continue
                 raise
 
-        # Use the SAME regression weight as the ELBO for CAVI consistency.
-        # All coordinate updates must optimise the same objective; using a
-        # different rw for v broke CAVI guarantees and caused ELBO non-
-        # monotonicity.  The Laplace prior b_v is auto-calibrated (see
-        # _calibrate_b_v) so that data precision and prior precision cross
-        # over at a meaningful |v|, preserving sparsity despite the large rw.
-        rw_v = self.regression_weight
-        precision = prior_precision + rw_v * 2 * prec_sum               # (kappa, K)
-        term1 = rw_v * term1_sum
-        term2 = rw_v * 2.0 * (parta_sum - E_v * partb_sum)
+        precision = prior_precision + 2 * prec_sum               # (kappa, K)
+        term1 = term1_sum
+        term2 = 2.0 * (parta_sum - E_v * partb_sum)
         mean_prec = term1 - term2
 
         sigma_v_diag_new = 1.0 / precision
 
-        if self.v_prior == 'normal':
-            # Clip v per-element
-            v_clip = min(5.0, 10.0 / np.sqrt(self.K))
-            mu_v_new = xp.clip(mean_prec / precision, -v_clip, v_clip)
+        # Safety clip — with p-scaled prior the Laplace naturally
+        # constrains v, so this is a safety net only.
+        v_abs_clip = min(50.0, 500.0 / np.sqrt(self.K))
+        mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
 
-            # Adaptive damping — scale with K so that the per-iteration logit
-            # change ≈ K * alpha * |v| stays bounded regardless of K.
-            # K=50 → 0.15 (unchanged); K=348 → ~0.043.
-            alpha_max = min(0.15, 7.5 / self.K)
-            alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
-            mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+        # Moderate damping
+        alpha_max = min(0.15, 7.5 / np.sqrt(self.K))
+        alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
+        mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
 
-            # --- Period-2 oscillation detection and correction ---
-            if self._v_prev_mu is None:
-                self._v_prev_mu = xp.zeros_like(self.mu_v)
-                self._v_raw_prev = xp.zeros_like(self.mu_v)
+        # Per-element step cap.
+        max_step = min(1.0, 50.0 / np.sqrt(self.K))
+        delta = mu_v_candidate - self.mu_v
+        delta = xp.clip(delta, -max_step, max_step)
+        mu_v_candidate = self.mu_v + delta
 
-            sign_flip_now = (self.mu_v * mu_v_candidate) < 0
-            sign_flip_prev = (self._v_prev_mu * self.mu_v) < 0
-            oscillating = sign_flip_now & sign_flip_prev
+        # Period-2 oscillation detection and correction
+        if self._v_prev_mu is None:
+            self._v_prev_mu = xp.zeros_like(self.mu_v)
+            self._v_raw_prev = xp.zeros_like(self.mu_v)
 
-            avg_raw = 0.5 * (mu_v_new + self._v_raw_prev)
-            corrected = (1.0 - alpha) * self.mu_v + alpha * avg_raw
-            mu_v_candidate = xp.where(oscillating, corrected, mu_v_candidate)
+        sign_flip_now = (self.mu_v * mu_v_candidate) < 0
+        sign_flip_prev = (self._v_prev_mu * self.mu_v) < 0
+        oscillating = sign_flip_now & sign_flip_prev
 
-            self._v_prev_mu = xp.array(self.mu_v)
-            self._v_raw_prev = xp.array(mu_v_new)
-            self.mu_v = xp.clip(mu_v_candidate, -v_clip, v_clip)
-            # Use exact posterior variance — damping sigma creates a one-way
-            # ratchet that exponentially collapses variance over iterations
-            # because the data precision only grows as theta scales up.
-            self.sigma_v_diag = sigma_v_diag_new
-        else:
-            # Safety clip — with p-scaled prior the Laplace naturally
-            # constrains v, so this is a safety net only.
-            v_abs_clip = min(50.0, 500.0 / np.sqrt(self.K))
-            # K=130 → 43.9; K=50 → 50.0; K=500 → 22.4
-            mu_v_new = xp.clip(mean_prec / precision, -v_abs_clip, v_abs_clip)
+        period2 = xp.abs(mu_v_candidate - self._v_prev_mu) < 0.05 * (xp.abs(self.mu_v) + 1e-6)
+        oscillating = oscillating | period2
 
-            # Moderate damping: with p-scaled prior, the prior-data balance
-            # is well-conditioned (independent of p), so standard damping
-            # suffices for convergence stability.
-            alpha_max = min(0.15, 7.5 / np.sqrt(self.K))
-            # K=130 → 0.15; K=50 → 0.15; K=500 → 0.15 (cap)
-            alpha = min(alpha_max, 0.05 + (alpha_max - 0.05) * (iteration / max(200, iteration)))
-            mu_v_candidate = (1.0 - alpha) * self.mu_v + alpha * mu_v_new
+        avg_raw = 0.5 * (mu_v_new + self._v_raw_prev)
+        corrected = (1.0 - alpha) * self.mu_v + alpha * avg_raw
+        mu_v_candidate = xp.where(oscillating, corrected, mu_v_candidate)
 
-            # Per-element step cap.
-            max_step = min(1.0, 50.0 / np.sqrt(self.K))
-            # K=130 → 1.0
-            delta = mu_v_candidate - self.mu_v
-            delta = xp.clip(delta, -max_step, max_step)
-            mu_v_candidate = self.mu_v + delta
+        self._v_prev_mu = xp.array(self.mu_v)
+        self._v_raw_prev = xp.array(mu_v_new)
+        self.mu_v = xp.clip(mu_v_candidate, -v_abs_clip, v_abs_clip)
 
-            # Period-2 oscillation detection and correction
-            if self._v_prev_mu is None:
-                self._v_prev_mu = xp.zeros_like(self.mu_v)
-                self._v_raw_prev = xp.zeros_like(self.mu_v)
-
-            # Sign-flip detection (original)
-            sign_flip_now = (self.mu_v * mu_v_candidate) < 0
-            sign_flip_prev = (self._v_prev_mu * self.mu_v) < 0
-            oscillating = sign_flip_now & sign_flip_prev
-
-            # Period-2 cycle detection: if candidate ≈ v_{t-1} the
-            # system is bouncing between two attractors.  Average the
-            # raw proposals to escape the cycle.
-            period2 = xp.abs(mu_v_candidate - self._v_prev_mu) < 0.05 * (xp.abs(self.mu_v) + 1e-6)
-            oscillating = oscillating | period2
-
-            avg_raw = 0.5 * (mu_v_new + self._v_raw_prev)
-            corrected = (1.0 - alpha) * self.mu_v + alpha * avg_raw
-            mu_v_candidate = xp.where(oscillating, corrected, mu_v_candidate)
-
-            self._v_prev_mu = xp.array(self.mu_v)
-            self._v_raw_prev = xp.array(mu_v_new)
-            self.mu_v = xp.clip(mu_v_candidate, -v_abs_clip, v_abs_clip)
-
-            # Floor sigma_v_diag to prevent posterior variance collapse.
-            # With theta normalization, data precision is bounded (~N*lambda
-            # instead of N*lambda*E[theta]^2), so 1e-3 suffices.
-            sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-4)
-            # Laplace prior precision depends on mu_v through omega, so
-            # sigma and mu must move in lockstep.  Damping both at the
-            # same rate keeps q(v) coherent.
-            self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
+        # Floor sigma_v_diag to prevent posterior variance collapse.
+        sigma_v_diag_new = xp.maximum(sigma_v_diag_new, 1e-4)
+        # Laplace prior precision depends on mu_v through omega, so
+        # sigma and mu must move in lockstep.
+        self.sigma_v_diag = (1.0 - alpha) * self.sigma_v_diag + alpha * sigma_v_diag_new
 
     def _update_gamma(self, y, X_aux, iteration=0):
         """gamma posterior (Gaussian, JJ bound)."""
@@ -1474,20 +1344,24 @@ class CAVI:
         alpha_max = min(0.3, 3.0 / p)
         alpha = min(alpha_max, 0.05 * alpha_max / 0.3 + (alpha_max - 0.05 * alpha_max / 0.3) * (iteration / max(200, iteration)))
 
-        # Use the same regression weight as the ELBO for CAVI consistency.
-        rw_v = self.regression_weight
         for k in range(self.kappa):
-            # Scale gamma prior by p to match p-scaled regression_weight.
+            # Scale gamma prior by p.  Do NOT scale the intercept (column 0).
             prec_prior = self.p * xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            # Precision: 1/sigma^2 I + rw_v * 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
+            if self.use_intercept:
+                if USE_JAX:
+                    prec_prior = prec_prior.at[0, 0].set(
+                        1.0 / (self.sigma_gamma ** 2))
+                else:
+                    prec_prior[0, 0] = 1.0 / (self.sigma_gamma ** 2)
+            # Precision: 1/sigma^2 I + 2 Sum_i W_{ik} lambda(zeta_{ik}) x^aux_i x^aux_i^T
             W_lam_k = W[:, k] * lam[:, k]  # (n,) -- class-weighted lambda
-            weighted_X = X_aux * (rw_v * 2 * W_lam_k)[:, None]
+            weighted_X = X_aux * (2 * W_lam_k)[:, None]
             prec_lik = weighted_X.T @ X_aux
             prec = prec_prior + prec_lik
 
-            # Residual: rw_v * (W*(y - 0.5) - 2*W*lambda(zeta) theta*v)
+            # Residual: W*(y - 0.5) - 2*W*lambda(zeta)*theta*v
             theta_v_k = theta_v[:, k]
-            residual = rw_v * (W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k)
+            residual = W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k
             mean_prec = X_aux.T @ residual
 
             if USE_JAX:
@@ -1658,7 +1532,7 @@ class CAVI:
 
         del E_log_theta  # free the full (n, K) array
 
-        elbo += self.regression_weight * regression_ll
+        elbo += regression_ll
         elbo += theta_prior
         elbo -= self.n * self.K * gammaln_a
         elbo += theta_entropy
@@ -1666,59 +1540,48 @@ class CAVI:
         # === Prior: p(beta|eta) — active entries only ===
         # Masked entries are absent from the model, so they contribute
         # nothing to the prior or its normalization constant.
-        if self.use_spike_slab_beta:
-            # Raw (non-r-weighted) expected values for prior/entropy terms
-            _E_log_beta_raw = digamma(self.a_beta) - xp.log(self.b_beta)
-            _E_beta_raw = self.a_beta / self.b_beta
+        # === Prior: p(beta|eta) — spike-and-slab ===
+        _E_log_beta_raw = digamma(self.a_beta) - xp.log(self.b_beta)
+        _E_beta_raw = self.a_beta / self.b_beta
 
-            # Gamma prior (weighted by r_beta; masked entries have r=0)
-            _beta_prior_terms = ((self.c - 1) * _E_log_beta_raw
-                                 + self.c * E_log_eta[:, None]
-                                 - E_eta[:, None] * _E_beta_raw)
-            elbo += xp.sum(self.r_beta * _beta_prior_terms)
-            elbo -= xp.sum(self.r_beta) * gammaln(self.c)
-            del _beta_prior_terms
+        # Gamma prior (weighted by r_beta; masked entries have r=0)
+        _beta_prior_terms = ((self.c - 1) * _E_log_beta_raw
+                             + self.c * E_log_eta[:, None]
+                             - E_eta[:, None] * _E_beta_raw)
+        elbo += xp.sum(self.r_beta * _beta_prior_terms)
+        elbo -= xp.sum(self.r_beta) * gammaln(self.c)
+        del _beta_prior_terms
 
-            # Beta prior on pi_j: E[log p(pi_j | alpha_pi, beta_pi)]
-            _E_log_pi = digamma(self.a_pi) - digamma(self.a_pi + self.b_pi)
-            _E_log_1mpi = digamma(self.b_pi) - digamma(self.a_pi + self.b_pi)
-            elbo += xp.sum((self.alpha_pi - 1) * _E_log_pi
-                           + (self.beta_pi - 1) * _E_log_1mpi)
-            elbo -= xp.sum(gammaln(self.alpha_pi) + gammaln(self.beta_pi)
-                           - gammaln(self.alpha_pi + self.beta_pi))
+        # Beta prior on pi_j: E[log p(pi_j | alpha_pi, beta_pi)]
+        _E_log_pi = digamma(self.a_pi) - digamma(self.a_pi + self.b_pi)
+        _E_log_1mpi = digamma(self.b_pi) - digamma(self.a_pi + self.b_pi)
+        elbo += xp.sum((self.alpha_pi - 1) * _E_log_pi
+                       + (self.beta_pi - 1) * _E_log_1mpi)
+        elbo -= xp.sum(gammaln(self.alpha_pi) + gammaln(self.beta_pi)
+                       - gammaln(self.alpha_pi + self.beta_pi))
 
-            # Entropy of q(z_{jk}) = Bernoulli(r_{jk})
-            _r_clip = xp.clip(self.r_beta, 1e-7, 1 - 1e-7)
-            elbo -= xp.sum(_r_clip * xp.log(_r_clip)
-                           + (1 - _r_clip) * xp.log(1 - _r_clip))
-            del _r_clip
+        # Entropy of q(z_{jk}) = Bernoulli(r_{jk})
+        _r_clip = xp.clip(self.r_beta, 1e-7, 1 - 1e-7)
+        elbo -= xp.sum(_r_clip * xp.log(_r_clip)
+                       + (1 - _r_clip) * xp.log(1 - _r_clip))
+        del _r_clip
 
-            # Entropy of q(pi_j) = Beta(a_pi, b_pi)
-            _H_pi = (gammaln(self.a_pi) + gammaln(self.b_pi)
-                      - gammaln(self.a_pi + self.b_pi)
-                      - (self.a_pi - 1) * digamma(self.a_pi)
-                      - (self.b_pi - 1) * digamma(self.b_pi)
-                      + (self.a_pi + self.b_pi - 2) * digamma(self.a_pi + self.b_pi))
-            elbo += xp.sum(_H_pi)
-            del _H_pi
+        # Entropy of q(pi_j) = Beta(a_pi, b_pi)
+        _H_pi = (gammaln(self.a_pi) + gammaln(self.b_pi)
+                  - gammaln(self.a_pi + self.b_pi)
+                  - (self.a_pi - 1) * digamma(self.a_pi)
+                  - (self.b_pi - 1) * digamma(self.b_pi)
+                  + (self.a_pi + self.b_pi - 2) * digamma(self.a_pi + self.b_pi))
+        elbo += xp.sum(_H_pi)
+        del _H_pi
 
-            # Entropy of q(beta_{jk}) — weighted by r_beta (inactive = no entropy)
-            _psi_a_beta = digamma(self.a_beta)
-            _beta_entropy = (self.a_beta - xp.log(self.b_beta)
-                             + gammaln(self.a_beta)
-                             + (1 - self.a_beta) * _psi_a_beta)
-            elbo += xp.sum(self.r_beta * _beta_entropy)
-            del _psi_a_beta, _beta_entropy, _E_log_beta_raw, _E_beta_raw
-        else:
-            _beta_prior_terms = ((self.c - 1) * E_log_beta
-                                 + self.c * E_log_eta[:, None]
-                                 - E_eta[:, None] * E_beta)
-            if self._active_beta is not None:
-                elbo += xp.sum(xp.where(self._active_beta, _beta_prior_terms, 0.0))
-            else:
-                elbo += xp.sum(_beta_prior_terms)
-            del _beta_prior_terms
-            elbo -= self._n_active_beta * gammaln(self.c)
+        # Entropy of q(beta_{jk}) — weighted by r_beta (inactive = no entropy)
+        _psi_a_beta = digamma(self.a_beta)
+        _beta_entropy = (self.a_beta - xp.log(self.b_beta)
+                         + gammaln(self.a_beta)
+                         + (1 - self.a_beta) * _psi_a_beta)
+        elbo += xp.sum(self.r_beta * _beta_entropy)
+        del _psi_a_beta, _beta_entropy, _E_log_beta_raw, _E_beta_raw
 
         # === Prior: p(xi) ===
         elbo += xp.sum((self.ap - 1) * E_log_xi
@@ -1730,52 +1593,42 @@ class CAVI:
                        + self.cp * xp.log(self.dp) - self.dp * E_eta)
         elbo -= self.p * gammaln(self.cp)
 
-        # === Prior: p(v) — scaled by p to match p-scaled regression_weight ===
-        # The p factor makes the prior-data balance independent of n_genes.
-        # q(v) entropy (below) is NOT scaled — it's about q, not p.
+        # === Prior: p(v) — Laplace, scaled by p ===
         _p = float(self.p)
-        if self.v_prior == 'normal':
-            sigma_v_eff_sq = (self.sigma_v ** 2) / self.K
-            elbo -= _p * 0.5 * xp.sum(self.mu_v ** 2 + self.sigma_v_diag) / sigma_v_eff_sq
-            elbo -= _p * 0.5 * self.kappa * self.K * xp.log(2 * xp.pi * sigma_v_eff_sq)
-        else:
-            E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
-            omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-            E_inv_s = 1.0 / (self.b_v * omega) + 1.0 / (omega ** 2)
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
+        omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
+        E_inv_s = 1.0 / (self.b_v * omega)  # MAP approximation
 
-            mu_s = self.b_v / omega
-            E_log_s = xp.log(xp.maximum(mu_s, 1e-12))
-            elbo += _p * xp.sum(-0.5 * xp.log(2 * xp.pi) - 0.5 * E_log_s
-                                - 0.5 * E_v_sq * E_inv_s)
+        mu_s = self.b_v / omega
+        E_log_s = xp.log(xp.maximum(mu_s, 1e-12))
+        elbo += _p * xp.sum(-0.5 * xp.log(2 * xp.pi) - 0.5 * E_log_s
+                            - 0.5 * E_v_sq * E_inv_s)
 
-            rate_s = 1.0 / (2.0 * self.b_v ** 2)
-            elbo += _p * xp.sum(xp.log(rate_s) - mu_s * rate_s)
+        rate_s = 1.0 / (2.0 * self.b_v ** 2)
+        elbo += _p * xp.sum(xp.log(rate_s) - mu_s * rate_s)
 
-            lambda_s = 1.0 / (self.b_v ** 2)
-            elbo += _p * 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
-                                              / xp.maximum(lambda_s, 1e-12)))
+        lambda_s = 1.0 / (self.b_v ** 2)
+        elbo += _p * 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
+                                          / xp.maximum(lambda_s, 1e-12)))
 
-        # === Prior: p(gamma) — scaled by p to match p-scaled regression_weight ===
+        # === Prior: p(gamma) — scaled by p, except intercept (col 0) ===
         if self.p_aux > 0:
             sigma_gamma_sq = self.sigma_gamma ** 2
             for k in range(self.kappa):
-                elbo -= _p * 0.5 * self.p_aux * float(xp.log(2 * xp.pi * sigma_gamma_sq))
-                elbo -= _p * 0.5 * float(xp.sum(self.mu_gamma[k] ** 2)
-                                         + xp.trace(self.Sigma_gamma[k])) / sigma_gamma_sq
+                # Per-element scaling: p for aux covariates, 1 for intercept
+                _gamma_scale = xp.full(self.p_aux, _p)
+                if self.use_intercept:
+                    if USE_JAX:
+                        _gamma_scale = _gamma_scale.at[0].set(1.0)
+                    else:
+                        _gamma_scale[0] = 1.0
+                # E[log p(gamma)] = -0.5 * sum_j scale_j * (log(2pi*sigma^2) + (mu_j^2 + Sigma_jj)/sigma^2)
+                elbo -= 0.5 * float(xp.sum(_gamma_scale)) * float(xp.log(2 * xp.pi * sigma_gamma_sq))
+                _mu_sq_plus_var = self.mu_gamma[k] ** 2 + xp.diag(self.Sigma_gamma[k])
+                elbo -= 0.5 * float(xp.sum(_gamma_scale * _mu_sq_plus_var)) / sigma_gamma_sq
 
         # === Entropy: -E[log q] ===
-        # q(beta) — spike-slab entropy already handled above in prior block
-        if not self.use_spike_slab_beta:
-            # q(beta) — active entries only (masked entries are not latent variables)
-            psi_a_beta = digamma(self.a_beta)
-            _beta_entropy = (self.a_beta - xp.log(self.b_beta)
-                             + gammaln(self.a_beta)
-                             + (1 - self.a_beta) * psi_a_beta)
-            if self._active_beta is not None:
-                elbo += xp.sum(xp.where(self._active_beta, _beta_entropy, 0.0))
-            else:
-                elbo += xp.sum(_beta_entropy)
-            del psi_a_beta, _beta_entropy
+        # q(beta) entropy already handled above in spike-slab prior block
         # q(xi)
         elbo += xp.sum(self.a_xi - xp.log(self.b_xi)
                        + self._gammaln_a_xi
@@ -1915,7 +1768,7 @@ class CAVI:
 
         total_ll = poisson_ll_per_sample
         if regression_ll_per_sample is not None:
-            total_ll += self.regression_weight * regression_ll_per_sample
+            total_ll += regression_ll_per_sample
 
         return (float(total_ll), float(poisson_ll_per_sample),
                 regression_ll_per_sample, true_bernoulli_ll_per_sample)
@@ -1982,27 +1835,8 @@ class CAVI:
         # Initialize (creates numpy arrays, then transfers to device)
         self._initialize(X_train, y, X_aux)
 
-        # Auto-scale regression_weight by p (n_genes).  Poisson LL sums
-        # O(N*p) terms while regression LL sums O(N*kappa).  For regression
-        # to influence theta, rw must be O(p).  To prevent this from
-        # overwhelming the v/gamma priors, we ALSO scale those priors by p
-        # (see _update_v, _update_gamma, _compute_elbo).  The p factors
-        # cancel in the posterior mean of v and gamma, making the model
-        # behavior independent of the number of genes.
-        if self.kappa > 0:
-            rw_old = self.regression_weight
-            self._rw_user = rw_old  # Store pre-scaling value for calibration
-            self.regression_weight = self.regression_weight * float(self.p)
-            if verbose:
-                print(f"  regression_weight auto-scaled: {rw_old:.4f} * "
-                      f"n_genes={self.p} = {self.regression_weight:.1f}")
-
         # Re-scale Laplace b_v using patient count instead of cell count.
-        # When labels are patient-level (shared across cells from the same
-        # donor), the effective sample size for regression is n_patients, not
-        # n_cells.  Without this, the prior is ~sqrt(n_cells/n_patients) times
-        # too weak, causing v to saturate at its clip bounds.
-        if n_patients is not None and self.v_prior == 'laplace':
+        if n_patients is not None:
             b_v_old = self.b_v
             b_v_eff = self._b_v_orig * np.sqrt(self.K) / np.sqrt(n_patients)
             if verbose:
@@ -2085,6 +1919,9 @@ class CAVI:
             'jj_val_ll': [],            # (iter, JJ bound LL per sample)
             'eta_stats': [],            # (iter, min, median, max) of E[η]
             'beta_stats': [],           # (iter, min, median, max) of E[β]
+            'v_stats': [],              # (iter, min, median, max, mean_abs, n_near_zero, n_large)
+            'sigma_v_stats': [],        # (iter, min, median, max)
+            'gamma_stats': [],          # (iter, intercept, *aux_coeffs)
             'eta_vs_counts': None,      # final: (E[η], gene_total_counts, active_mask)
             'bp_dp': (float(self.bp), float(self.dp)),
             'implied_E_xi_prior': float((self.ap + self.K * self.a) / self.bp),
@@ -2133,7 +1970,7 @@ class CAVI:
             # Skip early iterations: phi starts random, z_sums are noise.
             # After warmup, anneal tau from 0→1 so data likelihood is
             # gradually introduced and r_beta doesn't make drastic decisions.
-            if self.use_spike_slab_beta and t > ss_warmup:
+            if t > ss_warmup:
                 _tau = min(1.0, (t - ss_warmup) / max(1, ss_anneal_iters))
                 _theta_col_sum = xp.zeros(self.K)
                 for i0 in range(0, self.n, self._row_chunk):
@@ -2150,15 +1987,14 @@ class CAVI:
                 print(f"  [diag t={t}] after beta,eta: "
                       f"E[beta]=[{float(self.E_beta.min()):.4e},{float(self.E_beta.max()):.4e}] "
                       f"E[eta]=[{float(self.E_eta.min()):.4e},{float(self.E_eta.max()):.4e}]")
-                if self.use_spike_slab_beta:
-                    r_np = to_numpy(self.r_beta)
-                    n_active = int((r_np > 0.5).sum())
-                    n_total = r_np.size
-                    mean_r = float(r_np.mean())
-                    genes_multi = int(((r_np > 0.5).sum(axis=1) > 1).sum())
-                    print(f"  [spike-slab t={t}] active={n_active}/{n_total} "
-                          f"({100*n_active/n_total:.1f}%) mean_r={mean_r:.4f} "
-                          f"genes_in_>1_prog={genes_multi}")
+                r_np = to_numpy(self.r_beta)
+                n_active = int((r_np > 0.5).sum())
+                n_total = r_np.size
+                mean_r = float(r_np.mean())
+                genes_multi = int(((r_np > 0.5).sum(axis=1) > 1).sum())
+                print(f"  [spike-slab t={t}] active={n_active}/{n_total} "
+                      f"({100*n_active/n_total:.1f}%) mean_r={mean_r:.4f} "
+                      f"genes_in_>1_prog={genes_multi}")
 
             # 2b. Rescale factors — DISABLED.
             # _rescale_factors() is not a valid CAVI coordinate-ascent step:
@@ -2215,7 +2051,7 @@ class CAVI:
             # Only at t=0: by t>0 theta has concentrated so the median data
             # precision across factors drops to ~0, making the calibration
             # formula produce absurdly large b_v.
-            if t == 0 and self.v_prior == 'laplace' and self.kappa > 0:
+            if t == 0 and self.kappa > 0:
                 self._calibrate_b_v(y, X_aux)
                 # Re-init sigma_v_diag to match the calibrated b_v.
                 # At t=0 there is no accumulated posterior info.  Without
@@ -2244,8 +2080,7 @@ class CAVI:
                           f"sigma2_v=[{float(self.sigma_v_diag.min()):.4e},{float(self.sigma_v_diag.max()):.4e}]")
 
                 # v saturation monitoring
-                _v_clip = min(50.0, 500.0 / np.sqrt(self.K)) if self.v_prior == 'laplace' \
-                    else min(5.0, 10.0 / np.sqrt(self.K))
+                _v_clip = min(50.0, 500.0 / np.sqrt(self.K))
                 _mu_v_np = np.asarray(self.mu_v)
                 _abs_v = np.abs(_mu_v_np)
                 _n_at_bound = int(np.sum(_abs_v >= _v_clip - 0.01))
@@ -2319,6 +2154,25 @@ class CAVI:
                 self.diagnostics_['beta_stats'].append(
                     (t, float(_E_beta_np.min()), float(np.median(_E_beta_np)),
                      float(_E_beta_np.max())))
+
+                # v, sigma_v, gamma convergence traces (scalars only)
+                if self.kappa > 0:
+                    _v_np = np.asarray(self.mu_v).ravel()
+                    _abs_v = np.abs(_v_np)
+                    self.diagnostics_['v_stats'].append((
+                        t, float(_v_np.min()), float(np.median(_v_np)),
+                        float(_v_np.max()), float(_abs_v.mean()),
+                        int(np.sum(_abs_v < 0.5)),    # n near zero
+                        int(np.sum(_abs_v > 5.0)),     # n large
+                    ))
+                    _sv_np = np.asarray(self.sigma_v_diag).ravel()
+                    self.diagnostics_['sigma_v_stats'].append((
+                        t, float(_sv_np.min()), float(np.median(_sv_np)),
+                        float(_sv_np.max())))
+                    if self.p_aux > 0:
+                        # Store all gamma values (typically 3: intercept, age, sex)
+                        _g = tuple(float(x) for x in np.asarray(self.mu_gamma).ravel())
+                        self.diagnostics_['gamma_stats'].append((t,) + _g)
 
                 # Held-out LL (with breakdown)
                 holl = None
@@ -2484,10 +2338,9 @@ class CAVI:
             'Sigma_gamma': to_numpy(self.Sigma_gamma).copy(),
             'zeta': to_numpy(self.zeta).copy(),
         }
-        if self.use_spike_slab_beta:
-            cp['r_beta'] = to_numpy(self.r_beta).copy()
-            cp['a_pi'] = to_numpy(self.a_pi).copy()
-            cp['b_pi'] = to_numpy(self.b_pi).copy()
+        cp['r_beta'] = to_numpy(self.r_beta).copy()
+        cp['a_pi'] = to_numpy(self.a_pi).copy()
+        cp['b_pi'] = to_numpy(self.b_pi).copy()
         return cp
 
     def _restore(self, cp):
@@ -2541,8 +2394,7 @@ class CAVI:
         # Pre-compute label-independent regression quantities (tiny, (kappa, K))
         E_v = self.mu_v                                  # (kappa, K)
         E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
-        has_regression = self.regression_weight > 0
-        rw = self.regression_weight
+        has_regression = True
 
         for _ in range(n_iter):
             E_log_theta = digamma(a_theta) - xp.log(b_theta)
@@ -2587,7 +2439,7 @@ class CAVI:
                 R_quad = (2.0 * lam) @ E_v_sq                # (n_new, K)
 
                 # Solve quadratic: b^2 - b_poisson*b - rw*R_quad*a_theta = 0
-                c_quad = rw * R_quad
+                c_quad = R_quad
                 disc = xp.sqrt(xp.square(b_poisson) + 4.0 * c_quad * a_theta)
                 b_theta = (b_poisson + disc) / 2.0
                 b_theta = xp.maximum(b_theta, 0.1 * b_poisson)

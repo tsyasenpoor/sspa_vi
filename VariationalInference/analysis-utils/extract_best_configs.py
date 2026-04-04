@@ -11,8 +11,8 @@ import glob
 
 RESULTS_ROOT = "/labs/Aguiar/SSPA_BRAY/results/sim_pathway/pbmc_bayes_opt"
 EXPERIMENTS = ["exp0_easy", "exp1_medium", "exp2_hard", "exp3_intersectional"]
-PRIORS = ["normal", "laplace"]
-MODES = ["combined", "masked", "unmasked"]
+PRIORS = [ "laplace"]
+MODES = ["unmasked"]
 
 
 def get_latest_best_params(prior, mode, exp):

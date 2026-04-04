@@ -80,32 +80,36 @@ SHARED_SEARCH_SPACE = {
     'sigma_v': ('log_float', 0.05, 2.0),
     'b_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
-    'regression_weight': ('log_float', 0.1, 500.0),
+    # With p-scaled prior (Fix 23), rw_user is the pre-multiplication value
+    # (effective rw = rw_user * p).  The ratio c_quad/b_poisson in the theta
+    # update simplifies to rw_user * v^2 / avg_beta — independent of p, N,
+    # and K.  One universal range works for all datasets.  Old ranges
+    # (0.1-500) were for the unscaled-prior regime where v went to clips.
+    'regression_weight': ('log_float', 0.001, 5.0),
     'alpha_pi': ('log_float', 0.1, 5.0),
     'beta_pi_scale': ('log_float', 1.0, 50.0),
 }
 
 # --- Dataset-specific presets ---
+# regression_weight is NOT overridden per dataset — the universal range
+# (0.001, 5.0) works for all because the p-scaled prior makes the
+# theta regression correction ratio p- and N-independent.
 DATASET_PRESETS = {
     'pbmc': {
         'n_factors': ('int', 20, 500, 5),
-        'regression_weight': ('log_float', 10.0, 500.0),
         'alpha_theta': ('float', 1.5, 4.0),
         'alpha_beta': ('float', 1.5, 4.0),
     },
     'simulation': {
         'n_factors': ('int', 20, 80, 5),
-        'regression_weight': ('log_float', 0.5, 50.0),
         'alpha_theta': ('float', 1.5, 4.0),
         'alpha_beta': ('float', 1.5, 4.0),
     },
     'emtab': {
         'n_factors': ('int', 20, 200, 10),
-        'regression_weight': ('log_float', 1.0, 200.0),
     },
     'covid': {
         'n_factors': ('int', 500, 5000, 100),
-        'regression_weight': ('log_float', 1.0, 500.0),
     },
 }
 

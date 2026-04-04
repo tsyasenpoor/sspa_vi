@@ -1042,7 +1042,7 @@ def plot_diagnostics(diagnostics, save_dir, fname="diagnostics.png"):
         print("No diagnostics available. Run fit() first.")
         return
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 15))
+    fig, axes = plt.subplots(4, 2, figsize=(14, 20))
 
     # --- Plot 1: Train theta L1 norms ---
     ax = axes[0, 0]
@@ -1128,6 +1128,42 @@ def plot_diagnostics(diagnostics, save_dir, fname="diagnostics.png"):
     ax.set_ylabel('E[beta_jk]')
     ax.set_title('E[beta] over iterations')
     ax.legend()
+
+    # --- Plot 7: v convergence trace ---
+    ax = axes[3, 0]
+    if diag.get('v_stats'):
+        data = list(zip(*diag['v_stats']))
+        iters = data[0]
+        vmins, vmeds, vmaxs, mean_abs = data[1], data[2], data[3], data[4]
+        n_near_zero, n_large = data[5], data[6]
+        ax.plot(iters, mean_abs, 'b-', label='mean |v|')
+        ax.fill_between(iters, vmins, vmaxs, alpha=0.12, color='b', label='min–max')
+        ax.plot(iters, vmeds, 'b--', alpha=0.5, label='median v')
+        ax2 = ax.twinx()
+        ax2.plot(iters, n_near_zero, 'g:', label='|v|<0.5')
+        ax2.plot(iters, n_large, 'r:', label='|v|>5')
+        ax2.set_ylabel('Count', color='gray')
+        ax2.tick_params(axis='y', labelcolor='gray')
+        ax2.legend(loc='right', fontsize=8)
+        ax.legend(loc='upper left', fontsize=8)
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('v')
+    ax.set_title('v weights convergence')
+
+    # --- Plot 8: gamma convergence trace ---
+    ax = axes[3, 1]
+    if diag.get('gamma_stats') and len(diag['gamma_stats']) > 0:
+        data = list(zip(*diag['gamma_stats']))
+        iters = data[0]
+        n_gamma = len(data) - 1
+        labels = ['intercept'] + [f'aux_{j}' for j in range(n_gamma - 1)]
+        for j in range(n_gamma):
+            ax.plot(iters, data[j + 1], label=labels[j])
+        ax.legend(fontsize=8)
+        ax.axhline(0, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('gamma')
+    ax.set_title('gamma (covariate weights) convergence')
 
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
