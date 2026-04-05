@@ -294,7 +294,7 @@ def gen_baselines_script(res: tuple) -> str:
 
         echo "Running baselines for disease (seed=$SEED)..."
 
-        python -u {VI_DIR}/run_baselines.py \\
+        python -u {VI_DIR}/comp/run_baselines.py \\
             --data {DATA_DIR} \\
             --label-column disease \\
             --aux-columns age sex_female \\
@@ -327,7 +327,7 @@ def gen_spectra_sup_script(res: tuple) -> str:
 
         # Fit Spectra (supervised with REACTOME pathways)
         FIT_START=$(date +%s)
-        python -u {VI_DIR}/run_spectra_supervised.py \\
+        python -u {VI_DIR}/comp/run_spectra_supervised.py \\
             --h5ad {H5AD_IBD} \\
             --gmt-file {GMT_FILE} \\
             --output-dir "$SPECTRA_OUT" \\
@@ -352,7 +352,7 @@ print(f'Wrote metadata: {{len(meta)}} samples')
 "
 
         # Downstream classifiers
-        python -u {VI_DIR}/run_spectra_baselines.py \\
+        python -u {VI_DIR}/comp/run_spectra_baselines.py \\
             --cell-scores "$SPECTRA_OUT/spectra_cell_scores.npy" \\
             --data "$SPECTRA_OUT/metadata_ibd.csv" \\
             --labels disease \\
@@ -452,7 +452,7 @@ print(f'Wrote scHPF inputs to {{tmpdir}}: {{src.n_obs}} samples x {{src.n_vars}}
         conda activate jax_gpu
         echo "Python (baselines): $(python --version)"
 
-        python -u {VI_DIR}/run_schpf_baselines.py \\
+        python -u {VI_DIR}/comp/run_schpf_baselines.py \\
             --model {model_file} \\
             --data "$TMPDIR_SCHPF/metadata_ibd.csv" \\
             --labels disease \\

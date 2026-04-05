@@ -154,12 +154,6 @@ def parse_args() -> argparse.Namespace:
 
     # Training options
     parser.add_argument(
-        '--regression-weight',
-        type=float,
-        default=1.0,
-        help='Weight for classification objective (higher=more focus on classification)'
-    )
-    parser.add_argument(
         '--check-freq',
         type=int,
         default=5,
@@ -180,24 +174,11 @@ def parse_args() -> argparse.Namespace:
         help='Gamma shape prior for beta (gene loadings). scHPF default 0.3.'
     )
     parser.add_argument(
-        '--sigma-v',
-        type=float,
-        default=1.0,
-        help='Gaussian prior std for v (classification weights). Used when --v-prior=normal.'
-    )
-    parser.add_argument(
         '--b-v',
         type=float,
         default=1.0,
-        help='Laplace prior scale for v (classification weights). Used when --v-prior=laplace. '
+        help='Laplace prior scale for v (classification weights). '
              'Smaller b_v = stronger sparsity.'
-    )
-    parser.add_argument(
-        '--v-prior',
-        type=str,
-        default='normal',
-        choices=['normal', 'laplace'],
-        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)."
     )
     parser.add_argument(
         '--sigma-gamma',
@@ -250,12 +231,6 @@ def parse_args() -> argparse.Namespace:
         help='Spike-and-slab mixture weight for beta.'
     )
     parser.add_argument(
-        '--spike-slab-beta',
-        action='store_true',
-        default=False,
-        help='Enable spike-and-slab prior on beta for exact-zero gene programs.'
-    )
-    parser.add_argument(
         '--alpha-pi',
         type=float,
         default=1.0,
@@ -294,7 +269,8 @@ def parse_args() -> argparse.Namespace:
         '--v-warmup',
         type=int,
         default=50,
-        help='Iterations before regression (v/gamma) updates begin'
+        help='Poisson-only warmup iterations before regression (v/gamma/zeta) updates begin. '
+             'Higher values (100-200) recommended for masked mode with many pathways.'
     )
 
     # Normalization options
@@ -680,20 +656,13 @@ def main():
     # =========================================================================
     # STEP 3.5: Hyperparameters
     # =========================================================================
-    sigma_v = args.sigma_v
-
     print(f"\nModel Hyperparameters (scHPF):")
     print(f"  a (theta shape): {args.a:.4f}")
     print(f"  c (beta shape):  {args.c:.4f}")
     print(f"  ap, cp:          1.0, 1.0 (fixed)")
     print(f"  bp, dp:          empirical (computed from data)")
-    print(f"  v_prior:         {args.v_prior}")
-    if args.v_prior == 'normal':
-        print(f"  sigma_v:         {sigma_v:.4f}")
-    else:
-        print(f"  b_v:             {args.b_v:.4f}")
+    print(f"  b_v:             {args.b_v:.4f}")
     print(f"  sigma_gamma:     {args.sigma_gamma:.4f}")
-    print(f"  regression_wt:   {args.regression_weight:.4f}")
     print(f"  max_iter:        {args.max_iter}")
     print(f"  tol:             {args.tol}")
 
@@ -728,18 +697,14 @@ def main():
         ap=ap_val,
         c=c_val,
         cp=cp_val,
-        sigma_v=sigma_v,
         b_v=args.b_v,
-        v_prior=args.v_prior,
         sigma_gamma=args.sigma_gamma,
-        regression_weight=args.regression_weight,
         use_intercept=not args.no_intercept,
         random_state=args.seed,
         mode=args.mode,
         pathway_mask=pathway_mask,
         pathway_names=pathway_names,
         n_pathway_factors=n_pathway_factors,
-        use_spike_slab_beta=args.spike_slab_beta,
         alpha_pi=args.alpha_pi,
         beta_pi_scale=args.beta_pi_scale,
     )
@@ -805,9 +770,7 @@ def main():
         'n_factors': model.K,
         'a': float(model.a),
         'c': float(model.c),
-        'sigma_v': float(model.sigma_v),
         'b_v': float(model.b_v),
-        'v_prior': model.v_prior,
         'E_beta': np.array(model.E_beta),
         'E_log_beta': np.array(model.E_log_beta),
         'mu_v': np.array(model.mu_v),
@@ -945,10 +908,20 @@ def main():
     # STEP 6b: Fit Platt calibrators on validation set
     # =========================================================================
     calibrators = {}
+    # Compute validation probabilities once, then slice per outcome
+    from sklearn.linear_model import LogisticRegression as _PlattLR
+    _probs_val_all = model.predict_proba(X_val, X_aux_val)
     for k in range(n_outcomes):
         lname = label_columns[k]
-        cal = model.fit_calibrator(
-            X_val, _y_val_2d[:, k], X_aux_val, method='platt')
+        if _probs_val_all.ndim > 1:
+            _probs_k = _probs_val_all[:, k]
+        else:
+            _probs_k = _probs_val_all
+        _probs_k = np.clip(_probs_k, 1e-7, 1 - 1e-7)
+        _logits_k = np.log(_probs_k / (1 - _probs_k))
+        _lr = _PlattLR(C=1e10, solver='lbfgs', max_iter=1000)
+        _lr.fit(_logits_k.reshape(-1, 1), _y_val_2d[:, k])
+        cal = {'method': 'platt', 'a': float(_lr.coef_[0, 0]), 'b': float(_lr.intercept_[0])}
         calibrators[lname] = cal
         print(f"Platt calibrator [{lname}]: a={cal['a']:.4f}, b={cal['b']:.4f}")
 
@@ -985,7 +958,7 @@ def main():
         y_test_pred_k = (_proba_test_2d[:, k] > thr_k).astype(int)
         metrics_k = compute_metrics(_y_test_2d[:, k], y_test_pred_k, _proba_test_2d[:, k])
         test_metrics_all[lname] = metrics_k
-        print(f"\nTest Results [{lname}]:")
+        print(f"\nTest Results [{lname}] (cell-level, {len(_y_test_2d)} cells):")
         print(f"  Accuracy:  {metrics_k['accuracy']:.4f}")
         if 'auc' in metrics_k:
             print(f"  AUC:       {metrics_k['auc']:.4f}")
@@ -1126,6 +1099,27 @@ def main():
         patient_pred_path = output_dir / f'{prefix}_patient_predictions.csv.gz'
         patient_pred_df.to_csv(patient_pred_path, compression='gzip', index=False)
         print(f"\nSaved patient-level predictions to {patient_pred_path}")
+
+        # --- Summary: Cell-level vs Patient-level AUC ---
+        print("\n" + "-" * 60)
+        print("AUC Summary: Cell-level vs Patient-level")
+        print("-" * 60)
+        print(f"  {'Label':<25} {'Split':<7} {'Cell AUC':>10} {'Patient AUC':>12} {'N_cells':>8} {'N_patients':>11}")
+        for split_name in ['val', 'test']:
+            cell_m = (val_metrics_all if split_name == 'val' else test_metrics_all)
+            pat_m = patient_metrics_all.get(split_name, {})
+            _split_cells = len(splits[split_name])
+            for lc in label_columns:
+                c_auc = cell_m.get(lc, {}).get('auc', float('nan'))
+                p_auc = pat_m.get(lc, {}).get('auc', float('nan'))
+                n_pat = 'N/A'
+                if split_name in patient_metrics_all:
+                    # Count patients from the patient predictions
+                    _pat_rows = [r for r in all_patient_pred_rows
+                                 if r['split'].iloc[0] == split_name and r['label'].iloc[0] == lc]
+                    n_pat = str(len(_pat_rows[0])) if _pat_rows else 'N/A'
+                print(f"  {lc:<25} {split_name:<7} {c_auc:>10.4f} {p_auc:>12.4f} {_split_cells:>8} {n_pat:>11}")
+        print("-" * 60)
 
     # =========================================================================
     # STEP 7c: Decomposed Diagnostics — cov-only vs factor vs full

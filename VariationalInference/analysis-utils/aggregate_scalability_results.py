@@ -10,10 +10,14 @@ Walks the results directory tree and collects:
 Outputs a unified CSV for analysis.
 
 Usage:
-    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/aggregate_scalability_results.py \
-        --results-root /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/methods \
-        --output /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/all_metrics.csv
-"""
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/aggregate_scalability_results.py \
+        --results-root /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/methods \
+        --output /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/all_metrics.csv
+
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/aggregate_scalability_results.py \
+        --results-root /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/methods \
+        --output /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/all_metrics.csv
+        """
 from __future__ import annotations
 
 import argparse
@@ -222,10 +226,10 @@ def _parse_baselines(baselines_dir: Path, ratio, seed: int) -> list[dict]:
 def parse_args():
     p = argparse.ArgumentParser(description="Aggregate scalability benchmark results")
     p.add_argument("--results-root",
-                   default="/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark/methods",
+                   default="/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/methods",
                    help="Root directory of method results")
     p.add_argument("--output", "-o",
-                   default="/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark/summary/all_metrics.csv",
+                   default="/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/summary/all_metrics.csv",
                    help="Output CSV path")
     return p.parse_args()
 

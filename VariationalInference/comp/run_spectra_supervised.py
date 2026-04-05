@@ -17,11 +17,11 @@ import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path for VariationalInference imports
+# Add BRay/ to path for VariationalInference imports (comp/ → VI/ → BRay/)
 script_dir = Path(__file__).resolve().parent
-parent_dir = script_dir.parent
-if str(parent_dir) not in sys.path:
-    sys.path.insert(0, str(parent_dir))
+bray_dir = script_dir.parent.parent
+if str(bray_dir) not in sys.path:
+    sys.path.insert(0, str(bray_dir))
 
 import argparse
 import numpy as np

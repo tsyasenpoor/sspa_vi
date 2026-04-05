@@ -10,10 +10,14 @@ Reads the aggregated CSV from aggregate_scalability_results.py and produces:
   3. Val F1  vs dataset size by method and label
 
 Usage:
-    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/plot_scalability_benchmarks.py \
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/plot_scalability_benchmarks.py \
+        --input  /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/all_metrics.csv \
+        --output-dir /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/plots
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/plot_scalability_benchmarks.py \
         --input  /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/all_metrics.csv \
         --output-dir /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/plots
-"""
+    """
+
 from __future__ import annotations
 
 import argparse
@@ -32,7 +36,6 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 METHOD_DISPLAY = {
     "drgp_unmasked": "DRGP (unmasked)",
-    "drgp_unmasked_fix": "DRGP (unmasked, fix)",
     "baselines/lr": "LR",
     "baselines/lrl": "LR-L1",
     "baselines/lrr": "LR-Ridge",
@@ -62,11 +65,11 @@ for _m in METHOD_DISPLAY:
         METHOD_FAMILY[_m] = "Spectra"
 
 FAMILY_COLORS = {
-    "DRGP": "#E69F00",           # Okabe-Ito orange
-    "Raw Classifier": "#56B4E9", # Okabe-Ito sky blue
-    "MF+Classifier": "#009E73",  # Okabe-Ito bluish green
-    "scHPF": "#CC79A7",          # Okabe-Ito reddish purple
-    "Spectra": "#0072B2",        # Okabe-Ito blue
+    "DRGP": "#E69F00",           # Okabe-Ito orange (our method)
+    "Raw Classifier": "#999999", # gray
+    "MF+Classifier": "#666666",  # dark gray
+    "scHPF": "#AAAAAA",          # light gray
+    "Spectra": "#444444",        # charcoal
 }
 FAMILY_MARKERS = {
     "DRGP": "D",
@@ -75,14 +78,6 @@ FAMILY_MARKERS = {
     "scHPF": "^",
     "Spectra": "v",
 }
-
-
-def _style(method: str):
-    family = METHOD_FAMILY.get(method, "Other")
-    return {
-        "color": FAMILY_COLORS.get(family, "#7f7f7f"),
-        "marker": FAMILY_MARKERS.get(family, "x"),
-    }
 
 
 def _display(method: str) -> str:
@@ -105,32 +100,30 @@ def _build_patient_to_cells(df: pd.DataFrame) -> dict[int, int]:
     )
 
 
-def _add_cell_axis(ax: plt.Axes, patient_to_cells: dict[int, int]):
-    """Add a secondary x-axis showing cell counts."""
-    if not patient_to_cells:
-        return
-    ax2 = ax.twiny()
-    ax2.set_xlim(ax.get_xlim())
-    patient_ticks = sorted(patient_to_cells.keys())
-    ax2.set_xticks(patient_ticks)
-    ax2.set_xticklabels(
-        [f"{patient_to_cells[p]:,}" for p in patient_ticks],
-        fontsize=9,
-    )
-    ax2.set_xlabel("Number of Cells (total)", fontsize=11)
-
-
 # ---------------------------------------------------------------------------
 # Benchmark: wall time + peak memory
 # ---------------------------------------------------------------------------
 
 def plot_benchmark_panel(df: pd.DataFrame, out_dir: Path, p2c: dict):
-    """Side-by-side wall time and peak memory vs number of patients."""
+    """Bar charts with seed-level scatter: one col per patient count, two rows."""
     cols = ["ratio", "seed", "method", "wall_time_s", "peak_rss_mb"]
     bm = df[df["wall_time_s"].notna()][cols].drop_duplicates()
     if bm.empty:
         print("  No benchmark data to plot.")
         return
+
+    bench_display = {
+        "drgp_unmasked": "DRGP",
+        "schpf": "scHPF",
+        "spectra_sup": "Spectra",
+        "baselines": "Baselines",
+    }
+    bench_colors = {
+        "drgp_unmasked": "#E69F00",
+        "schpf": "#AAAAAA",
+        "spectra_sup": "#444444",
+        "baselines": "#999999",
+    }
 
     def _bench_group(m):
         if m.startswith("drgp"):
@@ -146,79 +139,76 @@ def plot_benchmark_panel(df: pd.DataFrame, out_dir: Path, p2c: dict):
     bm = bm.copy()
     bm["group"] = bm["method"].apply(_bench_group)
 
+    # One entry per (seed, group, ratio)
     grouped = (
         bm.groupby(["ratio", "seed", "group"])
         .agg({"wall_time_s": "first", "peak_rss_mb": "first"})
         .reset_index()
     )
-    stats = (
-        grouped.groupby(["group", "ratio"])
-        .agg(
-            time_mean=("wall_time_s", "mean"),
-            time_std=("wall_time_s", "std"),
-            mem_mean=("peak_rss_mb", "mean"),
-            mem_std=("peak_rss_mb", "std"),
-        )
-        .reset_index()
+
+    ratios = sorted(grouped["ratio"].unique())
+    all_groups = sorted(grouped["group"].unique(), key=lambda g: bench_display.get(g, g))
+    n_ratios = len(ratios)
+
+    metrics_info = [
+        ("wall_time_s", 60.0, "Wall Time (minutes)"),
+        ("peak_rss_mb", 1024.0, "Peak Memory (GB)"),
+    ]
+
+    fig, axes = plt.subplots(
+        len(metrics_info), n_ratios,
+        figsize=(4.5 * n_ratios, 5 * len(metrics_info)),
+        squeeze=False, sharey="row",
     )
-    stats["time_std"] = stats["time_std"].fillna(0)
-    stats["mem_std"] = stats["mem_std"].fillna(0)
 
-    bench_display = {
-        "drgp_unmasked": "DRGP (unmasked)",
-        "drgp_unmasked_fix": "DRGP (unmasked, fix)",
-        "schpf": "scHPF",
-        "spectra_sup": "Spectra",
-        "baselines": "Baselines (raw)",
-    }
-    bench_colors = {
-        "drgp_unmasked": "#E69F00",      # Okabe-Ito orange
-        "drgp_unmasked_fix": "#F0E442",  # Okabe-Ito yellow
-        "schpf": "#CC79A7",              # Okabe-Ito reddish purple
-        "spectra_sup": "#0072B2",        # Okabe-Ito blue
-        "baselines": "#56B4E9",          # Okabe-Ito sky blue
-    }
-    bench_markers = {
-        "drgp_unmasked": "D",
-        "drgp_unmasked_fix": "d",
-        "schpf": "^",
-        "spectra_sup": "v",
-        "baselines": "o",
-    }
+    for row, (col_name, divisor, ylabel) in enumerate(metrics_info):
+        for col, ratio in enumerate(ratios):
+            ax = axes[row, col]
+            sub = grouped[grouped["ratio"] == ratio]
+            groups_here = [g for g in all_groups if g in sub["group"].values]
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            if not groups_here:
+                ax.set_visible(False)
+                continue
 
-    for grp in sorted(stats["group"].unique()):
-        g = stats[stats["group"] == grp].sort_values("ratio")
-        n_patients = g["ratio"].values  # ratio column IS patient count now
+            positions = np.arange(len(groups_here))
+            colors = [bench_colors.get(g, "#7f7f7f") for g in groups_here]
 
-        label = bench_display.get(grp, grp)
-        color = bench_colors.get(grp, "#7f7f7f")
-        marker = bench_markers.get(grp, "x")
+            for i, g in enumerate(groups_here):
+                vals = sub[sub["group"] == g][col_name].values / divisor
+                mean_val = vals.mean()
+                ax.bar(
+                    i, mean_val, width=0.55, color=colors[i],
+                    edgecolor="black", linewidth=0.5, alpha=0.75,
+                )
+                # Overlay individual seed points with jitter
+                jitter = np.random.default_rng(42).uniform(-0.12, 0.12, size=len(vals))
+                ax.scatter(
+                    np.full_like(vals, i) + jitter, vals,
+                    color="black", s=18, zorder=3, alpha=0.7,
+                    edgecolors="white", linewidths=0.4,
+                )
 
-        ax1.errorbar(
-            n_patients, g["time_mean"] / 60, yerr=g["time_std"] / 60,
-            label=label, color=color, marker=marker, markersize=8,
-            capsize=4, linewidth=2, alpha=0.85,
-        )
-        ax2.errorbar(
-            n_patients, g["mem_mean"] / 1024, yerr=g["mem_std"] / 1024,
-            label=label, color=color, marker=marker, markersize=8,
-            capsize=4, linewidth=2, alpha=0.85,
-        )
+            ax.set_xticks(positions)
+            ax.set_xticklabels(
+                [bench_display.get(g, g) for g in groups_here],
+                fontsize=8, rotation=35, ha="right",
+            )
+            ax.grid(True, axis="y", alpha=0.3)
 
-    for ax, ylabel, title in [
-        (ax1, "Wall Time (minutes)", "Wall Time vs Dataset Size"),
-        (ax2, "Peak Memory (GB)", "Peak Memory vs Dataset Size"),
-    ]:
-        ax.set_xlabel("Number of Patients", fontsize=12)
-        ax.set_ylabel(ylabel, fontsize=12)
-        ax.set_title(title, fontsize=13, fontweight="bold")
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=10)
-        _add_cell_axis(ax, p2c)
+            n_cells_str = f" ({p2c[ratio]:,} cells)" if ratio in p2c else ""
+            if row == 0:
+                ax.set_title(
+                    f"{int(ratio)} patients{n_cells_str}",
+                    fontsize=10, fontweight="bold",
+                )
+            if col == 0:
+                ax.set_ylabel(ylabel, fontsize=11)
 
+    fig.suptitle(
+        "Wall Time and Peak Memory by Method and Dataset Size",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
     fig.tight_layout()
     fig.savefig(out_dir / "benchmark_time_memory.png", dpi=200, bbox_inches="tight")
     fig.savefig(out_dir / "benchmark_time_memory.pdf", bbox_inches="tight")
@@ -232,46 +222,88 @@ def plot_benchmark_panel(df: pd.DataFrame, out_dir: Path, p2c: dict):
 
 def _plot_metric(
     df: pd.DataFrame, metric: str, out_dir: Path, p2c: dict,
-    ylim: tuple = (0.0, 1.0),
 ):
-    """Generic: val <metric> vs number of patients, one subplot per label."""
+    """Grouped box plots: one column per patient count, one row per label.
+
+    Within each panel, methods are shown as individual boxes so the discrete
+    dataset sizes are not connected by misleading trend lines.
+    """
     val = df[(df["split"] == "val") & df[metric].notna()].copy()
     if val.empty:
         print(f"  No val {metric.upper()} data to plot.")
         return
 
     labels = sorted(val["label"].unique())
+    ratios = sorted(val["ratio"].unique())
     n_labels = len(labels)
-    fig, axes = plt.subplots(1, n_labels, figsize=(7 * n_labels, 6), squeeze=False)
+    n_ratios = len(ratios)
 
-    for idx, label_name in enumerate(labels):
-        ax = axes[0, idx]
-        sub = val[val["label"] == label_name]
-        stats = (
-            sub.groupby(["method", "ratio"])[metric]
-            .agg(["mean", "std"])
-            .reset_index()
-        )
-        stats["std"] = stats["std"].fillna(0)
+    fig, axes = plt.subplots(
+        n_labels, n_ratios,
+        figsize=(4.5 * n_ratios, 5 * n_labels),
+        squeeze=False,
+    )
 
-        for method in sorted(stats["method"].unique()):
-            g = stats[stats["method"] == method].sort_values("ratio")
-            n_patients = g["ratio"].values
-            style = _style(method)
-            ax.errorbar(
-                n_patients, g["mean"], yerr=g["std"],
-                label=_display(method), capsize=3, linewidth=1.5,
-                markersize=6, alpha=0.8, **style,
+    # Determine a consistent method order across all panels (sorted by family
+    # then display name) so colours and positions are comparable.
+    all_methods = sorted(val["method"].unique(), key=lambda m: (
+        METHOD_FAMILY.get(m, "ZZZ"), _display(m),
+    ))
+
+    for row, label_name in enumerate(labels):
+        for col, ratio in enumerate(ratios):
+            ax = axes[row, col]
+            sub = val[(val["label"] == label_name) & (val["ratio"] == ratio)]
+
+            # Only include methods that have data for this (label, ratio).
+            methods_here = [m for m in all_methods if m in sub["method"].values]
+            box_data = [sub[sub["method"] == m][metric].values for m in methods_here]
+            families = [METHOD_FAMILY.get(m, "Other") for m in methods_here]
+            colors = [FAMILY_COLORS.get(f, "#7f7f7f") for f in families]
+
+            if not box_data:
+                ax.set_visible(False)
+                continue
+
+            positions = np.arange(len(methods_here))
+            bp = ax.boxplot(
+                box_data, positions=positions, widths=0.55,
+                patch_artist=True, showmeans=True,
+                meanprops=dict(marker="D", markerfacecolor="white",
+                               markeredgecolor="black", markersize=4),
+                medianprops=dict(color="black", linewidth=1.2),
+                flierprops=dict(marker="o", markersize=3, alpha=0.5),
             )
+            for patch, c in zip(bp["boxes"], colors):
+                patch.set_facecolor(c)
+                patch.set_alpha(0.75)
 
-        ax.set_xlabel("Number of Patients", fontsize=12)
-        ax.set_ylabel(f"Val {metric.upper()}", fontsize=12)
-        ax.set_title(f"Val {metric.upper()} — {label_name}", fontsize=13, fontweight="bold")
-        ax.set_ylim(*ylim)
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=7, ncol=2, loc="lower right")
-        _add_cell_axis(ax, p2c)
+            ax.set_xticks(positions)
+            ax.set_xticklabels(
+                [_display(m) for m in methods_here],
+                fontsize=7, rotation=45, ha="right",
+            )
+            ax.grid(True, axis="y", alpha=0.3)
 
+            n_cells_str = f" ({p2c[ratio]:,} cells)" if ratio in p2c else ""
+            ax.set_title(
+                f"{int(ratio)} patients{n_cells_str}",
+                fontsize=10, fontweight="bold",
+            )
+            if col == 0:
+                ax.set_ylabel(f"Val {metric.upper()}", fontsize=11)
+
+        # Row label on the left-most axis
+        axes[row, 0].annotate(
+            label_name, xy=(-0.35, 0.5), xycoords="axes fraction",
+            fontsize=13, fontweight="bold", rotation=90,
+            va="center", ha="center",
+        )
+
+    fig.suptitle(
+        f"Val {metric.upper()} by Method and Dataset Size",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
     fig.tight_layout()
     fname = f"val_{metric}_vs_size"
     fig.savefig(out_dir / f"{fname}.png", dpi=200, bbox_inches="tight")
@@ -286,17 +318,15 @@ def _plot_metric(
 
 BENCH_DISPLAY = {
     "drgp_unmasked": "DRGP",
-    "drgp_unmasked_fix": "DRGP (fix)",
     "schpf": "scHPF",
     "spectra_sup": "Spectra",
     "baselines": "Baselines",
 }
 BENCH_COLORS = {
-    "drgp_unmasked": "#E69F00",      # Okabe-Ito orange
-    "drgp_unmasked_fix": "#F0E442",  # Okabe-Ito yellow
-    "schpf": "#CC79A7",              # Okabe-Ito reddish purple
-    "spectra_sup": "#0072B2",        # Okabe-Ito blue
-    "baselines": "#56B4E9",          # Okabe-Ito sky blue
+    "drgp_unmasked": "#E69F00",      # orange (our method)
+    "schpf": "#AAAAAA",              # light gray
+    "spectra_sup": "#444444",        # charcoal
+    "baselines": "#999999",          # gray
 }
 
 
@@ -313,7 +343,7 @@ def _bench_group(m: str) -> str:
 
 
 def plot_benchmark_bars(df: pd.DataFrame, out_dir: Path):
-    """Bar chart comparing wall time and peak memory across methods."""
+    """Bar chart with seed-level scatter for wall time and peak memory."""
     cols = ["seed", "method", "wall_time_s", "peak_rss_mb"]
     bm = df[df["wall_time_s"].notna()][[c for c in cols if c in df.columns]].drop_duplicates()
     if bm.empty:
@@ -329,49 +359,34 @@ def plot_benchmark_bars(df: pd.DataFrame, out_dir: Path):
         .agg({"wall_time_s": "first", "peak_rss_mb": "first"})
         .reset_index()
     )
-    stats = (
-        grouped.groupby("group")
-        .agg(
-            time_mean=("wall_time_s", "mean"),
-            time_std=("wall_time_s", "std"),
-            mem_mean=("peak_rss_mb", "mean"),
-            mem_std=("peak_rss_mb", "std"),
-        )
-        .reset_index()
-    )
-    stats["time_std"] = stats["time_std"].fillna(0)
-    stats["mem_std"] = stats["mem_std"].fillna(0)
-    stats = stats.sort_values("time_mean")
 
-    groups = stats["group"].tolist()
-    labels = [BENCH_DISPLAY.get(g, g) for g in groups]
-    colors = [BENCH_COLORS.get(g, "#7f7f7f") for g in groups]
-    x = np.arange(len(groups))
+    groups_sorted = sorted(grouped["group"].unique(), key=lambda g: BENCH_DISPLAY.get(g, g))
+    colors = [BENCH_COLORS.get(g, "#7f7f7f") for g in groups_sorted]
+    x = np.arange(len(groups_sorted))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    metrics_info = [
+        ("wall_time_s", 60.0, "Wall Time (minutes)", "Wall Time"),
+        ("peak_rss_mb", 1024.0, "Peak Memory (GB)", "Peak Memory"),
+    ]
 
-    # Wall time in minutes
-    ax1.bar(x, stats["time_mean"] / 60, yerr=stats["time_std"] / 60,
-            color=colors, capsize=5, edgecolor="black", linewidth=0.5)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(labels, fontsize=11)
-    ax1.set_ylabel("Wall Time (minutes)", fontsize=12)
-    ax1.set_title("Wall Time", fontsize=13, fontweight="bold")
-    ax1.grid(True, axis="y", alpha=0.3)
-    # Add value labels on bars
-    for i, (mean, std) in enumerate(zip(stats["time_mean"] / 60, stats["time_std"] / 60)):
-        ax1.text(i, mean + std + 0.5, f"{mean:.1f}", ha="center", va="bottom", fontsize=10)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Peak memory in GB
-    ax2.bar(x, stats["mem_mean"] / 1024, yerr=stats["mem_std"] / 1024,
-            color=colors, capsize=5, edgecolor="black", linewidth=0.5)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(labels, fontsize=11)
-    ax2.set_ylabel("Peak Memory (GB)", fontsize=12)
-    ax2.set_title("Peak Memory", fontsize=13, fontweight="bold")
-    ax2.grid(True, axis="y", alpha=0.3)
-    for i, (mean, std) in enumerate(zip(stats["mem_mean"] / 1024, stats["mem_std"] / 1024)):
-        ax2.text(i, mean + std + 0.1, f"{mean:.1f}", ha="center", va="bottom", fontsize=10)
+    for ax, (col_name, divisor, ylabel, title) in zip(axes, metrics_info):
+        for i, g in enumerate(groups_sorted):
+            vals = grouped[grouped["group"] == g][col_name].values / divisor
+            mean_val = vals.mean()
+            ax.bar(i, mean_val, width=0.55, color=colors[i],
+                   edgecolor="black", linewidth=0.5, alpha=0.75)
+            jitter = np.random.default_rng(42).uniform(-0.12, 0.12, size=len(vals))
+            ax.scatter(np.full_like(vals, i) + jitter, vals,
+                       color="black", s=18, zorder=3, alpha=0.7,
+                       edgecolors="white", linewidths=0.4)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([BENCH_DISPLAY.get(g, g) for g in groups_sorted], fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        ax.grid(True, axis="y", alpha=0.3)
 
     fig.suptitle("Benchmark Comparison", fontsize=14, fontweight="bold")
     fig.tight_layout()
@@ -382,7 +397,7 @@ def plot_benchmark_bars(df: pd.DataFrame, out_dir: Path):
 
 
 def _plot_metric_bars(df: pd.DataFrame, metric: str, out_dir: Path):
-    """Bar chart of val <metric> by method, one subplot per label."""
+    """Box plots of val <metric> by method with seed-level scatter, one subplot per label."""
     val = df[(df["split"] == "val") & df[metric].notna()].copy()
     if val.empty:
         print(f"  No val {metric.upper()} data to plot.")
@@ -395,27 +410,45 @@ def _plot_metric_bars(df: pd.DataFrame, metric: str, out_dir: Path):
     for idx, label_name in enumerate(labels):
         ax = axes[0, idx]
         sub = val[val["label"] == label_name]
-        stats = (
-            sub.groupby("method")[metric]
-            .agg(["mean", "std"])
-            .reset_index()
-            .sort_values("mean", ascending=False)
-        )
-        stats["std"] = stats["std"].fillna(0)
 
-        methods = stats["method"].tolist()
-        disp_labels = [_display(m) for m in methods]
+        # Sort methods by family then display name
+        methods = sorted(sub["method"].unique(), key=lambda m: (
+            METHOD_FAMILY.get(m, "ZZZ"), _display(m),
+        ))
+        box_data = [sub[sub["method"] == m][metric].values for m in methods]
         families = [METHOD_FAMILY.get(m, "Other") for m in methods]
         colors = [FAMILY_COLORS.get(f, "#7f7f7f") for f in families]
-        x = np.arange(len(methods))
 
-        ax.bar(x, stats["mean"].values, yerr=stats["std"].values,
-               color=colors, capsize=4, edgecolor="black", linewidth=0.5)
-        ax.set_xticks(x)
-        ax.set_xticklabels(disp_labels, fontsize=8, rotation=35, ha="right")
+        positions = np.arange(len(methods))
+        bp = ax.boxplot(
+            box_data, positions=positions, widths=0.55,
+            patch_artist=True, showmeans=True,
+            meanprops=dict(marker="D", markerfacecolor="white",
+                           markeredgecolor="black", markersize=4),
+            medianprops=dict(color="black", linewidth=1.2),
+            flierprops=dict(marker="o", markersize=3, alpha=0.5),
+        )
+        for patch, c in zip(bp["boxes"], colors):
+            patch.set_facecolor(c)
+            patch.set_alpha(0.75)
+
+        # Overlay individual seed points
+        rng = np.random.default_rng(42)
+        for i, vals in enumerate(box_data):
+            jitter = rng.uniform(-0.12, 0.12, size=len(vals))
+            ax.scatter(
+                np.full_like(vals, i) + jitter, vals,
+                color="black", s=18, zorder=3, alpha=0.7,
+                edgecolors="white", linewidths=0.4,
+            )
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels(
+            [_display(m) for m in methods],
+            fontsize=8, rotation=35, ha="right",
+        )
         ax.set_ylabel(f"Val {metric.upper()}", fontsize=12)
         ax.set_title(f"{label_name}", fontsize=13, fontweight="bold")
-        ax.set_ylim(0, 1.05)
         ax.grid(True, axis="y", alpha=0.3)
 
     fig.suptitle(f"Val {metric.upper()} by Method", fontsize=14, fontweight="bold")
@@ -478,10 +511,10 @@ def main():
         plot_benchmark_panel(df, out_dir, p2c)
 
         print("Plotting val AUC ...")
-        _plot_metric(df, "auc", out_dir, p2c, ylim=(0.4, 1.0))
+        _plot_metric(df, "auc", out_dir, p2c)
 
         print("Plotting val F1 ...")
-        _plot_metric(df, "f1", out_dir, p2c, ylim=(0.0, 1.0))
+        _plot_metric(df, "f1", out_dir, p2c)
     else:
         print("Plotting benchmark bars ...")
         plot_benchmark_bars(df, out_dir)

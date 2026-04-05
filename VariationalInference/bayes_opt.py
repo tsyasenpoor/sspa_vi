@@ -27,7 +27,7 @@ Usage:
     # Only tune specific params
     python -m VariationalInference.bayes_opt \
         --data /path/to/data.h5ad \
-        --params-to-tune n_factors regression_weight \
+        --params-to-tune n_factors b_v \
         --n-trials 30
 """
 import os
@@ -77,23 +77,13 @@ SHARED_SEARCH_SPACE = {
     'alpha_beta': ('float', 0.5, 4.0),
     'alpha_xi': ('float', 0.5, 4.0),
     'alpha_eta': ('float', 0.5, 4.0),
-    'sigma_v': ('log_float', 0.05, 2.0),
     'b_v': ('log_float', 0.05, 2.0),
     'sigma_gamma': ('log_float', 0.1, 2.0),
-    # With p-scaled prior (Fix 23), rw_user is the pre-multiplication value
-    # (effective rw = rw_user * p).  The ratio c_quad/b_poisson in the theta
-    # update simplifies to rw_user * v^2 / avg_beta — independent of p, N,
-    # and K.  One universal range works for all datasets.  Old ranges
-    # (0.1-500) were for the unscaled-prior regime where v went to clips.
-    'regression_weight': ('log_float', 0.001, 5.0),
     'alpha_pi': ('log_float', 0.1, 5.0),
     'beta_pi_scale': ('log_float', 1.0, 50.0),
 }
 
 # --- Dataset-specific presets ---
-# regression_weight is NOT overridden per dataset — the universal range
-# (0.001, 5.0) works for all because the p-scaled prior makes the
-# theta regression correction ratio p- and N-independent.
 DATASET_PRESETS = {
     'pbmc': {
         'n_factors': ('int', 20, 500, 5),
@@ -131,9 +121,7 @@ def _suggest_param(trial: optuna.Trial, name: str, spec: tuple):
         raise ValueError(f"Unknown param type: {ptype}")
 
 
-def build_search_space(dataset_preset: Optional[str] = None,
-                       v_prior: str = 'normal',
-                       use_spike_slab_beta: bool = False) -> Dict[str, tuple]:
+def build_search_space(dataset_preset: Optional[str] = None) -> Dict[str, tuple]:
     """
     Build the full search space for VI (CAVI).
 
@@ -142,9 +130,6 @@ def build_search_space(dataset_preset: Optional[str] = None,
     dataset_preset : str, optional
         One of 'pbmc', 'simulation', 'emtab', 'covid'. Overrides defaults for
         dataset-specific ranges.
-    v_prior : str, default='normal'
-        Prior for v: 'normal' or 'laplace'. When 'laplace', tunes b_v
-        instead of sigma_v.
 
     Returns
     -------
@@ -152,17 +137,6 @@ def build_search_space(dataset_preset: Optional[str] = None,
         Mapping param_name -> (type, *args) for _suggest_param.
     """
     space = dict(SHARED_SEARCH_SPACE)
-
-    # Only include the relevant v prior parameter
-    if v_prior == 'laplace':
-        space.pop('sigma_v', None)
-    else:
-        space.pop('b_v', None)
-
-    # Spike-slab params only relevant when enabled
-    if not use_spike_slab_beta:
-        space.pop('alpha_pi', None)
-        space.pop('beta_pi_scale', None)
 
     if dataset_preset and dataset_preset in DATASET_PRESETS:
         space.update(DATASET_PRESETS[dataset_preset])
@@ -514,7 +488,6 @@ class HyperparameterOptimizer:
         random_state: Optional[int] = None,
         output_dir: str = './bayes_opt_results',
         study_name: Optional[str] = None,
-        v_prior: str = 'normal',
         max_n_factors: Optional[int] = None,
         convert_to_ensembl: bool = True,
     ):
@@ -541,7 +514,6 @@ class HyperparameterOptimizer:
         self.val_ratio = val_ratio
         self.random_state = random_state
         self.output_dir = Path(output_dir)
-        self.v_prior = v_prior.lower()
         self.max_n_factors = max_n_factors
         self.convert_to_ensembl = convert_to_ensembl
         self.study_name = study_name or f'vi_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
@@ -688,15 +660,8 @@ class HyperparameterOptimizer:
         self.load_pathways()
 
         # Build search space
-        _spike_slab = self.fixed_params.get('use_spike_slab_beta', False)
-        self.search_space = build_search_space(
-            self.dataset_preset, self.v_prior,
-            use_spike_slab_beta=_spike_slab)
+        self.search_space = build_search_space(self.dataset_preset)
         self._apply_search_space_guards()
-
-        # Always pass v_prior as a fixed param so the model knows which prior to use
-        if 'v_prior' not in self.fixed_params:
-            self.fixed_params['v_prior'] = self.v_prior
 
         # For masked / pathway_init: n_factors IS the number of pathways — not searchable.
         if self.mode in ('masked', 'pathway_init') and self.pathway_mask is not None:
@@ -1064,7 +1029,7 @@ def parse_args(argv=None):
         '--fixed-params', nargs='+', default=None,
         metavar='KEY=VALUE',
         help='Fix specific params at given values (not tuned). '
-             'Format: key=value pairs, e.g. --fixed-params n_factors=50 regression_weight=100'
+             'Format: key=value pairs, e.g. --fixed-params n_factors=50 b_v=0.5'
     )
 
     # Training limits for each trial
@@ -1086,12 +1051,6 @@ def parse_args(argv=None):
     # Output
     parser.add_argument('--output-dir', default='./bayes_opt_results', help='Output directory')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
-
-    # Prior for v
-    parser.add_argument(
-        '--v-prior', default='normal', choices=['normal', 'laplace'],
-        help="Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso)"
-    )
 
     # Gene ID conversion
     parser.add_argument(
@@ -1169,7 +1128,6 @@ def main(argv=None):
         val_ratio=args.val_ratio,
         random_state=args.seed,
         output_dir=args.output_dir,
-        v_prior=args.v_prior,
         max_n_factors=args.max_n_factors,
         convert_to_ensembl=args.convert_to_ensembl,
     )

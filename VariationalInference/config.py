@@ -49,13 +49,9 @@ class VIConfig:
         Prior shape for depth correction.
     alpha_eta : float, default=2.0
         Prior shape for gene scaling.
-sigma_v : float, default=0.2
-        Prior std for classification weights (used when v_prior='normal').
     b_v : float, default=1.0
-        Laplace prior scale for classification weights (used when v_prior='laplace').
+        Laplace prior scale for classification weights.
         Smaller b_v = stronger sparsity. Var[v] = 2*b_v^2.
-    v_prior : str, default='normal'
-        Prior distribution for v: 'normal' (Gaussian) or 'laplace' (Bayesian Lasso).
     sigma_gamma : float, default=0.5
         Prior std for auxiliary feature effects.
     pi_v : float, default=0.9
@@ -111,18 +107,14 @@ sigma_v : float, default=0.2
     alpha_beta: float = 2.0
     alpha_xi: float = 2.0
     alpha_eta: float = 2.0
-    sigma_v: float = 0.2
     b_v: float = 1.0
-    v_prior: str = 'normal'
     sigma_gamma: float = 0.5
     pi_v: float = 0.9
     pi_beta: float = 0.05
     spike_variance_v: float = 1e-6
     spike_value_beta: float = 1e-6
-    regression_weight: float = 1.0
     use_class_weights: bool = True
     use_intercept: bool = True
-    use_spike_slab_beta: bool = False
     alpha_pi: float = 1.0
     beta_pi_scale: Optional[float] = None
 
@@ -176,18 +168,14 @@ sigma_v : float, default=0.2
             'alpha_beta': self.alpha_beta,
             'alpha_xi': self.alpha_xi,
             'alpha_eta': self.alpha_eta,
-            'sigma_v': self.sigma_v,
             'b_v': self.b_v,
-            'v_prior': self.v_prior,
             'sigma_gamma': self.sigma_gamma,
             'random_state': self.random_state,
             'pi_v': self.pi_v,
             'pi_beta': self.pi_beta,
             'spike_variance_v': self.spike_variance_v,
             'spike_value_beta': self.spike_value_beta,
-            'regression_weight': self.regression_weight,
             'use_class_weights': self.use_class_weights,
-            'use_spike_slab_beta': self.use_spike_slab_beta,
             'alpha_pi': self.alpha_pi,
             'beta_pi_scale': self.beta_pi_scale,
         }

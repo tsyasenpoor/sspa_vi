@@ -256,7 +256,7 @@ def gen_spectra_sup_script(n_patients: int, res: tuple) -> str:
 
         # Fit Spectra (supervised with REACTOME pathways)
         FIT_START=$(date +%s)
-        python -u {VI_DIR}/run_spectra_supervised.py \\
+        python -u {VI_DIR}/comp/run_spectra_supervised.py \\
             --h5ad {H5AD} \\
             --gmt-file {GMT_FILE} \\
             --output-dir "$SPECTRA_OUT" \\
@@ -284,7 +284,7 @@ print(f'Wrote metadata: {{len(meta)}} cells')
 "
 
         # Downstream classifiers
-        python -u {VI_DIR}/run_spectra_baselines.py \\
+        python -u {VI_DIR}/comp/run_spectra_baselines.py \\
             --cell-scores "$SPECTRA_OUT/spectra_cell_scores.npy" \\
             --data "$SPECTRA_OUT/metadata_covid.csv" \\
             --labels severity outcome \\
@@ -388,7 +388,7 @@ print(f'Wrote scHPF inputs to {{tmpdir}}: {{src.n_obs}} cells x {{src.n_vars}} g
         conda activate jax_gpu
         echo "Python (baselines): $(python --version)"
 
-        python -u {VI_DIR}/run_schpf_baselines.py \\
+        python -u {VI_DIR}/comp/run_schpf_baselines.py \\
             --model {model_file} \\
             --data "$TMPDIR_SCHPF/metadata_covid.csv" \\
             --labels severity outcome \\
@@ -429,7 +429,7 @@ def gen_baselines_script(n_patients: int, res: tuple) -> str:
 
             echo "Running baselines for $LABEL_TAG (seed=$SEED)..."
 
-            python -u {VI_DIR}/run_baselines.py \\
+            python -u {VI_DIR}/comp/run_baselines.py \\
                 --data {H5AD} \\
                 --label-column "$LABEL" \\
                 --aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes \\
@@ -447,7 +447,7 @@ def gen_baselines_script(n_patients: int, res: tuple) -> str:
             mkdir -p "$PAT_OUT"
             echo "Running patient-level eval for $LABEL_TAG (seed=$SEED)..."
 
-            python -u {VI_DIR}/run_baselines_patient_eval.py \
+            python -u {VI_DIR}/comp/run_baselines_patient_eval.py \
                 --data {H5AD} \
                 --model-dir "$RUN_OUT" \
                 --label-column "$LABEL" \
