@@ -1143,12 +1143,15 @@ class CAVI:
         W = self._sample_weights                    # (n, kappa)
         E_v = self.mu_v
 
-        # Laplace prior precision: E[1/s] for IG(mu_s, lambda_s)
-        # where mu_s = b_v/omega, lambda_s = 1/b_v^2.
-        # E[1/X] = 1/mu + 1/lambda = omega/b_v + b_v^2.
+        # Laplace prior precision: E[1/s] for InvGaussian posterior.
+        # GIG(-1/2, a=1/b_v^2, b=omega^2) => IG(mu=omega*b_v, lambda=omega^2)
+        # E[1/X] = 1/mu + 1/lambda = 1/(omega*b_v) + 1/omega^2
+        # Capped at 1/b_v^2 (marginal Laplace precision) to prevent
+        # zero-trapping when omega is small in mean-field VB.
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
         omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-        E_inv_s = omega / self.b_v + self.b_v ** 2
+        E_inv_s = 1.0 / (self.b_v * omega + 1e-12) + 1.0 / (omega ** 2 + 1e-12)
+        E_inv_s = xp.minimum(E_inv_s, 1.0 / (self.b_v ** 2))
         prior_precision = E_inv_s
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
@@ -1466,15 +1469,15 @@ class CAVI:
         # === Prior: p(v|s) + p(s) + H[q(v)] + H[q(s)] — Laplace (Eqs. 51-52, 58, 60) ===
         E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
         omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-        # E[1/s] for IG(mu_s, lambda_s): E[1/X] = 1/mu + 1/lambda = omega/b_v + b_v^2
-        E_inv_s = omega / self.b_v + self.b_v ** 2
+        # GIG(-1/2, a=1/b_v^2, b=omega^2) => IG(mu=omega*b_v, lambda=omega^2)
+        # E[1/X] = 1/mu + 1/lambda = 1/(omega*b_v) + 1/omega^2
+        E_inv_s = 1.0 / (self.b_v * omega + 1e-12) + 1.0 / (omega ** 2 + 1e-12)
+        E_inv_s = xp.minimum(E_inv_s, 1.0 / (self.b_v ** 2))
         # InvGaussian parameters (Eq. 39)
-        mu_s = self.b_v / xp.maximum(omega, 1e-12)
-        lambda_s = 1.0 / (self.b_v ** 2)
-        # E[s] = mu_s for InvGaussian
+        mu_s = omega * self.b_v                        # E[s] = omega * b_v
+        lambda_s = omega ** 2                           # shape parameter
         E_s = mu_s
-        # E[log s] ≈ log(mu_s) (first-order approximation; exact requires
-        # numerical integration of the InvGaussian log-moment)
+        # E[log s] ~ log(mu_s) (first-order approximation)
         E_log_s = xp.log(xp.maximum(mu_s, 1e-12))
 
         # Eq. 51: E[log p(v|s)] = -0.5*log(2pi) - 0.5*E[log s] - 0.5*E[v^2]*E[1/s]
@@ -1821,8 +1824,8 @@ class CAVI:
             # 2. Gene-side updates: r_beta first (if spike-slab), then beta and eta
             if self.use_spike_slab:
                 # Support learning protocol (spike-and-slab modes only)
-                _ss_update_freq = 5
-                _ss_rho_max = 0.05
+                _ss_update_freq = 2
+                _ss_rho_max = 0.3
                 _ss_freeze_patience = 20
 
             if self.use_spike_slab:
@@ -1839,7 +1842,7 @@ class CAVI:
                     rho = min(_ss_rho_max,
                               (t - ss_warmup + 1) / max(1, ss_anneal_iters) * _ss_rho_max)
                     self.r_beta = (1.0 - rho) * r_old + rho * r_prop
-                    self.r_beta = xp.maximum(self.r_beta, 0.01)
+                    self.r_beta = xp.maximum(self.r_beta, 1e-6)
                     # Sync q(pi) with damped q(m)
                     r_sum = self.r_beta.sum(axis=0)
                     self.a_pi = self.alpha_pi + r_sum

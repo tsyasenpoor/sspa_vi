@@ -11,8 +11,8 @@ Outputs a unified CSV for analysis.
 
 Usage:
     python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/aggregate_scalability_results.py \
-        --results-root /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/methods \
-        --output /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/all_metrics.csv
+        --results-root /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/methods \
+        --output /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/all_metrics.csv
 
     python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/aggregate_scalability_results.py \
         --results-root /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/methods \
