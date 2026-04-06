@@ -964,7 +964,7 @@ class CAVI:
 
         self._invalidate_beta_cache()
 
-    def _update_theta(self, z_sum_theta, y, X_aux):
+    def _update_theta(self, z_sum_theta, y, X_aux, ramp=1.0):
         """
         theta shape and rate (scHPF Eq 7, cell side + JJ regression).
 
@@ -1016,6 +1016,10 @@ class CAVI:
                 R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
                 R_lin_c = R_lin_c - 2.0 * E_theta_c * (W_lam_c @ E_v_sq_col)
                 R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
+
+                # Ramp regression contribution during post-warmup transition
+                R_lin_c = R_lin_c * ramp
+                R_quad_c = R_quad_c * ramp
 
                 # --- solve quadratic for b_theta ---
                 b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
@@ -1152,7 +1156,7 @@ class CAVI:
 
         return R_linear, R_quad_coeff
 
-    def _update_v(self, y, X_aux, iteration=0):
+    def _update_v(self, y, X_aux, iteration=0, ramp=1.0):
         """
         v posterior (diagonal Gaussian, JJ bound, Laplace/Bayesian Lasso prior).
 
@@ -1234,12 +1238,12 @@ class CAVI:
         mean_prec = term1 - term2
 
         mu_v_new = mean_prec / precision
-        alpha_v = 0.3  # step-size: 0.3 = take 30% step toward CAVI optimum
+        alpha_v = 0.3 * ramp  # step-size ramped during post-warmup transition
         self.mu_v = (1.0 - alpha_v) * self.mu_v + alpha_v * mu_v_new
         self.sigma_v_diag = 1.0 / precision  # variance is exact
 
-    def _update_gamma(self, y, X_aux, iteration=0):
-        """gamma posterior (Gaussian, JJ bound)."""
+    def _update_gamma(self, y, X_aux, iteration=0, ramp=1.0):
+        """gamma posterior (Gaussian, JJ bound) with under-relaxation."""
         if self.p_aux == 0:
             return
         y_exp = y if y.ndim > 1 else y[:, None]
@@ -1256,7 +1260,9 @@ class CAVI:
             else:
                 theta_v[i0:i1] = E_theta_c @ self.mu_v.T
 
-        # Exact CAVI update (Eq. 41): no rw scaling, no damping, no clipping
+        # CAVI update (Eq. 41) with under-relaxation to prevent oscillation.
+        # Step size is ramped from 0 to 0.3 over the post-warmup ramp period.
+        alpha_gamma = 0.3 * ramp
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
             W_lam_k = W[:, k] * lam[:, k]
@@ -1268,14 +1274,18 @@ class CAVI:
             mean_prec = X_aux.T @ residual
 
             if USE_JAX:
-                self.Sigma_gamma = self.Sigma_gamma.at[k].set(xp.linalg.inv(prec))
+                Sigma_new = xp.linalg.inv(prec)
+                Sigma_damped = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
+                self.Sigma_gamma = self.Sigma_gamma.at[k].set(Sigma_damped)
             else:
-                self.Sigma_gamma[k] = np.linalg.inv(prec)
+                Sigma_new = np.linalg.inv(prec)
+                self.Sigma_gamma[k] = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
             mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
             if USE_JAX:
-                self.mu_gamma = self.mu_gamma.at[k].set(mu_gamma_new)
+                mu_damped = (1.0 - alpha_gamma) * self.mu_gamma[k] + alpha_gamma * mu_gamma_new
+                self.mu_gamma = self.mu_gamma.at[k].set(mu_damped)
             else:
-                self.mu_gamma[k] = mu_gamma_new
+                self.mu_gamma[k] = (1.0 - alpha_gamma) * self.mu_gamma[k] + alpha_gamma * mu_gamma_new
 
     # =================================================================
     # ELBO
@@ -1927,9 +1937,12 @@ class CAVI:
             self._refresh_log_caches()  # still needed: beta/eta just changed
 
             # 3. Update theta, xi
-            # During v_warmup, run Poisson-only theta (no regression correction)
+            # During v_warmup, run Poisson-only theta (no regression correction).
+            # After warmup, linearly ramp regression influence over 50 iterations.
+            ramp_iters = 50
             if t >= v_warmup:
-                self._update_theta(z_sum_theta, y, X_aux)
+                ramp = min(1.0, (t - v_warmup + 1) / ramp_iters)
+                self._update_theta(z_sum_theta, y, X_aux, ramp=ramp)
             else:
                 # Pure Poisson theta update: b_theta = E[xi] + sum_j E[beta_jk]
                 self.a_theta = self.a + z_sum_theta
@@ -1963,8 +1976,16 @@ class CAVI:
 
             # 5. Update v, gamma (skip during Poisson-only warmup)
             if t >= v_warmup:
-                self._update_v(y, X_aux, iteration=t)
-                self._update_gamma(y, X_aux, iteration=t)
+                self._update_v(y, X_aux, iteration=t, ramp=ramp)
+                self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
+                # Safety clipping to prevent extreme values
+                self.mu_v = xp.clip(self.mu_v, -10.0, 10.0)
+                if USE_JAX:
+                    self.mu_gamma = xp.clip(self.mu_gamma, -20.0, 20.0)
+                else:
+                    self.mu_gamma = np.clip(self.mu_gamma, -20.0, 20.0)
+                if diag and ramp < 1.0:
+                    print(f"  [diag t={t}] regression ramp={ramp:.3f}")
 
             if diag:
                 t_updates = time.time() - t_iter_start
