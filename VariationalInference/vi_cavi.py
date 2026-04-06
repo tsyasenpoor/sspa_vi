@@ -1171,18 +1171,11 @@ class CAVI:
         W = self._sample_weights                    # (n, kappa)
         E_v = self.mu_v
 
-        # Laplace prior precision: E[1/s] for InvGaussian posterior.
-        # GIG(-1/2, a=1/b_v^2, b=omega^2) => IG(mu=omega*b_v, lambda=omega^2)
-        # E[1/X] = 1/mu + 1/lambda = 1/(omega*b_v) + 1/omega^2
-        # Capped at 1/b_v^2 (marginal Laplace precision) to prevent
-        # zero-trapping when omega is small in mean-field VB.
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
-        omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-        E_inv_s = 1.0 / (self.b_v * omega + 1e-12) + 1.0 / (omega ** 2 + 1e-12)
-        # No cap: allow full adaptive shrinkage. Small omega → large E_inv_s
-        # (strong shrinkage for near-zero v), large omega → small E_inv_s
-        # (relaxed penalty for disease-relevant factors).
-        prior_precision = E_inv_s
+        # Fixed Laplace prior: 1/b_v^2 for all factors.
+        # The adaptive E[1/s] shrinks with |v|, creating a runaway feedback loop
+        # where large |v| → weak prior → even larger |v|. Using the marginal
+        # Laplace precision provides consistent regularization.
+        prior_precision = xp.full_like(self.mu_v, 1.0 / (self.b_v ** 2))
 
         # Accumulate (kappa, K) sufficient statistics in chunks to avoid
         # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
@@ -1236,11 +1229,12 @@ class CAVI:
         mu_v_new = mean_prec / precision
         # Trust region: limit CAVI target to within ±delta of current value.
         # delta scales with posterior std so uncertain factors can move more.
-        delta_v = xp.maximum(1.0, 3.0 * xp.sqrt(1.0 / precision))
+        delta_v = 3.0 * self.b_v  # fixed trust region based on prior scale
         mu_v_new = xp.clip(mu_v_new, self.mu_v - delta_v, self.mu_v + delta_v)
         alpha_v = 0.3 * ramp  # step-size ramped during post-warmup transition
         self.mu_v = (1.0 - alpha_v) * self.mu_v + alpha_v * mu_v_new
-        self.sigma_v_diag = 1.0 / precision  # variance is exact
+        sigma_v_new = 1.0 / precision
+        self.sigma_v_diag = (1.0 - alpha_v) * self.sigma_v_diag + alpha_v * sigma_v_new
 
     def _update_gamma(self, y, X_aux, iteration=0, ramp=1.0):
         """gamma posterior (Gaussian, JJ bound) with under-relaxation."""
@@ -1281,7 +1275,7 @@ class CAVI:
             mu_gamma_new = Sigma_new @ mean_prec
 
             # Trust region: limit CAVI target to within ±delta of current value
-            delta_gamma = xp.maximum(1.0, 3.0 * xp.sqrt(xp.diag(Sigma_new)))
+            delta_gamma = 3.0 * self.sigma_gamma  # fixed trust region based on prior scale
             mu_gamma_new = xp.clip(mu_gamma_new,
                                    self.mu_gamma[k] - delta_gamma,
                                    self.mu_gamma[k] + delta_gamma)
