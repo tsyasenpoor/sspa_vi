@@ -310,10 +310,28 @@ class CAVI:
             self._n_active_beta = int(self._active_beta.sum())
             # Fix a_eta: only count active factors per gene (hard mask semantics)
             m_j = self._active_beta.sum(axis=1)  # (p,) number of active factors
+            n_orphan = int((m_j == 0).sum())
+            if n_orphan > 0:
+                print(f"  [WARNING] {n_orphan} genes have ZERO active factors "
+                      f"(no pathway membership). These genes contribute nothing "
+                      f"to reconstruction and may cause NaN in phi.")
             self.a_eta = self.cp + m_j * self.c
         else:
             self._active_beta = None  # means all active
             self._n_active_beta = self.p * K
+
+        # Boolean mask: True for (j,k) that are pathway-constrained AND active.
+        # These entries are exempt from spike-and-slab updates.
+        self._npath = self.n_pathway_factors if self.mode == 'combined' else 0
+        if self.mode == 'combined' and self.n_pathway_factors is not None:
+            npath = self.n_pathway_factors
+            self._pw_active = np.zeros((self.p, K), dtype=bool)
+            if self._active_beta is not None:
+                self._pw_active[:, :npath] = self._active_beta[:, :npath]
+            else:
+                self._pw_active[:, :npath] = True
+        else:
+            self._pw_active = None
 
         # --- spike-and-slab on beta ---
         if self.use_spike_slab:
@@ -327,10 +345,21 @@ class CAVI:
             self.r_beta = np.full((self.p, K), 0.5, dtype=np.float32)
             if self._active_beta is not None:
                 self.r_beta = np.where(self._active_beta, self.r_beta, 0.0)
-            # Sum over factors (axis=1) for per-gene pi (Eq. 27)
-            r_sum_init = self.r_beta.sum(axis=1)  # (p,)
+            # Combined mode: pathway factors have deterministic r=mask (not learned)
+            if self._pw_active is not None:
+                npath = self._npath
+                self.r_beta[:, :npath] = np.where(
+                    self._active_beta[:, :npath], 1.0, 0.0)
+            # Pi init: count only FREE factors (pathway factors are exempt)
+            if self._npath > 0:
+                npath = self._npath
+                r_sum_init = self.r_beta[:, npath:].sum(axis=1)
+                n_free = float(K - npath)
+            else:
+                r_sum_init = self.r_beta.sum(axis=1)
+                n_free = float(K)
             self.a_pi = (self.alpha_pi + r_sum_init).astype(np.float32)  # (p,)
-            self.b_pi = (self.beta_pi + float(K) - r_sum_init).astype(np.float32)  # (p,)
+            self.b_pi = (self.beta_pi + n_free - r_sum_init).astype(np.float32)  # (p,)
         else:
             # Masked mode: pathway mask IS the support, no pi/m machinery
             self.beta_pi = 1.0
@@ -583,7 +612,12 @@ class CAVI:
         if self._E_beta_cache is None:
             raw = self.a_beta / self.b_beta
             if self.use_spike_slab:
-                self._E_beta_cache = self.r_beta * raw
+                # Pathway factors in combined mode: r=1 (deterministic)
+                if self._pw_active is not None:
+                    r_eff = xp.where(self._pw_active, 1.0, self.r_beta)
+                else:
+                    r_eff = self.r_beta
+                self._E_beta_cache = r_eff * raw
             else:
                 # Masked mode: use raw slab on active entries, 0 elsewhere
                 if self._active_beta is not None:
@@ -628,9 +662,12 @@ class CAVI:
             # exactly (same mechanism as pathway masking).
             _slab_log = _dig_beta - xp.log(self.b_beta)
             # Continuous log(rho) penalty per Eq. 21 — no hard threshold.
-            # log(1e-10) ≈ -23, giving phi ≈ e^{-23} ≈ 1e-10 (effectively
-            # zero but without the discontinuity that caused phi shocks).
-            _with_penalty = _slab_log + xp.log(xp.clip(self.r_beta, 1e-10, 1.0))
+            # Pathway factors in combined mode: no r penalty (deterministic r=1)
+            if self._pw_active is not None:
+                r_for_log = xp.where(self._pw_active, 1.0, self.r_beta)
+            else:
+                r_for_log = self.r_beta
+            _with_penalty = _slab_log + xp.log(xp.clip(r_for_log, 1e-10, 1.0))
             self._E_log_beta_cache = _with_penalty
         else:
             # Masked mode: no r_beta weighting, mask applied below
@@ -889,7 +926,12 @@ class CAVI:
         # Slab update (Eq. 23)
         new_a = self.c + z_sum_beta
         if self.use_spike_slab:
-            new_b = self.E_eta[:, None] + self.r_beta * theta_sum[None, :]
+            # Pathway factors in combined mode use r=1 (not learned r_beta)
+            if self._pw_active is not None:
+                r_for_rate = xp.where(self._pw_active, 1.0, self.r_beta)
+            else:
+                r_for_rate = self.r_beta
+            new_b = self.E_eta[:, None] + r_for_rate * theta_sum[None, :]
         else:
             # Masked mode: no r_beta weighting, mask handles support
             new_b = self.E_eta[:, None] + theta_sum[None, :]
@@ -952,10 +994,20 @@ class CAVI:
         if self._active_beta is not None:
             self.r_beta = xp.where(self._active_beta, self.r_beta, 0.0)
 
-        # Update pi posterior (Eq. 27) — sum over factors (axis=1), shape (p,)
-        r_sum = self.r_beta.sum(axis=1)  # (p,)
+        # Combined mode: pathway factors keep deterministic r from mask
+        if self._pw_active is not None:
+            self.r_beta = xp.where(self._pw_active, 1.0, self.r_beta)
+
+        # Update pi posterior (Eq. 27) — count only free factors
+        if self._npath > 0:
+            npath = self._npath
+            r_sum = self.r_beta[:, npath:].sum(axis=1)
+            n_free = float(self.K - npath)
+        else:
+            r_sum = self.r_beta.sum(axis=1)
+            n_free = float(self.K)
         self.a_pi = self.alpha_pi + r_sum
-        self.b_pi = self.beta_pi + (float(self.K) - r_sum)
+        self.b_pi = self.beta_pi + (n_free - r_sum)
 
         self._invalidate_beta_cache()
 
@@ -1474,15 +1526,30 @@ class CAVI:
             elbo -= self.p * (gammaln(self.alpha_pi) + gammaln(self.beta_pi)
                               - gammaln(self.alpha_pi + self.beta_pi))
 
-            # Bernoulli prior on m (Eq. 47) — pi_j broadcasts as (p, 1)
-            elbo += xp.sum(self.r_beta * _E_log_pi[:, None]
-                           + (1.0 - self.r_beta) * _E_log_1mpi[:, None])
+            # Bernoulli prior on m (Eq. 47) — only free factors (pathway r is deterministic)
+            _m_prior = (self.r_beta * _E_log_pi[:, None]
+                        + (1.0 - self.r_beta) * _E_log_1mpi[:, None])
+            if self._pw_active is not None:
+                _is_free = ~self._pw_active
+                if self._active_beta is not None:
+                    _is_free = _is_free & self._active_beta
+                elbo += xp.sum(xp.where(_is_free, _m_prior, 0.0))
+            else:
+                elbo += xp.sum(_m_prior)
+            del _m_prior
 
-            # Entropy of q(m_{jk}) = Bernoulli(r_{jk}) (Eq. 56)
+            # Entropy of q(m_{jk}) = Bernoulli(r_{jk}) (Eq. 56) — free factors only
             _r_clip = xp.clip(self.r_beta, 1e-7, 1 - 1e-7)
-            elbo -= xp.sum(_r_clip * xp.log(_r_clip)
-                           + (1 - _r_clip) * xp.log(1 - _r_clip))
-            del _r_clip
+            _m_entropy = (_r_clip * xp.log(_r_clip)
+                          + (1 - _r_clip) * xp.log(1 - _r_clip))
+            if self._pw_active is not None:
+                _is_free = ~self._pw_active
+                if self._active_beta is not None:
+                    _is_free = _is_free & self._active_beta
+                elbo -= xp.sum(xp.where(_is_free, _m_entropy, 0.0))
+            else:
+                elbo -= xp.sum(_m_entropy)
+            del _r_clip, _m_entropy
 
             # Entropy of q(pi_j) = Beta(a_pi_j, b_pi_j) (Eq. 57) — per-gene
             _H_pi = (gammaln(self.a_pi) + gammaln(self.b_pi)
@@ -1913,10 +1980,19 @@ class CAVI:
                               (t - ss_warmup + 1) / max(1, ss_anneal_iters) * _ss_rho_max)
                     self.r_beta = (1.0 - rho) * r_old + rho * r_prop
                     self.r_beta = xp.maximum(self.r_beta, 1e-6)
-                    # Sync q(pi) with damped q(m) — per-gene (Eq. 27)
-                    r_sum = self.r_beta.sum(axis=1)  # (p,)
+                    # Protect pathway factors in combined mode
+                    if self._pw_active is not None:
+                        self.r_beta = xp.where(self._pw_active, 1.0, self.r_beta)
+                    # Sync q(pi) with damped q(m) — count only free factors
+                    if self._npath > 0:
+                        npath = self._npath
+                        r_sum = self.r_beta[:, npath:].sum(axis=1)
+                        n_free = float(self.K - npath)
+                    else:
+                        r_sum = self.r_beta.sum(axis=1)
+                        n_free = float(self.K)
                     self.a_pi = self.alpha_pi + r_sum
-                    self.b_pi = self.beta_pi + (float(self.K) - r_sum)
+                    self.b_pi = self.beta_pi + (n_free - r_sum)
                     self._invalidate_beta_cache()
             # Now update beta and eta using current (damped) r_beta
             self._update_beta(z_sum_beta)
