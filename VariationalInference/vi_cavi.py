@@ -1226,11 +1226,7 @@ class CAVI:
         # overshoot when E[theta] is small.  Taking a partial step toward
         # the CAVI optimum guarantees improvement on a damped objective.
         # No rw scaling — CAVI updates use the natural model (rw=1).
-        # Cap data precision at prior_precision so data never overwhelms
-        # the Laplace prior more than 2:1 — ensures adaptive shrinkage
-        # can actually distinguish disease-relevant from irrelevant factors.
         data_prec = 2 * prec_sum                                 # (kappa, K)
-        data_prec = xp.minimum(data_prec, prior_precision)       # cap at prior
         precision = prior_precision + data_prec                  # (kappa, K)
         precision = xp.maximum(precision, 1e-12)
         term1 = term1_sum
@@ -1238,6 +1234,10 @@ class CAVI:
         mean_prec = term1 - term2
 
         mu_v_new = mean_prec / precision
+        # Trust region: limit CAVI target to within ±delta of current value.
+        # delta scales with posterior std so uncertain factors can move more.
+        delta_v = xp.maximum(1.0, 3.0 * xp.sqrt(1.0 / precision))
+        mu_v_new = xp.clip(mu_v_new, self.mu_v - delta_v, self.mu_v + delta_v)
         alpha_v = 0.3 * ramp  # step-size ramped during post-warmup transition
         self.mu_v = (1.0 - alpha_v) * self.mu_v + alpha_v * mu_v_new
         self.sigma_v_diag = 1.0 / precision  # variance is exact
@@ -1273,18 +1273,27 @@ class CAVI:
             residual = W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k
             mean_prec = X_aux.T @ residual
 
+            # Compute CAVI target using the TRUE new Sigma (not the damped one)
             if USE_JAX:
                 Sigma_new = xp.linalg.inv(prec)
-                Sigma_damped = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
-                self.Sigma_gamma = self.Sigma_gamma.at[k].set(Sigma_damped)
             else:
                 Sigma_new = np.linalg.inv(prec)
-                self.Sigma_gamma[k] = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
-            mu_gamma_new = self.Sigma_gamma[k] @ mean_prec
+            mu_gamma_new = Sigma_new @ mean_prec
+
+            # Trust region: limit CAVI target to within ±delta of current value
+            delta_gamma = xp.maximum(1.0, 3.0 * xp.sqrt(xp.diag(Sigma_new)))
+            mu_gamma_new = xp.clip(mu_gamma_new,
+                                   self.mu_gamma[k] - delta_gamma,
+                                   self.mu_gamma[k] + delta_gamma)
+
+            # Damp Sigma and mu separately toward their CAVI targets
             if USE_JAX:
+                Sigma_damped = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
+                self.Sigma_gamma = self.Sigma_gamma.at[k].set(Sigma_damped)
                 mu_damped = (1.0 - alpha_gamma) * self.mu_gamma[k] + alpha_gamma * mu_gamma_new
                 self.mu_gamma = self.mu_gamma.at[k].set(mu_damped)
             else:
+                self.Sigma_gamma[k] = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
                 self.mu_gamma[k] = (1.0 - alpha_gamma) * self.mu_gamma[k] + alpha_gamma * mu_gamma_new
 
     # =================================================================
@@ -1978,12 +1987,6 @@ class CAVI:
             if t >= v_warmup:
                 self._update_v(y, X_aux, iteration=t, ramp=ramp)
                 self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
-                # Safety clipping to prevent extreme values
-                self.mu_v = xp.clip(self.mu_v, -10.0, 10.0)
-                if USE_JAX:
-                    self.mu_gamma = xp.clip(self.mu_gamma, -20.0, 20.0)
-                else:
-                    self.mu_gamma = np.clip(self.mu_gamma, -20.0, 20.0)
                 if diag and ramp < 1.0:
                     print(f"  [diag t={t}] regression ramp={ramp:.3f}")
 
