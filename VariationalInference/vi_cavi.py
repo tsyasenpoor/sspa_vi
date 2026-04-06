@@ -939,10 +939,12 @@ class CAVI:
         new_b = xp.maximum(new_b, 1e-6)
 
         # Cap E[beta] = a/b to prevent eta-beta collapse.
-        # When a_eta is small (masked mode, large K), the feedback loop
-        # large beta → large b_eta → small E[eta] → small rate → larger beta
-        # can drive E[beta] to 1e6+. Cap at 1e4 (typical converged ~O(1)-O(100)).
-        beta_cap = 1e4
+        # When a_eta is small (masked mode with sparse pathways), the
+        # feedback loop large beta → large b_eta → small E[eta] → even
+        # larger beta can drive E[beta] from O(1) to 1e6 in 5 iterations.
+        # Cap at 500: typical converged E[beta] is O(1)-O(100), and even
+        # the highest-expression genes need at most O(100) per factor.
+        beta_cap = 500.0
         new_b = xp.maximum(new_b, new_a / beta_cap)
 
         self.a_beta = new_a
@@ -972,8 +974,13 @@ class CAVI:
                 self._active_beta, E_beta_slab, 0.0).sum(axis=1)
         else:
             self.b_eta = self.dp + E_beta_slab.sum(axis=1)
-        # Floor at dp (prior rate) to prevent E[eta] exceeding its prior mean
-        # during spike-slab pruning when most beta entries are killed
+        # Floor b_eta to prevent E[eta] from collapsing.
+        # E[eta] = a_eta / b_eta; with a_eta ≈ 1.66 (masked, sparse pathways),
+        # b_eta must stay below ~1660 to keep E[eta] > 0.001.
+        # Use dp as lower bound, and cap b_eta so E[eta] >= 0.01.
+        eta_floor = 0.01  # minimum E[eta]
+        b_eta_cap = self.a_eta / eta_floor  # a_eta / 0.01
+        self.b_eta = xp.minimum(self.b_eta, b_eta_cap)
         self.b_eta = xp.maximum(self.b_eta, self.dp)
 
     def _update_r_beta(self, z_sum_beta, theta_col_sum):
