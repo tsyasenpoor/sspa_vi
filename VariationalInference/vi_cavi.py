@@ -973,13 +973,13 @@ class CAVI:
                 self._active_beta, E_beta_slab, 0.0).sum(axis=1)
         else:
             self.b_eta = self.dp + E_beta_slab.sum(axis=1)
-        # Floor b_eta to prevent E[eta] from collapsing.
-        # E[eta] = a_eta / b_eta; with a_eta ≈ 1.66 (masked, sparse pathways),
-        # b_eta must stay below ~1660 to keep E[eta] > 0.001.
-        # Use dp as lower bound, and cap b_eta so E[eta] >= 0.01.
-        eta_floor = 0.01  # minimum E[eta]
-        b_eta_cap = self.a_eta / eta_floor  # a_eta / 0.01
-        self.b_eta = xp.minimum(self.b_eta, b_eta_cap)
+        # In masked/combined mode, cap b_eta to prevent E[eta] collapse.
+        # a_eta ≈ 1.66 (sparse pathways), so b_eta must stay bounded.
+        # In unmasked mode, a_eta = cp + K*c ≈ 40 (K=130), self-regulating.
+        if self.mode in ('masked', 'combined'):
+            eta_floor = 0.01  # minimum E[eta]
+            b_eta_cap = self.a_eta / eta_floor
+            self.b_eta = xp.minimum(self.b_eta, b_eta_cap)
         self.b_eta = xp.maximum(self.b_eta, self.dp)
 
     def _update_r_beta(self, z_sum_beta, theta_col_sum):
