@@ -358,6 +358,10 @@ def save_results(
                 'p_aux': model.p_aux,
             }
 
+            # Spike-and-slab inclusion probabilities
+            if hasattr(model, 'r_beta') and model.r_beta is not None:
+                essential_params['r_beta'] = np.asarray(model.r_beta)
+
             # Optional: include training history
             if hasattr(model, 'elbo_history_'):
                 essential_params['elbo_history'] = model.elbo_history_
@@ -401,6 +405,19 @@ def save_results(
     beta_df.to_csv(beta_path, compression=compression)
     saved_files[f'{feature_type}_programs'] = beta_path
     print(f"Saved {feature_type} programs to {beta_path}")
+
+    # Save posterior inclusion probabilities (r_beta) for spike-and-slab models
+    if hasattr(model, 'r_beta') and model.r_beta is not None:
+        r_beta_arr = np.asarray(model.r_beta)  # handles CuPy arrays too
+        r_beta_df = pd.DataFrame(
+            r_beta_arr.T,  # Transpose to programs x genes (same layout as beta_df)
+            index=prog_labels,
+            columns=gene_list
+        )
+        r_beta_path = output_dir / f'{prefix}_r_beta{ext}'
+        r_beta_df.to_csv(r_beta_path, compression=compression)
+        saved_files['r_beta'] = r_beta_path
+        print(f"Saved r_beta (posterior inclusion probs) to {r_beta_path}")
 
     # --- Helper to add cell metadata columns to a theta DataFrame ---
     def _add_cell_metadata(theta_df):
@@ -757,19 +774,21 @@ def load_pathways(
     cache_dir: str = '/labs/Aguiar/SSPA_BRAY/cache',
     use_cache: bool = True,
     excluded_keywords: Optional[List[str]] = None,
-    require_prefix: Optional[str] = 'REACTOME'
+    require_prefix: Optional[str] = None,
+    pathway_selection: Optional[str] = None
 ) -> Tuple[np.ndarray, List[str], List[str]]:
     """
     Load pathway definitions from GMT file into a binary matrix.
-    
+
     GMT format: PATHWAY_NAME<tab>URL<tab>GENE1<tab>GENE2<tab>...
-    
+
     Caches the Ensembl-converted pathways to avoid repeated conversion overhead.
-    
+
     Parameters
     ----------
     gmt_path : str
-        Path to GMT file.
+        Path to GMT file. Can be the full C2 collection or a pre-filtered
+        subset GMT (e.g. from results/pathway_selections/).
     convert_to_ensembl : bool, default=True
         Convert gene symbols to Ensembl IDs.
     species : str, default='human'
@@ -790,12 +809,19 @@ def load_pathways(
         Default: ["ADME", "DRUG", "MISCELLANEOUS", "EMT"]
     require_prefix : str, optional
         If provided, only keep pathways starting with this prefix.
-        Default: 'REACTOME' (set to None to keep all sources).
-    
+        Default: None (keep all sources). Set to 'REACTOME' to restrict
+        to Reactome pathways only.
+    pathway_selection : str, optional
+        Path to a text file listing pathway names to keep (one per line),
+        or a pre-filtered GMT file. When provided, only pathways whose names
+        appear in this file are retained. This is applied before all other
+        filters. Pre-computed selections are available in
+        results/pathway_selections/ (e.g. covid_selected_pathways.txt).
+
     Returns
     -------
     pathway_mat : np.ndarray
-        Binary matrix (n_pathways, n_genes) where pathway_mat[i,j]=1 if 
+        Binary matrix (n_pathways, n_genes) where pathway_mat[i,j]=1 if
         gene j is in pathway i.
     pathway_names : list of str
         Pathway names corresponding to rows.
@@ -879,6 +905,30 @@ def load_pathways(
                 pickle.dump({'pathways': pathways, 'all_genes': all_genes}, f)
             print(f"  Cached converted pathways to {cache_file}")
     
+    # Apply pathway selection whitelist (pre-computed curated list)
+    if pathway_selection is not None:
+        selection_path = Path(pathway_selection)
+        if not selection_path.exists():
+            raise FileNotFoundError(
+                f"Pathway selection file not found: {pathway_selection}"
+            )
+        if selection_path.suffix == '.gmt':
+            # Selection is itself a GMT — parse pathway names from it
+            allowed = set()
+            with open(selection_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    if parts:
+                        allowed.add(parts[0])
+        else:
+            # Plain text file with one pathway name per line
+            with open(selection_path, 'r') as f:
+                allowed = {line.strip() for line in f if line.strip()}
+        n_before = len(pathways)
+        pathways = {k: v for k, v in pathways.items() if k in allowed}
+        print(f"  After pathway selection ({len(allowed)} allowed): "
+              f"{len(pathways)}/{n_before} pathways")
+
     # Apply pathway filtering by prefix
     if require_prefix is not None:
         n_before = len(pathways)
