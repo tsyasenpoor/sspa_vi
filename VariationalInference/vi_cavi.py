@@ -626,16 +626,12 @@ class CAVI:
             # ~50K observations per gene gives z_sum_beta ≈ 0.05, keeping
             # the entry alive.  Setting E_log_beta = -inf gives phi = 0
             # exactly (same mechanism as pathway masking).
-            _ss_thresh = 0.01
             _slab_log = _dig_beta - xp.log(self.b_beta)
-            # Above threshold: include log(r_beta) as soft penalty
-            # Below threshold: set to -inf for exact zero in softmax
-            _eps = 1e-6
-            _with_penalty = _slab_log + xp.log(xp.clip(self.r_beta, _eps, 1.0))
-            self._E_log_beta_cache = xp.where(
-                self.r_beta > _ss_thresh, _with_penalty,
-                xp.asarray(-xp.inf, dtype=_with_penalty.dtype)
-            )
+            # Continuous log(rho) penalty per Eq. 21 — no hard threshold.
+            # log(1e-10) ≈ -23, giving phi ≈ e^{-23} ≈ 1e-10 (effectively
+            # zero but without the discontinuity that caused phi shocks).
+            _with_penalty = _slab_log + xp.log(xp.clip(self.r_beta, 1e-10, 1.0))
+            self._E_log_beta_cache = _with_penalty
         else:
             # Masked mode: no r_beta weighting, mask applied below
             self._E_log_beta_cache = _dig_beta - xp.log(self.b_beta)
@@ -864,15 +860,14 @@ class CAVI:
             prec_per_factor += (W_lam[i0:i1].T @ E_theta_sq_c).sum(axis=0)
 
         data_prec = 2.0 * prec_per_factor  # (K,)
-        median_dp = float(xp.median(data_prec))
+        # Use per-cell per-factor median to avoid scale blow-up with large n
+        median_dp = float(xp.median(data_prec / self.n))
 
         if median_dp > 0:
-            b_v_new = 1.0 / (v_crossover * median_dp)
-            # Floor: don't make prior absurdly strong
-            b_v_new = max(b_v_new, 1e-6)
-            # No ceiling: b_v must be free to increase or decrease.
+            b_v_new = 1.0 / max(v_crossover * median_dp, 1e-6)
+            b_v_new = float(np.clip(b_v_new, 1e-4, 10.0))
             print(f"  [Laplace] b_v auto-calibrated: {self.b_v:.6f} -> "
-                  f"{b_v_new:.6f}  (median_data_prec={median_dp:.1f}, "
+                  f"{b_v_new:.6f}  (median_data_prec_per_cell={median_dp:.4f}, "
                   f"v_cross={v_crossover})")
             self.b_v = b_v_new
 
@@ -1218,7 +1213,11 @@ class CAVI:
         # The theta-v multiplicative coupling makes the exact CAVI update
         # overshoot when E[theta] is small.  Taking a partial step toward
         # the CAVI optimum guarantees improvement on a damped objective.
-        # No rw scaling — CAVI updates use the natural model (rw=1).
+        # Scale data terms by ramp for consistency with theta's ramp.
+        prec_sum = prec_sum * ramp
+        term1_sum = term1_sum * ramp
+        parta_sum = parta_sum * ramp
+        partb_sum = partb_sum * ramp
         data_prec = 2 * prec_sum                                 # (kappa, K)
         precision = prior_precision + data_prec                  # (kappa, K)
         precision = xp.maximum(precision, 1e-12)
@@ -1229,11 +1228,14 @@ class CAVI:
         mu_v_new = mean_prec / precision
         # Trust region: limit CAVI target to within ±delta of current value.
         # delta scales with posterior std so uncertain factors can move more.
-        delta_v = 3.0 * self.b_v  # fixed trust region based on prior scale
+        # Trust region proportional to posterior std (uncertain factors move more)
+        delta_v = 3.0 * xp.sqrt(xp.maximum(self.sigma_v_diag, 1e-8))
         mu_v_new = xp.clip(mu_v_new, self.mu_v - delta_v, self.mu_v + delta_v)
-        alpha_v = 0.3 * ramp  # step-size ramped during post-warmup transition
+        alpha_v = 0.1 * ramp  # step-size ramped during post-warmup transition
         self.mu_v = (1.0 - alpha_v) * self.mu_v + alpha_v * mu_v_new
         sigma_v_new = 1.0 / precision
+        sigma_v_floor = 0.01 * self.b_v ** 2  # 1% of prior variance
+        sigma_v_new = xp.maximum(sigma_v_new, sigma_v_floor)
         self.sigma_v_diag = (1.0 - alpha_v) * self.sigma_v_diag + alpha_v * sigma_v_new
 
     def _update_gamma(self, y, X_aux, iteration=0, ramp=1.0):
@@ -1260,11 +1262,12 @@ class CAVI:
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
             W_lam_k = W[:, k] * lam[:, k]
-            weighted_X = X_aux * (2 * W_lam_k)[:, None]
+            # Scale data terms by ramp for consistency with theta's ramp
+            weighted_X = X_aux * (2 * ramp * W_lam_k)[:, None]
             prec = prec_prior + weighted_X.T @ X_aux
 
             theta_v_k = theta_v[:, k]
-            residual = W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k
+            residual = ramp * (W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k)
             mean_prec = X_aux.T @ residual
 
             # Compute CAVI target using the TRUE new Sigma (not the damped one)
@@ -1880,6 +1883,11 @@ class CAVI:
             self._invalidate_theta_cache()
             random_phi = (t == 0)  # scHPF: random Dirichlet on first iter
             z_sum_beta, z_sum_theta = self._compute_phi_sparse(random_init=random_phi)
+            # Damp z_sum_theta to prevent phi-shock propagation into a_theta
+            if t > 0 and hasattr(self, '_z_sum_theta_prev'):
+                alpha_z = 0.5
+                z_sum_theta = alpha_z * z_sum_theta + (1 - alpha_z) * self._z_sum_theta_prev
+            self._z_sum_theta_prev = xp.array(z_sum_theta)
             if diag:
                 print(f"  [timing t={t}] phi: {time.time() - t_iter_start:.1f}s")
 
@@ -1942,7 +1950,11 @@ class CAVI:
             # 3. Update theta, xi
             # During v_warmup, run Poisson-only theta (no regression correction).
             # After warmup, linearly ramp regression influence over 50 iterations.
-            ramp_iters = 50
+            ramp_iters = 200
+            if t == v_warmup:
+                self._calibrate_b_v(y, X_aux, v_crossover=2.0)
+                # Re-init sigma_v_diag to match new b_v
+                self.sigma_v_diag = xp.full_like(self.sigma_v_diag, self.b_v ** 2)
             if t >= v_warmup:
                 ramp = min(1.0, (t - v_warmup + 1) / ramp_iters)
                 self._update_theta(z_sum_theta, y, X_aux, ramp=ramp)
