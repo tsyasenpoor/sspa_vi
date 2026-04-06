@@ -938,14 +938,13 @@ class CAVI:
         new_a = xp.maximum(new_a, 1e-6)
         new_b = xp.maximum(new_b, 1e-6)
 
-        # Cap E[beta] = a/b to prevent eta-beta collapse.
-        # When a_eta is small (masked mode with sparse pathways), the
-        # feedback loop large beta → large b_eta → small E[eta] → even
-        # larger beta can drive E[beta] from O(1) to 1e6 in 5 iterations.
-        # Cap at 500: typical converged E[beta] is O(1)-O(100), and even
-        # the highest-expression genes need at most O(100) per factor.
-        beta_cap = 500.0
-        new_b = xp.maximum(new_b, new_a / beta_cap)
+        # Cap E[beta] to prevent eta-beta collapse in masked/combined mode
+        # where a_eta is weak (cp + m_j*c ≈ 1.66). In unmasked mode,
+        # a_eta = cp + K*c is large enough to self-regulate, and surviving
+        # spike-slab factors legitimately need E[beta] >> 500.
+        if self.mode in ('masked', 'combined'):
+            beta_cap = 500.0
+            new_b = xp.maximum(new_b, new_a / beta_cap)
 
         self.a_beta = new_a
         self.b_beta = new_b
@@ -1298,7 +1297,8 @@ class CAVI:
         delta_v = 3.0 * xp.sqrt(xp.maximum(self.sigma_v_diag, 1e-8))
         mu_v_new = xp.clip(mu_v_new, self.mu_v - delta_v, self.mu_v + delta_v)
         # O(1/K) scaling: prevents v-gamma seesaw at large K (e.g. K=315 masked)
-        alpha_v = min(0.1, 1.0 / self.K) * ramp
+        # K=50: 0.1, K=130: 0.077, K=315: 0.032
+        alpha_v = min(0.1, 10.0 / self.K) * ramp
         self.mu_v = (1.0 - alpha_v) * self.mu_v + alpha_v * mu_v_new
         sigma_v_new = 1.0 / precision
         sigma_v_floor = 0.01 * self.b_v ** 2  # 1% of prior variance
@@ -1326,7 +1326,8 @@ class CAVI:
         # CAVI update (Eq. 41) with under-relaxation to prevent oscillation.
         # Step size is ramped from 0 to 0.3 over the post-warmup ramp period.
         # O(1/K) scaling to match v damping and prevent intercept-v seesaw
-        alpha_gamma = min(0.3, 3.0 / self.K) * ramp
+        # K=50: 0.3, K=130: 0.23, K=315: 0.095
+        alpha_gamma = min(0.3, 30.0 / self.K) * ramp
         for k in range(self.kappa):
             prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
             W_lam_k = W[:, k] * lam[:, k]
