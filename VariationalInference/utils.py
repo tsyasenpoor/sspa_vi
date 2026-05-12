@@ -394,12 +394,29 @@ def save_results(
     # Add classification weights if available
     if hasattr(model, 'mu_v'):
         n_outcomes = model.mu_v.shape[0]
+        is_ct_mode = getattr(model, '_use_cell_type_regression', False)
         for k in range(n_outcomes):
-            if label_columns is not None and k < len(label_columns):
-                col_name = f'v_weight_{label_columns[k]}'
+            lname = label_columns[k] if label_columns is not None and k < len(label_columns) else f'class{k}'
+            v_k = np.asarray(model.mu_v[k])
+            if is_ct_mode:
+                # Factor weights (K entries) go into beta_df indexed by gene programs
+                beta_df.insert(0, f'v_weight_{lname}', v_k[:model.K])
+                # Cell-type coefficients (C entries) saved separately below
             else:
-                col_name = f'v_weight_class{k}'
-            beta_df.insert(0, col_name, model.mu_v[k])
+                beta_df.insert(0, f'v_weight_{lname}', v_k)
+
+        # CT mode: save cell-type regression coefficients as a separate CSV
+        if is_ct_mode and model.n_cell_types is not None:
+            ct_coef_rows = {}
+            for k in range(n_outcomes):
+                lname = label_columns[k] if label_columns is not None and k < len(label_columns) else f'class{k}'
+                ct_coef_rows[lname] = np.asarray(model.mu_v[k, model.K:])
+            ct_coef_df = pd.DataFrame(ct_coef_rows)
+            ct_coef_df.index = [f'CT{c}' for c in range(model.n_cell_types)]
+            ct_coef_path = output_dir / f'{prefix}_ct_regression_coefs{ext}'
+            ct_coef_df.to_csv(ct_coef_path, compression=compression)
+            saved_files['ct_regression_coefs'] = ct_coef_path
+            print(f"Saved cell-type regression coefficients to {ct_coef_path}")
 
     beta_path = output_dir / f'{prefix}_{feature_type}_programs{ext}'
     beta_df.to_csv(beta_path, compression=compression)
@@ -719,7 +736,10 @@ def print_model_summary(model: Any, gene_list: Optional[List[str]] = None) -> No
     # Top genes per program
     if gene_list is not None:
         top_genes = get_top_genes_per_program(model, gene_list, n_top=5)
-        most_influential = np.argmax(np.abs(model.mu_v[0])) if model.mu_v.size > 0 else 0
+        _mv0 = np.asarray(model.mu_v[0])
+        if _mv0.ndim > 1:
+            _mv0 = _mv0.mean(axis=0)
+        most_influential = np.argmax(np.abs(_mv0)) if model.mu_v.size > 0 else 0
         print(f"\nTop 5 genes in most influential program (GP{most_influential + 1}):")
         for gene, loading in top_genes[f'GP{most_influential + 1}']:
             print(f"    {gene}: {loading:.4f}")
@@ -775,7 +795,8 @@ def load_pathways(
     use_cache: bool = True,
     excluded_keywords: Optional[List[str]] = None,
     require_prefix: Optional[str] = None,
-    pathway_selection: Optional[str] = None
+    pathway_selection: Optional[str] = None,
+    disable_adaptive_filter: bool = False
 ) -> Tuple[np.ndarray, List[str], List[str]]:
     """
     Load pathway definitions from GMT file into a binary matrix.
@@ -967,37 +988,41 @@ def load_pathways(
         pathways = pathways_filtered
         print(f"  After gene filter: {len(all_genes)} genes, {len(pathways)} pathways")
         
-        # Adaptive filtering: different thresholds based on original pathway size
-        # - Small pathways (<500 genes): keep if at least 2 genes in dataset
-        # - Large pathways (>=500 genes): keep if at least half of genes in dataset
-        SMALL_PATHWAY_THRESHOLD = 100
-        MIN_GENES_SMALL = 5
-        
-        pathways_adaptive = {}
-        n_dropped_small = 0
-        n_dropped_large = 0
-        for name, genes in pathways.items():
-            orig_size = original_pathway_sizes.get(name, len(genes))
-            n_overlap = len(genes)
-            
-            if orig_size < SMALL_PATHWAY_THRESHOLD:
-                # Small pathway: require at least 2 genes
-                if n_overlap >= MIN_GENES_SMALL:
-                    pathways_adaptive[name] = genes
+        if disable_adaptive_filter:
+            print(f"  Adaptive overlap-size filter DISABLED — keeping all "
+                  f"{len(pathways)} pathways regardless of data overlap")
+        else:
+            # Adaptive filtering: different thresholds based on original pathway size
+            # - Small pathways (<500 genes): keep if at least 2 genes in dataset
+            # - Large pathways (>=500 genes): keep if at least half of genes in dataset
+            SMALL_PATHWAY_THRESHOLD = 100
+            MIN_GENES_SMALL = 5
+
+            pathways_adaptive = {}
+            n_dropped_small = 0
+            n_dropped_large = 0
+            for name, genes in pathways.items():
+                orig_size = original_pathway_sizes.get(name, len(genes))
+                n_overlap = len(genes)
+
+                if orig_size < SMALL_PATHWAY_THRESHOLD:
+                    # Small pathway: require at least 2 genes
+                    if n_overlap >= MIN_GENES_SMALL:
+                        pathways_adaptive[name] = genes
+                    else:
+                        n_dropped_small += 1
                 else:
-                    n_dropped_small += 1
-            else:
-                # Large pathway: require at least half of genes in dataset
-                required = orig_size
-                if n_overlap >= required:
-                    pathways_adaptive[name] = genes
-                else:
-                    n_dropped_large += 1
-        
-        print(f"  After adaptive filter (small<{SMALL_PATHWAY_THRESHOLD}: ≥{MIN_GENES_SMALL}; "
-              f"large: ≥50%): {len(pathways_adaptive)} pathways "
-              f"(dropped {n_dropped_small} small, {n_dropped_large} large)")
-        pathways = pathways_adaptive
+                    # Large pathway: require at least half of genes in dataset
+                    required = orig_size
+                    if n_overlap >= required:
+                        pathways_adaptive[name] = genes
+                    else:
+                        n_dropped_large += 1
+
+            print(f"  After adaptive filter (small<{SMALL_PATHWAY_THRESHOLD}: ≥{MIN_GENES_SMALL}; "
+                  f"large: ≥50%): {len(pathways_adaptive)} pathways "
+                  f"(dropped {n_dropped_small} small, {n_dropped_large} large)")
+            pathways = pathways_adaptive
     
     # Filter pathways by size (after gene filter overlap)
     pathways_sized = {

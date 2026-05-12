@@ -43,6 +43,10 @@ def parse_args():
                    help="Label columns to predict")
     p.add_argument("--output-dir", "-o", default="./results/spectra_baselines")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split-seed", type=int, default=0,
+                   help="Seed for train/val/test splitting (deterministic). "
+                        "Decoupled from --seed so the same split can be reused "
+                        "across different init seeds.")
     p.add_argument("--train-ratio", type=float, default=0.7)
     p.add_argument("--val-ratio", type=float, default=0.15)
     return p.parse_args()
@@ -112,11 +116,11 @@ def main():
         unique_patients = np.unique(patient_ids)
         train_pat, temp_pat = train_test_split(
             unique_patients, test_size=(args.val_ratio + test_ratio),
-            random_state=args.seed
+            random_state=args.split_seed
         )
         val_proportion = args.val_ratio / (args.val_ratio + test_ratio)
         val_pat, test_pat = train_test_split(
-            temp_pat, test_size=(1 - val_proportion), random_state=args.seed
+            temp_pat, test_size=(1 - val_proportion), random_state=args.split_seed
         )
         train_set, val_set, test_set = set(train_pat), set(val_pat), set(test_pat)
         train_idx = np.where([p in train_set for p in patient_ids])[0]
@@ -125,11 +129,11 @@ def main():
         print(f"  Patient-grouped split: {len(train_pat)} / {len(val_pat)} / {len(test_pat)} patients")
     else:
         train_idx, temp_idx = train_test_split(
-            indices, test_size=(args.val_ratio + test_ratio), random_state=args.seed
+            indices, test_size=(args.val_ratio + test_ratio), random_state=args.split_seed
         )
         val_proportion = args.val_ratio / (args.val_ratio + test_ratio)
         val_idx, test_idx = train_test_split(
-            temp_idx, test_size=(1 - val_proportion), random_state=args.seed
+            temp_idx, test_size=(1 - val_proportion), random_state=args.split_seed
         )
 
     X_train = cell_scores[train_idx]

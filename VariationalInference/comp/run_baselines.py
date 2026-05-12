@@ -74,6 +74,10 @@ def parse_args():
                         help='Subsample dataset to exactly this many patients')
     parser.add_argument('--subsample-seed', type=int, default=0,
                         help='Seed for patient-level subsampling')
+    parser.add_argument('--split-seed', type=int, default=0,
+                        help='Seed for train/val/test splitting (deterministic). '
+                             'Decoupled from --seed so the same split can be reused '
+                             'across different init seeds.')
     parser.add_argument('--patient-column', type=str, default=None,
                         help='Column in adata.obs identifying patients/donors (e.g., sampleID). '
                              'When set, splits at patient level to prevent donor leakage.')
@@ -152,7 +156,7 @@ def main():
         layer='raw',
         convert_to_ensembl=True,
         filter_protein_coding=args.gene_annotation is not None,
-        random_state=args.seed,
+        random_state=args.split_seed,
         normalize=args.normalize,
         normalize_target_sum=args.normalize_target_sum,
         normalize_method=args.normalize_method,
@@ -182,7 +186,7 @@ def main():
     print("Training and Evaluating Baseline Methods")
     print("=" * 80)
     
-    from VariationalInference.comp_methods import train_alg, eval_alg
+    from VariationalInference.comp.comp_methods import train_alg, eval_alg
     
     all_results = {}
     

@@ -32,27 +32,27 @@ PATIENT_COUNTS_FULL = PATIENT_COUNTS_SUBSAMPLE + [148]  # includes full
 SEEDS = [42, 123, 456, 789, 1024]
 
 H5AD = "/labs/Aguiar/SSPA_BRAY/BRay/BRAY_FileTransfer/Covid19/covid19_filtered_fullgenes_clean.h5ad"
-GMT_FILE = "/archive/projects/SSPA_BRAY/sspa/c2.cp.v2024.1.Hs.symbols.gmt"
-RESULTS_ROOT = "/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level"
+GMT_FILE = "/labs/Aguiar/SSPA_BRAY/results/pathway_selections/covid_selected_pathways.gmt"
+RESULTS_ROOT = "/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_cell_level_no_split_seeds"
 METHODS_ROOT = f"{RESULTS_ROOT}/methods"
 
 VI_DIR = "/labs/Aguiar/SSPA_BRAY/BRay/VariationalInference"
 CONDA_SH = "/home/FCAM/tyasenpoor/miniconda3/etc/profile.d/conda.sh"
 MAIL_USER = "tsyasenpoor@uconn.edu"
 SUBSAMPLE_SEED = 0  # deterministic patient-level subsampling seed
+SPLIT_SEED = 0      # deterministic train/val/test split seed (shared across --seed values)
 
 # Common DRGP parameters
 DRGP_COMMON = (
-    '--n-factors 50 '
+    '--n-factors 500 '
     '--a 0.3 --c 0.3 '
-    '--sigma-v 2.0 --v-prior laplace '
+    '--b-v 2.0 '
     '--sigma-gamma 0.5 '
     '--max-iter 2000 --tol 0.001 '
     '--v-warmup 50 --check-freq 10 '
     '--early-stopping heldout_ll '
     '--label-column "CoVID-19 severity" Outcome '
     '--aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes '
-    '--patient-column sampleID '
     f'--pathway-file {GMT_FILE}'
 )
 
@@ -77,14 +77,14 @@ RESOURCE_PROFILES = {
     30: {
         "drgp":       (100, 48, "general", "general", 4, 1),
         "spectra":    (250, 24, "general", "general", 4, 1),
-        "schpf":      (400, 48, "himem",   "himem",   8, 0),
+        "schpf":      (400, 48, "general",   "general",   8, 0),
         "baselines":  (200, 12, "general", "general", 8, 0),
     },
     50: {
         "drgp":       (200, 96, "general", "general", 4, 1),
-        "spectra":    (500, 96, "himem",   "himem",   8, 1),
-        "schpf":      (600, 48, "himem",   "himem",   8, 0),
-        "baselines":  (300, 16, "himem",   "himem",   8, 0),
+        "spectra":    (450, 96, "general",   "general",   8, 1),
+        "schpf":      (450, 48, "general",   "general",   8, 0),
+        "baselines":  (300, 16, "general",   "general",   8, 0),
     },
     148: {
         "drgp":       (300, 48, "general", "general", 8, 1),
@@ -94,8 +94,8 @@ RESOURCE_PROFILES = {
 
 # Which methods run on which patient counts
 METHODS_SUBSAMPLE_ONLY = {"spectra_sup", "schpf"}  # 15, 30, 50 only
-METHODS_ALL = {"drgp_unmasked", "drgp_masked", "drgp_pathway_init",
-               "drgp_combined", "baselines"}         # 15, 30, 50, 148
+METHODS_ALL = {"drgp_unmasked", "drgp_masked",
+               "baselines"}                           # 15, 30, 50, 148
 
 
 def _subsample_arg(n_patients: int) -> str:
@@ -226,6 +226,7 @@ def gen_drgp_script(n_patients: int, mode: str, res: tuple) -> str:
             {DRGP_COMMON} \\
             {subsample} \\
             --seed $SEED \\
+            --split-seed {SPLIT_SEED} \\
             --output-dir "$OUTPUT" \\
             --verbose
     """)
@@ -254,15 +255,15 @@ def gen_spectra_sup_script(n_patients: int, res: tuple) -> str:
         BASELINE_OUT="{baseline_out}"
         mkdir -p "$SPECTRA_OUT" "$BASELINE_OUT"
 
-        # Fit Spectra (supervised with REACTOME pathways)
+        # Fit Spectra (supervised with selected pathways)
         FIT_START=$(date +%s)
         python -u {VI_DIR}/comp/run_spectra_supervised.py \\
             --h5ad {H5AD} \\
             --gmt-file {GMT_FILE} \\
             --output-dir "$SPECTRA_OUT" \\
-            --require-prefix REACTOME \\
+            --require-prefix "" \\
             --lam 0.01 \\
-            --num-epochs 10000 \\
+            --num-epochs 1000 \\
             {subsample} \\
             --seed $SEED \\
             --verbose
@@ -279,6 +280,10 @@ src = ad.read_h5ad('{H5AD}')
 src.var_names_make_unique()
 {'src = subsample_adata(src, n_patients=' + str(n_patients) + ', subsample_seed=' + str(SUBSAMPLE_SEED) + ')' if n_patients < 148 else '# full dataset'}
 meta = _build_metadata(src.obs)
+# Cell-level split: drop sampleID so run_spectra_baselines.py falls back to
+# stratified cell-level split (it auto-patient-groups if sampleID is present).
+if 'sampleID' in meta.columns:
+    meta = meta.drop(columns=['sampleID'])
 meta.to_csv('$SPECTRA_OUT/metadata_covid.csv')
 print(f'Wrote metadata: {{len(meta)}} cells')
 "
@@ -289,7 +294,8 @@ print(f'Wrote metadata: {{len(meta)}} cells')
             --data "$SPECTRA_OUT/metadata_covid.csv" \\
             --labels severity outcome \\
             --output-dir "$BASELINE_OUT" \\
-            --seed $SEED
+            --seed $SEED \\
+            --split-seed {SPLIT_SEED}
     """)
 
     footer = _benchmark_footer(spectra_out)
@@ -358,8 +364,10 @@ mmwrite(tmpdir / 'filtered.mtx', X_int.tocoo(), field='integer')
 genes = pd.DataFrame({{'gene_id': src.var_names.astype(str), 'gene_name': src.var_names.astype(str)}})
 genes.to_csv(tmpdir / 'genes.txt', sep='\\t', header=False, index=False)
 
-# Write metadata
+# Write metadata (drop sampleID → forces cell-level split in run_schpf_baselines.py)
 meta = _build_metadata(src.obs)
+if 'sampleID' in meta.columns:
+    meta = meta.drop(columns=['sampleID'])
 meta.to_csv(tmpdir / 'metadata_covid.csv')
 print(f'Wrote scHPF inputs to {{tmpdir}}: {{src.n_obs}} cells x {{src.n_vars}} genes')
 "
@@ -394,6 +402,7 @@ print(f'Wrote scHPF inputs to {{tmpdir}}: {{src.n_obs}} cells x {{src.n_vars}} g
             --labels severity outcome \\
             --output-dir "$BASELINE_OUT" \\
             --seed $SEED \\
+            --split-seed {SPLIT_SEED} \\
             --verbose
 
         # Clean up temp files
@@ -433,33 +442,14 @@ def gen_baselines_script(n_patients: int, res: tuple) -> str:
                 --data {H5AD} \\
                 --label-column "$LABEL" \\
                 --aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes \\
-                --patient-column sampleID \\
                 {subsample} \\
                 --output-dir "$RUN_OUT" \\
                 --latent-dim 50 \\
                 --seed $SEED \\
+                --split-seed {SPLIT_SEED} \\
                 --verbose
 
             echo "$LABEL_TAG finished at: $(date)"
-
-            # Patient-level evaluation from saved pickles (no retraining)
-            PAT_OUT="$OUT_ROOT/${{LABEL_TAG}}_patient"
-            mkdir -p "$PAT_OUT"
-            echo "Running patient-level eval for $LABEL_TAG (seed=$SEED)..."
-
-            python -u {VI_DIR}/comp/run_baselines_patient_eval.py \
-                --data {H5AD} \
-                --model-dir "$RUN_OUT" \
-                --label-column "$LABEL" \
-                --aux-columns Sex cm_asthma_copd cm_cardio cm_diabetes \
-                --patient-column sampleID \
-                {subsample} \
-                --output-dir "$PAT_OUT" \
-                --latent-dim 50 \
-                --seed $SEED \
-                --verbose
-
-            echo "$LABEL_TAG patient-level eval finished at: $(date)"
         done
     """)
 
@@ -496,9 +486,8 @@ def parse_args():
                    help="Patient counts to run (default: 15 30 50 for spectra/schpf, "
                         "15 30 50 148 for drgp/baselines)")
     p.add_argument("--methods", type=str, nargs="+",
-                   default=["drgp_unmasked", "drgp_masked", "drgp_pathway_init",
-                            "drgp_combined", "spectra_sup",
-                            "schpf", "baselines"],
+                   default=["drgp_unmasked", "drgp_masked",
+                            "spectra_sup", "schpf", "baselines"],
                    help="Methods to run")
     return p.parse_args()
 

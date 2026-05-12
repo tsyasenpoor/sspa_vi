@@ -392,3 +392,13 @@ VariationalInference/run_spectra.py
 jobs_sh/submit_sim_drgp_full.sh
 jobs_sh/ibd_test.sh
 jobs_sh/ibd_test.sh
+gsva_pbmc.py
+muster_pbmc.py
+jobs_sh/submit_biorepo_vi_bayes_opt.sh
+jobs_sh/submit_biorepo_vi_masked.sh
+jobs_sh/submit_biorepo_vi_singscore_bo_and_run.sh
+jobs_sh/submit_biorepo_vi_singscore_unmasked.sh
+jobs_sh/submit_biorepo_vi_unmasked.sh
+jobs_sh/submit_gsva_pbmc.sh
+jobs_sh/submit_muster_pbmc.sh
+jobs_sh/submit_pseudobulk_ct.sh

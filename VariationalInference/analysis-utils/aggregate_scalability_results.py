@@ -15,8 +15,18 @@ Usage:
         --output /labs/Aguiar/SSPA_BRAY/results/ibd_benchmark/summary/all_metrics.csv
 
     python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/aggregate_scalability_results.py \
-        --results-root /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/methods \
-        --output /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/all_metrics.csv
+        --results-root /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_cell_level_no_split_seeds/methods \
+        --output /labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_cell_level_no_split_seeds/all_metrics.csv
+
+    # Biorepo per-cell-type layout:
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/aggregate_scalability_results.py \
+        --results-root /labs/Aguiar/SSPA_BRAY/results/biorepo_vi_unmasked\
+        --output /labs/Aguiar/SSPA_BRAY/results/biorepo_vi_unmasked/all_metrics.csv
+
+    python /labs/Aguiar/SSPA_BRAY/BRay/VariationalInference/analysis-utils/aggregate_scalability_results.py \
+        --results-root /labs/Aguiar/SSPA_BRAY/results/biorepo_vi_singscore_unmasked \
+        --output /labs/Aguiar/SSPA_BRAY/results/biorepo_vi_singscore_unmasked/all_metrics.csv \
+        --cell-types cd4t cd8t Bcell NKcell monocytes allPBMC
         """
 from __future__ import annotations
 
@@ -223,6 +233,81 @@ def _parse_baselines(baselines_dir: Path, ratio, seed: int) -> list[dict]:
     return rows
 
 
+def _parse_biorepo_seed(seed_dir: Path, cell_type: str, seed: int) -> list[dict]:
+    """Parse DRGP results from a seed dir in the biorepo per-cell-type layout.
+
+    Layout: {results_root}/{celltype_dir}/seed{N}/{vi_metrics.csv,vi_summary.json.gz}
+    No benchmark.json; method is always drgp_unmasked.
+    """
+    rows = []
+    metrics_path = seed_dir / "vi_metrics.csv"
+    if not metrics_path.exists():
+        return rows
+
+    cell_counts = {}
+    summary_path = seed_dir / "vi_summary.json.gz"
+    if summary_path.exists():
+        with gzip.open(summary_path, "rt") as f:
+            d = json.load(f)
+        shapes = d.get("data_shapes", {})
+        if shapes:
+            cell_counts = {
+                "n_cells_train": shapes.get("n_train"),
+                "n_cells_val": shapes.get("n_val"),
+                "n_cells_test": shapes.get("n_test"),
+                "n_cells_total": sum(shapes.get(k, 0) for k in ("n_train", "n_val", "n_test")),
+            }
+
+    bm = _load_benchmark(seed_dir)
+    df_m = pd.read_csv(metrics_path)
+    for _, row in df_m.iterrows():
+        r = {
+            "cell_type": cell_type,
+            "seed": seed,
+            "method": "drgp_unmasked",
+            "ratio": None,
+            "label": row.get("label", "unknown"),
+            "split": row.get("split", "unknown"),
+            "accuracy": row.get("accuracy"),
+            "f1": row.get("f1"),
+            "auc": row.get("auc"),
+            "precision": row.get("precision"),
+            "recall": row.get("recall"),
+            "wall_time_s": bm.get("wall_time_seconds"),
+            "peak_rss_mb": bm.get("peak_rss_mb"),
+        }
+        r.update(cell_counts)
+        rows.append(r)
+    return rows
+
+
+def _detect_layout(results_root: Path) -> str:
+    """Infer directory layout from the immediate children of results_root."""
+    subdirs = [d for d in sorted(results_root.iterdir()) if d.is_dir() and d.name != "logs"]
+    if not subdirs:
+        return "unknown"
+
+    has_seed_underscore = any(d.name.startswith("seed_") for d in subdirs)
+    has_ratio = any(d.name.startswith("ratio_") or d.name.endswith("p") for d in subdirs)
+
+    if has_ratio:
+        return "scalability"
+    if has_seed_underscore:
+        return "flat"
+
+    # Biorepo: first-level dirs are cell-type dirs; their children are seed dirs
+    # containing vi_metrics.csv directly.
+    for ct_dir in subdirs[:3]:
+        if not ct_dir.is_dir():
+            continue
+        for child in ct_dir.iterdir():
+            if child.is_dir() and child.name.startswith("seed"):
+                if (child / "vi_metrics.csv").exists():
+                    return "biorepo"
+
+    return "unknown"
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Aggregate scalability benchmark results")
     p.add_argument("--results-root",
@@ -231,6 +316,9 @@ def parse_args():
     p.add_argument("--output", "-o",
                    default="/labs/Aguiar/SSPA_BRAY/results/scalability_benchmark_patient_level/summary/all_metrics.csv",
                    help="Output CSV path")
+    p.add_argument("--cell-types", nargs="*", default=None,
+                   help="(biorepo mode) restrict to these cell types; "
+                        "extracted as first underscore-delimited token of the cell-type dir name")
     return p.parse_args()
 
 
@@ -240,7 +328,8 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Scanning {results_root} ...")
+    layout = _detect_layout(results_root)
+    print(f"Scanning {results_root} (layout={layout}) ...")
 
     all_rows = []
 
@@ -270,17 +359,29 @@ def main():
             for row in all_rows[rows_before:]:
                 row.update(cell_counts)
 
-    # Detect directory layout:
-    #   - Scalability: results_root/ratio_dir/seed_dir/method_dir/
-    #   - Flat:        results_root/seed_dir/method_dir/
-    subdirs = [d for d in sorted(results_root.iterdir()) if d.is_dir()]
-    has_seed_dirs = any(d.name.startswith("seed_") for d in subdirs)
-    has_ratio_dirs = any(
-        d.name.startswith("ratio_") or d.name.endswith("p") for d in subdirs
-    )
+    if layout == "biorepo":
+        # Biorepo layout: {results_root}/{celltype_dir}/seed{N}/vi_metrics.csv
+        ct_filter = set(args.cell_types) if args.cell_types else None
+        ct_dirs = sorted(
+            d for d in results_root.iterdir()
+            if d.is_dir() and d.name != "logs"
+        )
+        for ct_dir in ct_dirs:
+            cell_type = ct_dir.name.split("_")[0]
+            if ct_filter and cell_type not in ct_filter:
+                continue
+            for seed_dir in sorted(ct_dir.iterdir()):
+                if not seed_dir.is_dir() or not seed_dir.name.startswith("seed"):
+                    continue
+                try:
+                    seed = int(seed_dir.name.replace("seed", ""))
+                except ValueError:
+                    continue
+                all_rows.extend(_parse_biorepo_seed(seed_dir, cell_type, seed))
 
-    if has_ratio_dirs and not has_seed_dirs:
+    elif layout == "scalability":
         # Scalability layout: ratio_dir / seed_dir / method_dir
+        subdirs = [d for d in sorted(results_root.iterdir()) if d.is_dir()]
         for ratio_dir in subdirs:
             rname = ratio_dir.name
             if rname.startswith("ratio_"):
@@ -299,8 +400,9 @@ def main():
                 seed = int(seed_dir.name.replace("seed_", ""))
                 _collect_seed_dir(seed_dir, ratio, seed)
 
-    elif has_seed_dirs:
+    elif layout == "flat":
         # Flat layout: seed_dir / method_dir  (no ratio level)
+        subdirs = [d for d in sorted(results_root.iterdir()) if d.is_dir()]
         for seed_dir in subdirs:
             if not seed_dir.name.startswith("seed_"):
                 continue
@@ -308,6 +410,7 @@ def main():
             _collect_seed_dir(seed_dir, ratio=None, seed=seed)
 
     else:
+        subdirs = [d for d in sorted(results_root.iterdir()) if d.is_dir()]
         print(f"Unrecognized directory layout under {results_root}")
         print(f"  Found: {[d.name for d in subdirs[:10]]}")
         return
@@ -322,12 +425,16 @@ def main():
 
     # Summary: mean test AUC
     print("\n" + "=" * 90)
-    print("PERFORMANCE: Mean test AUC by method and ratio (across seeds)")
-    print("=" * 90)
-
     test_df = df[(df["split"] == "test") & df["auc"].notna()]
     if len(test_df) > 0:
-        pivot = test_df.groupby(["method", "label", "ratio"])["auc"].agg(["mean", "std"]).round(4)
+        if "cell_type" in df.columns and df["cell_type"].notna().any():
+            print("PERFORMANCE: Mean test AUC by cell type and label (across seeds)")
+            print("=" * 90)
+            pivot = test_df.groupby(["cell_type", "label"])["auc"].agg(["mean", "std"]).round(4)
+        else:
+            print("PERFORMANCE: Mean test AUC by method and ratio (across seeds)")
+            print("=" * 90)
+            pivot = test_df.groupby(["method", "label", "ratio"])["auc"].agg(["mean", "std"]).round(4)
         print(pivot.to_string())
 
     # Summary: benchmark metrics

@@ -92,21 +92,6 @@ def parse_args() -> argparse.Namespace:
              'Multiple columns enable multi-outcome inference (e.g., --label-column severity outcome).'
     )
     parser.add_argument(
-        '--n-cell-types',
-        type=int,
-        default=None,
-        help='Number of distinct cell types in pseudo-bulk input. Enables '
-             'cell-type-aware regression: v becomes (kappa x n_cell_types x K). '
-             'Requires --cell-type-column and --patient-column.'
-    )
-    parser.add_argument(
-        '--cell-type-column',
-        type=str,
-        default=None,
-        help='obs column identifying the cell type of each pseudo-bulk row '
-             '(e.g. celltype_subclust). Used when --n-cell-types is set.'
-    )
-    parser.add_argument(
         '--aux-columns',
         type=str,
         nargs='+',
@@ -165,28 +150,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=50,
         help='Number of unconstrained data-driven gene programs (DRGPs) for combined mode'
-    )
-    parser.add_argument(
-        '--require-prefix',
-        type=str,
-        default=None,
-        help='If set, only pathways whose names start with this prefix are kept '
-             '(e.g. REACTOME). Applied inside load_pathways before size filters.'
-    )
-    parser.add_argument(
-        '--no-adaptive-filter',
-        action='store_true',
-        help='Disable the adaptive overlap-size filter inside load_pathways '
-             '(keep every pathway regardless of how many genes intersect the data).'
-    )
-    parser.add_argument(
-        '--excluded-keywords',
-        nargs='*',
-        default=[],
-        metavar='KW',
-        help='Pathway name substrings to exclude (case-insensitive). '
-             'Defaults to empty — no keyword filtering. '
-             'Example: --excluded-keywords ADME DRUG'
     )
 
     # Training options
@@ -343,10 +306,7 @@ def parse_args() -> argparse.Namespace:
         '--seed',
         type=int,
         default=None,
-        help='Seed for MODEL initialization only (default: None = auto from time). '
-             'Does NOT affect the train/val/test split — that is controlled by '
-             '--split-seed. Passed to CAVI(random_state=...), which reseeds '
-             'np.random locally at model construction.'
+        help='Random seed for reproducibility (default: None = true random)'
     )
     parser.add_argument(
         '--verbose', '-v',
@@ -357,13 +317,6 @@ def parse_args() -> argparse.Namespace:
         '--debug',
         action='store_true',
         help='Print detailed debug information'
-    )
-    parser.add_argument(
-        '--diag-every-iter',
-        action='store_true',
-        help='Diagnostic: print mu_v[:, :3] at EVERY iteration (not just every '
-             '--check-freq) so the CAVI v-update oscillation period can be '
-             'measured. Small print overhead per iteration.'
     )
     parser.add_argument(
         '--profile',
@@ -403,13 +356,6 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help='Seed for patient-level subsampling (deterministic).'
     )
-    parser.add_argument(
-        '--split-seed',
-        type=int,
-        default=0,
-        help='Seed for train/val/test splitting (deterministic). Decoupled from '
-             '--seed so the same split can be reused across different VI init seeds.'
-    )
 
     # Patient-level splitting (prevents donor leakage in single-cell data)
     parser.add_argument(
@@ -430,6 +376,7 @@ def main():
     import cProfile
     import pstats
     import io
+    import random
 
     # =========================================================================
     # STEP 1: Parse Arguments
@@ -437,18 +384,19 @@ def main():
     args = parse_args()
 
     # =========================================================================
-    # STEP 1.5: Resolve seeds (model init decoupled from data split)
+    # STEP 1.5: Set Random Seeds for Full Reproducibility
     # =========================================================================
-    # --seed controls MODEL initialization only. CAVI(random_state=args.seed)
-    # reseeds np.random locally at model construction (vi_cavi.py:186-188).
-    # --split-seed controls the train/val/test split (default 0), passed
-    # explicitly to DataLoader. No global RNG is set here so pre-model code
-    # paths cannot accidentally leak --seed into data randomization.
-    if args.seed is None:
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        print(f"[SEED] Set Python/NumPy random seed to {args.seed}")
+    else:
         import time
-        args.seed = int(time.time() * 1000) % (2**32)
-    print(f"[SEED] Model init seed = {args.seed}  "
-          f"(data split seed = {args.split_seed}, decoupled)")
+        auto_seed = int(time.time() * 1000) % (2**32)
+        random.seed(auto_seed)
+        np.random.seed(auto_seed)
+        args._auto_seed = auto_seed
+        print(f"[SEED] No seed provided, using auto-generated seed: {auto_seed}")
 
     # Initialize profiler if requested
     profiler = None
@@ -471,14 +419,12 @@ def main():
 
     print(f"  label_column: {label_columns}")
     print(f"  aux_columns:  {args.aux_columns}")
-    print(f"  random_seed:  {args.seed}")
+    seed_display = args.seed if args.seed else f"auto ({getattr(args, '_auto_seed', 'unknown')})"
+    print(f"  random_seed:  {seed_display}")
     print(f"  output_dir:   {args.output_dir}")
     if args.mode in ['masked', 'pathway_init', 'combined']:
         print(f"  pathway_file: {args.pathway_file}")
         print(f"  pathway_size: [{args.pathway_min_genes}, {args.pathway_max_genes}]")
-        kw_str = ', '.join(args.excluded_keywords) if args.excluded_keywords else "(none)"
-        print(f"  excl_keywords:{kw_str}")
-        print(f"  adaptive_filt:{'disabled' if args.no_adaptive_filter else 'enabled'}")
     if args.normalize:
         print(f"  normalize:    True (target_sum={args.normalize_target_sum:.0f}, method={args.normalize_method})")
 
@@ -538,7 +484,7 @@ def main():
         layer=args.layer,
         convert_to_ensembl=True,
         filter_protein_coding=args.gene_annotation is not None,
-        random_state=args.split_seed,
+        random_state=args.seed,
         normalize=args.normalize,
         normalize_target_sum=args.normalize_target_sum,
         normalize_method=args.normalize_method,
@@ -615,10 +561,7 @@ def main():
             min_genes=args.pathway_min_genes,
             max_genes=args.pathway_max_genes,
             cache_dir=args.cache_dir,
-            use_cache=True,
-            excluded_keywords=args.excluded_keywords,
-            require_prefix=args.require_prefix,
-            disable_adaptive_filter=args.no_adaptive_filter,
+            use_cache=True
         )
 
         # Align pathway matrix columns to match gene_list order
@@ -764,47 +707,106 @@ def main():
         n_pathway_factors=n_pathway_factors,
         alpha_pi=args.alpha_pi,
         beta_pi_scale=args.beta_pi_scale,
-        n_cell_types=args.n_cell_types,
     )
 
     model = ModelClass(**model_kwargs)
 
-    fit_kwargs = dict(
-        X_train=X_train,
-        y_train=y_train,
-        X_aux_train=X_aux_train,
-        X_val=X_val,
-        y_val=y_val,
-        X_aux_val=X_aux_val,
-        max_iter=args.max_iter,
-        check_freq=args.check_freq,
-        tol=args.tol,
-        v_warmup=args.v_warmup,
-        verbose=True,
-        early_stopping=args.early_stopping,
-        n_patients=n_train_patients,
-        patient_ids=train_patient_ids,
-        diag_every_iter=args.diag_every_iter,
-    )
+    # =========================================================================
+    # RESUME FROM CHECKPOINT (skip training)
+    # =========================================================================
+    import scipy.sparse as _sp
+    from VariationalInference.jax_backend import xp as _xp, to_device as _to_device
 
-    # CT mode: build integer index arrays from obs columns
-    if args.n_cell_types is not None:
-        if not (args.cell_type_column and args.patient_column):
-            raise ValueError(
-                "--n-cell-types requires both --cell-type-column and --patient-column"
-            )
-        cell_meta = data['cell_metadata']
-        train_cells = splits['train']
-        obs_train = cell_meta.loc[train_cells]
-        fit_kwargs['patient_idx']   = pd.factorize(obs_train[args.patient_column])[0]
-        fit_kwargs['cell_type_idx'] = pd.factorize(obs_train[args.cell_type_column])[0]
-        print(f"  CT mode: patient_column={args.patient_column}, "
-              f"cell_type_column={args.cell_type_column}, "
-              f"n_cell_types={args.n_cell_types}")
+    checkpoint_path = Path(args.output_dir) / 'model_checkpoint.npz'
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"No checkpoint found at {checkpoint_path}. "
+            f"This script requires a pre-trained model checkpoint."
+        )
+    print(f"\n[RESUME] Loading model checkpoint from {checkpoint_path}")
+    ckpt = np.load(checkpoint_path, allow_pickle=True)
 
-    model.fit(**fit_kwargs)
+    K_ckpt = int(ckpt['n_factors'])
+    assert K_ckpt == n_factors, f"Checkpoint K={K_ckpt} != configured n_factors={n_factors}"
 
-    print("\nTraining complete!")
+    # Compute empirical bp/dp from training data (same as fit() does)
+    X_csr = X_train.tocsr() if _sp.issparse(X_train) and X_train.format != 'csr' else (
+        X_train if _sp.issparse(X_train) else _sp.csr_matrix(X_train))
+    model.n, model.p = X_csr.shape
+    model.kappa = 1 if y_train.ndim == 1 else y_train.shape[1]
+    # During fit, X_aux has an intercept column prepended before _initialize.
+    # p_aux therefore includes the intercept when use_intercept=True.
+    _raw_paux = X_aux_train.shape[1] if X_aux_train is not None and X_aux_train.size > 0 else 0
+    model.p_aux = _raw_paux + (1 if model.use_intercept else 0)
+    model.bp = model.ap * model._mean_var_ratio(X_csr, axis=1)
+    model.dp = model.cp * model._mean_var_ratio(X_csr, axis=0)
+    INV_BUDGET_MEAN_MAX = 1e4
+    a_xi0 = model.ap + K_ckpt * model.a
+    a_eta0 = model.cp + K_ckpt * model.c
+    bp_floor = a_xi0 / INV_BUDGET_MEAN_MAX
+    dp_floor = a_eta0 / INV_BUDGET_MEAN_MAX
+    if model.bp < bp_floor: model.bp = bp_floor
+    if model.dp < dp_floor: model.dp = dp_floor
+    if model.bp > 1000 * model.dp: model.dp = model.bp / 1000
+    elif model.dp > 1000 * model.bp: model.bp = model.dp / 1000
+
+    # Load trained parameters from checkpoint onto the device.
+    # E_beta and E_log_beta are @property — set the underlying cache fields.
+    _E_beta_np = np.asarray(ckpt['E_beta'])
+    _E_log_beta_np = np.asarray(ckpt['E_log_beta'])
+    model._E_beta_cache = _to_device(_E_beta_np)
+    # Populate a_beta/b_beta with values that would reproduce E_beta if the
+    # cache were ever invalidated (a_beta = E_beta, b_beta = 1.0).
+    model.a_beta = _to_device(_E_beta_np.astype(np.float32))
+    model.b_beta = _to_device(np.ones_like(_E_beta_np, dtype=np.float32))
+    model.mu_v = _to_device(np.asarray(ckpt['mu_v']))
+    model.sigma_v_diag = _to_device(np.asarray(ckpt['sigma_v_diag']))
+    model.mu_gamma = _to_device(np.asarray(ckpt['mu_gamma']))
+    # Sigma_gamma not in checkpoint: use prior (sigma_gamma^2 * I). Only
+    # affects variance correction in predict_proba -- Platt recalibrates anyway.
+    if model.p_aux > 0:
+        Sigma_gamma_init = np.stack([
+            np.eye(model.p_aux, dtype=np.float32) * (model.sigma_gamma ** 2)
+            for _ in range(model.kappa)
+        ])
+    else:
+        Sigma_gamma_init = np.zeros((model.kappa, 0, 0), dtype=np.float32)
+    model.Sigma_gamma = _to_device(Sigma_gamma_init)
+
+    # Active beta mask: pre-computed in E_log_beta (-inf for masked entries).
+    # Build boolean mask from finite entries, or None for unmasked mode.
+    if args.mode == 'masked':
+        _elb_np = np.asarray(ckpt['E_log_beta'])
+        model._active_beta = _to_device(np.isfinite(_elb_np))
+        model._n_active_beta = int(np.isfinite(_elb_np).sum())
+    else:
+        model._active_beta = None
+        model._n_active_beta = model.p * K_ckpt
+
+    # E_log_beta cache (already has -inf masking applied in checkpoint)
+    model._E_log_beta_cache = _to_device(_E_log_beta_np)
+
+    # Default: no JJ regularization at inference (matches training default)
+    if not hasattr(model, 'test_jj_reg'):
+        model.test_jj_reg = False
+
+    # Populate histories for downstream logging (if available)
+    if 'elbo_history' in ckpt.files:
+        try:
+            model.elbo_history_ = list(map(tuple, np.asarray(ckpt['elbo_history']).tolist()))
+        except Exception:
+            model.elbo_history_ = []
+    if 'holl_history' in ckpt.files:
+        try:
+            model.holl_history_ = list(map(tuple, np.asarray(ckpt['holl_history']).tolist()))
+        except Exception:
+            model.holl_history_ = []
+
+    print(f"[RESUME] Loaded: K={K_ckpt}, n={model.n}, p={model.p}, "
+          f"kappa={model.kappa}, p_aux={model.p_aux}")
+    print(f"[RESUME] bp={model.bp:.6f}, dp={model.dp:.6f}")
+    print(f"[RESUME] mu_v range=[{float(model.mu_v.min()):.4f}, {float(model.mu_v.max()):.4f}]")
+    print("\nTraining skipped (loaded from checkpoint).")
     if hasattr(model, 'elbo_history_') and model.elbo_history_:
         print(f"  Final ELBO: {model.elbo_history_[-1][1]:.2f}")
         print(f"  Iterations: {model.elbo_history_[-1][0] + 1}")
@@ -827,7 +829,8 @@ def main():
     print(f"mu_v sum:   {model.mu_v.sum():.6f}")
 
     # STABILITY DIAGNOSTIC: Save v vector for cross-run comparison
-    v_stability_path = output_dir / f'v_vector_seed{args.seed}.npy'
+    seed_label = args.seed if args.seed else getattr(args, '_auto_seed', 'unknown')
+    v_stability_path = output_dir / f'v_vector_seed{seed_label}.npy'
     np.save(v_stability_path, model.mu_v.flatten())
     print(f"\n[STABILITY] Saved v vector to {v_stability_path}")
     print(f"[STABILITY] To check stability across seeds, run:")
@@ -835,33 +838,7 @@ def main():
     print(f"    v2 = np.load('v_vector_seed<B>.npy')")
     print(f"    print(f'Spearman r = {{spearmanr(v1, v2).correlation:.4f}}')")
 
-    # =========================================================================
-    # CHECKPOINT: Save model parameters immediately after training
-    # =========================================================================
-    print("\n[CHECKPOINT] Saving model parameters immediately after training...")
-    checkpoint_params = {
-        'n_factors': model.K,
-        'a': float(model.a),
-        'c': float(model.c),
-        'b_v': float(model.b_v),
-        'E_beta': np.array(model.E_beta),
-        'E_log_beta': np.array(model.E_log_beta),
-        'mu_v': np.array(model.mu_v),
-        'sigma_v_diag': np.array(model.sigma_v_diag),
-        'mu_gamma': np.array(model.mu_gamma),
-        'n': model.n,
-        'p': model.p,
-        'p_aux': model.p_aux,
-    }
-    if hasattr(model, 'elbo_history_'):
-        checkpoint_params['elbo_history'] = model.elbo_history_
-    if hasattr(model, 'holl_history_'):
-        checkpoint_params['holl_history'] = model.holl_history_
-
-    checkpoint_path = output_dir / 'model_checkpoint.npz'
-    np.savez_compressed(checkpoint_path, **checkpoint_params)
-    print(f"[CHECKPOINT] Saved to {checkpoint_path}")
-    print(f"[CHECKPOINT] If downstream OOMs, model can be reconstructed from this file")
+    # (checkpoint already exists on disk — we loaded it above)
 
     # =========================================================================
     # STEP 5: Evaluate on Training Set
@@ -879,8 +856,7 @@ def main():
     # DEBUG: Compute logits and correlation with labels (use normalized theta)
     _theta_sums = E_theta_train.sum(axis=1, keepdims=True)
     _theta_norm_train = E_theta_train / np.maximum(_theta_sums, 1e-8)
-    _mu_v_2d = np.array(model.mu_v[:, :model.K] if model._use_cell_type_regression else model.mu_v)
-    train_logits = _theta_norm_train @ _mu_v_2d.T
+    train_logits = _theta_norm_train @ np.array(model.mu_v).T
     if model.p_aux > 0 and model.mu_gamma is not None:
         _X_aux_debug = model._prepend_intercept(X_aux_train, n=X_aux_train.shape[0])
         train_logits = train_logits + _X_aux_debug @ model.mu_gamma.T
@@ -993,9 +969,15 @@ def main():
             _probs_k = _probs_val_all
         _probs_k = np.clip(_probs_k, 1e-7, 1 - 1e-7)
         _logits_k = np.log(_probs_k / (1 - _probs_k))
-        _lr = _PlattLR(C=1e10, solver='lbfgs', max_iter=1000)
-        _lr.fit(_logits_k.reshape(-1, 1), _y_val_2d[:, k])
-        cal = {'method': 'platt', 'a': float(_lr.coef_[0, 0]), 'b': float(_lr.intercept_[0])}
+        y_val_k = _y_val_2d[:, k]
+        if len(np.unique(y_val_k)) < 2:
+            cal = {'method': 'platt', 'a': 1.0, 'b': 0.0}
+            print(f"  WARNING: validation set for [{lname}] has only one class; "
+                  f"using identity Platt calibrator (a=1, b=0).")
+        else:
+            _lr = _PlattLR(C=1e10, solver='lbfgs', max_iter=1000)
+            _lr.fit(_logits_k.reshape(-1, 1), y_val_k)
+            cal = {'method': 'platt', 'a': float(_lr.coef_[0, 0]), 'b': float(_lr.intercept_[0])}
         calibrators[lname] = cal
         print(f"Platt calibrator [{lname}]: a={cal['a']:.4f}, b={cal['b']:.4f}")
 
@@ -1053,24 +1035,10 @@ def main():
     print("=" * 80)
 
     prefix = 'vi'
-    saved_files = save_results(
-        model=model,
-        output_dir=output_dir,
-        gene_list=gene_list,
-        splits=splits,
-        prefix=prefix,
-        compress=True,
-        optimal_threshold=optimal_thresholds,
-        program_names=pathway_names,
-        mode=args.mode,
-        label_columns=label_columns,
-        aux_columns=aux_column_names,
-        val_test_data={
-            'X_val': X_val, 'X_aux_val': X_aux_val,
-            'X_test': X_test, 'X_aux_test': X_aux_test,
-        },
-        cell_metadata=data.get('cell_metadata'),
-    )
+    # Skip save_results (it references training-only attrs like E_theta, r_beta,
+    # training_time_). We produce the essentials (predictions, metrics, calibrators)
+    # below directly.
+    saved_files = {}
 
     # Predictions (per-outcome columns)
     def _build_pred_df(cell_ids, y_2d, proba_2d, thresholds_dict):
@@ -1223,8 +1191,7 @@ def main():
             logit_cov = np.array(X_aux_prep @ model.mu_gamma.T)      # (n, kappa)
             _ts = E_theta_split.sum(axis=1, keepdims=True)
             _tn = E_theta_split / np.maximum(_ts, 1e-8)
-            _mu_v_2d_ld = np.array(model.mu_v[:, :model.K] if model._use_cell_type_regression else model.mu_v)
-            logit_theta = np.array(_tn @ _mu_v_2d_ld.T)               # (n, kappa)
+            logit_theta = np.array(_tn @ model.mu_v.T)               # (n, kappa)
             logit_full = logit_cov + logit_theta
 
             for k in range(n_outcomes):
@@ -1349,11 +1316,12 @@ def main():
     print("Model Summary")
     print("=" * 80)
 
-    print_model_summary(model, gene_list)
+    try:
+        print_model_summary(model, gene_list)
+    except Exception as _e:
+        print(f"[WARN] print_model_summary skipped: {_e}")
 
-    # Save diagnostic plots
-    if hasattr(model, 'diagnostics_') and model.diagnostics_ is not None:
-        plot_diagnostics(model.diagnostics_, save_dir=output_dir)
+    # Skip diagnostic plots (diagnostics_ is populated during training).
 
     # =========================================================================
     # Profiling Output (if enabled)
