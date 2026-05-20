@@ -174,6 +174,11 @@ class DataLoader:
         if self.is_emtab:
             return False
 
+        # h5ad is always its own format — load_simulated_csv only handles CSV.
+        suffixes = ''.join(self.data_path.suffixes).lower()
+        if suffixes.endswith('.h5ad'):
+            return False
+
         path_lower = str(self.data_path).lower()
 
         # Original heuristic
@@ -181,7 +186,6 @@ class DataLoader:
             return True
 
         # CSV/CSV.gz file (not h5ad, not a directory)
-        suffixes = ''.join(self.data_path.suffixes).lower()
         is_csv = suffixes in ('.csv', '.csv.gz')
         if is_csv and not self.data_path.is_dir():
             return True
@@ -834,7 +838,7 @@ class DataLoader:
         # Check cache
         if self.use_cache:
             cache_key = self._get_cache_key()
-            cache_params = f"{layer}_{convert_to_ensembl}_{filter_protein_coding}_{min_cells_expressing}_{self.is_singscore}"
+            cache_params = f"{layer}_{convert_to_ensembl}_{filter_protein_coding}_{min_cells_expressing}_{self.is_singscore}_{normalize}_{normalize_target_sum}_{normalize_method}"
             cache_file = self.cache_dir / f"preprocessed_{cache_key}_{hashlib.md5(cache_params.encode()).hexdigest()[:8]}.pkl"
 
             if cache_file.exists():

@@ -259,18 +259,34 @@ class CAVI:
         # yields near-zero bp or dp (common with highly variable count data),
         # E[eta] can reach 1e9+ at t=0, triggering the eta-beta collapse loop.
         INV_BUDGET_MEAN_MAX = 1e4
+        # Cap bp/dp from above so E[xi]/E[eta] don't VANISH. The empirical
+        # mean/var ratio diverges (-> 1e10+) when library sizes are nearly
+        # constant — e.g. after `--normalize`. That collapses E[xi] = a_xi/bp
+        # to ~0, killing the theta prior. Mirroring the floor, we set a ceiling
+        # so E[xi]/E[eta] stay ≥ INV_BUDGET_MEAN_MIN.
+        INV_BUDGET_MEAN_MIN = 1e-2
         a_xi0 = self.ap + K * self.a
         a_eta0 = self.cp + K * self.c  # worst-case (unmasked); masked is smaller
         bp_floor = a_xi0 / INV_BUDGET_MEAN_MAX
         dp_floor = a_eta0 / INV_BUDGET_MEAN_MAX
+        bp_ceil = a_xi0 / INV_BUDGET_MEAN_MIN
+        dp_ceil = a_eta0 / INV_BUDGET_MEAN_MIN
         if self.bp < bp_floor:
             print(f"  [floor] bp: {self.bp:.6f} -> {bp_floor:.6f} "
                   f"(caps E[xi] prior mean at {INV_BUDGET_MEAN_MAX:.0e})")
             self.bp = bp_floor
+        if self.bp > bp_ceil:
+            print(f"  [ceil] bp: {self.bp:.6e} -> {bp_ceil:.6f} "
+                  f"(floors E[xi] prior mean at {INV_BUDGET_MEAN_MIN:.0e})")
+            self.bp = bp_ceil
         if self.dp < dp_floor:
             print(f"  [floor] dp: {self.dp:.6f} -> {dp_floor:.6f} "
                   f"(caps E[eta] prior mean at {INV_BUDGET_MEAN_MAX:.0e})")
             self.dp = dp_floor
+        if self.dp > dp_ceil:
+            print(f"  [ceil] dp: {self.dp:.6e} -> {dp_ceil:.6f} "
+                  f"(floors E[eta] prior mean at {INV_BUDGET_MEAN_MIN:.0e})")
+            self.dp = dp_ceil
 
         # Bidirectional clipping: prevent extreme bp/dp ratio
         if self.bp > 1000 * self.dp:
@@ -922,7 +938,12 @@ class CAVI:
             # past the under-relaxation budget, and seeded the period-1 CAVI
             # oscillation seen in Reg at ramp=1. Bounding the rescale to 2×
             # the user value keeps prior–data precision balance intact.
-            b_v_new = float(np.clip(b_v_new, 1e-4, 2.0 * self.b_v))
+            # Lower clip raised from 1e-4 to 1e-2: with b_v=1e-4 the trust
+            # region delta_v = 3·sqrt(sigma_v_floor) = 3·sqrt(0.01·b_v²) = 3e-5
+            # freezes v entirely. Gamma then absorbs all regression signal and
+            # drifts unboundedly. Floor at 1e-2 keeps delta_v ≥ 3e-3, enough
+            # for v to reach reasonable magnitudes within ramp_iters=200.
+            b_v_new = float(np.clip(b_v_new, 1e-2, 2.0 * self.b_v))
             print(f"  [Laplace] b_v auto-calibrated: {self.b_v:.6f} -> "
                   f"{b_v_new:.6f}  (median_data_prec_per_cell={median_dp:.4f}, "
                   f"v_cross={v_crossover})")
@@ -958,11 +979,13 @@ class CAVI:
         new_a = xp.maximum(new_a, 1e-6)
         new_b = xp.maximum(new_b, 1e-6)
 
-        # Cap E[beta] to prevent eta-beta collapse in masked/combined mode
-        # where a_eta is weak (cp + m_j*c ≈ 1.66). In unmasked mode,
-        # a_eta = cp + K*c is large enough to self-regulate, and surviving
-        # spike-slab factors legitimately need E[beta] >> 500.
-        if self.mode in ('masked', 'combined'):
+        # Cap E[beta] to prevent eta-beta collapse in masked mode where
+        # a_eta is weak (cp + m_j*c ≈ 1.66). Combined was previously also
+        # capped, but that forced the theta-beta scale split asymmetrically
+        # vs unmasked: combined's θ became huge → data_prec huge → b_v
+        # auto-calibrated tiny → v frozen at init. Unmasked has no cap and
+        # the eta-beta collapse is mitigated by the bp/dp ceiling instead.
+        if self.mode == 'masked':
             beta_cap = 500.0
             new_b = xp.maximum(new_b, new_a / beta_cap)
 
@@ -2933,8 +2956,13 @@ class CAVI:
                 b_theta = (b_poisson + disc) / 2.0
                 b_theta = xp.maximum(b_theta, 0.1 * b_poisson)
                 b_theta = xp.maximum(b_theta, self.bp)
+                b_theta = xp.maximum(b_theta, 1e-2)
+                b_theta = xp.maximum(b_theta, a_theta / 1e4)
             else:
                 b_theta = b_poisson
+                b_theta = xp.maximum(b_theta, self.bp)
+                b_theta = xp.maximum(b_theta, 1e-2)
+                b_theta = xp.maximum(b_theta, a_theta / 1e4)
 
             b_xi = self.bp + E_theta.sum(axis=1)
 

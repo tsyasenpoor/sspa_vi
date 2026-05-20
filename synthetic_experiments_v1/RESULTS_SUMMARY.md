@@ -40,6 +40,11 @@ DRGP = Supervised Poisson Factorization via CAVI (`BRay/VariationalInference/vi_
 - Wilcoxon p<1e-9 in DRGP-winning cells (vs nmf_lr).
 - Figures: `A1_heatmap_cos_mean.png`, `A1_heatmap_support_auprc.png`, `A1_method_comparison_K10.png`, `A1_method_comparison_ood_K10.png`.
 
+**Followup analysis** (`src/analysis-utils/a1_followup.py`):
+- **π-axis check**: implementation verified (m_choices scale 4× across π). DRGP cosine is essentially π-invariant at well-specified K (spread ≤ 0.01); NMF, in contrast, **degrades with smaller π at K>K_true** (spread 0.039 at K=30) — a DRGP robustness win not visible in the original heatmap. See `A1_heatmap_cos_mean_rescaled.png` (median + Q5 dual panel, vmin=0.85).
+- **Paired-seed scatter** (`A1_paired_seed_scatter_K10.png`): at K_fit=10, Pearson r(DRGP cos, NMF cos) = **0.129** and r(DRGP OOD, NMF OOD) = **0.265** across 150 paired runs. DRGP's failures are **uncorrelated** with NMF's — instability is **method-specific, not generator-specific** → multi-restart with ELBO selection is the indicated fix.
+- **Outlier seeds at K_fit=10**: 49/150 (seed, π) cells have DRGP cos < 0.95 (worst: seed 48/π=0.20 at 0.750, seed 1/π=0.10 at 0.808, seed 10/π=0.05 at 0.798). NMF cos on the same 49 cells is ≥0.998 with two exceptions. Candidate set for multi-restart investigation at `figures/A1/A1_outlier_seeds_K10.csv`.
+
 ### A2 — Support recovery / FDR calibration
 
 `results/aggregated/A2_support_recovery/summary.csv`, figures `figures/A2/`.
@@ -55,7 +60,17 @@ DRGP = Supervised Poisson Factorization via CAVI (`BRay/VariationalInference/vi_
 
 **Finding**: spike-and-slab posterior `s_kj` is well-calibrated (FDR@0.5 ≈ 0 from K=10 onward) but recall-limited — roughly half of true-support genes never escape the prior. AUPRC plateaus at ~0.47.
 
-Figures: `pr_curves_K10.png`, `fdr_calibration_K10.png`, `auprc_heatmap.png`, `auprc_vs_K.png`.
+**Magnitude-stratified AUPRC** (`figures/A2/A2_magnitude_stratified_auprc.{png,csv}`, 1,500 (seed, k_true) combos at K_fit=10):
+
+| π | top-tercile of |β| AUPRC (median) | bottom-tercile AUPRC (median) |
+|---|---|---|
+| 0.05 | **1.00** | **0.00** |
+| 0.10 | **1.00** | **0.00** |
+| 0.20 | **1.00** | **0.01** |
+
+The aggregate 0.40 is not a "half the support" story but a **clean bimodal regime**: DRGP perfectly recovers the high-loading support and almost completely shrinks the low-loading tail (this is the spike-and-slab working as designed). FDR remains 0 because the low-loading genes that aren't recovered also aren't falsely declared.
+
+Figures: `pr_curves_K10.png`, `fdr_calibration_K10.png`, `auprc_heatmap.png`, `auprc_vs_K.png`, `A2_magnitude_stratified_auprc.png`.
 
 ### B1 — Program ranking (4 modes)
 

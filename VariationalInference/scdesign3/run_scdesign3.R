@@ -63,30 +63,39 @@ if (grepl("\\.h5ad$", input_file)) {
     # First, determine dimensions and names from obs/var groups
     # This must be done BEFORE building the sparse matrix to ensure consistency
 
-    # Get gene names (var index)
-    if ("var" %in% names(h5_data) && "_index" %in% names(h5_data$var)) {
-        gene_names <- h5_data$var$`_index`
-    } else if ("var_names" %in% names(h5_data)) {
-        gene_names <- h5_data$var_names
-    } else {
-        gene_names <- NULL  # Will generate later
+    # Helper: read the AnnData index for an obs/var group. Modern h5ad stores
+    # the index under its real column name (e.g. "Sample_ID") and records the
+    # location in an HDF5 attribute `_index` on the group. Older files use the
+    # literal key "_index". This helper handles both.
+    read_anndata_index <- function(input_file, group, fallback_top) {
+        idx <- NULL
+        # 1. Try the `_index` attribute on the group, which names the real column.
+        try({
+            attrs <- rhdf5::h5readAttributes(input_file, group)
+            if (!is.null(attrs[["_index"]])) {
+                idx_col <- as.character(attrs[["_index"]])
+                if (idx_col %in% names(h5_data[[group]])) {
+                    idx <- h5_data[[group]][[idx_col]]
+                }
+            }
+        }, silent = TRUE)
+        # 2. Fallback: literal "_index" key inside the group.
+        if (is.null(idx) && group %in% names(h5_data) &&
+            "_index" %in% names(h5_data[[group]])) {
+            idx <- h5_data[[group]][["_index"]]
+        }
+        # 3. Fallback: top-level "obs_names" / "var_names" (very old layout).
+        if (is.null(idx) && fallback_top %in% names(h5_data)) {
+            idx <- h5_data[[fallback_top]]
+        }
+        if (!is.null(idx) && is.numeric(idx)) {
+            idx <- paste0(if (group == "obs") "Cell_" else "Gene_", idx)
+        }
+        idx
     }
 
-    # Get cell names (obs index) - handle both string and numeric indices
-    if ("obs" %in% names(h5_data) && "_index" %in% names(h5_data$obs)) {
-        cell_names <- h5_data$obs$`_index`
-        # Convert numeric indices to strings if needed
-        if (is.numeric(cell_names)) {
-            cell_names <- paste0("Cell_", cell_names)
-        }
-    } else if ("obs_names" %in% names(h5_data)) {
-        cell_names <- h5_data$obs_names
-        if (is.numeric(cell_names)) {
-            cell_names <- paste0("Cell_", cell_names)
-        }
-    } else {
-        cell_names <- NULL  # Will generate later
-    }
+    gene_names <- read_anndata_index(input_file, "var", "var_names")
+    cell_names <- read_anndata_index(input_file, "obs", "obs_names")
 
     # Determine n_obs and n_var from names if available
     n_var_from_names <- if (!is.null(gene_names)) length(gene_names) else NULL
@@ -184,23 +193,39 @@ if (grepl("\\.h5ad$", input_file)) {
 
             # Check orientation and transpose if needed
             # We want: rows = genes (n_var), cols = cells (n_obs)
+            orient_from_one <- function(rc, known, axis) {
+                # axis = "var" means `known` is n_var (expected nrow);
+                # axis = "obs" means `known` is n_obs (expected ncol).
+                if (axis == "var") {
+                    if (nrow(rc) == known) { cat("  Inferred genes x cells from n_var\n"); return(rc) }
+                    if (ncol(rc) == known) { cat("  Transposing to genes x cells (n_var matched ncol)\n"); return(t(rc)) }
+                } else {
+                    if (ncol(rc) == known) { cat("  Inferred genes x cells from n_obs\n"); return(rc) }
+                    if (nrow(rc) == known) { cat("  Transposing to genes x cells (n_obs matched nrow)\n"); return(t(rc)) }
+                }
+                cat("  WARNING: known dim (", known, ") matches neither nrow (", nrow(rc),
+                    ") nor ncol (", ncol(rc), "); assuming obs x var and transposing\n")
+                t(rc)
+            }
+
             if (!is.na(n_var) && !is.na(n_obs)) {
                 if (nrow(raw_counts) == n_var && ncol(raw_counts) == n_obs) {
-                    # Already in correct orientation (genes x cells)
                     cat("  Matrix already in genes x cells format, no transpose needed\n")
                     counts <- raw_counts
                 } else if (nrow(raw_counts) == n_obs && ncol(raw_counts) == n_var) {
-                    # Need to transpose (cells x genes -> genes x cells)
                     cat("  Matrix in cells x genes format, transposing\n")
                     counts <- t(raw_counts)
                 } else {
                     cat("  WARNING: Matrix dimensions (", nrow(raw_counts), "x", ncol(raw_counts),
                         ") don't match expected (", n_var, "x", n_obs, ") or (", n_obs, "x", n_var, ")\n")
-                    # Assume it's obs x var and transpose
                     counts <- t(raw_counts)
                 }
+            } else if (!is.na(n_var)) {
+                counts <- orient_from_one(raw_counts, n_var, "var")
+            } else if (!is.na(n_obs)) {
+                counts <- orient_from_one(raw_counts, n_obs, "obs")
             } else {
-                # No metadata, just transpose (assume standard AnnData obs x var format)
+                # No metadata at all - assume standard AnnData obs x var format
                 counts <- t(raw_counts)
             }
         }
