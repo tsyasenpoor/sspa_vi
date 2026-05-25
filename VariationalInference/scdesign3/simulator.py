@@ -391,8 +391,19 @@ class ScDesign3Simulator:
                 print(result.stdout)
 
             if result.returncode != 0:
+                # SIGKILL (137) and segfault (139) lose stderr; surface stdout
+                # and exit code so OOMs aren't mistaken for "silent failures".
+                if not verbose:
+                    print("STDOUT:", result.stdout)
                 print("STDERR:", result.stderr)
-                raise RuntimeError(f"scDesign3 failed:\n{result.stderr}")
+                print(f"exit_code={result.returncode}")
+                if result.returncode == 137:
+                    print("  (137 = SIGKILL; usually OOM. Try a slimmer h5ad "
+                          "or sbatch with --mem=100G.)")
+                raise RuntimeError(
+                    f"scDesign3 failed (exit={result.returncode}):\n"
+                    f"{result.stderr or '<empty stderr — see stdout above>'}"
+                )
 
         except subprocess.TimeoutExpired:
             raise RuntimeError("scDesign3 timed out (>4 hours)")

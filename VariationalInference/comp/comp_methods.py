@@ -91,7 +91,7 @@ def train_alg(
 
 def eval_alg(
     model, algorithm, x_data_test, x_aux_data_test, y_data_test, save_path, latent_dim,
-    nmf=None
+    nmf=None, cell_ids=None
 ):
     """Evaluate a trained baseline classifier on held-out data.
 
@@ -162,6 +162,8 @@ def eval_alg(
         "confusion_matrix": test_confusion_matrix,
         "y_true": y_true,
         "y_pred": y_pred,
+        "y_prob": (y_pred_proba_full[:, 1] if n_classes == 2 else y_pred_proba_full),
+        "cell_ids": (np.asarray(cell_ids) if cell_ids is not None else None),
     }
     os.makedirs(save_path, exist_ok=True)
     joblib.dump(results, os.path.join(save_path, f"{algorithm}_results.pkl"))

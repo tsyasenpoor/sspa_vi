@@ -59,7 +59,7 @@ _CLASSIFIERS = {
 }
 
 
-def evaluate(model, X, y_true, label_name, alg_name, save_path):
+def evaluate(model, X, y_true, label_name, alg_name, save_path, cell_ids=None):
     y_pred = model.predict(X)
     y_proba = model.predict_proba(X)
     n_classes = y_proba.shape[1]
@@ -79,8 +79,10 @@ def evaluate(model, X, y_true, label_name, alg_name, save_path):
     print(f"    confusion matrix:\n{cm}")
 
     os.makedirs(save_path, exist_ok=True)
-    np.savez(os.path.join(save_path, f"{alg_name}_{label_name}_preds.npz"),
-             y_true=y_true, y_pred=y_pred, y_proba=y_proba)
+    save_kwargs = dict(y_true=y_true, y_pred=y_pred, y_proba=y_proba)
+    if cell_ids is not None:
+        save_kwargs["cell_ids"] = np.asarray(cell_ids)
+    np.savez(os.path.join(save_path, f"{alg_name}_{label_name}_preds.npz"), **save_kwargs)
 
     return {
         "accuracy": float(acc), "precision": float(prec),
@@ -167,9 +169,11 @@ def main():
             joblib.dump(clf, os.path.join(alg_dir, f"{alg_name}_model.pkl"))
 
             print("  [validation]")
-            val_res = evaluate(clf, X_val, y_val, label_col, alg_name, alg_dir)
+            val_res = evaluate(clf, X_val, y_val, label_col, alg_name, alg_dir,
+                               cell_ids=df.index[val_idx].to_numpy())
             print("  [test]")
-            test_res = evaluate(clf, X_test, y_test, label_col, alg_name, alg_dir)
+            test_res = evaluate(clf, X_test, y_test, label_col, alg_name, alg_dir,
+                                cell_ids=df.index[test_idx].to_numpy())
 
             all_results[f"{alg_name}_{label_col}"] = {
                 "train_accuracy": float(clf.score(X_train, y_train)),

@@ -68,7 +68,7 @@ _CLASSIFIERS = {
 }
 
 
-def evaluate(model, X, y_true, label_name, alg_name, save_path):
+def evaluate(model, X, y_true, label_name, alg_name, save_path, cell_ids=None):
     """Evaluate classifier and return metrics dict."""
     y_pred = model.predict(X)
     y_proba = model.predict_proba(X)
@@ -96,10 +96,12 @@ def evaluate(model, X, y_true, label_name, alg_name, save_path):
         "roc_auc": float(auc),
     }
 
-    # Save predictions
+    # Save predictions (with cell_ids when available for patient-level eval downstream)
     os.makedirs(save_path, exist_ok=True)
-    np.savez(os.path.join(save_path, f"{alg_name}_{label_name}_preds.npz"),
-             y_true=y_true, y_pred=y_pred, y_proba=y_proba)
+    save_kwargs = dict(y_true=y_true, y_pred=y_pred, y_proba=y_proba)
+    if cell_ids is not None:
+        save_kwargs["cell_ids"] = np.asarray(cell_ids)
+    np.savez(os.path.join(save_path, f"{alg_name}_{label_name}_preds.npz"), **save_kwargs)
 
     return results
 
@@ -220,11 +222,13 @@ def main():
 
             # Evaluate val
             print("  [validation]")
-            val_res = evaluate(clf, X_val, y_val, label_col, alg_name, alg_dir)
+            val_res = evaluate(clf, X_val, y_val, label_col, alg_name, alg_dir,
+                               cell_ids=df.index[val_idx].to_numpy())
 
             # Evaluate test
             print("  [test]")
-            test_res = evaluate(clf, X_test, y_test, label_col, alg_name, alg_dir)
+            test_res = evaluate(clf, X_test, y_test, label_col, alg_name, alg_dir,
+                                cell_ids=df.index[test_idx].to_numpy())
 
             all_results[f"{alg_name}_{label_col}"] = {
                 "train_accuracy": float(train_acc),

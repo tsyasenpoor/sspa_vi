@@ -217,7 +217,8 @@ def main():
                 y_data_test=y_test,
                 save_path=str(output_dir),
                 latent_dim=args.latent_dim,
-                nmf=nmf_obj
+                nmf=nmf_obj,
+                cell_ids=splits['test'],
             )
             
             # Also evaluate on validation set

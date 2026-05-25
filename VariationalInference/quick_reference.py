@@ -319,8 +319,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--normalize-target-sum',
         type=float,
-        default=1e4,
-        help='Target library size for normalization'
+        default=0.0,
+        help='Target library size for normalization. Default 0 = auto = median '
+             'library size (counts-per-median, scHPF-style; data-adaptive).'
     )
     parser.add_argument(
         '--normalize-method',

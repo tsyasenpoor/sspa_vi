@@ -655,7 +655,7 @@ class DataLoader:
 
     def normalize_counts(
         self,
-        target_sum: float = 1e4,
+        target_sum: float = 0.0,
         method: str = 'library_size'
     ) -> pd.DataFrame:
         """
@@ -663,8 +663,10 @@ class DataLoader:
 
         Parameters
         ----------
-        target_sum : float, default=1e4
+        target_sum : float, default=0.0
             Target library size (counts per cell will sum to ~this value).
+            If 0 or negative, the median library size is used (counts-per-median
+            normalization, as in scHPF). This is data-adaptive and recommended.
         method : str, default='library_size'
             Normalization method:
             - 'library_size': Divide by cell total, multiply by target_sum.
@@ -680,6 +682,12 @@ class DataLoader:
 
         X = self.raw_df.values.astype(np.float64)
         n_cells, n_genes = X.shape
+
+        # Auto-target = median library size (counts-per-median, scHPF style).
+        # Avoids the data-specific tuning required by a fixed target_sum.
+        if target_sum is None or target_sum <= 0:
+            target_sum = float(np.median(X.sum(axis=1)))
+            self._log(f"  target_sum=auto -> median library size = {target_sum:.0f}")
 
         self._log(f"Normalizing counts (method={method}, target_sum={target_sum:.0f})")
 
