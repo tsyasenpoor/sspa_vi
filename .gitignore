@@ -408,3 +408,10 @@ VariationalInference/scdesign3/perturb_flat.py
 VariationalInference/scdesign3/run_scdesign3.R
 VariationalInference/scdesign3/tst.py
 VariationalInference/scdesign3/eval_flat_recovery.py
+VariationalInference/analysis-utils/posthoc_head_rescore.py
+VariationalInference/analysis-utils/pg_gibbs_diagnostic.py
+VariationalInference/analysis-utils/gibbs_vs_cavi_one_seed.py
+VariationalInference/analysis-utils/gibbs_smoke_test.py
+VariationalInference/analysis-utils/gibbs_ibd_run.py
+VariationalInference/analysis-utils/svi_biorepo_run.py
+VariationalInference/analysis-utils/svi_ibd_run.py

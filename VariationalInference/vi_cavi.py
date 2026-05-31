@@ -3,6 +3,14 @@ import scipy.sparse as sp
 from typing import Tuple, Optional, Dict, Any, List
 import time
 
+# Optional dependency: polyagamma is needed only for regression_inference='pg_gibbs'.
+try:
+    from polyagamma import random_polyagamma as _random_polyagamma
+    _HAS_POLYAGAMMA = True
+except ImportError:
+    _random_polyagamma = None
+    _HAS_POLYAGAMMA = False
+
 try:
     from .jax_backend import (
         xp, USE_JAX, HAS_GPU, to_device, to_numpy,
@@ -150,8 +158,27 @@ class CAVI:
         alpha_pi: float = 1.0,
         beta_pi_scale: Optional[float] = 5.0,
         n_cell_types: Optional[int] = None,
+        regression_inference: str = "jj",
+        pg_n_sweeps_per_iter: int = 5,
+        pg_ema_alpha: float = 0.25,
         **_ignored,
     ):
+        # Regression-head inference: 'jj' is the Jaakkola-Jordan variational
+        # bound (mean-field on v). 'pg_gibbs' runs an interleaved Pólya-Gamma
+        # Gibbs block per CAVI iteration — this breaks the mean-field
+        # assumption on (v, omega) and captures the v↔theta correlation that
+        # MFVB collapses (which inflates ||v|| 5-10× on supervised PF; see
+        # project memory "DRGP head predictive gap" + "Full Gibbs sampler").
+        if regression_inference not in ("jj", "pg_gibbs"):
+            raise ValueError(
+                f"regression_inference must be 'jj' or 'pg_gibbs', got {regression_inference!r}")
+        self.regression_inference = regression_inference
+        self.pg_n_sweeps_per_iter = int(pg_n_sweeps_per_iter)
+        # EMA on posterior-moment estimates between outer iters dampens MC noise
+        # from each block's sample mean (otherwise gamma / v trajectories look
+        # noisy even after the chain converges — see seed_1024 diagnostics 2026-05).
+        # alpha=1.0 is "no smoothing" (overwrite); 0.25 is reasonable default.
+        self.pg_ema_alpha = float(pg_ema_alpha)
         self.K = n_factors
         self.a = a
         self.ap = ap
@@ -429,6 +456,23 @@ class CAVI:
             self.zeta = np.ones((self._n_patients, self.kappa))
         else:
             self.zeta = np.ones((self.n, self.kappa))
+
+        # --- PG-Gibbs auxiliary (only used when regression_inference='pg_gibbs') ---
+        # omega_pg has same shape as zeta so it's a drop-in for `lam = lambda_jj(zeta)`
+        # (we return omega_pg/2.0 from self._lambda() in PG mode).
+        # s_pg holds the Bayesian-Lasso local scale parameters (the τ² latent in the
+        # scale-mixture-of-normals representation of the Laplace prior on v).
+        if self.regression_inference == "pg_gibbs":
+            if self._use_cell_type_regression:
+                # PG-interleaved CAVI in CT mode would need per-patient omega; defer.
+                raise NotImplementedError(
+                    "regression_inference='pg_gibbs' not yet supported in CT mode")
+            # E[PG(1,0)] = 1/4, so 2*lam ≈ 1/2 at init → matches lambda_jj(zeta=1)
+            self.omega_pg = np.full((self.n, self.kappa), 0.25)
+            self.s_pg = np.full((self.kappa, self.K), 2.0 * self.b_v ** 2)
+            # Independent RNG for the Gibbs block so JJ-mode runs are bit-identical
+            seed = getattr(self, "seed_used_", None)
+            self._pg_rng = np.random.default_rng(seed + 1 if seed is not None else None)
 
         # --- Oscillation tracking for v update ---
         self._v_prev_mu = None
@@ -1091,7 +1135,7 @@ class CAVI:
 
         # Pre-compute tiny (kappa, K) quantities for regression rate parts
         y_exp = y if y.ndim > 1 else y[:, None]        # (n, kappa)
-        lam = lambda_jj(self.zeta)                       # (n, kappa)
+        lam = self._lambda()                             # (n, kappa)
         W = self._sample_weights                         # (n, kappa)
         # No rw scaling in CAVI updates — the paper's model has weight 1
         # on both Poisson and regression terms. rw is only for ELBO monitoring.
@@ -1215,6 +1259,220 @@ class CAVI:
                     continue
                 raise
         self.zeta = xp.concatenate(zeta_chunks, axis=0) if len(zeta_chunks) > 1 else zeta_chunks[0]
+
+    # ------------------------------------------------------------------
+    # Polya-Gamma interleaved block (alternative to JJ MFVB on v, gamma)
+    # ------------------------------------------------------------------
+
+    def _lambda(self):
+        """Return the (n, kappa) effective JJ-style lambda matrix.
+
+        JJ mode: lambda_jj(self.zeta) — tightened by the JJ variational
+        parameter. PG mode: self.omega_pg / 2.0 — the natural drop-in,
+        since at the JJ optimum E[omega | psi] = 2·lambda_jj(psi).
+
+        Returning a single matrix lets the existing theta/beta/ELBO machinery
+        consume either inference path with no further branching.
+        """
+        if self.regression_inference == "pg_gibbs":
+            return self.omega_pg / 2.0
+        return lambda_jj(self.zeta)
+
+    def _pg_gibbs_block(self, y, X_aux):
+        """Interleaved Pólya-Gamma Gibbs block for (omega, v, gamma, s).
+
+        Runs `self.pg_n_sweeps_per_iter` Gibbs sweeps with theta and beta
+        held FIXED at their current variational posterior means. At the
+        end, posterior moments from the sample chain are written back to
+            self.mu_v          (kappa, K)         — sample mean
+            self.sigma_v_diag  (kappa, K)         — sample variance
+            self.mu_gamma      (kappa, p_aux)     — sample mean
+            self.Sigma_gamma   (kappa, p_aux, p_aux) — sample covariance
+            self.omega_pg      (n, kappa)         — sample mean of omega
+
+        Heavy matrix ops (Cholesky, solves, sums) run on the active backend
+        via `xp` (JAX/GPU when USE_JAX is True). The PG sampler `polyagamma`
+        is CPU-only, so for each sweep we copy ψ to host, draw omega, copy
+        back. With n × kappa typically small (a few hundred) this transfer
+        is cheap relative to the Cholesky / GEMM that follow.
+
+        Currently only standard (non-CT) mode is supported.
+        """
+        if self._use_cell_type_regression:
+            raise NotImplementedError(
+                "PG-Gibbs block: CT mode (n_cell_types>0) not implemented yet")
+        if not _HAS_POLYAGAMMA:
+            raise RuntimeError(
+                "regression_inference='pg_gibbs' requires the `polyagamma` "
+                "package. `pip install polyagamma`.")
+
+        # ---- device-side state ----
+        E_theta = self.a_theta / xp.maximum(self.b_theta, 1e-12)   # (n, K), device
+        X_aux_dev = X_aux if (X_aux is not None and self.p_aux > 0) else None
+        y_2d_dev = y if y.ndim > 1 else y[:, None]
+        kappa_y_all = to_device((np.asarray(y_2d_dev) - 0.5).astype(np.float32))
+
+        # Bring v, gamma, s to device for sampling (matrix ops on device)
+        v_cur = self.mu_v                          # (kappa, K) device
+        g_cur = self.mu_gamma if self.p_aux > 0 else None
+        s_cur_dev = to_device(self.s_pg.astype(np.float32))  # (kappa, K) device
+
+        n_sw = self.pg_n_sweeps_per_iter
+        kappa = self.kappa
+
+        v_samples = []          # list of (kappa, K) device arrays
+        g_samples = []          # list of (kappa, p_aux) device arrays
+        omega_samples = []      # list of (n, kappa) device arrays
+        psi_samples = []        # for E[ψ²] -> zeta update
+
+        bv = float(self.b_v)
+        bv2_inv = 1.0 / (bv * bv) if bv > 0 else 1e6
+
+        for sw in range(n_sw):
+            v_row_list = []
+            g_row_list = [] if g_cur is not None else None
+            omega_row_list = []
+            psi_row_list = []
+            for k in range(kappa):
+                # 1) psi_ik = θ_i^T v_k + (x_aux)^T γ_k on device
+                psi_dev = E_theta @ v_cur[k]
+                if g_cur is not None:
+                    psi_dev = psi_dev + X_aux_dev @ g_cur[k]
+                psi_host = np.asarray(to_numpy(psi_dev), dtype=np.float64)
+                # 2) ω ~ PG(1, |ψ|) on host
+                omega_host = np.asarray(_random_polyagamma(
+                    z=np.abs(psi_host), size=self.n), dtype=np.float32)
+                omega_dev = to_device(omega_host)
+
+                # 3) v_k | ω, γ, θ, y, s  ~  N(μ, Σ)
+                k_y = kappa_y_all[:, k]
+                if g_cur is not None:
+                    aux_off = X_aux_dev @ g_cur[k]
+                else:
+                    aux_off = xp.zeros(self.n, dtype=xp.float32)
+                # Σ⁻¹ = diag(1/s) + θ' diag(ω) θ
+                prec_v = (E_theta.T * omega_dev) @ E_theta
+                prec_v = prec_v + xp.diag(1.0 / xp.maximum(s_cur_dev[k], 1e-12))
+                # tiny ridge (helps Cholesky stability when ω has near-zero entries)
+                prec_v = prec_v + xp.eye(self.K, dtype=prec_v.dtype) * 1e-6
+                L_v = xp.linalg.cholesky(prec_v)
+                rhs_v = E_theta.T @ (k_y - omega_dev * aux_off)
+                mu_v_post = xp.linalg.solve(L_v.T, xp.linalg.solve(L_v, rhs_v))
+                noise_v = to_device(self._pg_rng.standard_normal(self.K).astype(np.float32))
+                v_new = mu_v_post + xp.linalg.solve(L_v.T, noise_v)
+                v_cur = v_cur.at[k].set(v_new) if USE_JAX else \
+                    self._set_row(v_cur, k, v_new)
+
+                # 4) γ_k | ω, v, θ, y  ~  N(μ, Σ)
+                if g_cur is not None:
+                    theta_v_pred = E_theta @ v_new
+                    prec_g = (X_aux_dev.T * omega_dev) @ X_aux_dev
+                    prec_g = prec_g + xp.eye(self.p_aux, dtype=prec_g.dtype) \
+                              * (1.0 / (self.sigma_gamma ** 2) + 1e-6)
+                    L_g = xp.linalg.cholesky(prec_g)
+                    rhs_g = X_aux_dev.T @ (k_y - omega_dev * theta_v_pred)
+                    mu_g_post = xp.linalg.solve(L_g.T, xp.linalg.solve(L_g, rhs_g))
+                    noise_g = to_device(self._pg_rng.standard_normal(self.p_aux).astype(np.float32))
+                    g_new = mu_g_post + xp.linalg.solve(L_g.T, noise_g)
+                    g_cur = g_cur.at[k].set(g_new) if USE_JAX else \
+                        self._set_row(g_cur, k, g_new)
+
+                # 5) s_kℓ | v_kℓ  via Park-Casella (host — small loop)
+                v_new_h = np.asarray(to_numpy(v_new), dtype=np.float64)
+                s_row = np.empty(self.K, dtype=np.float32)
+                for ell in range(self.K):
+                    vk = abs(v_new_h[ell])
+                    if vk < 1e-9:
+                        inv_s = self._pg_rng.wald(mean=1e9, scale=bv2_inv)
+                    else:
+                        inv_s = self._pg_rng.wald(mean=1.0 / (bv * vk), scale=bv2_inv)
+                    s_row[ell] = 1.0 / max(inv_s, 1e-12)
+                s_cur_dev = (s_cur_dev.at[k].set(to_device(s_row))
+                             if USE_JAX else self._set_row(s_cur_dev, k, to_device(s_row)))
+
+                v_row_list.append(v_new)
+                if g_row_list is not None:
+                    g_row_list.append(g_new)
+                omega_row_list.append(omega_dev)
+                # psi sample after this sweep update (use the v we just drew)
+                psi_after = E_theta @ v_new
+                if g_cur is not None:
+                    psi_after = psi_after + X_aux_dev @ g_new
+                psi_row_list.append(psi_after)
+
+            v_samples.append(xp.stack(v_row_list, axis=0))                # (kappa, K)
+            if g_row_list is not None:
+                g_samples.append(xp.stack(g_row_list, axis=0))            # (kappa, p_aux)
+            omega_samples.append(xp.stack(omega_row_list, axis=1))        # (n, kappa)
+            psi_samples.append(xp.stack(psi_row_list, axis=1))            # (n, kappa)
+
+        # ---- aggregate posterior moments + EMA smoothing -------------------
+        # Sample-derived estimates (this outer iter):
+        v_chain = xp.stack(v_samples, axis=0)               # (n_sw, kappa, K)
+        new_mu_v = v_chain.mean(axis=0)
+        new_sigma_v = v_chain.var(axis=0) + 1e-8
+        alpha = self.pg_ema_alpha
+
+        # EMA blend with previous outer iter's posterior estimates. alpha=1.0
+        # means "overwrite" (raw MC noise visible); alpha<1 dampens.
+        if alpha >= 1.0 - 1e-9:
+            self.mu_v = new_mu_v
+            self.sigma_v_diag = new_sigma_v
+        else:
+            self.mu_v = alpha * new_mu_v + (1.0 - alpha) * self.mu_v
+            self.sigma_v_diag = alpha * new_sigma_v + (1.0 - alpha) * self.sigma_v_diag
+
+        if g_samples:
+            g_chain = xp.stack(g_samples, axis=0)           # (n_sw, kappa, p_aux)
+            new_mu_g = g_chain.mean(axis=0)
+            if n_sw > 1:
+                Sigma_g_chunks = []
+                for k in range(kappa):
+                    gk = g_chain[:, k, :]                   # (n_sw, p_aux)
+                    gk_centered = gk - gk.mean(axis=0, keepdims=True)
+                    cov_k = (gk_centered.T @ gk_centered) / max(n_sw - 1, 1)
+                    cov_k = cov_k + xp.eye(self.p_aux, dtype=cov_k.dtype) * 1e-8
+                    Sigma_g_chunks.append(cov_k)
+                new_Sigma_g = xp.stack(Sigma_g_chunks, axis=0)
+            else:
+                new_Sigma_g = xp.broadcast_to(
+                    xp.eye(self.p_aux, dtype=new_mu_g.dtype) * (self.sigma_gamma ** 2),
+                    (kappa, self.p_aux, self.p_aux),
+                )
+            if alpha >= 1.0 - 1e-9:
+                self.mu_gamma = new_mu_g
+                self.Sigma_gamma = new_Sigma_g
+            else:
+                self.mu_gamma = alpha * new_mu_g + (1.0 - alpha) * self.mu_gamma
+                self.Sigma_gamma = alpha * new_Sigma_g + (1.0 - alpha) * self.Sigma_gamma
+
+        # omega and zeta (used by theta's supervised correction) — EMA too.
+        omega_chain = xp.stack(omega_samples, axis=0)       # (n_sw, n, kappa)
+        new_omega = to_numpy(omega_chain.mean(axis=0)).astype(np.float32)
+        if alpha >= 1.0 - 1e-9:
+            self.omega_pg = new_omega
+        else:
+            self.omega_pg = alpha * new_omega + (1.0 - alpha) * self.omega_pg
+
+        # zeta in PG mode is a DERIVED quantity (not a variational param):
+        # it's sqrt(E[psi²]) from the current PG samples, used only to keep the
+        # JJ-style ELBO diagnostic and zeta-saturation print working. It has
+        # NO role in the inference itself under PG-Gibbs — those updates use
+        # omega_pg (via self._lambda()) directly.
+        psi_chain = xp.stack(psi_samples, axis=0)           # (n_sw, n, kappa)
+        E_psi_sq = (psi_chain ** 2).mean(axis=0)
+        new_zeta = xp.minimum(xp.sqrt(xp.maximum(E_psi_sq, 1e-8)), self.zeta_max)
+        if alpha >= 1.0 - 1e-9:
+            self.zeta = new_zeta
+        else:
+            self.zeta = alpha * new_zeta + (1.0 - alpha) * self.zeta
+
+        self.s_pg = np.asarray(to_numpy(s_cur_dev), dtype=np.float32)
+
+    def _set_row(self, arr, k, row):
+        """In-place row set that works for numpy arrays (JAX uses .at[k].set)."""
+        arr[k] = row
+        return arr
 
     def _regression_rate_parts(self, y, X_aux):
         """
@@ -2490,7 +2748,11 @@ class CAVI:
             # After warmup, linearly ramp regression influence over 50 iterations.
             ramp_iters = 200
             if t == v_warmup:
-                if not self._use_cell_type_regression:
+                # b_v auto-calibration uses the JJ data precision; under PG-Gibbs
+                # the Bayesian-Lasso scale s is sampled per-iteration via
+                # Park-Casella, so we don't pre-calibrate b_v.
+                if (not self._use_cell_type_regression
+                        and self.regression_inference == "jj"):
                     self._calibrate_b_v(y, X_aux, v_crossover=2.0)
                 # Re-init sigma_v_diag to match new b_v
                 self.sigma_v_diag = xp.full_like(self.sigma_v_diag, self.b_v ** 2)
@@ -2533,8 +2795,26 @@ class CAVI:
 
             # 5. Update v, gamma (skip during Poisson-only warmup)
             if t >= v_warmup:
-                if self._use_cell_type_regression:
+                if self.regression_inference == "pg_gibbs":
+                    # PG-interleaved CAVI: replace MFVB v/gamma/zeta updates with
+                    # a Gibbs block over (omega, v, gamma, s). Updates mu_v,
+                    # sigma_v_diag, mu_gamma, Sigma_gamma, omega_pg, and zeta
+                    # (the last is set to sqrt(E[psi²]) so any code that still
+                    # references self.zeta — e.g., ELBO diagnostics — keeps
+                    # working).
+                    self._pg_gibbs_block(y, X_aux)
+                    if diag_every_iter and verbose:
+                        _v_np = np.asarray(self.mu_v)
+                        _preview = [
+                            tuple(float(x) for x in _v_np[k, :3])
+                            for k in range(self.kappa)
+                        ]
+                        print(f"  [pg-v t={t}] mu_v[:, :3] = {_preview} "
+                              f"||v||={float(np.linalg.norm(_v_np)):.3f}  "
+                              f"|v|_max={float(np.abs(_v_np).max()):.3f}")
+                elif self._use_cell_type_regression:
                     self._update_v_ct(ramp=ramp)
+                    self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
                 else:
                     self._update_v(y, X_aux, iteration=t, ramp=ramp)
                     if diag_every_iter and verbose:
@@ -2545,7 +2825,7 @@ class CAVI:
                         ]
                         print(f"  [v-iter t={t}] "
                               f"mu_v[:, :3] = {_preview}  ramp={ramp:.3f}")
-                self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
+                    self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
                 if diag and ramp < 1.0:
                     print(f"  [diag t={t}] regression ramp={ramp:.3f}")
 
@@ -2596,7 +2876,9 @@ class CAVI:
                 elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux)
 
             # 7. Tighten zeta for next iteration (Eq. 42, only when regression active)
-            if t >= v_warmup:
+            # In PG mode the Gibbs block already set self.zeta = sqrt(E[psi²]) using
+            # the Monte Carlo samples, so we skip the JJ-specific recompute.
+            if t >= v_warmup and self.regression_inference == "jj":
                 if self._use_cell_type_regression:
                     self._update_zeta_ct()
                 else:

@@ -309,6 +309,34 @@ def parse_args() -> argparse.Namespace:
         help='Poisson-only warmup iterations before regression (v/gamma/zeta) updates begin. '
              'Higher values (100-200) recommended for masked mode with many pathways.'
     )
+    parser.add_argument(
+        '--regression-inference',
+        choices=['jj', 'pg_gibbs'],
+        default='jj',
+        help=("Inference method for the logistic regression head. 'jj' (default) "
+              "uses the Jaakkola-Jordan variational lower bound (mean-field on v). "
+              "'pg_gibbs' uses an interleaved Pólya-Gamma Gibbs block per CAVI "
+              "iteration; this breaks the mean-field on (v, omega) and captures "
+              "the v↔theta correlation that MFVB collapses (fixes ||v||-inflation).")
+    )
+    parser.add_argument(
+        '--pg-n-sweeps-per-iter',
+        type=int,
+        default=5,
+        help='Number of PG-Gibbs sweeps to run per outer CAVI iteration when '
+             "--regression-inference=pg_gibbs. Higher = lower MC noise per outer "
+             'iter but slower. Default 5 is a reasonable starting point.'
+    )
+    parser.add_argument(
+        '--pg-ema-alpha',
+        type=float,
+        default=0.25,
+        help='Exponential-moving-average mixing weight for posterior-moment '
+             'estimates between outer CAVI iters under --regression-inference=pg_gibbs. '
+             'alpha=1.0 disables smoothing (raw MC noise visible in gamma/v trajectories). '
+             'Lower values (0.1-0.3) dampen MC sampling noise without changing the '
+             'stationary posterior estimate.'
+    )
 
     # Normalization options
     parser.add_argument(
@@ -766,6 +794,9 @@ def main():
         alpha_pi=args.alpha_pi,
         beta_pi_scale=args.beta_pi_scale,
         n_cell_types=args.n_cell_types,
+        regression_inference=args.regression_inference,
+        pg_n_sweeps_per_iter=args.pg_n_sweeps_per_iter,
+        pg_ema_alpha=args.pg_ema_alpha,
     )
 
     model = ModelClass(**model_kwargs)
