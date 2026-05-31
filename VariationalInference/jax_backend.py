@@ -9,7 +9,7 @@ Usage::
     from .jax_backend import (
         xp, USE_JAX, to_device, to_numpy,
         digamma, gammaln, logsumexp_rows, softmax_rows,
-        log_expit, lambda_jj, scatter_add_to, phi_chunk_core,
+        log_expit, omega_bar, scatter_add_to, phi_chunk_core,
         expit, backend_info,
     )
 """
@@ -107,6 +107,19 @@ if USE_JAX:
         safe = jnp.maximum(jnp.abs(zeta), 1e-8)
         return jnp.tanh(safe / 2.0) / (4.0 * safe)
 
+    @jit
+    def omega_bar(c):
+        """PG(1, 0) variational mean E[omega] = (1/(2c)) * tanh(c/2).
+
+        Stable c->0 limit = 1/4. The `safe_c` trick avoids 0/0 in the
+        gradient path; the explicit `where` branch handles the c<1e-4 case
+        with a 2nd-order Taylor expansion 0.25 - c^2/48.
+        """
+        safe_c = jnp.where(c < 1e-4, 1.0, c)
+        big   = jnp.tanh(safe_c / 2.0) / (2.0 * safe_c)
+        small = 0.25 - c ** 2 / 48.0
+        return jnp.where(c < 1e-4, small, big)
+
     @partial(jit, static_argnums=(2,))
     def _segment_sum_sorted(values, indices, num_segments):
         """segment_sum for pre-sorted indices (much faster than scatter)."""
@@ -163,6 +176,15 @@ else:
     def lambda_jj(zeta):
         safe = np.maximum(np.abs(zeta), 1e-8)
         return np.tanh(safe / 2.0) / (4.0 * safe)
+
+    def omega_bar(c):
+        """PG(1, 0) variational mean — NumPy fallback. See JAX docstring."""
+        out = np.empty_like(c)
+        small = c < 1e-4
+        out[small]   = 0.25 - c[small] ** 2 / 48.0
+        cs = c[~small]
+        out[~small]  = np.tanh(cs / 2.0) / (2.0 * cs)
+        return out
 
     def scatter_add_to(target, indices, values, *, sorted_indices=False):
         """Accumulate via sparse CSC matmul (no Python K-loop).
