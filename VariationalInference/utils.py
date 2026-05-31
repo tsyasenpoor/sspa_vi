@@ -1105,25 +1105,20 @@ def plot_diagnostics(diagnostics, save_dir, fname="diagnostics.png"):
     ax.set_title('Train theta L1 norms')
     ax.legend()
 
-    # --- Plot 2: zeta saturation and lambda(zeta) ---
+    # --- Plot 2: (was zeta saturation; zeta removed in PG-CAVI — plot wbar instead) ---
     ax = axes[0, 1]
-    if diag['zeta_stats']:
-        iters, zmins, zmeds, zmaxs, frac_caps = zip(*diag['zeta_stats'])
-        ax.plot(iters, zmeds, 'g-', label='zeta median')
-        ax.fill_between(iters, zmins, zmaxs, alpha=0.15, color='g')
-        ax2 = ax.twinx()
-        ax2.plot(iters, frac_caps, 'r--', label='frac at cap')
-        ax2.set_ylabel('Fraction at zeta_max', color='r')
-        ax2.tick_params(axis='y', labelcolor='r')
+    if diag.get('wbar_stats'):
+        iters, wmins, wmeds, wmaxs = zip(*diag['wbar_stats'])
+        ax.plot(iters, wmeds, 'g-', label='wbar median')
+        ax.fill_between(iters, wmins, wmaxs, alpha=0.15, color='g')
         ax.legend(loc='upper left')
-        ax2.legend(loc='upper right')
     ax.set_xlabel('Iteration')
-    ax.set_ylabel('zeta')
-    ax.set_title('zeta saturation')
+    ax.set_ylabel('wbar')
+    ax.set_title('wbar (PG posterior mean) over iterations')
 
-    # --- Plot 3: True Bernoulli LL vs JJ bound ---
+    # --- Plot 3: True Bernoulli LL vs PG-CAVI supervised LL ---
     ax = axes[1, 0]
-    if diag['true_val_ll'] and diag['jj_val_ll']:
+    if diag.get('true_val_ll') and diag.get('jj_val_ll'):
         iters_t, vals_t = zip(*diag['true_val_ll'])
         iters_j, vals_j = zip(*diag['jj_val_ll'])
         ax.plot(iters_t, vals_t, 'b-o', markersize=3, label='True Bernoulli LL')
