@@ -102,12 +102,6 @@ if USE_JAX:
         return jax.nn.sigmoid(x)
 
     @jit
-    def lambda_jj(zeta):
-        """JJ bound helper: tanh(z/2) / (4z)."""
-        safe = jnp.maximum(jnp.abs(zeta), 1e-8)
-        return jnp.tanh(safe / 2.0) / (4.0 * safe)
-
-    @jit
     def omega_bar(c):
         """PG(1, 0) variational mean E[omega] = (1/(2c)) * tanh(c/2).
 
@@ -172,10 +166,6 @@ else:
         np.exp(work, out=work)
         work /= work.sum(axis=1, keepdims=True)
         return work
-
-    def lambda_jj(zeta):
-        safe = np.maximum(np.abs(zeta), 1e-8)
-        return np.tanh(safe / 2.0) / (4.0 * safe)
 
     def omega_bar(c):
         """PG(1, 0) variational mean — NumPy fallback. See JAX docstring."""
