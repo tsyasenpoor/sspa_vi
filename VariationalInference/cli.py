@@ -76,21 +76,6 @@ def create_parser() -> argparse.ArgumentParser:
         help='Column name in adata.obs for labels'
     )
     train_parser.add_argument(
-        '--n-cell-types',
-        type=int,
-        default=None,
-        help='Number of distinct cell types in pseudo-bulk input. Enables '
-             'cell-type-aware regression: v becomes (kappa x n_cell_types x K). '
-             'Requires --cell-type-column and --patient-column.'
-    )
-    train_parser.add_argument(
-        '--cell-type-column',
-        type=str,
-        default=None,
-        help='obs column identifying the cell type of each pseudo-bulk row '
-             '(e.g. celltype_subclust). Used when --n-cell-types is set.'
-    )
-    train_parser.add_argument(
         '--aux-columns',
         type=str,
         nargs='+',
@@ -403,7 +388,6 @@ def cmd_train(args: argparse.Namespace) -> int:
         b_v=args.b_v,
         sigma_gamma=args.sigma_gamma,
         random_state=args.seed,
-        n_cell_types=args.n_cell_types,
     )
 
     model = ModelClass(**model_kwargs)
@@ -422,29 +406,6 @@ def cmd_train(args: argparse.Namespace) -> int:
         verbose=args.verbose,
         early_stopping=args.early_stopping,
     )
-
-    # CT mode: build integer index arrays from obs columns
-    _ct_patient_idx = None
-    _ct_cell_type_idx = None
-    if args.n_cell_types is not None:
-        if not (args.cell_type_column and args.patient_column):
-            raise ValueError(
-                "--n-cell-types requires both --cell-type-column and --patient-column"
-            )
-        import pandas as pd
-        obs = data.get('obs_train')  # DataLoader may expose this; fall back to adata
-        if obs is None:
-            raise ValueError(
-                "DataLoader did not expose obs_train; "
-                "pass patient_idx and cell_type_idx directly via the Python API."
-            )
-        _ct_patient_idx   = pd.factorize(obs[args.patient_column])[0]
-        _ct_cell_type_idx = pd.factorize(obs[args.cell_type_column])[0]
-        fit_kwargs['patient_idx']   = _ct_patient_idx
-        fit_kwargs['cell_type_idx'] = _ct_cell_type_idx
-        print(f"  CT mode: patient_column={args.patient_column}, "
-              f"cell_type_column={args.cell_type_column}, "
-              f"n_cell_types={args.n_cell_types}")
 
     model.fit(**fit_kwargs)
 
