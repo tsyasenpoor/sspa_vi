@@ -496,7 +496,7 @@ class CAVI:
         self._to_device()
 
         # Adaptive row chunk size for (n, K) operations -- shared across
-        # _update_zeta, _update_theta, _update_v, _compute_elbo.
+        # _update_omega, _update_theta, _update_v, _update_gamma, _compute_elbo.
         # Starts at auto-tuned value and shrinks on OOM.
         self._row_chunk = _row_chunk_size(self.n, self.K, n_intermediates=4)
 
@@ -1582,7 +1582,7 @@ class CAVI:
         elbo -= self.p * gammaln(self.cp)
 
         # === Prior: p(v|s) + p(s) + H[q(v)] + H[q(s)] — Laplace (Eqs. 51-52, 58, 60) ===
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K) or (kappa, K+C) in CT mode
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
         omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
         # GIG(-1/2, a=1/b_v^2, b=omega^2) => IG(mu=omega*b_v, lambda=omega^2)
         # E[1/X] = 1/mu + 1/lambda = 1/(omega*b_v) + 1/omega^2
@@ -1904,7 +1904,7 @@ class CAVI:
             'c_pg_stats': [],           # (iter, min, median, max) of PG tilt c_pg
             'wbar_stats': [],           # (iter, min, median, max) of omega_bar(c_pg)
             'true_val_ll': [],          # (iter, true Bernoulli LL per sample)
-            'jj_val_ll': [],            # (iter, JJ bound LL per sample)
+            'jj_val_ll': [],            # (iter, PG-CAVI supervised LL per sample; key name retained for plotting compat)
             'eta_stats': [],            # (iter, min, median, max) of E[η]
             'beta_stats': [],           # (iter, min, median, max) of E[β]
             'v_stats': [],              # (iter, min, median, max, mean_abs, n_near_zero, n_large)
