@@ -786,10 +786,6 @@ def main():
     # E_log_beta cache (already has -inf masking applied in checkpoint)
     model._E_log_beta_cache = _to_device(_E_log_beta_np)
 
-    # Default: no JJ regularization at inference (matches training default)
-    if not hasattr(model, 'test_jj_reg'):
-        model.test_jj_reg = False
-
     # Populate histories for downstream logging (if available)
     if 'elbo_history' in ckpt.files:
         try:

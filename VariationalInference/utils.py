@@ -1067,7 +1067,7 @@ def plot_diagnostics(diagnostics, save_dir, fname="diagnostics.png"):
     Plots (3x2 grid):
     1. Train theta L1 norm distribution over iterations
     2. zeta saturation and lambda(zeta) over iterations
-    3. True validation logistic loss vs JJ bound
+    3. True validation logistic loss vs PG-CAVI bound
     4. eta vs gene total counts (mask consistency)
     5. E[eta] range over iterations (eta-beta collapse detector)
     6. E[beta] range over iterations
@@ -1118,15 +1118,15 @@ def plot_diagnostics(diagnostics, save_dir, fname="diagnostics.png"):
 
     # --- Plot 3: True Bernoulli LL vs PG-CAVI supervised LL ---
     ax = axes[1, 0]
-    if diag.get('true_val_ll') and diag.get('jj_val_ll'):
+    if diag.get('true_val_ll') and diag.get('bound_val_ll'):
         iters_t, vals_t = zip(*diag['true_val_ll'])
-        iters_j, vals_j = zip(*diag['jj_val_ll'])
+        iters_j, vals_j = zip(*diag['bound_val_ll'])
         ax.plot(iters_t, vals_t, 'b-o', markersize=3, label='True Bernoulli LL')
-        ax.plot(iters_j, vals_j, 'r-s', markersize=3, label='JJ bound LL')
+        ax.plot(iters_j, vals_j, 'r-s', markersize=3, label='PG-CAVI bound LL')
         ax.legend()
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Validation LL / sample')
-    ax.set_title('True logistic loss vs JJ bound')
+    ax.set_title('True logistic loss vs PG-CAVI bound')
 
     # --- Plot 4: eta vs gene total counts (mask consistency) ---
     ax = axes[1, 1]
@@ -1287,7 +1287,7 @@ def plot_training_curves(model, save_dir, fname="training_curves.png"):
             ax2 = ax.twinx()
             if 'reg' in data:
                 ax2.plot(iters, data['reg'], 'coral', lw=1, ls='--',
-                         marker='.', ms=2, label='HO Reg (JJ)')
+                         marker='.', ms=2, label='HO Reg')
             if 'bern' in data:
                 ax2.plot(iters, data['bern'], 'mediumpurple', lw=1, ls=':',
                          marker='.', ms=2, label='HO Bernoulli (true)')

@@ -146,7 +146,6 @@ class CAVI:
         pathway_names: Optional[List[str]] = None,
         n_pathway_factors: Optional[int] = None,
         nnz_chunk_size: int = 1_000_000,
-        test_jj_reg: bool = False,
         alpha_pi: float = 1.0,
         beta_pi_scale: Optional[float] = 5.0,
         **_ignored,
@@ -160,7 +159,6 @@ class CAVI:
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
         self.use_class_weights = use_class_weights
-        self.test_jj_reg = test_jj_reg
 
         self.use_intercept = use_intercept
         self.nnz_chunk_size = nnz_chunk_size
@@ -1670,7 +1668,7 @@ class CAVI:
         X_aux_v_dev = to_device(X_aux_val)
 
         a_theta_v, b_theta_v = self._infer_theta_sparse(
-            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=True)
+            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev)
 
         E_log_beta = self._E_log_beta_cache
         E_beta = self.E_beta
@@ -1900,11 +1898,10 @@ class CAVI:
         self.diagnostics_ = {
             'theta_l1_train': [],       # (iter, mean, std, min, max) of ||E[θ_i]||_1
             'theta_l1_val': [],         # (iter, mean, std, min, max) of ||E[θ_i]||_1 (val)
-            'theta_l1_val_no_jj': [],   # (iter, mean, std, min, max) pure Poisson θ
             'c_pg_stats': [],           # (iter, min, median, max) of PG tilt c_pg
             'wbar_stats': [],           # (iter, min, median, max) of omega_bar(c_pg)
             'true_val_ll': [],          # (iter, true Bernoulli LL per sample)
-            'jj_val_ll': [],            # (iter, PG-CAVI supervised LL per sample; key name retained for plotting compat)
+            'bound_val_ll': [],         # (iter, PG-CAVI supervised LL bound per sample)
             'eta_stats': [],            # (iter, min, median, max) of E[η]
             'beta_stats': [],           # (iter, min, median, max) of E[β]
             'v_stats': [],              # (iter, min, median, max, mean_abs, n_near_zero, n_large)
@@ -2218,12 +2215,12 @@ class CAVI:
                         best_holl_params = self._checkpoint()
                         best_params = best_holl_params  # keep alias
 
-                    # Track true vs JJ validation LL for diagnostics
+                    # Track true Bernoulli LL vs PG-CAVI bound LL on validation
                     if holl_true_bernoulli is not None:
                         self.diagnostics_['true_val_ll'].append(
                             (t, holl_true_bernoulli))
                     if holl_reg is not None:
-                        self.diagnostics_['jj_val_ll'].append(
+                        self.diagnostics_['bound_val_ll'].append(
                             (t, holl_reg))
 
                 # Decomposed prediction diagnostics (covariates-only vs theta-only vs full)
@@ -2263,7 +2260,7 @@ class CAVI:
                         holl_parts = [f"  HO-LL={holl:.2f}"]
                         holl_parts.append(f"  HO-Pois={holl_pois:.2f}")
                         if holl_reg is not None:
-                            holl_parts.append(f"  HO-Reg(JJ)={holl_reg:.4e}")
+                            holl_parts.append(f"  HO-Reg={holl_reg:.4e}")
                         if holl_true_bernoulli is not None:
                             holl_parts.append(f"  HO-Bern={holl_true_bernoulli:.4e}")
                         holl_str = "".join(holl_parts)
@@ -2395,22 +2392,13 @@ class CAVI:
     # predict / transform (API compat)
     # =================================================================
 
-    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None,
-                            use_jj_reg=None):
+    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None):
         """Infer theta for new data using chunked sparse phi.
 
-        Parameters
-        ----------
-        use_jj_reg : bool or None
-            If True, include the PG-CAVI quadratic regularization in theta rate
-            (matches training regime). If False, use pure Poisson+Gamma
-            inference for theta. If None, uses self.test_jj_reg.
-            (Name retained for backward compatibility with saved configs.)
-
-        Returns a_theta, b_theta.
+        Theta inference matches the training regime: includes the PG-CAVI
+        supervised quadratic regularization (0.5 * wbar @ E_v_sq * E[theta]
+        on the Gamma rate, from notes §3.2). Returns a_theta, b_theta.
         """
-        if use_jj_reg is None:
-            use_jj_reg = self.test_jj_reg
         a_theta = to_device(np.random.uniform(0.5 * self.a, 1.5 * self.a, (n_new, self.K)))
         b_theta = to_device(np.full((n_new, self.K), self.bp))
         a_xi = to_device(np.full(n_new, self.ap + self.K * self.a))
@@ -2457,34 +2445,29 @@ class CAVI:
             a_theta = self.a + z_sum
             b_poisson = E_xi[:, None] + beta_col_sums[None, :]
 
-            if use_jj_reg:
-                # Raw theta for regression (PG-CAVI)
-                Var_theta = E_theta / b_theta
-                theta_v = E_theta @ E_v.T                     # (n_new, kappa)
-                if X_aux_new is not None and self.p_aux > 0:
-                    theta_v = theta_v + X_aux_new @ self.mu_gamma.T
-                # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
-                E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
-                c_new = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
-                wbar_new = omega_bar(c_new)                  # (n_new, kappa)
+            # PG-CAVI quadratic regularization on theta rate (matches training).
+            # Raw theta for regression
+            Var_theta = E_theta / b_theta
+            theta_v = E_theta @ E_v.T                     # (n_new, kappa)
+            if X_aux_new is not None and self.p_aux > 0:
+                theta_v = theta_v + X_aux_new @ self.mu_gamma.T
+            # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
+            E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
+            c_new = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
+            wbar_new = omega_bar(c_new)                  # (n_new, kappa)
 
-                # Quadratic regularization: R_quad_coeff = 0.5 * wbar @ E_v_sq
-                # (PG-CAVI factor: 0.5 from notes §3.2).
-                R_quad = 0.5 * wbar_new @ E_v_sq             # (n_new, K)
+            # Quadratic regularization: R_quad_coeff = 0.5 * wbar @ E_v_sq
+            # (PG-CAVI factor: 0.5 from notes §3.2).
+            R_quad = 0.5 * wbar_new @ E_v_sq             # (n_new, K)
 
-                # Solve quadratic: b^2 - b_poisson*b - R_quad*a_theta = 0
-                c_quad = R_quad
-                disc = xp.sqrt(xp.square(b_poisson) + 4.0 * c_quad * a_theta)
-                b_theta = (b_poisson + disc) / 2.0
-                b_theta = xp.maximum(b_theta, 0.1 * b_poisson)
-                b_theta = xp.maximum(b_theta, self.bp)
-                b_theta = xp.maximum(b_theta, 1e-2)
-                b_theta = xp.maximum(b_theta, a_theta / 1e4)
-            else:
-                b_theta = b_poisson
-                b_theta = xp.maximum(b_theta, self.bp)
-                b_theta = xp.maximum(b_theta, 1e-2)
-                b_theta = xp.maximum(b_theta, a_theta / 1e4)
+            # Solve quadratic: b^2 - b_poisson*b - R_quad*a_theta = 0
+            c_quad = R_quad
+            disc = xp.sqrt(xp.square(b_poisson) + 4.0 * c_quad * a_theta)
+            b_theta = (b_poisson + disc) / 2.0
+            b_theta = xp.maximum(b_theta, 0.1 * b_poisson)
+            b_theta = xp.maximum(b_theta, self.bp)
+            b_theta = xp.maximum(b_theta, 1e-2)
+            b_theta = xp.maximum(b_theta, a_theta / 1e4)
 
             b_xi = self.bp + E_theta.sum(axis=1)
 
@@ -2511,7 +2494,7 @@ class CAVI:
         X_aux_v_dev = to_device(X_aux_v)
 
         a_theta_v, b_theta_v = self._infer_theta_sparse(
-            X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev, use_jj_reg=True)
+            X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev)
         E_theta_v = a_theta_v / b_theta_v
         y_np = np.asarray(y_val, dtype=np.float32)
         if y_np.ndim == 1:
