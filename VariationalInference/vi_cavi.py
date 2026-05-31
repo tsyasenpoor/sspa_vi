@@ -3,26 +3,18 @@ import scipy.sparse as sp
 from typing import Tuple, Optional, Dict, Any, List
 import time
 
-# Optional dependency: polyagamma is needed only for regression_inference='pg_gibbs'.
-try:
-    from polyagamma import random_polyagamma as _random_polyagamma
-    _HAS_POLYAGAMMA = True
-except ImportError:
-    _random_polyagamma = None
-    _HAS_POLYAGAMMA = False
-
 try:
     from .jax_backend import (
         xp, USE_JAX, HAS_GPU, to_device, to_numpy,
         digamma, gammaln, logsumexp_rows, softmax_rows,
-        log_expit, lambda_jj, scatter_add_to, phi_chunk_core,
+        log_expit, omega_bar, scatter_add_to, phi_chunk_core,
         expit as _expit, backend_info,
     )
 except ImportError:
     from jax_backend import (
         xp, USE_JAX, HAS_GPU, to_device, to_numpy,
         digamma, gammaln, logsumexp_rows, softmax_rows,
-        log_expit, lambda_jj, scatter_add_to, phi_chunk_core,
+        log_expit, omega_bar, scatter_add_to, phi_chunk_core,
         expit as _expit, backend_info,
     )
 
@@ -157,28 +149,8 @@ class CAVI:
         test_jj_reg: bool = False,
         alpha_pi: float = 1.0,
         beta_pi_scale: Optional[float] = 5.0,
-        n_cell_types: Optional[int] = None,
-        regression_inference: str = "jj",
-        pg_n_sweeps_per_iter: int = 5,
-        pg_ema_alpha: float = 0.25,
         **_ignored,
     ):
-        # Regression-head inference: 'jj' is the Jaakkola-Jordan variational
-        # bound (mean-field on v). 'pg_gibbs' runs an interleaved Pólya-Gamma
-        # Gibbs block per CAVI iteration — this breaks the mean-field
-        # assumption on (v, omega) and captures the v↔theta correlation that
-        # MFVB collapses (which inflates ||v|| 5-10× on supervised PF; see
-        # project memory "DRGP head predictive gap" + "Full Gibbs sampler").
-        if regression_inference not in ("jj", "pg_gibbs"):
-            raise ValueError(
-                f"regression_inference must be 'jj' or 'pg_gibbs', got {regression_inference!r}")
-        self.regression_inference = regression_inference
-        self.pg_n_sweeps_per_iter = int(pg_n_sweeps_per_iter)
-        # EMA on posterior-moment estimates between outer iters dampens MC noise
-        # from each block's sample mean (otherwise gamma / v trajectories look
-        # noisy even after the chain converges — see seed_1024 diagnostics 2026-05).
-        # alpha=1.0 is "no smoothing" (overwrite); 0.25 is reasonable default.
-        self.pg_ema_alpha = float(pg_ema_alpha)
         self.K = n_factors
         self.a = a
         self.ap = ap
@@ -189,10 +161,6 @@ class CAVI:
         self.regression_weight = regression_weight
         self.use_class_weights = use_class_weights
         self.test_jj_reg = test_jj_reg
-        # Cap on JJ auxiliary zeta.  Keeps lambda_JJ(zeta) >= lambda_JJ(zeta_max) > 0,
-        # preventing the quadratic braking on theta from vanishing.
-        # At zeta_max=4: lambda_min ~ 0.060.  The JJ bound remains valid for any zeta.
-        self.zeta_max = 4.0
 
         self.use_intercept = use_intercept
         self.nnz_chunk_size = nnz_chunk_size
@@ -204,9 +172,6 @@ class CAVI:
         self.n_pathway_factors = n_pathway_factors
         self.alpha_pi = alpha_pi
         self._beta_pi_scale = beta_pi_scale  # resolved to K in _initialize
-        self.n_cell_types = n_cell_types
-        # Set to True in fit() when patient_idx + cell_type_idx are provided
-        self._use_cell_type_regression = False
 
         if mode in ['masked', 'pathway_init'] and pathway_mask is None:
             raise ValueError(f"pathway_mask required for mode='{mode}'")
@@ -418,17 +383,10 @@ class CAVI:
 
         # --- v: Laplace (Bayesian Lasso) init ---
         self._b_v_orig = self.b_v
-        if self._use_cell_type_regression:
-            C = self.n_cell_types
-            # v_l is a (K+C) vector: first K entries are factor weights,
-            # last C entries are cell-type regression coefficients.
-            self.mu_v = np.random.randn(self.kappa, K + C) * 0.01
-            self.sigma_v_diag = np.full((self.kappa, K + C), 2.0 * self.b_v ** 2)
-        else:
-            self.mu_v = np.random.randn(self.kappa, K) * 0.01
-            # b_v is used directly as the Laplace scale parameter.
-            # Var[v] = 2*b_v^2 under the Laplace prior.
-            self.sigma_v_diag = np.full((self.kappa, K), 2.0 * self.b_v ** 2)
+        self.mu_v = np.random.randn(self.kappa, K) * 0.01
+        # b_v is used directly as the Laplace scale parameter.
+        # Var[v] = 2*b_v^2 under the Laplace prior.
+        self.sigma_v_diag = np.full((self.kappa, K), 2.0 * self.b_v ** 2)
 
         # --- gamma: N(0, sigma_gamma^2) ---
         if self.p_aux > 0:
@@ -451,28 +409,13 @@ class CAVI:
             self.mu_gamma = np.zeros((self.kappa, 0))
             self.Sigma_gamma = np.zeros((self.kappa, 0, 0))
 
-        # --- JJ auxiliary ---
-        if self._use_cell_type_regression:
-            self.zeta = np.ones((self._n_patients, self.kappa))
-        else:
-            self.zeta = np.ones((self.n, self.kappa))
-
-        # --- PG-Gibbs auxiliary (only used when regression_inference='pg_gibbs') ---
-        # omega_pg has same shape as zeta so it's a drop-in for `lam = lambda_jj(zeta)`
-        # (we return omega_pg/2.0 from self._lambda() in PG mode).
-        # s_pg holds the Bayesian-Lasso local scale parameters (the τ² latent in the
-        # scale-mixture-of-normals representation of the Laplace prior on v).
-        if self.regression_inference == "pg_gibbs":
-            if self._use_cell_type_regression:
-                # PG-interleaved CAVI in CT mode would need per-patient omega; defer.
-                raise NotImplementedError(
-                    "regression_inference='pg_gibbs' not yet supported in CT mode")
-            # E[PG(1,0)] = 1/4, so 2*lam ≈ 1/2 at init → matches lambda_jj(zeta=1)
-            self.omega_pg = np.full((self.n, self.kappa), 0.25)
-            self.s_pg = np.full((self.kappa, self.K), 2.0 * self.b_v ** 2)
-            # Independent RNG for the Gibbs block so JJ-mode runs are bit-identical
-            seed = getattr(self, "seed_used_", None)
-            self._pg_rng = np.random.default_rng(seed + 1 if seed is not None else None)
+        # --- PG-CAVI augmentation tilt ---
+        # c_pg[i,k] = sqrt(E[A_ik^2]) (notation `c` in PG_CAVI_implementation_notes.md
+        # §3.6; suffix `_pg` avoids collision with the gamma-prior scalar self.c).
+        # wbar[i,k] = omega_bar(c_pg[i,k]) — deterministic PG variational mean.
+        # Init: c_pg = 0 so wbar = omega_bar(0) = 1/4 (Taylor branch of omega_bar).
+        self.c_pg = np.zeros((self.n, self.kappa), dtype=np.float32)
+        self.wbar = np.full((self.n, self.kappa), 0.25, dtype=np.float32)
 
         # --- Oscillation tracking for v update ---
         self._v_prev_mu = None
@@ -955,7 +898,7 @@ class CAVI:
         The data precision is 2 * sum_i lambda_i * E[theta^2].
         Setting them equal: b_v = 1 / (v0 * median_data_prec_per_factor).
         """
-        lam = lambda_jj(self.zeta)
+        lam = self.wbar / 2.0  # PG-CAVI: 2*lam = wbar at tilt optimum
         W = self._sample_weights
         W_lam = W * lam  # (n, kappa)
 
@@ -1113,12 +1056,12 @@ class CAVI:
 
     def _update_theta(self, z_sum_theta, y, X_aux, ramp=1.0):
         """
-        theta shape and rate (scHPF Eq 7, cell side + JJ regression).
+        theta shape and rate (scHPF Eq 7, cell side + PG-CAVI regression).
 
         Solves the quadratic for b_theta in one step:
             b^2 - b_base*b - c_quad*a_theta = 0
             b = (b_base + sqrt(b_base^2 + 4*c_quad*a_theta)) / 2
-        which is always positive (given c_quad > 0, guaranteed by the zeta cap).
+        which is always positive (given c_quad >= 0, guaranteed by wbar >= 0).
 
         Row-chunked when regression is active to avoid multiple full (n, K)
         intermediates (R_linear, R_quad, b_base, disc) living simultaneously.
@@ -1135,7 +1078,7 @@ class CAVI:
 
         # Pre-compute tiny (kappa, K) quantities for regression rate parts
         y_exp = y if y.ndim > 1 else y[:, None]        # (n, kappa)
-        lam = self._lambda()                             # (n, kappa)
+        wbar = self.wbar                                 # (n, kappa)
         W = self._sample_weights                         # (n, kappa)
         # No rw scaling in CAVI updates — the paper's model has weight 1
         # on both Poisson and regression terms. rw is only for ELBO monitoring.
@@ -1154,15 +1097,20 @@ class CAVI:
                 # --- inline _regression_rate_parts for this chunk ---
                 E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
                 W_c = W[i0:i1]
-                W_lam_c = W_c * lam[i0:i1]
+                W_wbar_c = W_c * wbar[i0:i1]
                 theta_v_c = E_theta_c @ E_v.T                             # (chunk, kappa)
                 if self.p_aux > 0:
                     theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
 
                 R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
-                R_lin_c = R_lin_c + 2.0 * ((W_lam_c * theta_v_c) @ E_v)
-                R_lin_c = R_lin_c - 2.0 * E_theta_c * (W_lam_c @ E_v_sq_col)
-                R_quad_c = (2.0 * W_lam_c) @ E_v_sq                       # (chunk, K)
+                R_lin_c = R_lin_c + (W_wbar_c * theta_v_c) @ E_v          # was 2.0 * lam → wbar
+                R_lin_c = R_lin_c - E_theta_c * (W_wbar_c @ E_v_sq_col)   # was 2.0 * lam → wbar
+                # ** Critical 0.5 from notes §3.2 — DO NOT remove. **
+                # JJ had c_quad = 2*lambda*E_v_sq; PG-CAVI has c_quad = 0.5*wbar*E_v_sq.
+                # Since wbar = 2*lambda at the tilt optimum, this is HALF the JJ rate
+                # contribution. Verify: if you started from a JJ checkpoint and removed
+                # only `lam → wbar/2`, the self-term would be 2× too large.
+                R_quad_c = 0.5 * W_wbar_c @ E_v_sq                        # (chunk, K)
 
                 # Ramp regression contribution during post-warmup transition
                 R_lin_c = R_lin_c * ramp
@@ -1212,45 +1160,35 @@ class CAVI:
         # Floor to prevent E[xi] explosion from tiny bp + tiny E[theta] sums
         self.b_xi = xp.maximum(self.b_xi, 1e-6)
 
-    def _update_zeta(self, X_aux):
-        """JJ auxiliary: zeta_{ik} = min(sqrt(E[A^2_{ik}]), zeta_max).
+    def _update_omega(self, X_aux):
+        """PG augmentation tilt: c_pg_{ik} = sqrt(E[A^2_{ik}]); wbar = omega_bar(c_pg).
 
-        Capping zeta keeps lambda_JJ(zeta) bounded from below, which prevents the
-        quadratic braking on theta from vanishing.  The JJ lower bound is valid
-        for ANY zeta, so capping gives a slightly looser but still valid bound.
-        Each CAVI update still provably increases this capped-zeta ELBO.
+        Per PG_CAVI_implementation_notes.md §3.6, E[A^2] includes ONLY the
+        Var[theta] cross term — NOT Var[v] or Var[gamma] cross terms (paper
+        parity; revisit if recovery testing shows it matters).
+
+        No cap on c_pg (under PG-CAVI, wbar = omega_bar(c) is monotone
+        decreasing from 1/4 to 0 as c grows, so the quadratic braking on
+        theta is naturally bounded; we don't need the JJ-era zeta_max).
 
         Row-chunked with adaptive OOM guard.
         """
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K) -- tiny
-        # Pre-compute gamma variance for E[A^2] correction
-        if self.p_aux > 0:
-            gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
-                                  for k in range(self.kappa)])  # (kappa, p_aux)
-        else:
-            gamma_var = None
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
         min_chunk = max(1024, self.n // 256)
-
-        zeta_chunks = []
+        c_chunks = []
         i0 = 0
         while i0 < self.n:
             i1 = min(i0 + self._row_chunk, self.n)
             try:
                 b_theta_c = self.b_theta[i0:i1]
                 E_theta_c = self.a_theta[i0:i1] / b_theta_c
-                # A = theta @ v + x_aux @ gamma (raw theta, Eq. 36)
                 Var_theta_c = E_theta_c / b_theta_c
                 E_A_c = E_theta_c @ self.mu_v.T
                 if self.p_aux > 0:
                     E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
+                # Var[theta] cross term ONLY (§3.6).
                 E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
-                # E[theta]^2 * Var(v) cross-term
-                E_A_sq_c = E_A_sq_c + xp.square(E_theta_c) @ self.sigma_v_diag.T
-                if gamma_var is not None:
-                    E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
-                zeta_chunks.append(
-                    xp.minimum(xp.sqrt(xp.maximum(E_A_sq_c, 1e-8)), self.zeta_max)
-                )
+                c_chunks.append(xp.sqrt(xp.maximum(E_A_sq_c, 1e-12)))
                 i0 = i1
             except Exception as exc:
                 if _is_oom_error(exc) and self._row_chunk > min_chunk:
@@ -1258,277 +1196,22 @@ class CAVI:
                     print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
                     continue
                 raise
-        self.zeta = xp.concatenate(zeta_chunks, axis=0) if len(zeta_chunks) > 1 else zeta_chunks[0]
-
-    # ------------------------------------------------------------------
-    # Polya-Gamma interleaved block (alternative to JJ MFVB on v, gamma)
-    # ------------------------------------------------------------------
-
-    def _lambda(self):
-        """Return the (n, kappa) effective JJ-style lambda matrix.
-
-        JJ mode: lambda_jj(self.zeta) — tightened by the JJ variational
-        parameter. PG mode: self.omega_pg / 2.0 — the natural drop-in,
-        since at the JJ optimum E[omega | psi] = 2·lambda_jj(psi).
-
-        Returning a single matrix lets the existing theta/beta/ELBO machinery
-        consume either inference path with no further branching.
-        """
-        if self.regression_inference == "pg_gibbs":
-            return self.omega_pg / 2.0
-        return lambda_jj(self.zeta)
-
-    def _pg_gibbs_block(self, y, X_aux):
-        """Interleaved Pólya-Gamma Gibbs block for (omega, v, gamma, s).
-
-        Runs `self.pg_n_sweeps_per_iter` Gibbs sweeps with theta and beta
-        held FIXED at their current variational posterior means. At the
-        end, posterior moments from the sample chain are written back to
-            self.mu_v          (kappa, K)         — sample mean
-            self.sigma_v_diag  (kappa, K)         — sample variance
-            self.mu_gamma      (kappa, p_aux)     — sample mean
-            self.Sigma_gamma   (kappa, p_aux, p_aux) — sample covariance
-            self.omega_pg      (n, kappa)         — sample mean of omega
-
-        Heavy matrix ops (Cholesky, solves, sums) run on the active backend
-        via `xp` (JAX/GPU when USE_JAX is True). The PG sampler `polyagamma`
-        is CPU-only, so for each sweep we copy ψ to host, draw omega, copy
-        back. With n × kappa typically small (a few hundred) this transfer
-        is cheap relative to the Cholesky / GEMM that follow.
-
-        Currently only standard (non-CT) mode is supported.
-        """
-        if self._use_cell_type_regression:
-            raise NotImplementedError(
-                "PG-Gibbs block: CT mode (n_cell_types>0) not implemented yet")
-        if not _HAS_POLYAGAMMA:
-            raise RuntimeError(
-                "regression_inference='pg_gibbs' requires the `polyagamma` "
-                "package. `pip install polyagamma`.")
-
-        # ---- device-side state ----
-        E_theta = self.a_theta / xp.maximum(self.b_theta, 1e-12)   # (n, K), device
-        X_aux_dev = X_aux if (X_aux is not None and self.p_aux > 0) else None
-        y_2d_dev = y if y.ndim > 1 else y[:, None]
-        kappa_y_all = to_device((np.asarray(y_2d_dev) - 0.5).astype(np.float32))
-
-        # Bring v, gamma, s to device for sampling (matrix ops on device)
-        v_cur = self.mu_v                          # (kappa, K) device
-        g_cur = self.mu_gamma if self.p_aux > 0 else None
-        s_cur_dev = to_device(self.s_pg.astype(np.float32))  # (kappa, K) device
-
-        n_sw = self.pg_n_sweeps_per_iter
-        kappa = self.kappa
-
-        v_samples = []          # list of (kappa, K) device arrays
-        g_samples = []          # list of (kappa, p_aux) device arrays
-        omega_samples = []      # list of (n, kappa) device arrays
-        psi_samples = []        # for E[ψ²] -> zeta update
-
-        bv = float(self.b_v)
-        bv2_inv = 1.0 / (bv * bv) if bv > 0 else 1e6
-
-        for sw in range(n_sw):
-            v_row_list = []
-            g_row_list = [] if g_cur is not None else None
-            omega_row_list = []
-            psi_row_list = []
-            for k in range(kappa):
-                # 1) psi_ik = θ_i^T v_k + (x_aux)^T γ_k on device
-                psi_dev = E_theta @ v_cur[k]
-                if g_cur is not None:
-                    psi_dev = psi_dev + X_aux_dev @ g_cur[k]
-                psi_host = np.asarray(to_numpy(psi_dev), dtype=np.float64)
-                # 2) ω ~ PG(1, |ψ|) on host
-                omega_host = np.asarray(_random_polyagamma(
-                    z=np.abs(psi_host), size=self.n), dtype=np.float32)
-                omega_dev = to_device(omega_host)
-
-                # 3) v_k | ω, γ, θ, y, s  ~  N(μ, Σ)
-                k_y = kappa_y_all[:, k]
-                if g_cur is not None:
-                    aux_off = X_aux_dev @ g_cur[k]
-                else:
-                    aux_off = xp.zeros(self.n, dtype=xp.float32)
-                # Σ⁻¹ = diag(1/s) + θ' diag(ω) θ
-                prec_v = (E_theta.T * omega_dev) @ E_theta
-                prec_v = prec_v + xp.diag(1.0 / xp.maximum(s_cur_dev[k], 1e-12))
-                # tiny ridge (helps Cholesky stability when ω has near-zero entries)
-                prec_v = prec_v + xp.eye(self.K, dtype=prec_v.dtype) * 1e-6
-                L_v = xp.linalg.cholesky(prec_v)
-                rhs_v = E_theta.T @ (k_y - omega_dev * aux_off)
-                mu_v_post = xp.linalg.solve(L_v.T, xp.linalg.solve(L_v, rhs_v))
-                noise_v = to_device(self._pg_rng.standard_normal(self.K).astype(np.float32))
-                v_new = mu_v_post + xp.linalg.solve(L_v.T, noise_v)
-                v_cur = v_cur.at[k].set(v_new) if USE_JAX else \
-                    self._set_row(v_cur, k, v_new)
-
-                # 4) γ_k | ω, v, θ, y  ~  N(μ, Σ)
-                if g_cur is not None:
-                    theta_v_pred = E_theta @ v_new
-                    prec_g = (X_aux_dev.T * omega_dev) @ X_aux_dev
-                    prec_g = prec_g + xp.eye(self.p_aux, dtype=prec_g.dtype) \
-                              * (1.0 / (self.sigma_gamma ** 2) + 1e-6)
-                    L_g = xp.linalg.cholesky(prec_g)
-                    rhs_g = X_aux_dev.T @ (k_y - omega_dev * theta_v_pred)
-                    mu_g_post = xp.linalg.solve(L_g.T, xp.linalg.solve(L_g, rhs_g))
-                    noise_g = to_device(self._pg_rng.standard_normal(self.p_aux).astype(np.float32))
-                    g_new = mu_g_post + xp.linalg.solve(L_g.T, noise_g)
-                    g_cur = g_cur.at[k].set(g_new) if USE_JAX else \
-                        self._set_row(g_cur, k, g_new)
-
-                # 5) s_kℓ | v_kℓ  via Park-Casella (host — small loop)
-                v_new_h = np.asarray(to_numpy(v_new), dtype=np.float64)
-                s_row = np.empty(self.K, dtype=np.float32)
-                for ell in range(self.K):
-                    vk = abs(v_new_h[ell])
-                    if vk < 1e-9:
-                        inv_s = self._pg_rng.wald(mean=1e9, scale=bv2_inv)
-                    else:
-                        inv_s = self._pg_rng.wald(mean=1.0 / (bv * vk), scale=bv2_inv)
-                    s_row[ell] = 1.0 / max(inv_s, 1e-12)
-                s_cur_dev = (s_cur_dev.at[k].set(to_device(s_row))
-                             if USE_JAX else self._set_row(s_cur_dev, k, to_device(s_row)))
-
-                v_row_list.append(v_new)
-                if g_row_list is not None:
-                    g_row_list.append(g_new)
-                omega_row_list.append(omega_dev)
-                # psi sample after this sweep update (use the v we just drew)
-                psi_after = E_theta @ v_new
-                if g_cur is not None:
-                    psi_after = psi_after + X_aux_dev @ g_new
-                psi_row_list.append(psi_after)
-
-            v_samples.append(xp.stack(v_row_list, axis=0))                # (kappa, K)
-            if g_row_list is not None:
-                g_samples.append(xp.stack(g_row_list, axis=0))            # (kappa, p_aux)
-            omega_samples.append(xp.stack(omega_row_list, axis=1))        # (n, kappa)
-            psi_samples.append(xp.stack(psi_row_list, axis=1))            # (n, kappa)
-
-        # ---- aggregate posterior moments + EMA smoothing -------------------
-        # Sample-derived estimates (this outer iter):
-        v_chain = xp.stack(v_samples, axis=0)               # (n_sw, kappa, K)
-        new_mu_v = v_chain.mean(axis=0)
-        new_sigma_v = v_chain.var(axis=0) + 1e-8
-        alpha = self.pg_ema_alpha
-
-        # EMA blend with previous outer iter's posterior estimates. alpha=1.0
-        # means "overwrite" (raw MC noise visible); alpha<1 dampens.
-        if alpha >= 1.0 - 1e-9:
-            self.mu_v = new_mu_v
-            self.sigma_v_diag = new_sigma_v
-        else:
-            self.mu_v = alpha * new_mu_v + (1.0 - alpha) * self.mu_v
-            self.sigma_v_diag = alpha * new_sigma_v + (1.0 - alpha) * self.sigma_v_diag
-
-        if g_samples:
-            g_chain = xp.stack(g_samples, axis=0)           # (n_sw, kappa, p_aux)
-            new_mu_g = g_chain.mean(axis=0)
-            if n_sw > 1:
-                Sigma_g_chunks = []
-                for k in range(kappa):
-                    gk = g_chain[:, k, :]                   # (n_sw, p_aux)
-                    gk_centered = gk - gk.mean(axis=0, keepdims=True)
-                    cov_k = (gk_centered.T @ gk_centered) / max(n_sw - 1, 1)
-                    cov_k = cov_k + xp.eye(self.p_aux, dtype=cov_k.dtype) * 1e-8
-                    Sigma_g_chunks.append(cov_k)
-                new_Sigma_g = xp.stack(Sigma_g_chunks, axis=0)
-            else:
-                new_Sigma_g = xp.broadcast_to(
-                    xp.eye(self.p_aux, dtype=new_mu_g.dtype) * (self.sigma_gamma ** 2),
-                    (kappa, self.p_aux, self.p_aux),
-                )
-            if alpha >= 1.0 - 1e-9:
-                self.mu_gamma = new_mu_g
-                self.Sigma_gamma = new_Sigma_g
-            else:
-                self.mu_gamma = alpha * new_mu_g + (1.0 - alpha) * self.mu_gamma
-                self.Sigma_gamma = alpha * new_Sigma_g + (1.0 - alpha) * self.Sigma_gamma
-
-        # omega and zeta (used by theta's supervised correction) — EMA too.
-        omega_chain = xp.stack(omega_samples, axis=0)       # (n_sw, n, kappa)
-        new_omega = to_numpy(omega_chain.mean(axis=0)).astype(np.float32)
-        if alpha >= 1.0 - 1e-9:
-            self.omega_pg = new_omega
-        else:
-            self.omega_pg = alpha * new_omega + (1.0 - alpha) * self.omega_pg
-
-        # zeta in PG mode is a DERIVED quantity (not a variational param):
-        # it's sqrt(E[psi²]) from the current PG samples, used only to keep the
-        # JJ-style ELBO diagnostic and zeta-saturation print working. It has
-        # NO role in the inference itself under PG-Gibbs — those updates use
-        # omega_pg (via self._lambda()) directly.
-        psi_chain = xp.stack(psi_samples, axis=0)           # (n_sw, n, kappa)
-        E_psi_sq = (psi_chain ** 2).mean(axis=0)
-        new_zeta = xp.minimum(xp.sqrt(xp.maximum(E_psi_sq, 1e-8)), self.zeta_max)
-        if alpha >= 1.0 - 1e-9:
-            self.zeta = new_zeta
-        else:
-            self.zeta = alpha * new_zeta + (1.0 - alpha) * self.zeta
-
-        self.s_pg = np.asarray(to_numpy(s_cur_dev), dtype=np.float32)
-
-    def _set_row(self, arr, k, row):
-        """In-place row set that works for numpy arrays (JAX uses .at[k].set)."""
-        arr[k] = row
-        return arr
-
-    def _regression_rate_parts(self, y, X_aux):
-        """
-        Compute the JJ regression correction to theta rate, split into linear
-        and quadratic parts.
-
-        The full correction is R = R_linear + R_quad_coeff * E[theta], where:
-          R_linear_{il} = Sum_k [-(y_{ik} - 0.5) v_{kl}
-                                + 2*lambda(zeta_{ik}) v_{kl} C^{(-l)}_{ik}]
-          R_quad_coeff_{il} = Sum_k [2*lambda(zeta_{ik}) E[v^2_{kl}]]
-
-        Memory-efficient: avoids (n, kappa, K) C_minus intermediate by
-        algebraic decomposition into (n, kappa) @ (kappa, K) matmuls.
-
-        Returns
-        -------
-        R_linear : (n, K) -- terms not depending on E[theta_{il}]
-        R_quad_coeff : (n, K) -- coefficient of E[theta_{il}], always >= 0
-        """
-        y_exp = y if y.ndim > 1 else y[:, None]  # (n, kappa)
-        lam = lambda_jj(self.zeta)                 # (n, kappa)
-        W = self._sample_weights                    # (n, kappa)
-        E_theta = self.E_theta                      # (n, K)
-        E_v = self.mu_v                             # (kappa, K)
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag # (kappa, K)
-
-        # Full linear predictor: (n, kappa) -- BLAS
-        theta_v = E_theta @ E_v.T
-        if self.p_aux > 0:
-            theta_v = theta_v + X_aux @ self.mu_gamma.T
-
-        W_lam = W * lam  # (n, kappa)
-
-        # BLAS matmuls to avoid (n, kappa, K) C_minus intermediate:
-        E_v_sq_col = xp.square(E_v)                             # (kappa, K) -- tiny
-        R_linear = -(W * (y_exp - 0.5)) @ E_v                   # (n, K)
-        R_linear = R_linear + 2.0 * ((W_lam * theta_v) @ E_v)   # fuse add
-        R_linear = R_linear - 2.0 * E_theta * (W_lam @ E_v_sq_col)  # fuse subtract
-
-        # R_quad via single BLAS matmul
-        R_quad_coeff = (2.0 * W_lam) @ E_v_sq                   # (n, K)
-
-        return R_linear, R_quad_coeff
+        self.c_pg = xp.concatenate(c_chunks, axis=0) if len(c_chunks) > 1 else c_chunks[0]
+        self.wbar = omega_bar(self.c_pg)
 
     def _update_v(self, y, X_aux, iteration=0, ramp=1.0):
         """
-        v posterior (diagonal Gaussian, JJ bound, Laplace/Bayesian Lasso prior).
+        v posterior (diagonal Gaussian, PG-CAVI, Laplace/Bayesian Lasso prior).
 
-            precision_{kl} = E_q[1/s_{kl}] + 2 Sum_i lambda(zeta_{ik}) E[theta^2_{il}]
+            precision_{kl} = E_q[1/s_{kl}] + Sum_i wbar_ik E[theta^2_{il}]
+            (equivalently 2*lam where lam = wbar/2 at the tilt optimum)
 
         Memory-efficient: row-chunked to avoid full (n, K) temporaries
         (E_theta_sq, Var_theta) while accumulating (kappa, K) sufficient
         statistics via BLAS matmuls.
         """
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = lambda_jj(self.zeta)
+        lam = self.wbar / 2.0  # PG-CAVI: 2*lam = wbar at tilt optimum
         W = self._sample_weights                    # (n, kappa)
         E_v = self.mu_v
 
@@ -1607,49 +1290,12 @@ class CAVI:
         self.sigma_v_diag = (1.0 - alpha_v) * self.sigma_v_diag + alpha_v * sigma_v_new
 
     def _update_gamma(self, y, X_aux, iteration=0, ramp=1.0):
-        """gamma posterior (Gaussian, JJ bound) with under-relaxation."""
+        """gamma posterior (Gaussian, PG-CAVI) with under-relaxation."""
         if self.p_aux == 0:
-            return
-        if self._use_cell_type_regression:
-            # Patient-level gamma update: same CAVI equations but summed over
-            # n_patients instead of n rows.  zeta is (n_patients, kappa) here.
-            A_pt  = self._build_patient_A()          # (n_patients, kappa)
-            lam_pt = lambda_jj(self.zeta)            # (n_patients, kappa)
-            W_pt  = self._W_patient                  # (n_patients, kappa)
-            y_pt  = self._y_patient                  # (n_patients, kappa)
-            X_pt  = self._X_aux_patient              # (n_patients, p_aux)
-            alpha_gamma = min(0.3, 30.0 / self.K) * ramp
-            for k in range(self.kappa):
-                prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
-                W_lam_k = W_pt[:, k] * lam_pt[:, k]
-                weighted_X = X_pt * (2 * ramp * W_lam_k)[:, None]
-                prec = prec_prior + weighted_X.T @ X_pt
-                residual = ramp * (W_pt[:, k] * (y_pt[:, k] - 0.5)
-                                   - 2 * W_lam_k * A_pt[:, k])
-                mean_prec = X_pt.T @ residual
-                if USE_JAX:
-                    Sigma_new = xp.linalg.inv(prec)
-                else:
-                    Sigma_new = np.linalg.inv(prec)
-                mu_gamma_new = Sigma_new @ mean_prec
-                delta_gamma = 3.0 * self.sigma_gamma
-                mu_gamma_new = xp.clip(mu_gamma_new,
-                                       self.mu_gamma[k] - delta_gamma,
-                                       self.mu_gamma[k] + delta_gamma)
-                if USE_JAX:
-                    self.Sigma_gamma = self.Sigma_gamma.at[k].set(
-                        (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new)
-                    self.mu_gamma = self.mu_gamma.at[k].set(
-                        (1.0 - alpha_gamma) * self.mu_gamma[k] + alpha_gamma * mu_gamma_new)
-                else:
-                    self.Sigma_gamma[k] = ((1.0 - alpha_gamma) * self.Sigma_gamma[k]
-                                           + alpha_gamma * Sigma_new)
-                    self.mu_gamma[k] = ((1.0 - alpha_gamma) * self.mu_gamma[k]
-                                        + alpha_gamma * mu_gamma_new)
             return
 
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = lambda_jj(self.zeta)
+        lam = self.wbar / 2.0  # PG-CAVI: 2*lam = wbar at tilt optimum
         W = self._sample_weights                    # (n, kappa)
 
         # Pre-compute E[theta] @ mu_v.T in chunks
@@ -1775,58 +1421,24 @@ class CAVI:
         poisson_ll -= self._gammaln_data_sum  # cached at init
         elbo += poisson_ll
 
-        # === Row-chunked theta terms: JJ regression LL, prior, entropy ===
+        # === Row-chunked theta terms: PG-CAVI supervised LL, prior, entropy ===
+        # L_sup per PG_CAVI_implementation_notes.md §4:
+        #   sum_ik [kappa_ik*E[A] - c/2 + log sigma(c) - 0.5*wbar*(E[A^2] - c^2)]
+        # At the c-tilt optimum (after _update_omega), c^2 = E[A^2] and the last
+        # term is 0, so L_sup reduces to the JJ form with lam = wbar/2. We keep
+        # the full form here for monotonicity-debugging purposes (the tilt may
+        # be slightly stale relative to theta/v/gamma if the ELBO is checked
+        # mid-iteration before _update_omega has refreshed).
         y_exp = y if y.ndim > 1 else y[:, None]
-        lam = lambda_jj(self.zeta)
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag   # (kappa, K) or (kappa, C, K) in CT mode
-        W = self._sample_weights  # (n, kappa)
+        lam = self.wbar / 2.0                         # PG-CAVI: 2*lam = wbar at optimum
+        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag   # (kappa, K)
+        W = self._sample_weights                       # (n, kappa)
 
         rw = self.regression_weight
         regression_ll = 0.0
         theta_prior = 0.0
         theta_entropy = 0.0
         gammaln_a = gammaln(self.a)
-
-        # --- CT mode: compute patient-level regression LL once, upfront ---
-        if self._use_cell_type_regression:
-            E_A_pt = self._build_patient_A()  # (n_patients, kappa)
-            # Var_A = factor variance (cell-level) + CT variance (patient-level)
-            E_v_sq_factor = self.mu_v[:, :self.K] ** 2 + self.sigma_v_diag[:, :self.K]  # (kappa, K)
-            sigma_v_factor = self.sigma_v_diag[:, :self.K]
-            sigma_v_ct     = self.sigma_v_diag[:, self.K:]                               # (kappa, C)
-            Var_A_cols = [xp.zeros(self._n_patients) for _ in range(self.kappa)]
-            pt_idx_d = self._patient_idx_dev
-            for i0_v in range(0, self.n, self._row_chunk):
-                i1_v = min(i0_v + self._row_chunk, self.n)
-                b_c = self.b_theta[i0_v:i1_v]
-                E_c = self.a_theta[i0_v:i1_v] / b_c
-                Var_c = E_c / b_c
-                pt_c = pt_idx_d[i0_v:i1_v]
-                var_contr = (
-                    Var_c @ E_v_sq_factor.T + xp.square(E_c) @ sigma_v_factor.T
-                )  # (chunk, kappa)
-                for l in range(self.kappa):
-                    Var_A_cols[l] = scatter_add_to(Var_A_cols[l], pt_c, var_contr[:, l])
-            Var_A_factor = xp.stack(Var_A_cols, axis=1)   # (n_patients, kappa)
-            Var_A_ct = xp.square(self._count_p) @ sigma_v_ct.T  # (n_patients, kappa)
-            Var_A_pt = Var_A_factor + Var_A_ct
-            E_A_sq_pt = xp.square(E_A_pt) + Var_A_pt
-            lam_pt = lambda_jj(self.zeta)             # (n_patients, kappa)
-            W_pt   = self._W_patient                  # (n_patients, kappa)
-            y_pt   = self._y_patient                  # (n_patients, kappa)
-            regression_ll = float(xp.sum(
-                W_pt * ((y_pt - 0.5) * E_A_pt - lam_pt * E_A_sq_pt)
-            ))
-            regression_ll += float(xp.sum(
-                W_pt * (lam_pt * xp.square(self.zeta) - 0.5 * self.zeta + log_expit(self.zeta))
-            ))
-
-        # Pre-compute gamma variance for E[A^2] correction (tiny, computed once)
-        if self.p_aux > 0:
-            gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
-                                  for k in range(self.kappa)])  # (kappa, p_aux)
-        else:
-            gamma_var = None
 
         i0 = 0
         while i0 < self.n:
@@ -1837,26 +1449,22 @@ class CAVI:
                 E_theta_c = a_theta_c / b_theta_c
                 E_log_theta_c = E_log_theta[i0:i1]
 
-                # --- JJ regression likelihood (Eq. 35-36, raw theta) ---
-                if not self._use_cell_type_regression:
-                    Var_theta_c = E_theta_c / b_theta_c                   # (chunk, K)
-                    E_A_c = E_theta_c @ self.mu_v.T                       # (chunk, kappa)
-                    if self.p_aux > 0:
-                        E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
-                    E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T       # (chunk, kappa)
-                    # E[theta]^2 * Var(v) cross-term
-                    E_A_sq_c = E_A_sq_c + xp.square(E_theta_c) @ self.sigma_v_diag.T
-                    if gamma_var is not None:
-                        E_A_sq_c = E_A_sq_c + xp.square(X_aux[i0:i1]) @ gamma_var.T
-                    lam_c = lam[i0:i1]
-                    W_c = W[i0:i1]
-                    zeta_c = self.zeta[i0:i1]
-                    regression_ll += xp.sum(
-                        W_c * ((y_exp[i0:i1] - 0.5) * E_A_c - lam_c * E_A_sq_c)
-                    )
-                    regression_ll += xp.sum(
-                        W_c * (lam_c * zeta_c ** 2 - 0.5 * zeta_c + log_expit(zeta_c))
-                    )
+                # --- PG-CAVI supervised LL ---
+                Var_theta_c = E_theta_c / b_theta_c                       # (chunk, K)
+                E_A_c = E_theta_c @ self.mu_v.T                           # (chunk, kappa)
+                if self.p_aux > 0:
+                    E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
+                # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
+                E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T           # (chunk, kappa)
+                lam_c = lam[i0:i1]
+                W_c = W[i0:i1]
+                c_pg_c = self.c_pg[i0:i1]
+                regression_ll += xp.sum(
+                    W_c * ((y_exp[i0:i1] - 0.5) * E_A_c - lam_c * E_A_sq_c)
+                )
+                regression_ll += xp.sum(
+                    W_c * (lam_c * c_pg_c ** 2 - 0.5 * c_pg_c + log_expit(c_pg_c))
+                )
 
                 # --- Prior p(theta|xi) ---
                 theta_prior += xp.sum(
@@ -2100,29 +1708,24 @@ class CAVI:
         poisson_ll_per_sample = float(poisson_ll) / n_val
 
         # Regression LL on validation data (if labels provided)
-        # CT mode: mu_v is (kappa, C, K); per-row matmul requires cell_type_idx
-        # which is not available here, so skip regression LL for val.
         regression_ll_per_sample = None
-        if y_val is not None and not self._use_cell_type_regression:
+        if y_val is not None:
             y_v = to_device(np.asarray(y_val, dtype=np.float32))
             if y_v.ndim == 1:
                 y_v = y_v[:, None]
-            # Raw theta for regression (Eq. 35-36)
+            # Raw theta for regression (PG-CAVI)
             Var_theta_v = a_theta_v / (b_theta_v ** 2)
             E_A = E_theta_v @ self.mu_v.T
             if self.p_aux > 0:
                 E_A = E_A + X_aux_v_dev @ self.mu_gamma.T
 
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
+            # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
             E_A_sq = E_A ** 2 + Var_theta_v @ E_v_sq.T
-            E_A_sq = E_A_sq + xp.square(E_theta_v) @ self.sigma_v_diag.T
-            if self.p_aux > 0:
-                gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
-                                      for k in range(self.kappa)])
-                E_A_sq = E_A_sq + xp.square(X_aux_v_dev) @ gamma_var.T
 
-            zeta_val = xp.sqrt(xp.maximum(E_A_sq, 1e-8))
-            lam = lambda_jj(zeta_val)
+            c_val = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
+            wbar_val = omega_bar(c_val)
+            lam = wbar_val / 2.0
 
             # Mask out degenerate (single-class) label columns so they
             # don't bias the held-out regression LL used for early stopping.
@@ -2132,8 +1735,8 @@ class CAVI:
             if valid_mask.any():
                 vm = to_device(valid_mask.astype(np.float32)[None, :])
                 reg_ll = xp.sum(((y_v - 0.5) * E_A - lam * E_A_sq) * vm)
-                reg_ll += xp.sum((lam * zeta_val ** 2 - 0.5 * zeta_val
-                                  + log_expit(zeta_val)) * vm)
+                reg_ll += xp.sum((lam * c_val ** 2 - 0.5 * c_val
+                                  + log_expit(c_val)) * vm)
             else:
                 reg_ll = 0.0
             regression_ll_per_sample = float(reg_ll / n_val)
@@ -2157,231 +1760,6 @@ class CAVI:
                 regression_ll_per_sample, true_bernoulli_ll_per_sample)
 
     # =================================================================
-    # Cell-type-aware regression helpers (CT mode)
-    # =================================================================
-
-    def _build_patient_A(self):
-        """Compute E[A_{p,l}] = (sum_{i in p} E[theta_i]) @ v_l[:K] + count_p @ v_l[K:].
-
-        v_l is the l-th row of mu_v (shape kappa x (K+C)):
-          - v_l[:K]: factor weights
-          - v_l[K:]: cell-type regression coefficients
-        count_p[p,c] = number of cells of type c in patient p.
-
-        Returns (n_patients, kappa).  Row-chunked to avoid materialising full (n, K).
-        """
-        pt_idx = self._patient_idx_dev   # (n,) int32, on device
-        v_factor = self.mu_v[:, :self.K]  # (kappa, K)
-        v_ct = self.mu_v[:, self.K:]      # (kappa, C)
-
-        # Factor part: scatter-add E_theta contributions per patient
-        A_factor_cols = [xp.zeros(self._n_patients) for _ in range(self.kappa)]
-        for i0 in range(0, self.n, self._row_chunk):
-            i1 = min(i0 + self._row_chunk, self.n)
-            E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]  # (chunk, K)
-            pt_c = pt_idx[i0:i1]   # (chunk,)
-            dot = E_theta_c @ v_factor.T  # (chunk, kappa)
-            for l in range(self.kappa):
-                A_factor_cols[l] = scatter_add_to(A_factor_cols[l], pt_c, dot[:, l])
-        A_factor = xp.stack(A_factor_cols, axis=1)  # (n_patients, kappa)
-
-        # CT part: count_p @ v_ct.T  (n_patients, kappa)
-        A_ct = self._count_p @ v_ct.T  # (n_patients, kappa)
-
-        return A_factor + A_ct
-
-    def _update_zeta_ct(self):
-        """JJ auxiliary for CT mode: zeta[p, l] = min(sqrt(E[A_p^2]), zeta_max).
-
-        E[A_p^2] = E[A_p]^2 + Var[A_p]
-        Var[A_p] = factor variance (cell-level) + CT variance (patient-level)
-          factor: sum_i sum_k (Var_theta[i,k]*E_v_sq_factor[l,k] + E_theta[i,k]^2*sigma_v_factor[l,k])
-          CT:     sum_c count_p[c]^2 * sigma_v_ct[l,c]
-        """
-        pt_idx = self._patient_idx_dev
-        E_A = self._build_patient_A()  # (n_patients, kappa)
-
-        E_v_sq_factor = self.mu_v[:, :self.K] ** 2 + self.sigma_v_diag[:, :self.K]  # (kappa, K)
-        sigma_v_factor = self.sigma_v_diag[:, :self.K]                               # (kappa, K)
-        sigma_v_ct = self.sigma_v_diag[:, self.K:]                                   # (kappa, C)
-
-        # Factor variance: cell-level scatter-add
-        Var_cols = [xp.zeros(self._n_patients) for _ in range(self.kappa)]
-        for i0 in range(0, self.n, self._row_chunk):
-            i1 = min(i0 + self._row_chunk, self.n)
-            b_theta_c = self.b_theta[i0:i1]
-            E_theta_c = self.a_theta[i0:i1] / b_theta_c  # (chunk, K)
-            Var_theta_c = E_theta_c / b_theta_c            # (chunk, K)
-            pt_c = pt_idx[i0:i1]
-            # var_contrib[j, l] = sum_k (Var_th[j,k]*E_v_sq_f[l,k] + E_th[j,k]^2*sig_vf[l,k])
-            var_contrib = (
-                Var_theta_c @ E_v_sq_factor.T
-                + xp.square(E_theta_c) @ sigma_v_factor.T
-            )  # (chunk, kappa)
-            for l in range(self.kappa):
-                Var_cols[l] = scatter_add_to(Var_cols[l], pt_c, var_contrib[:, l])
-
-        Var_A_factor = xp.stack(Var_cols, axis=1)  # (n_patients, kappa)
-
-        # CT variance: count_p^2 @ sigma_v_ct.T  (n_patients, kappa)
-        Var_A_ct = xp.square(self._count_p) @ sigma_v_ct.T
-
-        Var_A = Var_A_factor + Var_A_ct
-        E_A_sq = xp.square(E_A) + Var_A
-        self.zeta = xp.minimum(xp.sqrt(xp.maximum(E_A_sq, 1e-8)), self.zeta_max)
-
-    def _update_v_ct(self, ramp=1.0):
-        """CAVI update for v (kappa, K+C) in CT mode.
-
-        v_l[:K] = factor weights; v_l[K:] = cell-type regression coefficients.
-        Factor stats are accumulated cell-by-cell; CT stats are patient-level.
-        """
-        pt_idx = self._patient_idx_dev
-        lam = lambda_jj(self.zeta)           # (n_patients, kappa)
-        A_patient = self._build_patient_A()  # (n_patients, kappa)
-        K = self.K
-        C = self.n_cell_types
-        prior_precision = xp.full_like(self.mu_v, 1.0 / (self.b_v ** 2))  # (kappa, K+C)
-
-        # Sufficient stats for factor part (K dims)
-        prec_sum_f  = xp.zeros((self.kappa, K))
-        term1_sum_f = xp.zeros((self.kappa, K))
-        parta_sum_f = xp.zeros((self.kappa, K))
-        partb_sum_f = xp.zeros((self.kappa, K))
-
-        for i0 in range(0, self.n, self._row_chunk):
-            i1 = min(i0 + self._row_chunk, self.n)
-            b_theta_c = self.b_theta[i0:i1]
-            E_theta_c = self.a_theta[i0:i1] / b_theta_c        # (chunk, K)
-            Var_theta_c = E_theta_c / b_theta_c
-            E_theta_sq_c = xp.square(E_theta_c) + Var_theta_c  # (chunk, K)
-            pt_c = pt_idx[i0:i1]   # (chunk,)
-            W_p_c   = self._W_patient[pt_c, :]   # (chunk, kappa)
-            lam_p_c = lam[pt_c, :]               # (chunk, kappa)
-            A_p_c   = A_patient[pt_c, :]         # (chunk, kappa)
-            y_p_c   = self._y_patient[pt_c, :]   # (chunk, kappa)
-            W_lam_c = W_p_c * lam_p_c            # (chunk, kappa)
-            W_y_c   = W_p_c * (y_p_c - 0.5)     # (chunk, kappa)
-
-            prec_sum_f  = prec_sum_f  + W_lam_c.T @ E_theta_sq_c        # (kappa, K)
-            term1_sum_f = term1_sum_f + W_y_c.T @ E_theta_c             # (kappa, K)
-            parta_sum_f = parta_sum_f + (W_lam_c * A_p_c).T @ E_theta_c # (kappa, K)
-            partb_sum_f = partb_sum_f + W_lam_c.T @ xp.square(E_theta_c)# (kappa, K)
-
-        # Sufficient stats for CT part (C dims) — all patient-level
-        W_lam_pt = self._W_patient * lam          # (n_patients, kappa)
-        W_y_pt   = self._W_patient * (self._y_patient - 0.5)  # (n_patients, kappa)
-        count_p_sq = xp.square(self._count_p)     # (n_patients, C)
-
-        # prec_sum_ct[l,c] = sum_p W_lam[p,l] * count_p[p,c]^2
-        prec_sum_ct  = W_lam_pt.T @ count_p_sq                 # (kappa, C)
-        term1_sum_ct = W_y_pt.T @ self._count_p                # (kappa, C)
-        parta_sum_ct = (W_lam_pt * A_patient).T @ self._count_p # (kappa, C)
-        # For deterministic features, partb = prec (E[f^2] = f^2)
-        partb_sum_ct = prec_sum_ct
-
-        # Concatenate factor and CT stats
-        prec_sum  = xp.concatenate([prec_sum_f,  prec_sum_ct],  axis=1)  # (kappa, K+C)
-        term1_sum = xp.concatenate([term1_sum_f, term1_sum_ct], axis=1)
-        parta_sum = xp.concatenate([parta_sum_f, parta_sum_ct], axis=1)
-        partb_sum = xp.concatenate([partb_sum_f, partb_sum_ct], axis=1)
-
-        prec_sum  = prec_sum  * ramp
-        term1_sum = term1_sum * ramp
-        parta_sum = parta_sum * ramp
-        partb_sum = partb_sum * ramp
-
-        data_prec = 2.0 * prec_sum
-        precision = prior_precision + data_prec
-        precision = xp.maximum(precision, 1e-12)
-        E_v = self.mu_v
-        term2 = 2.0 * (parta_sum - E_v * partb_sum)
-        mu_v_new = (term1_sum - term2) / precision
-
-        delta_v = 1.0 * xp.sqrt(xp.maximum(self.sigma_v_diag, 1e-8))
-        mu_v_new = xp.clip(mu_v_new, self.mu_v - delta_v, self.mu_v + delta_v)
-        alpha_v = min(0.05, 5.0 / self.K) * ramp
-        self.mu_v = (1.0 - alpha_v) * self.mu_v + alpha_v * mu_v_new
-        sigma_v_new = xp.maximum(1.0 / precision, 0.01 * self.b_v ** 2)
-        self.sigma_v_diag = (1.0 - alpha_v) * self.sigma_v_diag + alpha_v * sigma_v_new
-
-    def _update_theta_ct(self, z_sum_theta, X_aux, ramp=1.0):
-        """CAVI update for theta in CT mode.
-
-        Like _update_theta but uses patient-level A, zeta, y, and W.
-        Only the factor part of v (mu_v[:, :K]) couples to theta.
-        The CT part (mu_v[:, K:]) contributes to A_patient but not to theta gradients.
-        """
-        self.a_theta = self.a + z_sum_theta
-
-        if self._active_beta is not None:
-            beta_sum = xp.where(self._active_beta, self.E_beta, 0.0).sum(axis=0)
-        else:
-            beta_sum = self.E_beta.sum(axis=0)  # (K,)
-
-        pt_idx = self._patient_idx_dev
-        lam_pt = lambda_jj(self.zeta)           # (n_patients, kappa)
-        A_patient = self._build_patient_A()     # (n_patients, kappa)
-
-        # Factor part of v only — (kappa, K)
-        v_factor    = self.mu_v[:, :self.K]
-        sigma_factor = self.sigma_v_diag[:, :self.K]
-        v_sq_factor = xp.square(v_factor)              # (kappa, K)
-        E_v_sq_factor = v_sq_factor + sigma_factor     # (kappa, K)
-
-        min_chunk = max(1024, self.n // 256)
-        b_theta_chunks = []
-        i0 = 0
-        while i0 < self.n:
-            i1 = min(i0 + self._row_chunk, self.n)
-            try:
-                b_theta_c = self.b_theta[i0:i1]
-                E_theta_c = self.a_theta[i0:i1] / b_theta_c  # (chunk, K)
-                pt_c = pt_idx[i0:i1]  # (chunk,)
-
-                # Patient-level scalars broadcast to rows
-                W_p_c   = self._W_patient[pt_c, :]         # (chunk, kappa)
-                lam_p_c = lam_pt[pt_c, :]                  # (chunk, kappa)
-                A_p_c   = A_patient[pt_c, :]               # (chunk, kappa)
-                y_p_c   = self._y_patient[pt_c, :]         # (chunk, kappa)
-                W_lam_c = W_p_c * lam_p_c                  # (chunk, kappa)
-                W_y_c   = W_p_c * (y_p_c - 0.5)           # (chunk, kappa)
-
-                # R_lin[j,k] = - sum_l W_y[j,l]*v_f[l,k]
-                #              + 2 * sum_l W_lam[j,l]*A_p[j,l]*v_f[l,k]
-                #              - 2 * E_theta[j,k] * sum_l W_lam[j,l]*v_f[l,k]^2
-                R_lin_c  = -W_y_c @ v_factor                           # (chunk, K)
-                R_lin_c  = R_lin_c + 2.0 * (W_lam_c * A_p_c) @ v_factor  # (chunk, K)
-                R_lin_c  = R_lin_c - 2.0 * E_theta_c * (W_lam_c @ v_sq_factor)  # (chunk, K)
-
-                # R_quad[j,k] = 2 * sum_l W_lam[j,l] * E_v_sq_factor[l,k]
-                R_quad_c = 2.0 * (W_lam_c @ E_v_sq_factor)  # (chunk, K)
-
-                R_lin_c  = R_lin_c  * ramp
-                R_quad_c = R_quad_c * ramp
-
-                b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]
-                b_base_c = b_poisson_c + R_lin_c
-                disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * R_quad_c * self.a_theta[i0:i1])
-                b_theta_c_new = (b_base_c + disc_c) / 2.0
-                b_theta_c_new = xp.maximum(b_theta_c_new, 0.1 * b_poisson_c)
-                b_theta_c_new = xp.maximum(b_theta_c_new, self.bp)
-                b_theta_c_new = xp.maximum(b_theta_c_new, 1e-2)
-                b_theta_c_new = xp.maximum(b_theta_c_new, self.a_theta[i0:i1] / 1e4)
-                b_theta_chunks.append(b_theta_c_new)
-                i0 = i1
-            except Exception as exc:
-                if _is_oom_error(exc) and self._row_chunk > min_chunk:
-                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
-                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
-                    continue
-                raise
-
-        self.b_theta = xp.concatenate(b_theta_chunks, axis=0) if len(b_theta_chunks) > 1 else b_theta_chunks[0]
-        self._theta_inner_iters = 1
-        self._invalidate_theta_cache()
-
-    # =================================================================
     # fit()
     # =================================================================
 
@@ -2393,7 +1771,7 @@ class CAVI:
             n_patients=None, patient_ids=None,
             ss_warmup=10, ss_anneal_iters=50,
             diag_every_iter=False,
-            patient_idx=None, cell_type_idx=None):
+            **_ignored):
         """
         Fit the supervised Poisson factorization model.
 
@@ -2406,7 +1784,7 @@ class CAVI:
         max_iter : int
         check_freq : int
         tol : float -- convergence if |pct_change| < tol twice in a row
-        v_warmup : int -- deprecated, kept for CLI compatibility (ignored)
+        v_warmup : int -- Poisson-only warmup iterations before regression head starts
         verbose : bool
         early_stopping : str
             'heldout_ll' -- stop on held-out LL / regression LL plateau (default).
@@ -2424,15 +1802,6 @@ class CAVI:
             patients per class, not cells) and each cell is down-weighted by
             the inverse of its donor's cell count, so large-cell donors do
             not dominate the regression loss.
-        patient_idx : array-like of shape (n,) or None
-            Integer array mapping each row of X_train to a patient index in
-            [0, n_patients).  Required for cell-type-aware regression mode.
-            When provided together with cell_type_idx, enables CT regression
-            where v is (kappa, K+n_cell_types): first K entries are factor weights,
-            last n_cell_types entries are cell-type regression coefficients.
-        cell_type_idx : array-like of shape (n,) or None
-            Integer array mapping each row of X_train to a cell-type index in
-            [0, n_cell_types).  Required for cell-type-aware regression mode.
         """
         t0 = time.time()
 
@@ -2448,108 +1817,22 @@ class CAVI:
             y = y[:, None]
         X_aux = np.asarray(X_aux_train, dtype=np.float32)
 
-        # --- Cell-type-aware regression setup (CT mode) ---
-        if patient_idx is not None and cell_type_idx is not None:
-            if self.n_cell_types is None:
-                raise ValueError(
-                    "n_cell_types must be set in the constructor when using "
-                    "patient_idx / cell_type_idx (CT regression mode)."
-                )
-            self._patient_idx = np.asarray(patient_idx, dtype=np.int32)
-            self._cell_type_idx = np.asarray(cell_type_idx, dtype=np.int32)
-            self._n_patients = int(self._patient_idx.max()) + 1
-            self._use_cell_type_regression = True
-            # With K*C terms in the Frobenius inner product, sigma_v_diag≈1 means
-            # Var[A_patient] ≈ K * b_v^2 even at initialisation, so zeta_max=4 saturates
-            # on the first update and crushes v to ~0. Scale to 0.5*K so the cap is rarely
-            # hit in steady state while still providing JJ stabilisation.
-            self.zeta_max = max(self.zeta_max, 0.5 * float(self.K))
-        else:
-            self._patient_idx = None
-            self._cell_type_idx = None
-            self._n_patients = None
-            self._use_cell_type_regression = False
-
         # Prepend intercept column (column of 1s) to X_aux
         X_aux = self._prepend_intercept(X_aux, n=X_train.shape[0])
 
         # Initialize (creates numpy arrays, then transfers to device)
         self._initialize(X_train, y, X_aux)
 
-        # --- CT mode: build patient-level y and class weights ---
-        if self._use_cell_type_regression:
-            y_2d = y  # (n, kappa), rows repeated per patient
-            # One label per patient (take first occurrence of each patient index)
-            y_patient_np = np.zeros((self._n_patients, self.kappa), dtype=np.float32)
-            seen = np.zeros(self._n_patients, dtype=bool)
-            for i, p in enumerate(self._patient_idx):
-                if not seen[p]:
-                    y_patient_np[p] = y_2d[i]
-                    seen[p] = True
-            self._y_patient = to_device(y_patient_np)
-
-            # Patient-level class weights
-            W_patient_np = np.ones((self._n_patients, self.kappa), dtype=np.float32)
-            if self.use_class_weights:
-                for k in range(self.kappa):
-                    n_pos = int(np.sum(y_patient_np[:, k] > 0.5))
-                    n_neg = self._n_patients - n_pos
-                    if n_pos > 0 and n_neg > 0:
-                        w_pos = self._n_patients / (2.0 * n_pos)
-                        w_neg = self._n_patients / (2.0 * n_neg)
-                        W_patient_np[:, k] = np.where(
-                            y_patient_np[:, k] > 0.5, w_pos, w_neg
-                        )
-                        if verbose:
-                            print(f"  CT patient_class_weights[{k}]: "
-                                  f"pos={n_pos} neg={n_neg} "
-                                  f"w_pos={w_pos:.3f} w_neg={w_neg:.3f}")
-            self._W_patient = to_device(W_patient_np)
-
-            # Transfer patient/cell-type index arrays to device
-            self._patient_idx_dev   = to_device(self._patient_idx)
-            self._cell_type_idx_dev = to_device(self._cell_type_idx)
-
-            # Precompute (n_patients, C) cell-type count matrix: count_p[p,c] = #cells of type c in patient p.
-            C = self.n_cell_types
-            count_p_np = np.zeros((self._n_patients, C), dtype=np.float32)
-            for i in range(len(self._patient_idx)):
-                count_p_np[self._patient_idx[i], self._cell_type_idx[i]] += 1.0
-            self._count_p = to_device(count_p_np)  # (n_patients, C)
-
-            # Patient-level aux covariates (first occurrence per patient).
-            # X_aux is still numpy at this point (device transfer happens later).
-            X_aux_patient_np = np.zeros((self._n_patients, X_aux.shape[1]), dtype=np.float32)
-            seen_pa = np.zeros(self._n_patients, dtype=bool)
-            for i, p in enumerate(self._patient_idx):
-                if not seen_pa[p]:
-                    X_aux_patient_np[p] = X_aux[i]
-                    seen_pa[p] = True
-            self._X_aux_patient = to_device(X_aux_patient_np)
-
-            if verbose:
-                print(f"  CT mode: n_patients={self._n_patients}, "
-                      f"n_cell_types={self.n_cell_types}, "
-                      f"v shape=(kappa={self.kappa}, K+C={self.K}+{self.n_cell_types})")
-
         # Auto-scale regression_weight by nnz/n so regression gradient
         # magnitude is comparable to Poisson reconstruction gradient.
         # Poisson LL sums ~O(nnz) terms, regression LL sums ~O(n*kappa).
         # Scaling by nnz/n makes per-sample gradients comparable.
-        # CT mode exception: pseudo-bulk rows are dense (mean expression),
-        # making nnz/n ~10^4 and catastrophically over-weighting the
-        # patient-level regression (20 patients vs 1.2M Poisson terms).
-        # Skip auto-scaling in CT mode; rw=1 keeps Poisson and regression
-        # losses naturally balanced.
-        if self.kappa > 0 and not self._use_cell_type_regression:
+        if self.kappa > 0:
             rw_old = self.regression_weight
             self.regression_weight = rw_old * float(self._nnz) / float(self.n)
             if verbose:
                 print(f"  regression_weight auto-scaled: {rw_old:.4f} * "
                       f"nnz/n={self._nnz}/{self.n} = {self.regression_weight:.1f}")
-        elif self.kappa > 0 and verbose:
-            print(f"  regression_weight: {self.regression_weight:.4f} "
-                  f"(CT mode — no nnz/n scaling)")
 
         # Recompute class weights at patient level when patient_ids given
         if patient_ids is not None and self.use_class_weights:
@@ -2618,8 +1901,8 @@ class CAVI:
             'theta_l1_train': [],       # (iter, mean, std, min, max) of ||E[θ_i]||_1
             'theta_l1_val': [],         # (iter, mean, std, min, max) of ||E[θ_i]||_1 (val)
             'theta_l1_val_no_jj': [],   # (iter, mean, std, min, max) pure Poisson θ
-            'zeta_stats': [],           # (iter, min, median, max, frac_at_cap)
-            'lambda_stats': [],         # (iter, min, median, max)
+            'c_pg_stats': [],           # (iter, min, median, max) of PG tilt c_pg
+            'wbar_stats': [],           # (iter, min, median, max) of omega_bar(c_pg)
             'true_val_ll': [],          # (iter, true Bernoulli LL per sample)
             'jj_val_ll': [],            # (iter, JJ bound LL per sample)
             'eta_stats': [],            # (iter, min, median, max) of E[η]
@@ -2748,20 +2031,12 @@ class CAVI:
             # After warmup, linearly ramp regression influence over 50 iterations.
             ramp_iters = 200
             if t == v_warmup:
-                # b_v auto-calibration uses the JJ data precision; under PG-Gibbs
-                # the Bayesian-Lasso scale s is sampled per-iteration via
-                # Park-Casella, so we don't pre-calibrate b_v.
-                if (not self._use_cell_type_regression
-                        and self.regression_inference == "jj"):
-                    self._calibrate_b_v(y, X_aux, v_crossover=2.0)
+                self._calibrate_b_v(y, X_aux, v_crossover=2.0)
                 # Re-init sigma_v_diag to match new b_v
                 self.sigma_v_diag = xp.full_like(self.sigma_v_diag, self.b_v ** 2)
             if t >= v_warmup:
                 ramp = min(1.0, (t - v_warmup + 1) / ramp_iters)
-                if self._use_cell_type_regression:
-                    self._update_theta_ct(z_sum_theta, X_aux, ramp=ramp)
-                else:
-                    self._update_theta(z_sum_theta, y, X_aux, ramp=ramp)
+                self._update_theta(z_sum_theta, y, X_aux, ramp=ramp)
             else:
                 # Pure Poisson theta update: b_theta = E[xi] + sum_j E[beta_jk]
                 self.a_theta = self.a + z_sum_theta
@@ -2793,39 +2068,20 @@ class CAVI:
             # Refresh digamma caches after theta/beta changed
             self._refresh_log_caches()
 
-            # 5. Update v, gamma (skip during Poisson-only warmup)
+            # 5. Update v, gamma, omega (skip during Poisson-only warmup)
             if t >= v_warmup:
-                if self.regression_inference == "pg_gibbs":
-                    # PG-interleaved CAVI: replace MFVB v/gamma/zeta updates with
-                    # a Gibbs block over (omega, v, gamma, s). Updates mu_v,
-                    # sigma_v_diag, mu_gamma, Sigma_gamma, omega_pg, and zeta
-                    # (the last is set to sqrt(E[psi²]) so any code that still
-                    # references self.zeta — e.g., ELBO diagnostics — keeps
-                    # working).
-                    self._pg_gibbs_block(y, X_aux)
-                    if diag_every_iter and verbose:
-                        _v_np = np.asarray(self.mu_v)
-                        _preview = [
-                            tuple(float(x) for x in _v_np[k, :3])
-                            for k in range(self.kappa)
-                        ]
-                        print(f"  [pg-v t={t}] mu_v[:, :3] = {_preview} "
-                              f"||v||={float(np.linalg.norm(_v_np)):.3f}  "
-                              f"|v|_max={float(np.abs(_v_np).max()):.3f}")
-                elif self._use_cell_type_regression:
-                    self._update_v_ct(ramp=ramp)
-                    self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
-                else:
-                    self._update_v(y, X_aux, iteration=t, ramp=ramp)
-                    if diag_every_iter and verbose:
-                        _v_np = np.asarray(self.mu_v)
-                        _preview = [
-                            tuple(float(x) for x in _v_np[k, :3])
-                            for k in range(self.kappa)
-                        ]
-                        print(f"  [v-iter t={t}] "
-                              f"mu_v[:, :3] = {_preview}  ramp={ramp:.3f}")
-                    self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
+                self._update_v(y, X_aux, iteration=t, ramp=ramp)
+                if diag_every_iter and verbose:
+                    _v_np = np.asarray(self.mu_v)
+                    _preview = [
+                        tuple(float(x) for x in _v_np[k, :3])
+                        for k in range(self.kappa)
+                    ]
+                    print(f"  [v-iter t={t}] "
+                          f"mu_v[:, :3] = {_preview}  ramp={ramp:.3f}")
+                self._update_gamma(y, X_aux, iteration=t, ramp=ramp)
+                # 5b. Refresh PG augmentation tilt from current posterior moments
+                self._update_omega(X_aux)
                 if diag and ramp < 1.0:
                     print(f"  [diag t={t}] regression ramp={ramp:.3f}")
 
@@ -2871,18 +2127,9 @@ class CAVI:
 
                 print(f"  [timing t={t}] updates: {t_updates:.1f}s")
 
-            # 6. Compute ELBO (BEFORE updating zeta, so ELBO uses same zeta as q-updates)
+            # 6. Compute ELBO
             if t % check_freq == 0:
                 elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux)
-
-            # 7. Tighten zeta for next iteration (Eq. 42, only when regression active)
-            # In PG mode the Gibbs block already set self.zeta = sqrt(E[psi²]) using
-            # the Monte Carlo samples, so we skip the JJ-specific recompute.
-            if t >= v_warmup and self.regression_inference == "jj":
-                if self._use_cell_type_regression:
-                    self._update_zeta_ct()
-                else:
-                    self._update_zeta(X_aux)
 
             if t % check_freq == 0:
                 self.elbo_history_.append((t, elbo, pois_ll, reg_ll))
@@ -2908,15 +2155,14 @@ class CAVI:
                      float(_theta_l1_train.min()),
                      float(_theta_l1_train.max())))
 
-                _zeta_np = to_numpy(self.zeta)
-                _lam_np = to_numpy(lambda_jj(self.zeta))
-                _frac_cap = float((_zeta_np >= self.zeta_max - 1e-4).mean())
-                self.diagnostics_['zeta_stats'].append(
-                    (t, float(_zeta_np.min()), float(np.median(_zeta_np)),
-                     float(_zeta_np.max()), _frac_cap))
-                self.diagnostics_['lambda_stats'].append(
-                    (t, float(_lam_np.min()), float(np.median(_lam_np)),
-                     float(_lam_np.max())))
+                _c_pg_np = to_numpy(self.c_pg)
+                _wbar_np = to_numpy(self.wbar)
+                self.diagnostics_['c_pg_stats'].append(
+                    (t, float(_c_pg_np.min()), float(np.median(_c_pg_np)),
+                     float(_c_pg_np.max())))
+                self.diagnostics_['wbar_stats'].append(
+                    (t, float(_wbar_np.min()), float(np.median(_wbar_np)),
+                     float(_wbar_np.max())))
 
                 # E[eta] and E[beta] stats (detect eta-beta collapse)
                 _E_eta_np = to_numpy(self.E_eta)
@@ -3130,7 +2376,8 @@ class CAVI:
             'sigma_v_diag': to_numpy(self.sigma_v_diag).copy(),
             'mu_gamma': to_numpy(self.mu_gamma).copy(),
             'Sigma_gamma': to_numpy(self.Sigma_gamma).copy(),
-            'zeta': to_numpy(self.zeta).copy(),
+            'c_pg': to_numpy(self.c_pg).copy(),
+            'wbar': to_numpy(self.wbar).copy(),
         }
         cp['r_beta'] = to_numpy(self.r_beta).copy()
         cp['a_pi'] = to_numpy(self.a_pi).copy()
@@ -3155,9 +2402,10 @@ class CAVI:
         Parameters
         ----------
         use_jj_reg : bool or None
-            If True, include JJ quadratic regularization in theta rate
+            If True, include the PG-CAVI quadratic regularization in theta rate
             (matches training regime). If False, use pure Poisson+Gamma
             inference for theta. If None, uses self.test_jj_reg.
+            (Name retained for backward compatibility with saved configs.)
 
         Returns a_theta, b_theta.
         """
@@ -3186,11 +2434,8 @@ class CAVI:
         K = self.K
 
         # Pre-compute label-independent regression quantities (tiny, (kappa, K))
-        # CT mode: mu_v is (kappa, C, K); can't do row-level matmul without
-        # cell_type_idx, so skip JJ correction during theta inference.
-        E_v = self.mu_v                                  # (kappa, K) or (kappa, C, K)
+        E_v = self.mu_v                                  # (kappa, K)
         E_v_sq = E_v ** 2 + self.sigma_v_diag
-        has_regression = not self._use_cell_type_regression
 
         for _ in range(n_iter):
             E_log_theta = digamma(a_theta) - xp.log(b_theta)
@@ -3212,27 +2457,22 @@ class CAVI:
             a_theta = self.a + z_sum
             b_poisson = E_xi[:, None] + beta_col_sums[None, :]
 
-            if has_regression and use_jj_reg:
-                # Raw theta for regression (Eq. 36)
+            if use_jj_reg:
+                # Raw theta for regression (PG-CAVI)
                 Var_theta = E_theta / b_theta
                 theta_v = E_theta @ E_v.T                     # (n_new, kappa)
                 if X_aux_new is not None and self.p_aux > 0:
                     theta_v = theta_v + X_aux_new @ self.mu_gamma.T
+                # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
                 E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
-                E_A_sq = E_A_sq + xp.square(E_theta) @ self.sigma_v_diag.T
-                if self.p_aux > 0:
-                    _gvar = xp.stack([xp.diag(self.Sigma_gamma[k])
-                                      for k in range(self.kappa)])
-                    E_A_sq = E_A_sq + xp.square(X_aux_new) @ _gvar.T
-                zeta_new = xp.minimum(
-                    xp.sqrt(xp.maximum(E_A_sq, 1e-8)), self.zeta_max
-                )
-                lam = lambda_jj(zeta_new)                    # (n_new, kappa)
+                c_new = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
+                wbar_new = omega_bar(c_new)                  # (n_new, kappa)
 
-                # Quadratic regularization: R_quad_coeff = 2 * lam @ E_v_sq
-                R_quad = (2.0 * lam) @ E_v_sq                # (n_new, K)
+                # Quadratic regularization: R_quad_coeff = 0.5 * wbar @ E_v_sq
+                # (PG-CAVI factor: 0.5 from notes §3.2).
+                R_quad = 0.5 * wbar_new @ E_v_sq             # (n_new, K)
 
-                # Solve quadratic: b^2 - b_poisson*b - rw*R_quad*a_theta = 0
+                # Solve quadratic: b^2 - b_poisson*b - R_quad*a_theta = 0
                 c_quad = R_quad
                 disc = xp.sqrt(xp.square(b_poisson) + 4.0 * c_quad * a_theta)
                 b_theta = (b_poisson + disc) / 2.0
@@ -3277,9 +2517,6 @@ class CAVI:
         if y_np.ndim == 1:
             y_np = y_np[:, None]
 
-        if self._use_cell_type_regression:
-            return None  # CT mode: no row-level mu_v matmul without cell_type_idx
-
         results = {}
         for name, logits in [
             ('cov_only',   X_aux_v_dev @ self.mu_gamma.T),
@@ -3305,16 +2542,12 @@ class CAVI:
             }
         return results
 
-    def predict_proba(self, X_new, X_aux_new=None, n_iter=20,
-                      patient_idx=None, cell_type_idx=None):
+    def predict_proba(self, X_new, X_aux_new=None, n_iter=20, **_ignored):
         """Predict P(y=1 | X_new).
 
         Uses the probit approximation to account for posterior variance in
         both theta and v, improving probability calibration:
             P(y=1) ≈ sigmoid(E[logit] / sqrt(1 + pi * Var[logit] / 3))
-
-        In CT mode (patient_idx and cell_type_idx provided), returns one
-        probability per unique patient (shape (n_patients,) or (n_patients, kappa)).
         """
         if sp.issparse(X_new):
             X_coo = X_new.tocoo()
@@ -3331,63 +2564,8 @@ class CAVI:
         a_theta, b_theta = self._infer_theta_sparse(
             X_coo, n_new, n_iter, X_aux_new=X_aux_new)
 
-        # --- CT mode prediction: patient-level aggregation ---
-        if self._use_cell_type_regression and patient_idx is not None and cell_type_idx is not None:
-            pt_idx_np = np.asarray(patient_idx, dtype=np.int32)
-            ct_idx_np = np.asarray(cell_type_idx, dtype=np.int32)
-            n_patients_new = int(pt_idx_np.max()) + 1
-            pt_dev = to_device(pt_idx_np)
-
-            v_factor    = self.mu_v[:, :self.K]          # (kappa, K)
-            v_ct        = self.mu_v[:, self.K:]           # (kappa, C)
-            sigma_factor = self.sigma_v_diag[:, :self.K]  # (kappa, K)
-            sigma_ct     = self.sigma_v_diag[:, self.K:]  # (kappa, C)
-            E_v_sq_factor = v_factor ** 2 + sigma_factor  # (kappa, K)
-
-            # Build count_p_new: (n_patients_new, C)
-            C = self.n_cell_types
-            count_p_new_np = np.zeros((n_patients_new, C), dtype=np.float32)
-            for i in range(len(pt_idx_np)):
-                count_p_new_np[pt_idx_np[i], ct_idx_np[i]] += 1.0
-            count_p_new = to_device(count_p_new_np)
-
-            # Factor part: scatter-add E[theta] @ v_factor per patient
-            A_cols   = [xp.zeros(n_patients_new) for _ in range(self.kappa)]
-            Var_cols = [xp.zeros(n_patients_new) for _ in range(self.kappa)]
-            for i0 in range(0, n_new, self._row_chunk):
-                i1 = min(i0 + self._row_chunk, n_new)
-                E_th_c   = a_theta[i0:i1] / b_theta[i0:i1]   # (chunk, K)
-                Var_th_c = E_th_c / b_theta[i0:i1]
-                pt_c = pt_dev[i0:i1]
-                dot  = E_th_c @ v_factor.T     # (chunk, kappa)
-                var_c = (
-                    Var_th_c @ E_v_sq_factor.T + xp.square(E_th_c) @ sigma_factor.T
-                )  # (chunk, kappa)
-                for l in range(self.kappa):
-                    A_cols[l]   = scatter_add_to(A_cols[l],   pt_c, dot[:, l])
-                    Var_cols[l] = scatter_add_to(Var_cols[l], pt_c, var_c[:, l])
-
-            E_A_factor = xp.stack(A_cols,   axis=1)  # (n_patients_new, kappa)
-            Var_A_factor = xp.stack(Var_cols, axis=1)
-
-            # CT part: count_p_new @ v_ct.T and variance
-            E_A_ct  = count_p_new @ v_ct.T                          # (n_patients_new, kappa)
-            Var_A_ct = xp.square(count_p_new) @ sigma_ct.T         # (n_patients_new, kappa)
-
-            E_A   = E_A_factor + E_A_ct
-            Var_A = Var_A_factor + Var_A_ct
-            scale = xp.sqrt(1.0 + (np.pi / 3.0) * Var_A)
-            logits_calibrated = E_A / scale
-            return to_numpy(_expit(logits_calibrated)).squeeze()
-
-        # --- Standard mode prediction ---
-        # CT mode fallback (no patient/cell-type index provided): use factor part only
-        if self._use_cell_type_regression:
-            mu_v_2d = self.mu_v[:, :self.K]
-            sv_2d   = self.sigma_v_diag[:, :self.K]
-        else:
-            mu_v_2d = self.mu_v
-            sv_2d   = self.sigma_v_diag
+        mu_v_2d = self.mu_v
+        sv_2d   = self.sigma_v_diag
 
         E_theta = a_theta / b_theta
         logits = E_theta @ mu_v_2d.T
