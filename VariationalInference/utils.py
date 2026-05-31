@@ -394,29 +394,10 @@ def save_results(
     # Add classification weights if available
     if hasattr(model, 'mu_v'):
         n_outcomes = model.mu_v.shape[0]
-        is_ct_mode = getattr(model, '_use_cell_type_regression', False)
         for k in range(n_outcomes):
             lname = label_columns[k] if label_columns is not None and k < len(label_columns) else f'class{k}'
             v_k = np.asarray(model.mu_v[k])
-            if is_ct_mode:
-                # Factor weights (K entries) go into beta_df indexed by gene programs
-                beta_df.insert(0, f'v_weight_{lname}', v_k[:model.K])
-                # Cell-type coefficients (C entries) saved separately below
-            else:
-                beta_df.insert(0, f'v_weight_{lname}', v_k)
-
-        # CT mode: save cell-type regression coefficients as a separate CSV
-        if is_ct_mode and model.n_cell_types is not None:
-            ct_coef_rows = {}
-            for k in range(n_outcomes):
-                lname = label_columns[k] if label_columns is not None and k < len(label_columns) else f'class{k}'
-                ct_coef_rows[lname] = np.asarray(model.mu_v[k, model.K:])
-            ct_coef_df = pd.DataFrame(ct_coef_rows)
-            ct_coef_df.index = [f'CT{c}' for c in range(model.n_cell_types)]
-            ct_coef_path = output_dir / f'{prefix}_ct_regression_coefs{ext}'
-            ct_coef_df.to_csv(ct_coef_path, compression=compression)
-            saved_files['ct_regression_coefs'] = ct_coef_path
-            print(f"Saved cell-type regression coefficients to {ct_coef_path}")
+            beta_df.insert(0, f'v_weight_{lname}', v_k)
 
     beta_path = output_dir / f'{prefix}_{feature_type}_programs{ext}'
     beta_df.to_csv(beta_path, compression=compression)

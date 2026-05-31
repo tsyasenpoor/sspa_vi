@@ -849,7 +849,7 @@ def main():
     # DEBUG: Compute logits and correlation with labels (use normalized theta)
     _theta_sums = E_theta_train.sum(axis=1, keepdims=True)
     _theta_norm_train = E_theta_train / np.maximum(_theta_sums, 1e-8)
-    _mu_v_2d = np.array(model.mu_v[:, :model.K] if model._use_cell_type_regression else model.mu_v)
+    _mu_v_2d = np.array(model.mu_v)
     train_logits = _theta_norm_train @ _mu_v_2d.T
     if model.p_aux > 0 and model.mu_gamma is not None:
         _X_aux_debug = model._prepend_intercept(X_aux_train, n=X_aux_train.shape[0])
