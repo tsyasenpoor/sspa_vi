@@ -43,6 +43,11 @@ class ScDesign3Config:
     n_cores: int = 1
     seed: int = 42
     return_model: bool = False
+    # If True, skip the scdesign3() fit/simulate and re-run extract_para only,
+    # loading marginal_models.rds + simulated_sce.rds from output_dir. Requires
+    # a prior run with return_model=True. The heavy count/metadata saves are
+    # also skipped (those files already exist).
+    extract_only: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for JSON serialization."""
@@ -61,6 +66,7 @@ class ScDesign3Config:
             "n_cores": self.n_cores,
             "seed": self.seed,
             "return_model": self.return_model,
+            "extract_only": self.extract_only,
         }
 
 
@@ -286,6 +292,7 @@ class ScDesign3Simulator:
         n_cores: int = 1,
         seed: int = 42,
         return_model: bool = False,
+        extract_only: bool = False,
         verbose: bool = True,
     ) -> ScDesign3Result:
         """
@@ -358,6 +365,7 @@ class ScDesign3Simulator:
             n_cores=n_cores,
             seed=seed,
             return_model=return_model,
+            extract_only=extract_only,
         )
 
         # Write config to temp file

@@ -1,18 +1,20 @@
 #!/usr/bin/env python
-"""Aggregate sim_easy 5-method x 5-seed comparison.
+"""Aggregate sim_sex_only_v1 method comparison.
 
 For each (method, seed) compute:
-  - test_auc       : disease prediction AUC on held-out cells
-  - up_auroc       : per-gene disease score vs 70 up-markers (background = non-markers)
-  - dn_auroc       : per-gene disease score (negated) vs 30 down-markers
-  - any_auroc      : |per-gene score| vs 100 markers
-  - any_auprc      : same, AUPRC
+  - test_auc           : disease-label (y) prediction AUC on held-out cells
+  - prog{l}_auroc      : per-gene method score vs membership in program l, l in {0,1,2}
+  - any_auroc          : per-gene score vs union of all program genes (90 genes, all up)
+  - any_auprc          : same, AUPRC
+
+All program genes are up-regulated in v1, so no up/down split.
 
 Methods:
   - drgp_unmasked            : gene_v_score from vi_gene_programs.csv.gz
-  - baselines/{alg}          : LR coefs (alg in lr,lrl,lrr) or NMF.components_ @ LR (mflr,mflrl,mflrr)
+  - baseline_{lr,lrl,lrr}    : LR/L1/L2 coefs (gene_v_score from a regularized LR)
+  - baseline_{mflr,mflrl,mflrr}: NMF.components_ @ downstream LR coef
   - schpf                    : gene_scores @ downstream LR coef
-  - spectra_unsup / sup_sim  : factor_scores.T @ downstream LR coef
+  - spectra_unsup / sup_sim  : factor_scores @ downstream LR coef
 """
 import json
 import sys
@@ -28,32 +30,33 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, "/labs/Aguiar/SSPA_BRAY/BRay")
 from VariationalInference.gene_convertor import GeneIDConverter  # noqa: E402
 
-DATA_DIR    = Path("/labs/Aguiar/SSPA_BRAY/scdesign3_IBD_10kcells_2kgenes/perturbed_disease_only_no_aux")
-RESULTS_DIR = Path("/labs/Aguiar/SSPA_BRAY/results/sim_easy/comparison")
+DATA_DIR    = Path("/labs/Aguiar/SSPA_BRAY/scdesign3_covid19_8kcells_10kgenes/perturbed_sex_only_v1")
+RESULTS_DIR = Path("/labs/Aguiar/SSPA_BRAY/results/sim_sex_only_v1/comparison")
 SEEDS = [42, 123, 456, 789, 1024]
 K = 10
+LABEL = "y"
 
 # ---------- ground truth ----------
-gt = json.load(open(DATA_DIR / "ground_truth.json"))
-up_syms = set(gt["disease_gene_names_up"])
-dn_syms = set(gt["disease_gene_names_down"])
+gt = np.load(DATA_DIR / "ground_truth.npz", allow_pickle=True)
+gene_arr = gt["gene_names"]
+sizes  = gt["program_gene_idx_sizes"]
+splits = np.split(gt["program_gene_idx_concat"], np.cumsum(sizes)[:-1])
+program_syms = [{str(gene_arr[i]) for i in idx} for idx in splits]
+all_program_syms = set().union(*program_syms)
+N_PROG = len(program_syms)
+print(f"Loaded ground truth: {N_PROG} programs, "
+      f"sizes {[len(s) for s in program_syms]}, union={len(all_program_syms)} genes")
 
+# Map symbols -> ENSG for baselines indexed in ENSG space.
 conv = GeneIDConverter(cache_file="/labs/Aguiar/SSPA_BRAY/BRay/gene_id_cache.json")
-up_ens_map, _ = conv.symbols_to_ensembl(list(up_syms), species="human")
-dn_ens_map, _ = conv.symbols_to_ensembl(list(dn_syms), species="human")
-up_ens = set(up_ens_map.values())
-dn_ens = set(dn_ens_map.values())
-
-# Reverse map: ENSG -> symbol (for any-method canonicalization)
-ens_to_sym = {**{v: k for k, v in up_ens_map.items()},
-              **{v: k for k, v in dn_ens_map.items()}}
+sym_to_ens, _ = conv.symbols_to_ensembl(list(all_program_syms), species="human")
+ens_to_sym = {v: k for k, v in sym_to_ens.items()}
 
 
 def auroc_marker(score: pd.Series, pos: set) -> float:
-    """AUROC of `score` to detect genes in `pos` vs rest (within score's index)."""
     y = pd.Series(0, index=score.index)
     common = score.index.intersection(pos)
-    if len(common) == 0:
+    if not len(common):
         return float("nan")
     y.loc[common] = 1
     if y.sum() == 0 or y.sum() == len(y):
@@ -64,7 +67,7 @@ def auroc_marker(score: pd.Series, pos: set) -> float:
 def auprc_marker(score: pd.Series, pos: set) -> float:
     y = pd.Series(0, index=score.index)
     common = score.index.intersection(pos)
-    if len(common) == 0:
+    if not len(common):
         return float("nan")
     y.loc[common] = 1
     if y.sum() == 0:
@@ -74,28 +77,21 @@ def auprc_marker(score: pd.Series, pos: set) -> float:
 
 
 def to_symbol_index(score: pd.Series) -> pd.Series:
-    """If index looks like ENSG, map to symbols (drop unmapped)."""
+    """If the index looks like ENSG, swap marker ENSG entries to symbols (others kept as-is)."""
     if not score.index.astype(str).str.startswith("ENSG").any():
         return score
-    new_idx = [ens_to_sym.get(g, None) for g in score.index]
-    keep = [i for i, s in enumerate(new_idx) if s is not None]
-    if not keep:  # nothing mapped — return as-is so markers in ENSG-space still match
-        return score
-    # Mix: map markers, keep unmapped as ENSG (they won't match either set)
-    new_idx_full = [ens_to_sym.get(g, g) for g in score.index]
-    out = pd.Series(score.values, index=new_idx_full)
-    out = out[~out.index.duplicated(keep="first")]
-    return out
+    new_idx = [ens_to_sym.get(g, g) for g in score.index]
+    out = pd.Series(score.values, index=new_idx)
+    return out[~out.index.duplicated(keep="first")]
 
 
 def score_metrics(score: pd.Series) -> dict:
     s = to_symbol_index(score).astype(float).replace([np.inf, -np.inf], np.nan).dropna()
-    return {
-        "up_auroc":   auroc_marker( s, up_syms),
-        "dn_auroc":   auroc_marker(-s, dn_syms),
-        "any_auroc":  auroc_marker( s.abs(), up_syms | dn_syms),
-        "any_auprc":  auprc_marker( s.abs(), up_syms | dn_syms),
-    }
+    out = {"any_auroc": auroc_marker(s, all_program_syms),
+           "any_auprc": auprc_marker(s, all_program_syms)}
+    for l in range(N_PROG):
+        out[f"prog{l}_auroc"] = auroc_marker(s, program_syms[l])
+    return out
 
 
 # ---------- per-method gene-score extractors ----------
@@ -104,8 +100,11 @@ def drgp_gene_score(seed_dir: Path) -> pd.Series:
     if not f.exists():
         return pd.Series(dtype=float)
     gp = pd.read_csv(f, index_col=0)
-    v = gp["v_weight_disease"].values
-    B = gp.drop(columns="v_weight_disease").T  # genes x K
+    v_col = next((c for c in gp.columns if c.startswith("v_weight_")), None)
+    if v_col is None:
+        return pd.Series(dtype=float)
+    v = gp[v_col].values
+    B = gp.drop(columns=v_col).T  # genes x K
     col = B.sum(axis=0).replace(0, np.nan)
     TF = B.div(col, axis=1).fillna(0.0)
     score = (TF.values * v).sum(axis=1)
@@ -113,7 +112,6 @@ def drgp_gene_score(seed_dir: Path) -> pd.Series:
 
 
 def drgp_test_auc(seed_dir: Path) -> float:
-    """Read test AUC out of vi_test_predictions.csv.gz."""
     f = seed_dir / "vi_test_predictions.csv.gz"
     if not f.exists():
         return float("nan")
@@ -137,10 +135,9 @@ def baseline_gene_score(seed_dir: Path, alg: str, gene_list_ens: list) -> pd.Ser
             return pd.Series(dtype=float)
         nmf = joblib.load(nmf_pkl)
         Kc = nmf.components_.shape[0]
-        # coef[:Kc] are factor coefs; project to genes
-        gene_attr = coef[:Kc] @ nmf.components_  # n_genes
+        gene_attr = coef[:Kc] @ nmf.components_
     else:
-        gene_attr = coef[:n]  # leading n are gene coefs
+        gene_attr = coef[:n]
     return pd.Series(gene_attr[:n], index=gene_list_ens, name=alg)
 
 
@@ -152,7 +149,6 @@ def baseline_test_auc(seed_dir: Path, alg: str) -> float:
 
 
 def _find_lr_model(seed_dir: Path, prefix: str) -> Path | None:
-    """Look for <prefix>_lr_model.pkl under baselines/disease/, then anywhere under baselines/."""
     p = seed_dir / "baselines" / "disease" / f"{prefix}_lr_model.pkl"
     if p.exists():
         return p
@@ -177,7 +173,7 @@ def schpf_gene_score(seed_dir: Path, gene_list_sym: list) -> pd.Series:
     gs_path = seed_dir / "model" / "gene_scores.npy"
     if not gs_path.exists():
         return pd.Series(dtype=float)
-    gs = np.load(gs_path)  # (n_genes, K)
+    gs = np.load(gs_path)
     lr_pkl = _find_lr_model(seed_dir, "schpf")
     if lr_pkl is None:
         return pd.Series(dtype=float)
@@ -188,49 +184,47 @@ def schpf_gene_score(seed_dir: Path, gene_list_sym: list) -> pd.Series:
 
 
 def schpf_test_auc(seed_dir: Path) -> float:
-    return _summary_test_auc(seed_dir, "schpf_baselines_summary.json", "schpf_lr_disease")
+    return _summary_test_auc(seed_dir, "schpf_baselines_summary.json", f"schpf_lr_{LABEL}")
 
 
 def spectra_gene_score(seed_dir: Path, gene_list_sym: list) -> pd.Series:
     fs = seed_dir / "model" / "spectra_factors.npy"
     if not fs.exists():
         return pd.Series(dtype=float)
-    factor_scores = np.load(fs)  # commonly (K, G)
+    factor_scores = np.load(fs)
     lr_pkl = _find_lr_model(seed_dir, "spectra")
     if lr_pkl is None:
         return pd.Series(dtype=float)
     coef = joblib.load(lr_pkl).named_steps["logisticregression"].coef_[0]
     Fmat = factor_scores.T if factor_scores.shape[0] == len(gene_list_sym) else factor_scores
-    gene_attr = coef[:Fmat.shape[0]] @ Fmat  # (n_genes,)
+    gene_attr = coef[:Fmat.shape[0]] @ Fmat
     n = min(len(gene_list_sym), gene_attr.shape[0])
     return pd.Series(gene_attr[:n], index=gene_list_sym[:n], name="spectra")
 
 
 def spectra_test_auc(seed_dir: Path) -> float:
-    return _summary_test_auc(seed_dir, "spectra_baselines_summary.json", "spectra_lr_disease")
+    return _summary_test_auc(seed_dir, "spectra_baselines_summary.json", f"spectra_lr_{LABEL}")
 
 
 # ---------- main loop ----------
 def _gene_lists():
-    """Cache gene lists: ENSG order for DataLoader-based runs, symbol order for raw runs."""
-    # Symbol order from h5ad var_names
+    """Symbol order from h5ad var_names; ENSG order from DataLoader's preprocessing."""
     import anndata as ad
-    a = ad.read_h5ad(DATA_DIR / "counts_perturbed.h5ad")
+    a = ad.read_h5ad(DATA_DIR / "perturbed.h5ad")
     gene_list_sym = list(a.var_names)
-    # ENSG order: use DataLoader to mirror baselines processing
     from VariationalInference.data_loader import DataLoader
     loader = DataLoader(
-        data_path=str(DATA_DIR / "counts_perturbed.h5ad"),
+        data_path=str(DATA_DIR / "perturbed.h5ad"),
         gene_annotation_path=None,
         cache_dir="/labs/Aguiar/SSPA_BRAY/cache",
         use_cache=True,
         verbose=False,
     )
     data = loader.load_and_preprocess(
-        label_column="disease",
+        label_column="y",
         aux_columns=[],
         train_ratio=0.7, val_ratio=0.15,
-        stratify_by="disease",
+        stratify_by="y",
         min_cells_expressing=0.001,
         layer="raw",
         convert_to_ensembl=True,
@@ -251,26 +245,22 @@ def main():
     BASE_ALGS = ["lr", "lrl", "lrr", "mflr", "mflrl", "mflrr"]
 
     for seed in SEEDS:
-        # DRGP
         d = RESULTS_DIR / "drgp_unmasked" / f"seed{seed}"
         rows.append({"method": "drgp_unmasked", "seed": seed,
                      "test_auc": drgp_test_auc(d),
                      **score_metrics(drgp_gene_score(d))})
 
-        # Baselines: each algorithm is its own method
         bd = RESULTS_DIR / "baselines" / f"seed{seed}"
         for alg in BASE_ALGS:
             rows.append({"method": f"baseline_{alg}", "seed": seed,
                          "test_auc": baseline_test_auc(bd, alg),
                          **score_metrics(baseline_gene_score(bd, alg, gene_ens))})
 
-        # scHPF
         d = RESULTS_DIR / "schpf" / f"seed{seed}"
         rows.append({"method": "schpf", "seed": seed,
                      "test_auc": schpf_test_auc(d),
                      **score_metrics(schpf_gene_score(d, gene_sym))})
 
-        # Spectra unsupervised + supervised
         for name in ["spectra_unsup", "spectra_sup_sim"]:
             d = RESULTS_DIR / name / f"seed{seed}"
             rows.append({"method": name, "seed": seed,
@@ -278,10 +268,11 @@ def main():
                          **score_metrics(spectra_gene_score(d, gene_sym))})
 
     df = pd.DataFrame(rows)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / "comparison_table.csv"
     df.to_csv(out, index=False)
     print(f"\nWrote {out}  ({len(df)} rows)")
-    print("\n=== Mean ± Std across seeds ===")
+    print("\n=== Mean +/- Std across seeds ===")
     summary = df.groupby("method").agg(["mean", "std"]).round(3)
     print(summary)
     summary.to_csv(RESULTS_DIR / "comparison_summary.csv")

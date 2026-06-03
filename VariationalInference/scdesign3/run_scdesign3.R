@@ -455,35 +455,62 @@ if (is.null(n_cores) || n_cores <= 0) {
     n_cores <- 1
 }
 
-# Run simulation
-tryCatch({
-    # Null-coalesce return_model parameter
-    return_model_val <- if (is.null(config$return_model)) FALSE else config$return_model
-    
-    result <- scdesign3(
-        sce = sce,
-        assay_use = "counts",
-        celltype = celltype_col,
-        pseudotime = pseudotime_col,
-        spatial = spatial_data,
-        other_covariates = NULL,
-        corr_formula = "1",
-        mu_formula = mu_formula,
-        sigma_formula = "1",
-        family_use = family_use,
-        n_cores = n_cores,
-        copula = copula_type,
-        ncell = n_cells,
-        return_model = return_model_val
+# Run simulation (or load from disk in extract-only mode)
+extract_only <- if (is.null(config$extract_only)) FALSE else config$extract_only
+
+if (extract_only) {
+    cat("\n[extract-only mode] Skipping scdesign3() and loading saved fits...\n")
+    marg_file <- file.path(output_dir, "marginal_models.rds")
+    sim_sce_file <- file.path(output_dir, "simulated_sce.rds")
+    if (!file.exists(marg_file)) {
+        cat("ERROR: missing", marg_file,
+            "\n       (extract_only requires a prior run with return_model=TRUE)\n")
+        quit(status = 1)
+    }
+    if (!file.exists(sim_sce_file)) {
+        cat("ERROR: missing", sim_sce_file, "\n")
+        quit(status = 1)
+    }
+    marginal_list_loaded <- readRDS(marg_file)
+    simulated_sce_loaded <- readRDS(sim_sce_file)
+    # Reconstruct just enough of `result` for the extract_para block below.
+    result <- list(
+        marginal_list = marginal_list_loaded,
+        new_covariate = as.data.frame(SummarizedExperiment::colData(simulated_sce_loaded)),
+        new_count = SummarizedExperiment::assay(simulated_sce_loaded, "counts")
     )
+    cat("Loaded marginal_list (", length(marginal_list_loaded),
+        "marginals) and", ncol(simulated_sce_loaded), "simulated cells.\n")
+} else {
+    tryCatch({
+        # Null-coalesce return_model parameter
+        return_model_val <- if (is.null(config$return_model)) FALSE else config$return_model
 
-    cat("\nSimulation completed successfully!\n")
-    cat("Generated", ncol(result$new_count), "cells with", nrow(result$new_count), "genes\n")
+        result <- scdesign3(
+            sce = sce,
+            assay_use = "counts",
+            celltype = celltype_col,
+            pseudotime = pseudotime_col,
+            spatial = spatial_data,
+            other_covariates = NULL,
+            corr_formula = "1",
+            mu_formula = mu_formula,
+            sigma_formula = "1",
+            family_use = family_use,
+            n_cores = n_cores,
+            copula = copula_type,
+            ncell = n_cells,
+            return_model = return_model_val
+        )
 
-}, error = function(e) {
-    cat("ERROR in scdesign3:", conditionMessage(e), "\n")
-    quit(status = 1)
-})
+        cat("\nSimulation completed successfully!\n")
+        cat("Generated", ncol(result$new_count), "cells with", nrow(result$new_count), "genes\n")
+
+    }, error = function(e) {
+        cat("ERROR in scdesign3:", conditionMessage(e), "\n")
+        quit(status = 1)
+    })
+}
 
 # Create output directory
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
@@ -491,61 +518,108 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 # Save simulated counts
 cat("\nSaving outputs to:", output_dir, "\n")
 
-# Save as CSV (for easy Python loading)
-counts_file <- file.path(output_dir, "simulated_counts.csv")
-write.csv(as.matrix(result$new_count), counts_file, row.names = TRUE)
-cat("  - simulated_counts.csv\n")
-
-# Save covariates/metadata
-if (!is.null(result$new_covariate)) {
-    meta_file <- file.path(output_dir, "simulated_metadata.csv")
-    write.csv(result$new_covariate, meta_file, row.names = TRUE)
-    cat("  - simulated_metadata.csv\n")
+# === Extract per-cell NB parameters (mu_mat, sigma_mat) for downstream perturbation. ===
+# Requires return_model = TRUE so result$marginal_list is populated. Saved as HDF5
+# to avoid the CSV bloat that hits OOM on large count matrices.
+if (!is.null(result$marginal_list)) {
+    tryCatch({
+        cat("\nExtracting NB parameters via extract_para()...\n")
+        # construct_data() is cheap; rebuild because scdesign3() doesn't expose $dat.
+        input_data <- construct_data(
+            sce = sce, assay_use = "counts",
+            celltype = celltype_col,
+            pseudotime = pseudotime_col,
+            spatial = spatial_data,
+            other_covariates = NULL,
+            corr_by = "1",
+            ncell = n_cells
+        )
+        para_res <- extract_para(
+            sce = sce, assay_use = "counts",
+            marginal_list = result$marginal_list,
+            n_cores = n_cores,
+            family_use = family_use,
+            new_covariate = result$new_covariate,
+            data = input_data$dat
+        )
+        cat("  mean_mat: ", paste(dim(para_res$mean_mat), collapse = " x "), "\n")
+        cat("  sigma_mat:", paste(dim(para_res$sigma_mat), collapse = " x "), "\n")
+        if (!requireNamespace("rhdf5", quietly = TRUE)) library(rhdf5)
+        params_file <- file.path(output_dir, "nb_params.h5")
+        if (file.exists(params_file)) file.remove(params_file)
+        rhdf5::h5createFile(params_file)
+        rhdf5::h5write(para_res$mean_mat,   params_file, "mu_mat")
+        rhdf5::h5write(para_res$sigma_mat,  params_file, "sigma_mat")
+        rhdf5::h5write(colnames(para_res$mean_mat), params_file, "gene_names")
+        rhdf5::h5write(rownames(para_res$mean_mat), params_file, "cell_names")
+        rhdf5::h5write(family_use, params_file, "family_use")
+        cat("  - nb_params.h5\n")
+    }, error = function(e) {
+        cat("[warn] extract_para failed:", conditionMessage(e),
+            "\n       counts/metadata will still be saved.\n")
+    })
+} else {
+    cat("\n[skip] extract_para: result$marginal_list is NULL (set return_model=TRUE)\n")
 }
 
-# Save as RDS (native R format, preserves structure)
-rds_file <- file.path(output_dir, "simulated_sce.rds")
-simulated_sce <- SingleCellExperiment(
-    assays = list(counts = result$new_count),
-    colData = result$new_covariate
-)
-saveRDS(simulated_sce, rds_file)
-cat("  - simulated_sce.rds\n")
+# In extract-only mode the heavy artifacts already exist on disk — skip re-writing.
+if (!extract_only) {
+    # Save as CSV (for easy Python loading)
+    counts_file <- file.path(output_dir, "simulated_counts.csv")
+    write.csv(as.matrix(result$new_count), counts_file, row.names = TRUE)
+    cat("  - simulated_counts.csv\n")
 
-# Save gene names
-gene_file <- file.path(output_dir, "gene_names.txt")
-writeLines(rownames(result$new_count), gene_file)
-cat("  - gene_names.txt\n")
-
-# Save simulation info as JSON
-info <- list(
-    n_cells = ncol(result$new_count),
-    n_genes = nrow(result$new_count),
-    family = family_use,
-    copula = copula_type,
-    celltype_column = celltype_col,
-    pseudotime_column = pseudotime_col,
-    mu_formula = mu_formula,
-    seed = config$seed,
-    input_file = config$input_file,
-    model_aic = if(!is.null(result$model_aic)) mean(result$model_aic, na.rm=TRUE) else NA,
-    model_bic = if(!is.null(result$model_bic)) mean(result$model_bic, na.rm=TRUE) else NA
-)
-info_file <- file.path(output_dir, "simulation_info.json")
-write(toJSON(info, auto_unbox = TRUE, pretty = TRUE), info_file)
-cat("  - simulation_info.json\n")
-
-# Optionally save fitted models
-if (!is.null(config$return_model) && config$return_model) {
-    if (!is.null(result$marginal_list)) {
-        marginal_file <- file.path(output_dir, "marginal_models.rds")
-        saveRDS(result$marginal_list, marginal_file)
-        cat("  - marginal_models.rds\n")
+    # Save covariates/metadata
+    if (!is.null(result$new_covariate)) {
+        meta_file <- file.path(output_dir, "simulated_metadata.csv")
+        write.csv(result$new_covariate, meta_file, row.names = TRUE)
+        cat("  - simulated_metadata.csv\n")
     }
-    if (!is.null(result$corr_list)) {
-        corr_file <- file.path(output_dir, "correlation_models.rds")
-        saveRDS(result$corr_list, corr_file)
-        cat("  - correlation_models.rds\n")
+
+    # Save as RDS (native R format, preserves structure)
+    rds_file <- file.path(output_dir, "simulated_sce.rds")
+    simulated_sce <- SingleCellExperiment(
+        assays = list(counts = result$new_count),
+        colData = result$new_covariate
+    )
+    saveRDS(simulated_sce, rds_file)
+    cat("  - simulated_sce.rds\n")
+
+    # Save gene names
+    gene_file <- file.path(output_dir, "gene_names.txt")
+    writeLines(rownames(result$new_count), gene_file)
+    cat("  - gene_names.txt\n")
+
+    # Save simulation info as JSON
+    info <- list(
+        n_cells = ncol(result$new_count),
+        n_genes = nrow(result$new_count),
+        family = family_use,
+        copula = copula_type,
+        celltype_column = celltype_col,
+        pseudotime_column = pseudotime_col,
+        mu_formula = mu_formula,
+        seed = config$seed,
+        input_file = config$input_file,
+        model_aic = if(!is.null(result$model_aic)) mean(result$model_aic, na.rm=TRUE) else NA,
+        model_bic = if(!is.null(result$model_bic)) mean(result$model_bic, na.rm=TRUE) else NA
+    )
+    info_file <- file.path(output_dir, "simulation_info.json")
+    write(toJSON(info, auto_unbox = TRUE, pretty = TRUE), info_file)
+    cat("  - simulation_info.json\n")
+
+    # Optionally save fitted models
+    if (!is.null(config$return_model) && config$return_model) {
+        if (!is.null(result$marginal_list)) {
+            marginal_file <- file.path(output_dir, "marginal_models.rds")
+            saveRDS(result$marginal_list, marginal_file)
+            cat("  - marginal_models.rds\n")
+        }
+        if (!is.null(result$corr_list)) {
+            corr_file <- file.path(output_dir, "correlation_models.rds")
+            saveRDS(result$corr_list, corr_file)
+            cat("  - correlation_models.rds\n")
+        }
     }
 }
 
