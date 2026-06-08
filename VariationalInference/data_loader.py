@@ -1266,7 +1266,13 @@ class DataLoader:
         patient_stratify = None
         if stratify_by is not None:
             if patient_column in obs.columns and stratify_by in obs.columns:
-                first_per_patient = obs_active.groupby(patient_column).first()
+                # Group by the STRING-cast patient column so the resulting
+                # index matches `patients` (which are sorted strings — see
+                # line 1255). Without this, an int patient_id column
+                # produces an int-indexed groupby and `.loc[patients, ...]`
+                # KeyErrors with a list of string keys.
+                patient_col_str = obs_active[patient_column].astype(str)
+                first_per_patient = obs_active.groupby(patient_col_str).first()
                 patient_stratify = first_per_patient.loc[patients, stratify_by].values
             else:
                 self._log(f"WARNING: Cannot stratify by '{stratify_by}' at patient level, "

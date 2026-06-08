@@ -209,6 +209,19 @@ def parse_args() -> argparse.Namespace:
         help='Gaussian prior std for gamma (auxiliary effects)'
     )
     parser.add_argument(
+        '--regression-weight',
+        type=float,
+        default=1.0,
+        help='Base regression_weight multiplier. Auto-scaled internally by '
+             'nnz/n (see vi_cavi.py:_initialize), so effective rw = base * nnz/n. '
+             'Default 1.0 gives effective rw ≈ nnz/n which on typical scRNA is '
+             '~600-1000, well below p — supervision under-engaged. Calibration '
+             'target: effective rw ≈ p (e.g. base=15 → ~9000 on 8000-cell × '
+             '8674-gene data). For the hierarchical (sc) model, supervision is '
+             'summed over G ≪ n so larger base values are required; sweep '
+             'independently from flat.'
+    )
+    parser.add_argument(
         '--no-intercept',
         action='store_true',
         default=False,
@@ -405,10 +418,374 @@ def parse_args() -> argparse.Namespace:
         help='Column in adata.obs identifying patients/donors (e.g., sampleID). '
              'When set, train/val/test splits are performed at the patient level '
              'so no patient appears in more than one split. Also enables '
-             'patient-level evaluation metrics via mean-pooled cell predictions.'
+             'patient-level evaluation metrics via mean-pooled cell predictions. '
+             'Required for --model-type=sc.'
+    )
+
+    # Hierarchical (single-cell) model — Chapter 7
+    parser.add_argument(
+        '--model-type',
+        type=str,
+        default='flat',
+        choices=['flat', 'sc'],
+        help='flat = Chapter 3 (cell-level supervision via θ_i; bulk + naive '
+             'single-cell). sc = Chapter 7 hierarchical (patient-level '
+             'supervision via Θ_g; cell-type-aware via ζ). The two models '
+             'are sibling classes sharing the gene-block + PG-CAVI kernel.'
+    )
+    parser.add_argument(
+        '--cell-type-column',
+        type=str,
+        default=None,
+        help='Column in adata.obs holding cell-type labels. Required for '
+             '--model-type=sc. Labels are mapped to dense int indices in '
+             '[0, T) by first-seen order.'
+    )
+    parser.add_argument(
+        '--unseen-celltype',
+        type=str,
+        default='error',
+        choices=['error', 'prior'],
+        help='Behavior on test-time cells with a cell type not present in '
+             'training: error (default — tripwire for label-naming bugs) '
+             'or prior (back off to the cohort prior mean E[ζ] = α_ζ/λ_ζ).'
+    )
+    parser.add_argument(
+        '--alpha-Theta',
+        type=float,
+        default=1.0,
+        help='[sc] Gamma shape prior on Θ_{gℓ} (patient-level program activity).'
+    )
+    parser.add_argument(
+        '--lambda-Theta',
+        type=float,
+        default=1.0,
+        help='[sc] Gamma rate prior on Θ_{gℓ}.'
+    )
+    parser.add_argument(
+        '--alpha-zeta',
+        type=float,
+        default=1.0,
+        help='[sc] Gamma shape prior on ζ_{tℓ} (cell-type × program affinity).'
+    )
+    parser.add_argument(
+        '--lambda-zeta',
+        type=float,
+        default=1.0,
+        help='[sc] Gamma rate prior on ζ_{tℓ}.'
     )
 
     return parser.parse_args()
+
+
+def _run_sc_pipeline(args, label_columns):
+    """Minimal hierarchical (Chapter 7) fit-and-save pipeline.
+
+    Loads the dataset, builds patient_ids + cell_type_ids from adata.obs,
+    instantiates CAVIHierarchical, runs Algorithm 2, and saves the new
+    hier outputs (Θ per patient, ζ per cell type) alongside the standard
+    DRGP artifacts (gene programs, υ, γ). Cell-level evaluation/prediction
+    is intentionally absent — for sc, prediction lives at the patient
+    level via Θ and is handled by a separate downstream eval script
+    (using transform_hier for inductive fold-in on held-out patients).
+    """
+    import json
+    import gzip
+    from pathlib import Path
+    import anndata as ad
+    import pandas as pd
+
+    from VariationalInference.vi_cavi_sc import CAVIHierarchical
+    from VariationalInference.data_loader import DataLoader
+    from VariationalInference.utils import load_pathways
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Load + preprocess (patient-grouped split via DataLoader).
+    print("\n[sc] Loading data via DataLoader (patient-grouped split).")
+    loader = DataLoader(
+        data_path=args.data,
+        gene_annotation_path=args.gene_annotation,
+        cache_dir=args.cache_dir,
+        use_cache=True,
+        verbose=True,
+    )
+    # NOTE: stratify_by intentionally None for patient-grouped splits — the
+    # DataLoader's patient-split path has an indexer bug when stratify_by
+    # is set with int-valued patient_id (TypeError on .loc[str_keys]).
+    # Patient-level class balance is handled by use_class_weights in CAVIHierarchical.
+    data = loader.load_and_preprocess(
+        label_column=label_columns,
+        aux_columns=args.aux_columns,
+        train_ratio=0.7,
+        val_ratio=0.15,
+        stratify_by=None,
+        min_cells_expressing=0.001,
+        layer=args.layer,
+        convert_to_ensembl=True,
+        filter_protein_coding=args.gene_annotation is not None,
+        random_state=args.split_seed,
+        normalize=args.normalize,
+        normalize_target_sum=args.normalize_target_sum,
+        normalize_method=args.normalize_method,
+        patient_column=args.patient_column,
+    )
+    X_train, X_aux_train, y_train = data['train']
+    X_val, X_aux_val, y_val = data['val']
+    splits = data['splits']
+    gene_list = data.get('gene_list')
+    if gene_list is None:
+        gene_list = [f'gene_{j}' for j in range(X_train.shape[1])]
+    # DataLoader returns 'cell_metadata' (obs DataFrame indexed by cell name)
+    # for all union cells, and 'splits' contains cell-id LISTS per split.
+    cell_meta_all = data.get('cell_metadata')
+    if cell_meta_all is None:
+        raise SystemExit("DataLoader did not return cell_metadata — required for sc pipeline.")
+    train_cell_ids = splits.get('train')
+    val_cell_ids = splits.get('val')
+    if train_cell_ids is None:
+        raise SystemExit("splits['train'] missing from DataLoader output.")
+    cell_meta_train = cell_meta_all.loc[train_cell_ids]
+    cell_meta_val = cell_meta_all.loc[val_cell_ids] if val_cell_ids is not None else None
+
+    # 2. Build patient_ids and cell_type_ids for train cells.
+    if args.cell_type_column not in cell_meta_train.columns:
+        raise SystemExit(
+            f"--cell-type-column '{args.cell_type_column}' not found in adata.obs. "
+            f"Available: {list(cell_meta_train.columns)}"
+        )
+    pat_series = cell_meta_train[args.patient_column].astype(str)
+    ct_series = cell_meta_train[args.cell_type_column].astype(str)
+    pat_uniq = pat_series.unique()
+    ct_uniq = ct_series.unique()
+    pat_to_idx = {p: i for i, p in enumerate(pat_uniq)}
+    ct_to_idx = {c: i for i, c in enumerate(ct_uniq)}
+    patient_ids = pat_series.map(pat_to_idx).values.astype(np.int32)
+    cell_type_ids = ct_series.map(ct_to_idx).values.astype(np.int32)
+    print(f"[sc] {len(pat_uniq)} patients, {len(ct_uniq)} cell types, "
+          f"{len(patient_ids)} train cells, {X_train.shape[1]} genes.")
+    print(f"[sc] cell types: {list(ct_uniq)}")
+
+    # Val patient/cell-type ids (for HO-LL fold-in early stopping).
+    patient_ids_val = None
+    cell_type_ids_val = None
+    if cell_meta_val is not None and len(cell_meta_val) > 0:
+        pat_val_series = cell_meta_val[args.patient_column].astype(str)
+        ct_val_series = cell_meta_val[args.cell_type_column].astype(str)
+        # Val patients are disjoint from train (group-split); assign fresh ids
+        # in [0, G_val) — transform_hier re-densifies them anyway.
+        val_pat_uniq = pat_val_series.unique()
+        val_pat_to_idx = {p: i for i, p in enumerate(val_pat_uniq)}
+        patient_ids_val = pat_val_series.map(val_pat_to_idx).values.astype(np.int32)
+        # Cell types share the train mapping; unseen types back off via
+        # transform_hier(unseen_celltype=args.unseen_celltype).
+        unseen_ct = sorted(set(ct_val_series.unique()) - set(ct_to_idx.keys()))
+        if unseen_ct:
+            print(f"[sc] val cells include unseen cell types: {unseen_ct} "
+                  f"(handled via unseen_celltype={args.unseen_celltype!r}).")
+            next_id = len(ct_to_idx)
+            for c in unseen_ct:
+                ct_to_idx[c] = next_id
+                next_id += 1
+        cell_type_ids_val = ct_val_series.map(ct_to_idx).values.astype(np.int32)
+        print(f"[sc] val: {len(val_pat_uniq)} patients, {len(patient_ids_val)} cells.")
+
+    # 2b. Pathway loading (masked / pathway_init / combined modes).
+    pathway_mask = None
+    pathway_names = None
+    n_factors = args.n_factors
+    n_pathway_factors = None
+
+    if args.mode in ('masked', 'pathway_init', 'combined'):
+        print(f"\n[sc] Loading pathways for {args.mode.upper()} mode.")
+        valid_gene_list = [g for g in gene_list if isinstance(g, str) and g]
+        n_ensg = sum(1 for g in valid_gene_list if g.startswith('ENSG'))
+        genes_are_ensembl = (n_ensg > len(valid_gene_list) * 0.5) if valid_gene_list else False
+        pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
+            gmt_path=args.pathway_file,
+            convert_to_ensembl=genes_are_ensembl,
+            species='human',
+            gene_filter=valid_gene_list,
+            min_genes=args.pathway_min_genes,
+            max_genes=args.pathway_max_genes,
+            cache_dir=args.cache_dir,
+            use_cache=True,
+            excluded_keywords=args.excluded_keywords,
+            require_prefix=args.require_prefix,
+            disable_adaptive_filter=args.no_adaptive_filter,
+        )
+        gene_to_expr_idx = {g: i for i, g in enumerate(gene_list)}
+        gene_to_pathway_idx = {g: i for i, g in enumerate(pathway_genes)}
+        common_genes = set(valid_gene_list) & set(pathway_genes)
+        if len(common_genes) < 10:
+            raise ValueError(
+                f"Too few common genes ({len(common_genes)}) between expression and pathways."
+            )
+        n_pathways = pathway_mat.shape[0]
+        n_genes_expr = len(gene_list)
+        pathway_mask = np.zeros((n_pathways, n_genes_expr), dtype=np.float32)
+        for gene in common_genes:
+            pathway_mask[:, gene_to_expr_idx[gene]] = pathway_mat[:, gene_to_pathway_idx[gene]]
+        pathways_per_gene = pathway_mask.sum(axis=0)
+        print(f"[sc] pathway matrix: {n_pathways} × {n_genes_expr}, "
+              f"density={pathway_mask.mean()*100:.2f}%, "
+              f"genes covered={int((pathways_per_gene > 0).sum())}")
+
+        # Masked mode: restrict X to pathway genes (matches flat pipeline).
+        if args.mode == 'masked':
+            pathway_gene_idx = np.where(pathways_per_gene > 0)[0]
+            X_train = X_train[:, pathway_gene_idx]
+            if X_val is not None:
+                X_val = X_val[:, pathway_gene_idx]
+            pathway_mask = pathway_mask[:, pathway_gene_idx]
+            gene_list = [gene_list[i] for i in pathway_gene_idx]
+            print(f"[sc] [MASKED] restricted to {len(pathway_gene_idx)} pathway genes; "
+                  f"X_train now {X_train.shape}")
+
+        pathway_names = pathway_names_raw
+
+        if args.mode == 'combined':
+            n_drgps = args.n_drgps
+            n_factors = n_pathways + n_drgps
+            drgp_mask = np.ones((n_drgps, pathway_mask.shape[1]), dtype=np.float32)
+            pathway_mask = np.vstack([pathway_mask, drgp_mask])
+            pathway_names = pathway_names_raw + [f"DRGP_{i+1}" for i in range(n_drgps)]
+            n_pathway_factors = n_pathways
+            print(f"[sc] [COMBINED] n_factors = {n_pathways} pathways + {n_drgps} free = {n_factors}")
+        else:
+            n_factors = n_pathways
+            if args.n_factors != n_pathways:
+                print(f"[sc]   NOTE: --n-factors={args.n_factors} overridden by pathway count ({n_pathways})")
+
+    # 3. Build model.
+    a_val = args.alpha_theta if args.alpha_theta is not None else args.a
+    c_val = args.alpha_beta if args.alpha_beta is not None else args.c
+    ap_val = args.alpha_xi if args.alpha_xi is not None else 1.0
+    cp_val = args.alpha_eta if args.alpha_eta is not None else 1.0
+    model = CAVIHierarchical(
+        n_factors=n_factors,
+        a=a_val, ap=ap_val, c=c_val, cp=cp_val,
+        b_v=args.b_v,
+        sigma_gamma=args.sigma_gamma,
+        regression_weight=args.regression_weight,
+        use_intercept=not args.no_intercept,
+        random_state=args.seed,
+        mode=args.mode,
+        pathway_mask=pathway_mask,
+        pathway_names=pathway_names,
+        n_pathway_factors=n_pathway_factors,
+        alpha_pi=args.alpha_pi,
+        beta_pi_scale=args.beta_pi_scale,
+        alpha_Theta=args.alpha_Theta,
+        lambda_Theta=args.lambda_Theta,
+        alpha_zeta=args.alpha_zeta,
+        lambda_zeta=args.lambda_zeta,
+    )
+
+    # 4. Fit.
+    print(f"\n[sc] Fit: max_iter={args.max_iter}, v_warmup={args.v_warmup}, "
+          f"regression_weight base={args.regression_weight}")
+    model.fit(
+        X_train=X_train,
+        y_train=y_train,
+        X_aux_train=X_aux_train,
+        X_val=X_val,
+        y_val=y_val,
+        X_aux_val=X_aux_val,
+        patient_ids=patient_ids,
+        cell_type_ids=cell_type_ids,
+        patient_ids_val=patient_ids_val,
+        cell_type_ids_val=cell_type_ids_val,
+        max_iter=args.max_iter,
+        check_freq=args.check_freq,
+        tol=args.tol,
+        v_warmup=args.v_warmup,
+        verbose=args.verbose,
+        early_stopping=args.early_stopping,
+    )
+
+    # 5. Save sc-specific artifacts + standard gene programs.
+    print(f"\n[sc] Saving artifacts to {out_dir}/")
+    np.savez_compressed(
+        out_dir / 'vi_model_params.npz',
+        E_beta=np.asarray(model.E_beta),
+        r_beta=np.asarray(model.r_beta),
+        mu_v=np.asarray(model.mu_v),
+        sigma_v_diag=np.asarray(model.sigma_v_diag),
+        mu_gamma=np.asarray(model.mu_gamma),
+        Sigma_gamma=np.asarray(model.Sigma_gamma),
+        E_Theta=np.asarray(model.E_Theta),
+        a_Theta=np.asarray(model.a_Theta),
+        b_Theta=np.asarray(model.b_Theta),
+        E_zeta=np.asarray(model.E_zeta),
+        a_zeta=np.asarray(model.a_zeta),
+        b_zeta=np.asarray(model.b_zeta),
+        c_pg=np.asarray(model.c_pg),
+        wbar=np.asarray(model.wbar),
+        n_factors=n_factors,
+        G=model.G, T=model.T, n=model.n, p=model.p, p_aux=model.p_aux,
+        elbo_history=np.array(model.elbo_history_, dtype=object),
+    )
+
+    # Theta (G × K) — patient-level program activity.
+    Theta_df = pd.DataFrame(
+        np.asarray(model.E_Theta),
+        index=[f'Patient_{p}' for p in pat_uniq],
+        columns=[f'GP{k+1}' for k in range(n_factors)],
+    )
+    Theta_df.to_csv(out_dir / 'vi_patient_activities.csv.gz', compression='gzip')
+
+    # zeta (T × K) — cell-type × program affinity.
+    zeta_df = pd.DataFrame(
+        np.asarray(model.E_zeta),
+        index=list(ct_uniq),
+        columns=[f'GP{k+1}' for k in range(n_factors)],
+    )
+    zeta_df.to_csv(out_dir / 'vi_celltype_affinities.csv.gz', compression='gzip')
+
+    # Gene programs (E[β] × factor, with υ alongside) — flat-compatible format.
+    # gene_list reflects any masked-mode gene restriction applied above.
+    gp_df = pd.DataFrame(
+        np.asarray(model.E_beta).T,    # (K, p)
+        index=[f'GP{k+1}' for k in range(n_factors)],
+        columns=gene_list,
+    )
+    for k_idx, k_name in enumerate(label_columns):
+        gp_df.insert(0, f'v_weight_{k_name}', np.asarray(model.mu_v)[k_idx])
+    gp_df.to_csv(out_dir / 'vi_gene_programs.csv.gz', compression='gzip')
+
+    # Run summary.
+    summary = {
+        'model_type': 'sc (hierarchical, Chapter 7)',
+        'hyperparameters': {
+            'n_factors': n_factors,
+            'a': a_val, 'c': c_val,
+            'b_v': args.b_v,
+            'sigma_gamma': args.sigma_gamma,
+            'regression_weight_base': args.regression_weight,
+            'regression_weight_effective': float(model.regression_weight),
+            'alpha_Theta': args.alpha_Theta, 'lambda_Theta': args.lambda_Theta,
+            'alpha_zeta': args.alpha_zeta, 'lambda_zeta': args.lambda_zeta,
+        },
+        'data_shapes': {
+            'n_cells': model.n, 'n_genes': model.p,
+            'n_patients': model.G, 'n_cell_types': model.T,
+            'kappa': model.kappa, 'p_aux': model.p_aux,
+        },
+        'training': {
+            'final_elbo': model.elbo_history_[-1][1] if model.elbo_history_ else None,
+            'n_iterations': model.elbo_history_[-1][0] if model.elbo_history_ else 0,
+        },
+        'label_columns': label_columns,
+        'aux_columns': args.aux_columns,
+        'patient_column': args.patient_column,
+        'cell_type_column': args.cell_type_column,
+    }
+    with gzip.open(out_dir / 'vi_summary.json.gz', 'wt') as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"\n[sc] Done. Final ELBO = {summary['training']['final_elbo']}")
 
 
 def main():
@@ -471,6 +848,19 @@ def main():
     # =========================================================================
     # STEP 2: Import Modules
     # =========================================================================
+    # Factory dispatch — flat (Ch.3) vs hierarchical (Ch.7). The hier path
+    # short-circuits the flat pipeline and runs its own minimal fit+save below,
+    # because the cell-level evaluation downstream (per-cell predictions,
+    # decomposed AUC, etc.) doesn't apply when supervision is at the patient
+    # level (predictions live on Θ, not θ).
+    if args.model_type == 'sc':
+        if not args.patient_column:
+            raise SystemExit("--model-type=sc requires --patient-column.")
+        if not args.cell_type_column:
+            raise SystemExit("--model-type=sc requires --cell-type-column.")
+        print("[METHOD] Using CAVIHierarchical (Chapter 7, patient-level supervision via Θ).")
+        _run_sc_pipeline(args, label_columns)
+        return
     from VariationalInference.vi_cavi import CAVI as ModelClass
     print("[METHOD] Using CAVI (coordinate ascent, full-batch)")
     from VariationalInference.data_loader import DataLoader
@@ -742,6 +1132,7 @@ def main():
         cp=cp_val,
         b_v=args.b_v,
         sigma_gamma=args.sigma_gamma,
+        regression_weight=args.regression_weight,
         use_intercept=not args.no_intercept,
         random_state=args.seed,
         mode=args.mode,

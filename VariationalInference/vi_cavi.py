@@ -10,12 +10,18 @@ try:
         log_expit, omega_bar, scatter_add_to, phi_chunk_core,
         expit as _expit, backend_info,
     )
+    from .vi_pg_kernel import (
+        pg_tilt, pg_R_correction, pg_update_v, pg_update_gamma, pg_Lsup,
+    )
 except ImportError:
     from jax_backend import (
         xp, USE_JAX, HAS_GPU, to_device, to_numpy,
         digamma, gammaln, logsumexp_rows, softmax_rows,
         log_expit, omega_bar, scatter_add_to, phi_chunk_core,
         expit as _expit, backend_info,
+    )
+    from vi_pg_kernel import (  # type: ignore[no-redef]
+        pg_tilt, pg_R_correction, pg_update_v, pg_update_gamma, pg_Lsup,
     )
 
 
@@ -91,6 +97,240 @@ def _is_oom_error(exc: Exception) -> bool:
         or "cuda_error_out_of_memory" in msg
         or "allocator" in msg and "memory" in msg
     )
+
+
+# =====================================================================
+# Shared ELBO helpers (flat CAVI + hierarchical CAVI). Each returns a
+# scalar contribution to the ELBO. Inputs are kept explicit (no implicit
+# self) so the helpers can be called from either class with identical
+# semantics. See _compute_elbo / _compute_elbo_hier for usage.
+#
+# Numerical equivalence with the pre-refactor inline code is verified by
+# tmp/elbo_refactor/smoke.py before/after — relative discrepancy ≤ fp32
+# noise (~1e-6). Do NOT introduce clips/floors here that aren't in the
+# original blocks — see CLAUDE.md: "don't add bound/clip patches".
+# =====================================================================
+
+def _elbo_poisson_recon(*, a_theta, b_theta, E_log_beta, E_beta,
+                         X_row, X_col, X_data, nnz, n, K,
+                         row_chunk, effective_chunk, min_chunk,
+                         active_beta, gammaln_data_sum,
+                         on_row_chunk_shrink=None):
+    """Poisson Raikov reward + rate penalty, chunked.
+
+    Returns (poisson_ll, E_log_theta, row_chunk_updated). The caller
+    keeps `E_log_theta` (full (n,K)) for the θ prior/entropy block and
+    deletes it after.
+    """
+    elt_chunks = []
+    i0 = 0
+    while i0 < n:
+        i1 = min(i0 + row_chunk, n)
+        try:
+            elt_chunks.append(digamma(a_theta[i0:i1]) - xp.log(b_theta[i0:i1]))
+            i0 = i1
+        except Exception as exc:
+            if _is_oom_error(exc) and row_chunk > min_chunk:
+                row_chunk = max(min_chunk, row_chunk // 2)
+                if on_row_chunk_shrink is not None:
+                    on_row_chunk_shrink(row_chunk)
+                continue
+            raise
+    E_log_theta = xp.concatenate(elt_chunks, axis=0) if len(elt_chunks) > 1 else elt_chunks[0]
+    del elt_chunks
+
+    poisson_ll = 0.0
+    for start in range(0, nnz, effective_chunk):
+        end = min(start + effective_chunk, nnz)
+        row_c = X_row[start:end]
+        col_c = X_col[start:end]
+        data_c = X_data[start:end]
+        log_rates_c = E_log_theta[row_c] + E_log_beta[col_c]
+        log_sum_c = logsumexp_rows(log_rates_c).ravel()
+        # Floor -inf to a large negative value so dead genes don't make
+        # the entire ELBO = -inf.
+        log_sum_c = xp.maximum(log_sum_c, -100.0)
+        poisson_ll = poisson_ll + xp.dot(data_c, log_sum_c)
+        del log_rates_c
+
+    theta_col_sum = xp.zeros(K)
+    for i0 in range(0, n, row_chunk):
+        i1 = min(i0 + row_chunk, n)
+        theta_col_sum = theta_col_sum + (a_theta[i0:i1] / b_theta[i0:i1]).sum(axis=0)
+    if active_beta is not None:
+        beta_col_sum = xp.where(active_beta, E_beta, 0.0).sum(axis=0)
+    else:
+        beta_col_sum = E_beta.sum(axis=0)
+    poisson_ll = poisson_ll - xp.sum(theta_col_sum * beta_col_sum)
+    poisson_ll = poisson_ll - gammaln_data_sum
+    return poisson_ll, E_log_theta, row_chunk
+
+
+def _elbo_theta_entropy_chunked(*, a_theta, b_theta, n, row_chunk, min_chunk,
+                                 on_row_chunk_shrink=None):
+    """H[q(θ)] for Gamma(a_theta, b_theta), chunked over rows."""
+    theta_entropy = 0.0
+    i0 = 0
+    while i0 < n:
+        i1 = min(i0 + row_chunk, n)
+        try:
+            a_c = a_theta[i0:i1]
+            b_c = b_theta[i0:i1]
+            psi_a_c = digamma(a_c)
+            theta_entropy = theta_entropy + xp.sum(
+                a_c - xp.log(b_c)
+                + gammaln(a_c)
+                + (1 - a_c) * psi_a_c
+            )
+            i0 = i1
+        except Exception as exc:
+            if _is_oom_error(exc) and row_chunk > min_chunk:
+                row_chunk = max(min_chunk, row_chunk // 2)
+                if on_row_chunk_shrink is not None:
+                    on_row_chunk_shrink(row_chunk)
+                continue
+            raise
+    return theta_entropy, row_chunk
+
+
+def _elbo_beta_block(*, a_beta, b_beta, E_log_eta, E_eta, c_prior, p, K,
+                     active_beta, n_active_beta,
+                     use_spike_slab, pw_active, r_beta,
+                     a_pi, b_pi, alpha_pi, beta_pi):
+    """Slab Gamma prior on β̃ + (spike-slab π, m, Beta-π entropy + m entropy)
+    + slab Gaussian-Gamma entropy. Eqs. 46-48, 55-57 of the paper.
+    """
+    _E_log_beta_raw = digamma(a_beta) - xp.log(b_beta)
+    _E_beta_raw = a_beta / b_beta
+
+    # Gamma prior on slab beta_tilde (Eq. 48 — NOT weighted by rho)
+    _beta_prior_terms = ((c_prior - 1) * _E_log_beta_raw
+                         + c_prior * E_log_eta[:, None]
+                         - E_eta[:, None] * _E_beta_raw)
+    if active_beta is not None:
+        out = xp.sum(xp.where(active_beta, _beta_prior_terms, 0.0))
+        out = out - float(n_active_beta) * gammaln(c_prior)
+    else:
+        out = xp.sum(_beta_prior_terms)
+        out = out - p * K * gammaln(c_prior)
+
+    if use_spike_slab:
+        # Beta prior on pi_j (Eq. 46) — per-gene
+        _E_log_pi = digamma(a_pi) - digamma(a_pi + b_pi)
+        _E_log_1mpi = digamma(b_pi) - digamma(a_pi + b_pi)
+        out = out + xp.sum((alpha_pi - 1) * _E_log_pi
+                           + (beta_pi - 1) * _E_log_1mpi)
+        out = out - p * (gammaln(alpha_pi) + gammaln(beta_pi)
+                         - gammaln(alpha_pi + beta_pi))
+
+        # Bernoulli prior on m (Eq. 47) — free factors only
+        _m_prior = (r_beta * _E_log_pi[:, None]
+                    + (1.0 - r_beta) * _E_log_1mpi[:, None])
+        if pw_active is not None:
+            _is_free = ~pw_active
+            if active_beta is not None:
+                _is_free = _is_free & active_beta
+            out = out + xp.sum(xp.where(_is_free, _m_prior, 0.0))
+        else:
+            out = out + xp.sum(_m_prior)
+
+        # Entropy of q(m_{jk}) = Bernoulli(r_{jk}) (Eq. 56) — free factors only
+        _r_clip = xp.clip(r_beta, 1e-7, 1 - 1e-7)
+        _m_entropy = (_r_clip * xp.log(_r_clip)
+                      + (1 - _r_clip) * xp.log(1 - _r_clip))
+        if pw_active is not None:
+            _is_free = ~pw_active
+            if active_beta is not None:
+                _is_free = _is_free & active_beta
+            out = out - xp.sum(xp.where(_is_free, _m_entropy, 0.0))
+        else:
+            out = out - xp.sum(_m_entropy)
+
+        # Entropy of q(pi_j) = Beta(a_pi_j, b_pi_j) (Eq. 57) — per-gene
+        _H_pi = (gammaln(a_pi) + gammaln(b_pi)
+                  - gammaln(a_pi + b_pi)
+                  - (a_pi - 1) * digamma(a_pi)
+                  - (b_pi - 1) * digamma(b_pi)
+                  + (a_pi + b_pi - 2) * digamma(a_pi + b_pi))
+        out = out + xp.sum(_H_pi)
+
+    # Entropy of q(beta_tilde_{jk}) — NOT weighted by rho (Eq. 55)
+    _psi_a_beta = digamma(a_beta)
+    _beta_entropy = (a_beta - xp.log(b_beta)
+                     + gammaln(a_beta)
+                     + (1 - a_beta) * _psi_a_beta)
+    if active_beta is not None:
+        out = out + xp.sum(xp.where(active_beta, _beta_entropy, 0.0))
+    else:
+        out = out + xp.sum(_beta_entropy)
+    return out
+
+
+def _elbo_xi_block(*, E_log_xi, E_xi, a_xi, b_xi, gammaln_a_xi_cached,
+                    digamma_a_xi_cached, ap, bp, n):
+    """ξ Gamma prior + entropy."""
+    out = xp.sum((ap - 1) * E_log_xi + ap * xp.log(bp) - bp * E_xi)
+    out = out - n * gammaln(ap)
+    # q(xi) entropy
+    out = out + xp.sum(a_xi - xp.log(b_xi)
+                       + gammaln_a_xi_cached
+                       + (1 - a_xi) * digamma_a_xi_cached)
+    return out
+
+
+def _elbo_eta_block(*, E_log_eta, E_eta, a_eta, b_eta, gammaln_a_eta_cached,
+                     digamma_a_eta_cached, cp, dp, p):
+    """η Gamma prior + entropy."""
+    out = xp.sum((cp - 1) * E_log_eta + cp * xp.log(dp) - dp * E_eta)
+    out = out - p * gammaln(cp)
+    out = out + xp.sum(a_eta - xp.log(b_eta)
+                       + gammaln_a_eta_cached
+                       + (1 - a_eta) * digamma_a_eta_cached)
+    return out
+
+
+def _elbo_v_block(*, mu_v, sigma_v_diag, b_v):
+    """E[log p(v|s)] + E[log p(s)] + H[q(s)] + H[q(v)] — Bayesian-Lasso
+    via Inverse-Gaussian augmentation. Eqs. 51-52, 58, 60.
+    """
+    E_v_sq = mu_v ** 2 + sigma_v_diag  # (kappa, K)
+    omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
+    # GIG(-1/2): E[1/s] = 1/(omega*b_v) + 1/omega^2
+    E_inv_s = 1.0 / (b_v * omega + 1e-12) + 1.0 / (omega ** 2 + 1e-12)
+    mu_s = omega * b_v
+    lambda_s = omega ** 2
+    E_s = mu_s
+    E_log_s = xp.log(xp.maximum(mu_s, 1e-12))
+
+    # Eq. 51
+    out = xp.sum(-0.5 * xp.log(2 * xp.pi) - 0.5 * E_log_s
+                  - 0.5 * E_v_sq * E_inv_s)
+    # Eq. 52
+    rate_s = 1.0 / (2.0 * b_v ** 2)
+    out = out + xp.sum(xp.log(rate_s) - rate_s * E_s)
+    # Eq. 60
+    out = out + 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
+                                     / xp.maximum(lambda_s, 1e-12)))
+    # q(v) Gaussian entropy
+    out = out + 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * sigma_v_diag))
+    return out
+
+
+def _elbo_gamma_aux_block(*, mu_gamma, Sigma_gamma, sigma_gamma, kappa, p_aux):
+    """γ Gaussian prior + entropy (Eq. 53)."""
+    if p_aux <= 0:
+        return 0.0
+    sigma_gamma_sq = sigma_gamma ** 2
+    out = 0.0
+    log_2pi_sg = float(xp.log(2 * xp.pi * sigma_gamma_sq))
+    log_2pie = float(xp.log(2 * xp.pi * xp.e))
+    for k in range(kappa):
+        out = out - 0.5 * p_aux * log_2pi_sg
+        _mu_sq_plus_var = mu_gamma[k] ** 2 + xp.diag(Sigma_gamma[k])
+        out = out - 0.5 * float(xp.sum(_mu_sq_plus_var)) / sigma_gamma_sq
+        sign, logdet = xp.linalg.slogdet(Sigma_gamma[k])
+        out = out + 0.5 * (p_aux * log_2pie + float(logdet))
+    return out
 
 
 class CAVI:
@@ -1074,60 +1314,43 @@ class CAVI:
         else:
             beta_sum = self.E_beta.sum(axis=0)  # (K,)
 
-        # Pre-compute tiny (kappa, K) quantities for regression rate parts
-        y_exp = y if y.ndim > 1 else y[:, None]        # (n, kappa)
-        wbar = self.wbar                                 # (n, kappa)
-        W = self._sample_weights                         # (n, kappa)
-        # No rw scaling in CAVI updates — the paper's model has weight 1
-        # on both Poisson and regression terms. rw is only for ELBO monitoring.
-        # NOTE: do NOT use self.E_theta here — it materializes the full
-        # (n, K) cache.  Row slices are computed on-the-fly below.
-        E_v = self.mu_v                                  # (kappa, K)
-        E_v_sq = E_v ** 2 + self.sigma_v_diag            # (kappa, K)
-        E_v_sq_col = xp.square(E_v)                      # (kappa, K)
+        # Tempered supervised contribution to b_theta = b_Poisson + rw·R_lin
+        # with rw·R_quad multiplying a_theta inside the discriminant.
+        # rw is selected on validation (patient-grouped AUC); rw=1 with auto-scale
+        # gives effective ≈ nnz/n, which is ~10× below p — supervision near-dormant.
+        # See vi_pg_kernel.py docstring for the tempering rationale (sLDA / supervised
+        # PF up-weighting; power-posterior likelihood for O(np)-vs-O(nκ) balance).
+        E_theta_full = self.a_theta / self.b_theta
+        effective_rw = ramp * self.regression_weight
+        R_lin, R_quad, self._row_chunk = pg_R_correction(
+            E_design=E_theta_full,
+            mu_v=self.mu_v,
+            sigma_v_diag=self.sigma_v_diag,
+            mu_gamma=self.mu_gamma,
+            X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
+            wbar=self.wbar,
+            y=y,
+            sample_weights=self._sample_weights,
+            effective_rw=effective_rw,
+            row_chunk=self._row_chunk,
+        )
 
+        # --- solve quadratic b² - (b_Poisson + R_lin) b - R_quad · a = 0 in chunks ---
         min_chunk = max(1024, self.n // 256)
         b_theta_chunks = []
         i0 = 0
         while i0 < self.n:
             i1 = min(i0 + self._row_chunk, self.n)
             try:
-                # --- inline _regression_rate_parts for this chunk ---
-                E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
-                W_c = W[i0:i1]
-                W_wbar_c = W_c * wbar[i0:i1]
-                theta_v_c = E_theta_c @ E_v.T                             # (chunk, kappa)
-                if self.p_aux > 0:
-                    theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
-
-                R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ E_v            # (chunk, K)
-                R_lin_c = R_lin_c + (W_wbar_c * theta_v_c) @ E_v          # was 2.0 * lam → wbar
-                R_lin_c = R_lin_c - E_theta_c * (W_wbar_c @ E_v_sq_col)   # was 2.0 * lam → wbar
-                # ** Critical 0.5 from notes §3.2 — DO NOT remove. **
-                # JJ had c_quad = 2*lambda*E_v_sq; PG-CAVI has c_quad = 0.5*wbar*E_v_sq.
-                # Since wbar = 2*lambda at the tilt optimum, this is HALF the JJ rate
-                # contribution. Verify: if you started from a JJ checkpoint and removed
-                # only `lam → wbar/2`, the self-term would be 2× too large.
-                R_quad_c = 0.5 * W_wbar_c @ E_v_sq                        # (chunk, K)
-
-                # Ramp regression contribution during post-warmup transition
-                R_lin_c = R_lin_c * ramp
-                R_quad_c = R_quad_c * ramp
-
-                # --- solve quadratic for b_theta ---
                 b_poisson_c = self.E_xi[i0:i1, None] + beta_sum[None, :]  # (chunk, K)
-                b_base_c = b_poisson_c + R_lin_c
-                c_quad_c = R_quad_c
+                b_base_c = b_poisson_c + R_lin[i0:i1]
+                c_quad_c = R_quad[i0:i1]
                 disc_c = xp.sqrt(xp.square(b_base_c) + 4.0 * c_quad_c * self.a_theta[i0:i1])
                 b_theta_c = (b_base_c + disc_c) / 2.0
-
-                # Floor at 10% of b_poisson
+                # Existing floors (load-bearing — see CLAUDE.md "stability fixes").
                 b_theta_c = xp.maximum(b_theta_c, 0.1 * b_poisson_c)
-                # Floor at bp
                 b_theta_c = xp.maximum(b_theta_c, self.bp)
-                # Absolute floor
                 b_theta_c = xp.maximum(b_theta_c, 1e-2)
-                # Adaptive floor: cap E[theta] = a/b at 1e4
                 b_theta_c = xp.maximum(b_theta_c, self.a_theta[i0:i1] / 1e4)
                 b_theta_chunks.append(b_theta_c)
                 i0 = i1
@@ -1159,191 +1382,63 @@ class CAVI:
         self.b_xi = xp.maximum(self.b_xi, 1e-6)
 
     def _update_omega(self, X_aux):
-        """PG augmentation tilt: c_pg_{ik} = sqrt(E[A^2_{ik}]); wbar = omega_bar(c_pg).
-
-        Per PG_CAVI_implementation_notes.md §3.6, E[A^2] includes ONLY the
-        Var[theta] cross term — NOT Var[v] or Var[gamma] cross terms (paper
-        parity; revisit if recovery testing shows it matters).
-
-        No cap on c_pg (under PG-CAVI, wbar = omega_bar(c) is monotone
-        decreasing from 1/4 to 0 as c grows, so the quadratic braking on
-        theta is naturally bounded; we don't need the JJ-era zeta_max).
-
-        Row-chunked with adaptive OOM guard.
-        """
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
-        min_chunk = max(1024, self.n // 256)
-        c_chunks = []
-        i0 = 0
-        while i0 < self.n:
-            i1 = min(i0 + self._row_chunk, self.n)
-            try:
-                b_theta_c = self.b_theta[i0:i1]
-                E_theta_c = self.a_theta[i0:i1] / b_theta_c
-                Var_theta_c = E_theta_c / b_theta_c
-                E_A_c = E_theta_c @ self.mu_v.T
-                if self.p_aux > 0:
-                    E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
-                # Var[theta] cross term ONLY (§3.6).
-                E_A_sq_c = xp.square(E_A_c) + Var_theta_c @ E_v_sq.T
-                c_chunks.append(xp.sqrt(xp.maximum(E_A_sq_c, 1e-12)))
-                i0 = i1
-            except Exception as exc:
-                if _is_oom_error(exc) and self._row_chunk > min_chunk:
-                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
-                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
-                    continue
-                raise
-        self.c_pg = xp.concatenate(c_chunks, axis=0) if len(c_chunks) > 1 else c_chunks[0]
-        self.wbar = omega_bar(self.c_pg)
+        """PG augmentation tilt — delegates to pg_tilt (rw-independent at count 1)."""
+        E_theta_full = self.a_theta / self.b_theta
+        Var_theta_full = E_theta_full / self.b_theta
+        self.c_pg, self.wbar, self._row_chunk = pg_tilt(
+            E_design=E_theta_full,
+            Var_design=Var_theta_full,
+            mu_v=self.mu_v,
+            sigma_v_diag=self.sigma_v_diag,
+            mu_gamma=self.mu_gamma,
+            X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
+            row_chunk=self._row_chunk,
+        )
 
     def _update_v(self, y, X_aux, iteration=0, ramp=1.0):
-        """
-        v posterior (diagonal Gaussian, PG-CAVI, Laplace/Bayesian Lasso prior).
-
-            precision_{kl} = E_q[1/s_{kl}] + Sum_i wbar_ik E[theta^2_{il}]
-            (equivalently 2*lam where lam = wbar/2 at the tilt optimum)
-
-        Memory-efficient: row-chunked to avoid full (n, K) temporaries
-        (E_theta_sq, Var_theta) while accumulating (kappa, K) sufficient
-        statistics via BLAS matmuls.
-        """
-        y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self.wbar / 2.0  # PG-CAVI: 2*lam = wbar at tilt optimum
-        W = self._sample_weights                    # (n, kappa)
-        E_v = self.mu_v
-
-        # Fixed Laplace prior: 1/b_v^2 for all factors.
-        # The adaptive E[1/s] shrinks with |v|, creating a runaway feedback loop
-        # where large |v| → weak prior → even larger |v|. Using the marginal
-        # Laplace precision provides consistent regularization.
-        prior_precision = xp.full_like(self.mu_v, 1.0 / (self.b_v ** 2))
-
-        # Accumulate (kappa, K) sufficient statistics in chunks to avoid
-        # materializing full (n, K) intermediates (Var_theta, E_theta_sq).
-        # Uses self._row_chunk with adaptive OOM guard.
-        min_chunk = max(1024, self.n // 256)
-        prec_sum = xp.zeros((self.kappa, self.K))   # W_lam.T @ E_theta_sq
-        term1_sum = xp.zeros((self.kappa, self.K))   # W_y.T @ E_theta
-        parta_sum = xp.zeros((self.kappa, self.K))   # (W_lam * theta_v).T @ E_theta
-        partb_sum = xp.zeros((self.kappa, self.K))   # W_lam.T @ E_theta_plain_sq
-
-        i0 = 0
-        while i0 < self.n:
-            i1 = min(i0 + self._row_chunk, self.n)
-            try:
-                b_theta_c = self.b_theta[i0:i1]
-                E_theta_c = self.a_theta[i0:i1] / b_theta_c            # (chunk, K)
-                Var_theta_c = E_theta_c / b_theta_c                     # (chunk, K)
-                E_theta_sq_c = xp.square(E_theta_c) + Var_theta_c      # E[theta^2]
-
-                theta_v_c = E_theta_c @ E_v.T                          # (chunk, kappa)
-                if self.p_aux > 0:
-                    theta_v_c = theta_v_c + X_aux[i0:i1] @ self.mu_gamma.T
-
-                W_lam_c = W[i0:i1] * lam[i0:i1]                       # (chunk, kappa)
-                W_y_c = W[i0:i1] * (y_exp[i0:i1] - 0.5)              # (chunk, kappa)
-
-                prec_sum = prec_sum + W_lam_c.T @ E_theta_sq_c
-                term1_sum = term1_sum + W_y_c.T @ E_theta_c
-                parta_sum = parta_sum + (W_lam_c * theta_v_c).T @ E_theta_c
-                partb_sum = partb_sum + W_lam_c.T @ xp.square(E_theta_c)
-                i0 = i1
-            except Exception as exc:
-                if _is_oom_error(exc) and self._row_chunk > min_chunk:
-                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
-                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
-                    continue
-                raise
-
-        # CAVI update (Eq. 37) with under-relaxation to prevent oscillation.
-        # The theta-v multiplicative coupling makes the exact CAVI update
-        # overshoot when E[theta] is small.  Taking a partial step toward
-        # the CAVI optimum guarantees improvement on a damped objective.
-        # Scale data terms by ramp for consistency with theta's ramp.
-        prec_sum = prec_sum * ramp
-        term1_sum = term1_sum * ramp
-        parta_sum = parta_sum * ramp
-        partb_sum = partb_sum * ramp
-        data_prec = 2 * prec_sum                                 # (kappa, K)
-        precision = prior_precision + data_prec                  # (kappa, K)
-        precision = xp.maximum(precision, 1e-12)
-        term1 = term1_sum
-        term2 = 2.0 * (parta_sum - E_v * partb_sum)
-        mean_prec = term1 - term2
-
-        mu_v_new = mean_prec / precision
-        # Trust region: limit CAVI target to within ±delta of current value.
-        # delta scales with posterior std so uncertain factors can move more.
-        # Trust region proportional to posterior std (uncertain factors move more)
-        delta_v = 3.0 * xp.sqrt(xp.maximum(self.sigma_v_diag, 1e-8))
-        mu_v_new = xp.clip(mu_v_new, self.mu_v - delta_v, self.mu_v + delta_v)
-        # O(1/K) scaling: prevents v-gamma seesaw at large K (e.g. K=315 masked)
-        # K=50: 0.1, K=130: 0.077, K=315: 0.032
-        alpha_v = min(0.1, 10.0 / self.K) * ramp
-        self.mu_v = (1.0 - alpha_v) * self.mu_v + alpha_v * mu_v_new
-        sigma_v_new = 1.0 / precision
-        sigma_v_floor = 0.01 * self.b_v ** 2  # 1% of prior variance
-        sigma_v_new = xp.maximum(sigma_v_new, sigma_v_floor)
-        self.sigma_v_diag = (1.0 - alpha_v) * self.sigma_v_diag + alpha_v * sigma_v_new
+        """υ posterior — delegates to pg_update_v (data terms × effective_rw)."""
+        E_theta_full = self.a_theta / self.b_theta
+        Var_theta_full = E_theta_full / self.b_theta
+        effective_rw = ramp * self.regression_weight
+        self.mu_v, self.sigma_v_diag, self._row_chunk = pg_update_v(
+            E_design=E_theta_full,
+            Var_design=Var_theta_full,
+            mu_v=self.mu_v,
+            sigma_v_diag=self.sigma_v_diag,
+            mu_gamma=self.mu_gamma,
+            X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
+            y=y,
+            wbar=self.wbar,
+            sample_weights=self._sample_weights,
+            b_v=self.b_v,
+            K=self.K,
+            effective_rw=effective_rw,
+            ramp=ramp,
+            row_chunk=self._row_chunk,
+        )
 
     def _update_gamma(self, y, X_aux, iteration=0, ramp=1.0):
-        """gamma posterior (Gaussian, PG-CAVI) with under-relaxation."""
+        """γ posterior — delegates to pg_update_gamma (data terms × effective_rw)."""
         if self.p_aux == 0:
             return
-
-        y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self.wbar / 2.0  # PG-CAVI: 2*lam = wbar at tilt optimum
-        W = self._sample_weights                    # (n, kappa)
-
-        # Pre-compute E[theta] @ mu_v.T in chunks
-        theta_v = xp.zeros((self.n, self.kappa))
-        for i0 in range(0, self.n, self._row_chunk):
-            i1 = min(i0 + self._row_chunk, self.n)
-            E_theta_c = self.a_theta[i0:i1] / self.b_theta[i0:i1]
-            if USE_JAX:
-                theta_v = theta_v.at[i0:i1].set(E_theta_c @ self.mu_v.T)
-            else:
-                theta_v[i0:i1] = E_theta_c @ self.mu_v.T
-
-        # CAVI update (Eq. 41) with under-relaxation to prevent oscillation.
-        # Step size is ramped from 0 to 0.3 over the post-warmup ramp period.
-        # O(1/K) scaling to match v damping and prevent intercept-v seesaw
-        # K=50: 0.3, K=130: 0.23, K=315: 0.095
-        alpha_gamma = min(0.3, 30.0 / self.K) * ramp
-        for k in range(self.kappa):
-            prec_prior = xp.eye(self.p_aux) / (self.sigma_gamma ** 2)
-            W_lam_k = W[:, k] * lam[:, k]
-            # Scale data terms by ramp for consistency with theta's ramp
-            weighted_X = X_aux * (2 * ramp * W_lam_k)[:, None]
-            prec = prec_prior + weighted_X.T @ X_aux
-
-            theta_v_k = theta_v[:, k]
-            residual = ramp * (W[:, k] * (y_exp[:, k] - 0.5) - 2 * W_lam_k * theta_v_k)
-            mean_prec = X_aux.T @ residual
-
-            # Compute CAVI target using the TRUE new Sigma (not the damped one)
-            if USE_JAX:
-                Sigma_new = xp.linalg.inv(prec)
-            else:
-                Sigma_new = np.linalg.inv(prec)
-            mu_gamma_new = Sigma_new @ mean_prec
-
-            # Trust region: limit CAVI target to within ±delta of current value
-            delta_gamma = 3.0 * self.sigma_gamma  # fixed trust region based on prior scale
-            mu_gamma_new = xp.clip(mu_gamma_new,
-                                   self.mu_gamma[k] - delta_gamma,
-                                   self.mu_gamma[k] + delta_gamma)
-
-            # Damp Sigma and mu separately toward their CAVI targets
-            if USE_JAX:
-                Sigma_damped = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
-                self.Sigma_gamma = self.Sigma_gamma.at[k].set(Sigma_damped)
-                mu_damped = (1.0 - alpha_gamma) * self.mu_gamma[k] + alpha_gamma * mu_gamma_new
-                self.mu_gamma = self.mu_gamma.at[k].set(mu_damped)
-            else:
-                self.Sigma_gamma[k] = (1.0 - alpha_gamma) * self.Sigma_gamma[k] + alpha_gamma * Sigma_new
-                self.mu_gamma[k] = (1.0 - alpha_gamma) * self.mu_gamma[k] + alpha_gamma * mu_gamma_new
+        E_theta_full = self.a_theta / self.b_theta
+        effective_rw = ramp * self.regression_weight
+        self.mu_gamma, self.Sigma_gamma, self._row_chunk = pg_update_gamma(
+            E_design=E_theta_full,
+            mu_v=self.mu_v,
+            mu_gamma=self.mu_gamma,
+            Sigma_gamma=self.Sigma_gamma,
+            sigma_gamma_param=self.sigma_gamma,
+            X_aux=X_aux,
+            y=y,
+            wbar=self.wbar,
+            sample_weights=self._sample_weights,
+            K=self.K,
+            effective_rw=effective_rw,
+            ramp=ramp,
+            p_aux=self.p_aux,
+            row_chunk=self._row_chunk,
+        )
 
     # =================================================================
     # ELBO
@@ -1354,90 +1449,63 @@ class CAVI:
 
         Row-chunked for all theta-related (n, K) terms to avoid
         materializing multiple full (n, K) temporaries simultaneously.
+        Common terms (β/π/m, ξ, η, v, γ, Poisson recon, θ entropy) are
+        delegated to module-level _elbo_*_block helpers shared with the
+        hierarchical model — see _elbo_poisson_recon etc. above. The θ
+        *prior* is kept inline because the flat rate (E_xi * E_theta)
+        differs from hier's structured rate (E_xi * E_Theta * E_zeta).
         """
         E_beta = self.E_beta
         E_log_beta = self._E_log_beta_cache
         E_xi = self.E_xi
         E_eta = self.E_eta
-        # Reuse cached digamma for constant-shape a_xi, a_eta
         E_log_xi = self._digamma_a_xi - xp.log(self.b_xi)
         E_log_eta = self._digamma_a_eta - xp.log(self.b_eta)
 
-        elbo = 0.0
-
-        # === Poisson likelihood (collapsed z) -- chunked to avoid (nnz, K) ===
-        # E_log_theta is needed for random-access by sparse row indices,
-        # so we compute it in row chunks and concatenate, then delete after use.
         min_chunk = max(1024, self.n // 256)
-        elt_chunks = []
-        i0 = 0
-        while i0 < self.n:
-            i1 = min(i0 + self._row_chunk, self.n)
-            try:
-                elt_chunks.append(
-                    digamma(self.a_theta[i0:i1]) - xp.log(self.b_theta[i0:i1])
-                )
-                i0 = i1
-            except Exception as exc:
-                if _is_oom_error(exc) and self._row_chunk > min_chunk:
-                    self._row_chunk = max(min_chunk, self._row_chunk // 2)
-                    print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
-                    continue
-                raise
-        E_log_theta = xp.concatenate(elt_chunks, axis=0) if len(elt_chunks) > 1 else elt_chunks[0]
-        del elt_chunks
 
-        poisson_ll = 0.0
-        nnz = self._nnz
-        chunk = self._effective_chunk
-        for start in range(0, nnz, chunk):
-            end = min(start + chunk, nnz)
-            row_c = self._X_row[start:end]
-            col_c = self._X_col[start:end]
-            data_c = self._X_data[start:end]
-            log_rates_c = E_log_theta[row_c] + E_log_beta[col_c]  # (chunk, K)
-            log_sum_c = logsumexp_rows(log_rates_c).ravel()
-            # Floor -inf to a large negative value so dead genes don't
-            # make the entire ELBO = -inf.  A gene with all factors killed
-            # (E_log_beta = -inf) gives logsumexp = -inf; flooring to -30
-            # means exp(-30) ≈ 1e-13 rate, a steep but finite penalty.
-            log_sum_c = xp.maximum(log_sum_c, -100.0)
-            poisson_ll += xp.dot(data_c, log_sum_c)
-            del log_rates_c
+        def _shrink_cb(new_rc):
+            print(f"  [OOM guard] row chunk → {new_rc:,}")
 
-        # Compute E[theta].sum(axis=0) in chunks to avoid (n,K) cache
-        theta_col_sum = xp.zeros(self.K)
-        for i0 in range(0, self.n, self._row_chunk):
-            i1 = min(i0 + self._row_chunk, self.n)
-            theta_col_sum = theta_col_sum + (self.a_theta[i0:i1] / self.b_theta[i0:i1]).sum(axis=0)
-        # Use only active beta entries in the rate term (masked = absent = 0)
-        if self._active_beta is not None:
-            beta_col_sum = xp.where(self._active_beta, E_beta, 0.0).sum(axis=0)
-        else:
-            beta_col_sum = E_beta.sum(axis=0)
-        poisson_ll -= xp.sum(theta_col_sum * beta_col_sum)
-        poisson_ll -= self._gammaln_data_sum  # cached at init
-        elbo += poisson_ll
+        # === Poisson likelihood (collapsed z) — shared helper ===
+        poisson_ll, E_log_theta, self._row_chunk = _elbo_poisson_recon(
+            a_theta=self.a_theta, b_theta=self.b_theta,
+            E_log_beta=E_log_beta, E_beta=E_beta,
+            X_row=self._X_row, X_col=self._X_col, X_data=self._X_data,
+            nnz=self._nnz, n=self.n, K=self.K,
+            row_chunk=self._row_chunk, effective_chunk=self._effective_chunk,
+            min_chunk=min_chunk, active_beta=self._active_beta,
+            gammaln_data_sum=self._gammaln_data_sum,
+            on_row_chunk_shrink=_shrink_cb,
+        )
+        elbo = poisson_ll
 
-        # === Row-chunked theta terms: PG-CAVI supervised LL, prior, entropy ===
-        # L_sup per PG_CAVI_implementation_notes.md §4:
-        #   sum_ik [kappa_ik*E[A] - c/2 + log sigma(c) - 0.5*wbar*(E[A^2] - c^2)]
-        # At the c-tilt optimum (after _update_omega), c^2 = E[A^2] and the last
-        # term is 0, so L_sup reduces to the JJ form with lam = wbar/2. We keep
-        # the full form here for monotonicity-debugging purposes (the tilt may
-        # be slightly stale relative to theta/v/gamma if the ELBO is checked
-        # mid-iteration before _update_omega has refreshed).
-        y_exp = y if y.ndim > 1 else y[:, None]
-        lam = self.wbar / 2.0                         # PG-CAVI: 2*lam = wbar at optimum
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag   # (kappa, K)
-        W = self._sample_weights                       # (n, kappa)
-
+        # === Supervised LL (tempered ELBO) — delegated to pg_Lsup ===
+        # ELBO is the tempered objective L = E[log p(X|θ,β)] + rw·E[log p(y|θ,υ,γ)]
+        # + log-priors - entropy. pg_Lsup returns the raw L_sup; we multiply by rw.
+        # (ELBO uses full rw, not ramp·rw — the ramp is a warmup device for updates.)
+        E_theta_full = self.a_theta / self.b_theta
+        Var_theta_full = E_theta_full / self.b_theta
+        regression_ll_raw, self._row_chunk = pg_Lsup(
+            E_design=E_theta_full,
+            Var_design=Var_theta_full,
+            mu_v=self.mu_v,
+            sigma_v_diag=self.sigma_v_diag,
+            mu_gamma=self.mu_gamma,
+            X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
+            y=y,
+            c=self.c_pg,
+            wbar=self.wbar,
+            sample_weights=self._sample_weights,
+            row_chunk=self._row_chunk,
+        )
+        regression_ll = float(regression_ll_raw)
         rw = self.regression_weight
-        regression_ll = 0.0
-        theta_prior = 0.0
-        theta_entropy = 0.0
-        gammaln_a = gammaln(self.a)
+        elbo += rw * regression_ll
 
+        # === θ prior (flat rate = E_xi * E_theta) — chunked, kept inline ===
+        # Hier uses structured rate so this part can't be shared as-is.
+        theta_prior = 0.0
         i0 = 0
         while i0 < self.n:
             i1 = min(i0 + self._row_chunk, self.n)
@@ -1446,37 +1514,10 @@ class CAVI:
                 b_theta_c = self.b_theta[i0:i1]
                 E_theta_c = a_theta_c / b_theta_c
                 E_log_theta_c = E_log_theta[i0:i1]
-
-                # --- PG-CAVI supervised LL ---
-                Var_theta_c = E_theta_c / b_theta_c                       # (chunk, K)
-                E_A_c = E_theta_c @ self.mu_v.T                           # (chunk, kappa)
-                if self.p_aux > 0:
-                    E_A_c = E_A_c + X_aux[i0:i1] @ self.mu_gamma.T
-                # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
-                E_A_sq_c = E_A_c ** 2 + Var_theta_c @ E_v_sq.T           # (chunk, kappa)
-                lam_c = lam[i0:i1]
-                W_c = W[i0:i1]
-                c_pg_c = self.c_pg[i0:i1]
-                regression_ll += xp.sum(
-                    W_c * ((y_exp[i0:i1] - 0.5) * E_A_c - lam_c * E_A_sq_c)
-                )
-                regression_ll += xp.sum(
-                    W_c * (lam_c * c_pg_c ** 2 - 0.5 * c_pg_c + log_expit(c_pg_c))
-                )
-
-                # --- Prior p(theta|xi) ---
                 theta_prior += xp.sum(
                     (self.a - 1) * E_log_theta_c
                     + self.a * E_log_xi[i0:i1, None]
                     - E_xi[i0:i1, None] * E_theta_c
-                )
-
-                # --- Entropy -E[log q(theta)] ---
-                psi_a_c = digamma(a_theta_c)
-                theta_entropy += xp.sum(
-                    a_theta_c - xp.log(b_theta_c)
-                    + gammaln(a_theta_c)
-                    + (1 - a_theta_c) * psi_a_c
                 )
                 i0 = i1
             except Exception as exc:
@@ -1485,154 +1526,49 @@ class CAVI:
                     print(f"  [OOM guard] row chunk → {self._row_chunk:,}")
                     continue
                 raise
+        del E_log_theta
 
-        del E_log_theta  # free the full (n, K) array
-
-        elbo += rw * regression_ll
+        theta_entropy, self._row_chunk = _elbo_theta_entropy_chunked(
+            a_theta=self.a_theta, b_theta=self.b_theta, n=self.n,
+            row_chunk=self._row_chunk, min_chunk=min_chunk,
+            on_row_chunk_shrink=_shrink_cb,
+        )
         elbo += theta_prior
-        elbo -= self.n * self.K * gammaln_a
+        elbo -= self.n * self.K * gammaln(self.a)
         elbo += theta_entropy
 
-        # === Prior: p(beta|eta) — active entries only ===
-        # Masked entries are absent from the model, so they contribute
-        # nothing to the prior or its normalization constant.
-        # === Prior: p(beta|eta) — spike-and-slab ===
-        _E_log_beta_raw = digamma(self.a_beta) - xp.log(self.b_beta)
-        _E_beta_raw = self.a_beta / self.b_beta
-
-        # Gamma prior on slab beta_tilde (Eq. 48 — NOT weighted by rho;
-        # the slab variable exists for all (j,l) regardless of inclusion)
-        _beta_prior_terms = ((self.c - 1) * _E_log_beta_raw
-                             + self.c * E_log_eta[:, None]
-                             - E_eta[:, None] * _E_beta_raw)
-        if self._active_beta is not None:
-            elbo += xp.sum(xp.where(self._active_beta, _beta_prior_terms, 0.0))
-            elbo -= float(self._n_active_beta) * gammaln(self.c)
-        else:
-            elbo += xp.sum(_beta_prior_terms)
-            elbo -= self.p * self.K * gammaln(self.c)
-        del _beta_prior_terms
-
-        # Spike-and-slab pi/m terms (only when spike-slab is active)
-        if self.use_spike_slab:
-            # Beta prior on pi_j (Eq. 46) — per-gene, shape (p,)
-            _E_log_pi = digamma(self.a_pi) - digamma(self.a_pi + self.b_pi)    # (p,)
-            _E_log_1mpi = digamma(self.b_pi) - digamma(self.a_pi + self.b_pi)  # (p,)
-            elbo += xp.sum((self.alpha_pi - 1) * _E_log_pi
-                           + (self.beta_pi - 1) * _E_log_1mpi)
-            elbo -= self.p * (gammaln(self.alpha_pi) + gammaln(self.beta_pi)
-                              - gammaln(self.alpha_pi + self.beta_pi))
-
-            # Bernoulli prior on m (Eq. 47) — only free factors (pathway r is deterministic)
-            _m_prior = (self.r_beta * _E_log_pi[:, None]
-                        + (1.0 - self.r_beta) * _E_log_1mpi[:, None])
-            if self._pw_active is not None:
-                _is_free = ~self._pw_active
-                if self._active_beta is not None:
-                    _is_free = _is_free & self._active_beta
-                elbo += xp.sum(xp.where(_is_free, _m_prior, 0.0))
-            else:
-                elbo += xp.sum(_m_prior)
-            del _m_prior
-
-            # Entropy of q(m_{jk}) = Bernoulli(r_{jk}) (Eq. 56) — free factors only
-            _r_clip = xp.clip(self.r_beta, 1e-7, 1 - 1e-7)
-            _m_entropy = (_r_clip * xp.log(_r_clip)
-                          + (1 - _r_clip) * xp.log(1 - _r_clip))
-            if self._pw_active is not None:
-                _is_free = ~self._pw_active
-                if self._active_beta is not None:
-                    _is_free = _is_free & self._active_beta
-                elbo -= xp.sum(xp.where(_is_free, _m_entropy, 0.0))
-            else:
-                elbo -= xp.sum(_m_entropy)
-            del _r_clip, _m_entropy
-
-            # Entropy of q(pi_j) = Beta(a_pi_j, b_pi_j) (Eq. 57) — per-gene
-            _H_pi = (gammaln(self.a_pi) + gammaln(self.b_pi)
-                      - gammaln(self.a_pi + self.b_pi)
-                      - (self.a_pi - 1) * digamma(self.a_pi)
-                      - (self.b_pi - 1) * digamma(self.b_pi)
-                      + (self.a_pi + self.b_pi - 2) * digamma(self.a_pi + self.b_pi))
-            elbo += xp.sum(_H_pi)
-            del _H_pi
-
-        # Entropy of q(beta_tilde_{jk}) — NOT weighted by rho (Eq. 55);
-        # the slab variational distribution exists for all (j,l).
-        _psi_a_beta = digamma(self.a_beta)
-        _beta_entropy = (self.a_beta - xp.log(self.b_beta)
-                         + gammaln(self.a_beta)
-                         + (1 - self.a_beta) * _psi_a_beta)
-        if self._active_beta is not None:
-            elbo += xp.sum(xp.where(self._active_beta, _beta_entropy, 0.0))
-        else:
-            elbo += xp.sum(_beta_entropy)
-        del _psi_a_beta, _beta_entropy, _E_log_beta_raw, _E_beta_raw
-
-        # === Prior: p(xi) ===
-        elbo += xp.sum((self.ap - 1) * E_log_xi
-                       + self.ap * xp.log(self.bp) - self.bp * E_xi)
-        elbo -= self.n * gammaln(self.ap)
-
-        # === Prior: p(eta) ===
-        elbo += xp.sum((self.cp - 1) * E_log_eta
-                       + self.cp * xp.log(self.dp) - self.dp * E_eta)
-        elbo -= self.p * gammaln(self.cp)
-
-        # === Prior: p(v|s) + p(s) + H[q(v)] + H[q(s)] — Laplace (Eqs. 51-52, 58, 60) ===
-        E_v_sq = self.mu_v ** 2 + self.sigma_v_diag  # (kappa, K)
-        omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-        # GIG(-1/2, a=1/b_v^2, b=omega^2) => IG(mu=omega*b_v, lambda=omega^2)
-        # E[1/X] = 1/mu + 1/lambda = 1/(omega*b_v) + 1/omega^2
-        E_inv_s = 1.0 / (self.b_v * omega + 1e-12) + 1.0 / (omega ** 2 + 1e-12)
-        # No cap: allow full adaptive shrinkage. Small omega → large E_inv_s
-        # (strong shrinkage for near-zero v), large omega → small E_inv_s
-        # (relaxed penalty for disease-relevant factors).
-        # InvGaussian parameters (Eq. 39)
-        mu_s = omega * self.b_v                        # E[s] = omega * b_v
-        lambda_s = omega ** 2                           # shape parameter
-        E_s = mu_s
-        # E[log s] ~ log(mu_s) (first-order approximation)
-        E_log_s = xp.log(xp.maximum(mu_s, 1e-12))
-
-        # No rw scaling on prior/entropy terms — CAVI updates use rw=1,
-        # so the ELBO must match. rw only scales regression_ll for monitoring.
-
-        # Eq. 51: E[log p(v|s)] = -0.5*log(2pi) - 0.5*E[log s] - 0.5*E[v^2]*E[1/s]
-        elbo += xp.sum(-0.5 * xp.log(2 * xp.pi) - 0.5 * E_log_s
-                        - 0.5 * E_v_sq * E_inv_s)
-        # Eq. 52: E[log p(s)] = log(rate) - rate*E[s], where rate = 1/(2*b_v^2)
-        rate_s = 1.0 / (2.0 * self.b_v ** 2)
-        elbo += xp.sum(xp.log(rate_s) - rate_s * E_s)
-        # Eq. 60: H[q(s)] = 0.5*log(2*pi*e*mu_s^3/lambda_s)
-        elbo += 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
-                                      / xp.maximum(lambda_s, 1e-12)))
-
-        # === Prior: p(gamma) (Eq. 53) ===
-        if self.p_aux > 0:
-            sigma_gamma_sq = self.sigma_gamma ** 2
-            for k in range(self.kappa):
-                elbo -= 0.5 * self.p_aux * float(xp.log(2 * xp.pi * sigma_gamma_sq))
-                _mu_sq_plus_var = self.mu_gamma[k] ** 2 + xp.diag(self.Sigma_gamma[k])
-                elbo -= 0.5 * float(xp.sum(_mu_sq_plus_var)) / sigma_gamma_sq
-
-        # === Entropy: -E[log q] ===
-        # q(beta) entropy already handled above in spike-slab prior block
-        # q(xi)
-        elbo += xp.sum(self.a_xi - xp.log(self.b_xi)
-                       + self._gammaln_a_xi
-                       + (1 - self.a_xi) * self._digamma_a_xi)
-        # q(eta)
-        elbo += xp.sum(self.a_eta - xp.log(self.b_eta)
-                       + self._gammaln_a_eta
-                       + (1 - self.a_eta) * self._digamma_a_eta)
-        # q(v) Gaussian entropy
-        elbo += 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * self.sigma_v_diag))
-        # q(gamma) Gaussian entropy
-        if self.p_aux > 0:
-            for k in range(self.kappa):
-                sign, logdet = xp.linalg.slogdet(self.Sigma_gamma[k])
-                elbo += 0.5 * float(self.p_aux * xp.log(2 * xp.pi * xp.e) + logdet)
+        # === Shared gene-side / hyperprior blocks ===
+        elbo += _elbo_beta_block(
+            a_beta=self.a_beta, b_beta=self.b_beta,
+            E_log_eta=E_log_eta, E_eta=E_eta, c_prior=self.c,
+            p=self.p, K=self.K,
+            active_beta=self._active_beta, n_active_beta=self._n_active_beta,
+            use_spike_slab=self.use_spike_slab, pw_active=self._pw_active,
+            r_beta=self.r_beta,
+            a_pi=getattr(self, "a_pi", None), b_pi=getattr(self, "b_pi", None),
+            alpha_pi=self.alpha_pi, beta_pi=getattr(self, "beta_pi", None),
+        )
+        elbo += _elbo_xi_block(
+            E_log_xi=E_log_xi, E_xi=E_xi,
+            a_xi=self.a_xi, b_xi=self.b_xi,
+            gammaln_a_xi_cached=self._gammaln_a_xi,
+            digamma_a_xi_cached=self._digamma_a_xi,
+            ap=self.ap, bp=self.bp, n=self.n,
+        )
+        elbo += _elbo_eta_block(
+            E_log_eta=E_log_eta, E_eta=E_eta,
+            a_eta=self.a_eta, b_eta=self.b_eta,
+            gammaln_a_eta_cached=self._gammaln_a_eta,
+            digamma_a_eta_cached=self._digamma_a_eta,
+            cp=self.cp, dp=self.dp, p=self.p,
+        )
+        elbo += _elbo_v_block(
+            mu_v=self.mu_v, sigma_v_diag=self.sigma_v_diag, b_v=self.b_v,
+        )
+        elbo += _elbo_gamma_aux_block(
+            mu_gamma=self.mu_gamma, Sigma_gamma=self.Sigma_gamma,
+            sigma_gamma=self.sigma_gamma, kappa=self.kappa, p_aux=self.p_aux,
+        )
 
         return float(elbo), float(poisson_ll), float(regression_ll)
 
@@ -2392,12 +2328,23 @@ class CAVI:
     # predict / transform (API compat)
     # =================================================================
 
-    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None):
+    def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None,
+                            supervised=True):
         """Infer theta for new data using chunked sparse phi.
 
-        Theta inference matches the training regime: includes the PG-CAVI
-        supervised quadratic regularization (0.5 * wbar @ E_v_sq * E[theta]
-        on the Gamma rate, from notes §3.2). Returns a_theta, b_theta.
+        When ``supervised=True`` (default): matches the training regime,
+        including the PG-CAVI supervised quadratic regularization
+        (0.5 * wbar @ E_v_sq) on the Gamma rate (notes §3.2). Use this when
+        treating fold-in as part of the same supervised inference loop.
+
+        When ``supervised=False``: Poisson-only fold-in. The supervised
+        quadratic (which shapes test θ via the trained υ even without y_new)
+        is dropped, so b_theta = b_poisson with the existing floors. Use
+        this for inductive evaluation — "new, unlabeled patient" inference
+        that must be label-blind for honest comparison to unsupervised
+        baselines (scHPF / NMF / Spectra).
+
+        Returns a_theta, b_theta.
         """
         a_theta = to_device(np.random.uniform(0.5 * self.a, 1.5 * self.a, (n_new, self.K)))
         b_theta = to_device(np.full((n_new, self.K), self.bp))
@@ -2445,25 +2392,29 @@ class CAVI:
             a_theta = self.a + z_sum
             b_poisson = E_xi[:, None] + beta_col_sums[None, :]
 
-            # PG-CAVI quadratic regularization on theta rate (matches training).
-            # Raw theta for regression
-            Var_theta = E_theta / b_theta
-            theta_v = E_theta @ E_v.T                     # (n_new, kappa)
-            if X_aux_new is not None and self.p_aux > 0:
-                theta_v = theta_v + X_aux_new @ self.mu_gamma.T
-            # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
-            E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
-            c_new = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
-            wbar_new = omega_bar(c_new)                  # (n_new, kappa)
+            if supervised:
+                # PG-CAVI quadratic regularization on theta rate (matches training).
+                # Raw theta for regression
+                Var_theta = E_theta / b_theta
+                theta_v = E_theta @ E_v.T                     # (n_new, kappa)
+                if X_aux_new is not None and self.p_aux > 0:
+                    theta_v = theta_v + X_aux_new @ self.mu_gamma.T
+                # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
+                E_A_sq = xp.square(theta_v) + Var_theta @ E_v_sq.T
+                c_new = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
+                wbar_new = omega_bar(c_new)                  # (n_new, kappa)
 
-            # Quadratic regularization: R_quad_coeff = 0.5 * wbar @ E_v_sq
-            # (PG-CAVI factor: 0.5 from notes §3.2).
-            R_quad = 0.5 * wbar_new @ E_v_sq             # (n_new, K)
+                # Quadratic regularization: R_quad_coeff = 0.5 * wbar @ E_v_sq
+                # (PG-CAVI factor: 0.5 from notes §3.2).
+                R_quad = 0.5 * wbar_new @ E_v_sq             # (n_new, K)
 
-            # Solve quadratic: b^2 - b_poisson*b - R_quad*a_theta = 0
-            c_quad = R_quad
-            disc = xp.sqrt(xp.square(b_poisson) + 4.0 * c_quad * a_theta)
-            b_theta = (b_poisson + disc) / 2.0
+                # Solve quadratic: b^2 - b_poisson*b - R_quad*a_theta = 0
+                c_quad = R_quad
+                disc = xp.sqrt(xp.square(b_poisson) + 4.0 * c_quad * a_theta)
+                b_theta = (b_poisson + disc) / 2.0
+            else:
+                # Poisson-only fold-in (R_quad dropped) — see docstring.
+                b_theta = b_poisson
             b_theta = xp.maximum(b_theta, 0.1 * b_poisson)
             b_theta = xp.maximum(b_theta, self.bp)
             b_theta = xp.maximum(b_theta, 1e-2)
@@ -2654,8 +2605,14 @@ class CAVI:
 
         return calibrated.reshape(original_shape)
 
-    def transform(self, X_new, y_new=None, X_aux_new=None, n_iter=20, **kwargs):
-        """Infer theta for new data. Returns dict with E_theta, a_theta, b_theta."""
+    def transform(self, X_new, y_new=None, X_aux_new=None, n_iter=20,
+                  supervised=True, **kwargs):
+        """Infer theta for new data. Returns dict with E_theta, a_theta, b_theta.
+
+        ``supervised=False`` gives Poisson-only fold-in (drops the supervised
+        quadratic in `_infer_theta_sparse`) — use for label-blind inductive
+        evaluation where the trained υ must not shape test θ.
+        """
         if sp.issparse(X_new):
             X_coo = X_new.tocoo()
         else:
@@ -2668,7 +2625,7 @@ class CAVI:
             np.asarray(X_aux_new, dtype=np.float32), n=n_new)
         X_aux_dev = to_device(X_aux_new)
         a_theta, b_theta = self._infer_theta_sparse(
-            X_coo, n_new, n_iter, X_aux_new=X_aux_dev)
+            X_coo, n_new, n_iter, X_aux_new=X_aux_dev, supervised=supervised)
 
         return {
             'E_theta': to_numpy(a_theta / b_theta),
