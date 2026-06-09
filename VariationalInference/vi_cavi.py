@@ -24,6 +24,12 @@ except ImportError:
         pg_tilt, pg_R_correction, pg_update_v, pg_update_gamma, pg_Lsup,
     )
 
+if USE_JAX:
+    import jax.scipy.special as _jsp_for_erf
+    _erf = _jsp_for_erf.erf
+else:
+    from scipy.special import erf as _erf
+
 
 def _auto_chunk_size(nnz, K, target_gb=None):
     """Auto-tune chunk size to target a given work-array memory budget.
@@ -290,28 +296,34 @@ def _elbo_eta_block(*, E_log_eta, E_eta, a_eta, b_eta, gammaln_a_eta_cached,
 
 
 def _elbo_v_block(*, mu_v, sigma_v_diag, b_v):
-    """E[log p(v|s)] + E[log p(s)] + H[q(s)] + H[q(v)] — Bayesian-Lasso
-    via Inverse-Gaussian augmentation. Eqs. 51-52, 58, 60.
-    """
-    E_v_sq = mu_v ** 2 + sigma_v_diag  # (kappa, K)
-    omega = xp.sqrt(xp.maximum(E_v_sq, 1e-12))
-    # GIG(-1/2): E[1/s] = 1/(omega*b_v) + 1/omega^2
-    E_inv_s = 1.0 / (b_v * omega + 1e-12) + 1.0 / (omega ** 2 + 1e-12)
-    mu_s = omega * b_v
-    lambda_s = omega ** 2
-    E_s = mu_s
-    E_log_s = xp.log(xp.maximum(mu_s, 1e-12))
+    """Bayesian-Lasso block of the ELBO (MD §11.3, PDF below A.14).
 
-    # Eq. 51
-    out = xp.sum(-0.5 * xp.log(2 * xp.pi) - 0.5 * E_log_s
-                  - 0.5 * E_v_sq * E_inv_s)
-    # Eq. 52
-    rate_s = 1.0 / (2.0 * b_v ** 2)
-    out = out + xp.sum(xp.log(rate_s) - rate_s * E_s)
-    # Eq. 60
-    out = out + 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * mu_s ** 3
-                                     / xp.maximum(lambda_s, 1e-12)))
-    # q(v) Gaussian entropy
+    Uses the *collapsed* Laplace route:
+
+        E_q[log Laplace(υ_kℓ; 0, b_v)] = -log(2 b_v) - (1/b_v) E_q[|υ_kℓ|],
+
+    with the folded-normal mean for E_q[|υ|] under q(υ_kℓ)=N(μ, τ²). This
+    drops the s, log s bookkeeping (no IG/GIG entropy needed) while
+    leaving the augmentation implicit. q(υ) Gaussian entropy is added.
+
+    Correctness note (MD §13.1): the previous form used the spurious
+    two-term E[s⁻¹] = 1/(b_v·ω) + 1/ω², which assumed *s* itself were
+    inverse-Gaussian. In fact only the precision 1/s is IG, so E[s⁻¹] is
+    a single IG mean. The collapsed route here sidesteps the issue.
+    """
+    # Folded-normal mean of υ_kℓ ~ N(μ, τ²).
+    tau = xp.sqrt(xp.maximum(sigma_v_diag, 1e-12))
+    z = mu_v / tau
+    # 2·Φ(z) - 1 = erf(z/√2)
+    erf_z = _erf(z / float(np.sqrt(2.0)))
+    E_abs_v = (
+        tau * float(np.sqrt(2.0 / np.pi)) * xp.exp(-0.5 * xp.square(z))
+        + mu_v * erf_z
+    )
+
+    # E[log p(υ | b_v)] under the marginal Laplace.
+    out = xp.sum(-xp.log(2.0 * b_v) - E_abs_v / b_v)
+    # q(υ) Gaussian entropy.
     out = out + 0.5 * xp.sum(xp.log(2 * xp.pi * xp.e * sigma_v_diag))
     return out
 
@@ -1394,6 +1406,7 @@ class CAVI:
             mu_v=self.mu_v,
             sigma_v_diag=self.sigma_v_diag,
             mu_gamma=self.mu_gamma,
+            Sigma_gamma=self.Sigma_gamma,
             X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
             row_chunk=self._row_chunk,
         )
@@ -1495,6 +1508,7 @@ class CAVI:
             mu_v=self.mu_v,
             sigma_v_diag=self.sigma_v_diag,
             mu_gamma=self.mu_gamma,
+            Sigma_gamma=self.Sigma_gamma,
             X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
             y=y,
             c=self.c_pg,
@@ -1606,8 +1620,10 @@ class CAVI:
             np.asarray(X_aux_val, dtype=np.float32), n=n_val)
         X_aux_v_dev = to_device(X_aux_val)
 
+        # Validation fold-in: unsupervised (Algorithm 2 / Eq. A.17).
         a_theta_v, b_theta_v = self._infer_theta_sparse(
-            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev)
+            X_val_coo, n_val, n_iter, X_aux_new=X_aux_v_dev,
+            supervised=False)
 
         E_log_beta = self._E_log_beta_cache
         E_beta = self.E_beta
@@ -1657,8 +1673,24 @@ class CAVI:
                 E_A = E_A + X_aux_v_dev @ self.mu_gamma.T
 
             E_v_sq = self.mu_v ** 2 + self.sigma_v_diag
-            # E[A^2]: Var[theta] cross-term ONLY (notes §3.6).
-            E_A_sq = E_A ** 2 + Var_theta_v @ E_v_sq.T
+            # Full E[A²] decomposition (matches pg_Lsup / PDF Eq. A.15):
+            # (E[A])² + Σ_ℓ[Var(θ)·E[υ²] + E[θ]²·τ²_υ] + x_aux^T Σ_γ x_aux.
+            E_A_sq = (
+                E_A ** 2
+                + Var_theta_v @ E_v_sq.T
+                + xp.square(E_theta_v) @ self.sigma_v_diag.T
+            )
+            if self.p_aux > 0:
+                aux_var = xp.zeros((n_val, self.kappa))
+                for k in range(self.kappa):
+                    aux_var_k = xp.sum(
+                        (X_aux_v_dev @ self.Sigma_gamma[k]) * X_aux_v_dev,
+                        axis=1)
+                    if USE_JAX:
+                        aux_var = aux_var.at[:, k].set(aux_var_k)
+                    else:
+                        aux_var[:, k] = aux_var_k
+                E_A_sq = E_A_sq + aux_var
 
             c_val = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
             wbar_val = omega_bar(c_val)
@@ -2332,21 +2364,20 @@ class CAVI:
     # =================================================================
 
     def _infer_theta_sparse(self, X_coo, n_new, n_iter=20, X_aux_new=None,
-                            supervised=True):
+                            supervised=False):
         """Infer theta for new data using chunked sparse phi.
 
-        When ``supervised=True`` (default): matches the training regime,
-        including the PG-CAVI supervised quadratic regularization
-        (`ω̄ @ E_v_sq`, i.e. 2× the bare θ² coefficient — same KL-optimal
-        Gamma projection used in `pg_R_correction`). Use this when treating
-        fold-in as part of the same supervised inference loop.
+        Default (``supervised=False``): Poisson-only fold-in per PDF
+        Algorithm 2 / Eq. (A.17). Since y_new is absent, R_iℓ = 0 and the
+        rate reduces to b_θ = E[ξ] + Σ_j ρ_jℓ E[β̃_jℓ]. No PG variables
+        are required for fold-in. This is the documented, label-blind path
+        for inductive evaluation.
 
-        When ``supervised=False``: Poisson-only fold-in. The supervised
-        quadratic (which shapes test θ via the trained υ even without y_new)
-        is dropped, so b_theta = b_poisson with the existing floors. Use
-        this for inductive evaluation — "new, unlabeled patient" inference
-        that must be label-blind for honest comparison to unsupervised
-        baselines (scHPF / NMF / Spectra).
+        ``supervised=True`` keeps the PG-CAVI supervised quadratic that
+        couples test θ to the trained υ (via E[υ²]) even without y_new —
+        a label leak (see MEMORY: "DRGP θ label-leak"). Off by default;
+        keep only for diagnostics that intentionally trace training-regime
+        θ shaping.
 
         Returns a_theta, b_theta.
         """
@@ -2449,7 +2480,8 @@ class CAVI:
         X_aux_v_dev = to_device(X_aux_v)
 
         a_theta_v, b_theta_v = self._infer_theta_sparse(
-            X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev)
+            X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev,
+            supervised=False)
         E_theta_v = a_theta_v / b_theta_v
         y_np = np.asarray(y_val, dtype=np.float32)
         if y_np.ndim == 1:
@@ -2483,9 +2515,14 @@ class CAVI:
     def predict_proba(self, X_new, X_aux_new=None, n_iter=20, **_ignored):
         """Predict P(y=1 | X_new).
 
-        Uses the probit approximation to account for posterior variance in
-        both theta and v, improving probability calibration:
-            P(y=1) ≈ sigmoid(E[logit] / sqrt(1 + pi * Var[logit] / 3))
+        Per PDF (A.18), uses the Gaussian–logistic (probit-style)
+        approximation to integrate σ(A) over q(A):
+
+            P(y=1) ≈ σ( E_q[A] / sqrt(1 + (π/8) Var_q[A]) ).
+
+        Var_q[A] includes the full posterior variance contributions of θ,
+        υ, and γ (the same three pieces as (A.15)). Fold-in for θ is
+        Poisson-only (label-blind; matches Algorithm 2 / Eq. A.17).
         """
         if sp.issparse(X_new):
             X_coo = X_new.tocoo()
@@ -2500,7 +2537,7 @@ class CAVI:
         X_aux_new = to_device(X_aux_new)
 
         a_theta, b_theta = self._infer_theta_sparse(
-            X_coo, n_new, n_iter, X_aux_new=X_aux_new)
+            X_coo, n_new, n_iter, X_aux_new=X_aux_new, supervised=False)
 
         mu_v_2d = self.mu_v
         sv_2d   = self.sigma_v_diag
@@ -2512,13 +2549,21 @@ class CAVI:
 
         Var_theta = E_theta / b_theta
         E_v_sq = mu_v_2d ** 2 + sv_2d
+        # Full second-moment decomposition of A (matches (A.15)).
         var_logits = Var_theta @ E_v_sq.T + xp.square(E_theta) @ sv_2d.T
         if self.p_aux > 0:
-            gamma_var = xp.stack([xp.diag(self.Sigma_gamma[k])
-                                  for k in range(self.kappa)])  # (kappa, p_aux)
-            var_logits = var_logits + xp.square(X_aux_new) @ gamma_var.T
+            # Full quadratic form x^T Σ_γk x per row, k.
+            aux_var = xp.zeros((n_new, self.kappa))
+            for k in range(self.kappa):
+                aux_var_k = xp.sum(
+                    (X_aux_new @ self.Sigma_gamma[k]) * X_aux_new, axis=1)
+                if USE_JAX:
+                    aux_var = aux_var.at[:, k].set(aux_var_k)
+                else:
+                    aux_var[:, k] = aux_var_k
+            var_logits = var_logits + aux_var
 
-        scale = xp.sqrt(1.0 + (np.pi / 3.0) * var_logits)
+        scale = xp.sqrt(1.0 + (np.pi / 8.0) * var_logits)
         logits_calibrated = logits / scale
 
         return to_numpy(_expit(logits_calibrated)).squeeze()
@@ -2610,12 +2655,13 @@ class CAVI:
         return calibrated.reshape(original_shape)
 
     def transform(self, X_new, y_new=None, X_aux_new=None, n_iter=20,
-                  supervised=True, **kwargs):
+                  supervised=False, **kwargs):
         """Infer theta for new data. Returns dict with E_theta, a_theta, b_theta.
 
-        ``supervised=False`` gives Poisson-only fold-in (drops the supervised
-        quadratic in `_infer_theta_sparse`) — use for label-blind inductive
-        evaluation where the trained υ must not shape test θ.
+        Default ``supervised=False`` matches PDF Algorithm 2 / Eq. (A.17):
+        label-blind Poisson-only fold-in for inductive evaluation. Pass
+        ``supervised=True`` only when you intentionally want the trained υ
+        to shape test θ (training-regime diagnostic; leaks via E[υ²]).
         """
         if sp.issparse(X_new):
             X_coo = X_new.tocoo()

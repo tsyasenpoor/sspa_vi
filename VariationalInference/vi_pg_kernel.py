@@ -81,31 +81,53 @@ def _has_aux(X_aux) -> bool:
 # =========================================================================
 # pg_tilt — PG augmentation: c = sqrt(E[A²]); wbar = omega_bar(c). rw-independent.
 # =========================================================================
-def pg_tilt(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma, X_aux,
-            row_chunk):
+def pg_tilt(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma, Sigma_gamma,
+            X_aux, row_chunk):
     """Returns (c, wbar, row_chunk_used).
 
-    c²_{ik} = (E[design_i]^T μ_v_k + X_aux_i μ_γ_k^T)²
-              + Σ_ℓ Var[design_iℓ] (μ_v²_kℓ + σ²_v_kℓ)
-    wbar_{ik} = (1/(2 c_{ik})) tanh(c_{ik}/2)
+    Full second moment (MD §10 / PDF (A.15)):
 
-    `Var[design]` cross-term ONLY (paper notes §3.6; Var[υ], Var[γ]
-    cross-terms intentionally omitted for paper parity).
+        c²_{ik} = (E[A_{ik}])²
+                + Σ_ℓ [ Var(design_{iℓ})·E[υ²_{kℓ}] + E[design_{iℓ}]²·τ²_{υkℓ} ]
+                + x_aux_i^T Σ_{γk} x_aux_i
+
+    All three variance pieces are required: dropping the υ- or γ-variance
+    leaves c² as only a partial second moment and breaks the L_sup
+    residual identity (MD §13.2; PDF: "Retaining all three variance terms
+    is necessary for the tilt to equal the full second moment, so that
+    the residual in Eq. (A.16) vanishes at the optimum").
     """
     units = E_design.shape[0]
     min_chunk = _min_chunk(units)
     has_aux = _has_aux(X_aux)
     E_v_sq = mu_v ** 2 + sigma_v_diag                       # (kappa, K)
+    sigma_v_diag_T = sigma_v_diag.T                          # (K, kappa)
 
     chunks = []
     i0 = 0
     while i0 < units:
         i1 = min(i0 + row_chunk, units)
         try:
-            E_A_c = E_design[i0:i1] @ mu_v.T                # (chunk, kappa)
+            E_design_c = E_design[i0:i1]
+            E_A_c = E_design_c @ mu_v.T                     # (chunk, kappa)
             if has_aux:
                 E_A_c = E_A_c + X_aux[i0:i1] @ mu_gamma.T
+            # θ-variance × E[υ²]
             E_A_sq_c = xp.square(E_A_c) + Var_design[i0:i1] @ E_v_sq.T
+            # E[θ]² × Var(υ)  (missing previously)
+            E_A_sq_c = E_A_sq_c + xp.square(E_design_c) @ sigma_v_diag_T
+            # x_aux^T Σ_γk x_aux  (missing previously)
+            if has_aux:
+                X_aux_c = X_aux[i0:i1]
+                aux_var_c = xp.zeros((i1 - i0, mu_v.shape[0]))
+                for k in range(mu_v.shape[0]):
+                    aux_var_c_k = xp.sum(
+                        (X_aux_c @ Sigma_gamma[k]) * X_aux_c, axis=1)
+                    if USE_JAX:
+                        aux_var_c = aux_var_c.at[:, k].set(aux_var_c_k)
+                    else:
+                        aux_var_c[:, k] = aux_var_c_k
+                E_A_sq_c = E_A_sq_c + aux_var_c
             chunks.append(xp.sqrt(xp.maximum(E_A_sq_c, 1e-12)))
             i0 = i1
         except Exception as exc:
@@ -202,15 +224,24 @@ def pg_update_v(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma,
                 effective_rw, ramp, row_chunk):
     """Returns (new_mu_v, new_sigma_v_diag, row_chunk_used).
 
-    Tempered: data sufficient statistics × effective_rw. Laplace prior at weight 1.
-    Under-relaxed by α_v = min(0.1, 10/K) · ramp (trust region α scales with ramp,
-    not rw — supervision strength shouldn't change step size).
+    Tempered: data sufficient statistics × effective_rw. Bayesian-Lasso
+    prior at weight 1. Under-relaxed by α_v = min(0.1, 10/K) · ramp.
 
-    precision_kℓ = 1/b_v² + effective_rw · 2 · Σ_i W_ik (ω̄_ik/2) E[design²_iℓ]
-                                  = 1/b_v² + effective_rw · Σ_i W_ik ω̄_ik E[design²_iℓ]
+    The prior on υ_kℓ is the Gaussian-exponential scale mixture
+    υ_kℓ | s_kℓ ~ N(0, s_kℓ), s_kℓ ~ Exp(1/2b_v²), which marginalizes to
+    Laplace(0, b_v). The optimal q(s_kℓ⁻¹) is inverse-Gaussian (MD §9.2 /
+    PDF (A.14)), whose mean supplies the only required moment:
+
+        E_q[s_kℓ⁻¹] = 1 / (b_v · ω_kℓ),    ω_kℓ = sqrt(μ²_υkℓ + τ²_υkℓ).
+
+    precision_kℓ = E[s_kℓ⁻¹] + effective_rw · Σ_i W_ik ω̄_ik E[design²_iℓ]
     mean numerator (raw)
       = effective_rw · [Σ_i W_ik (y_ik - 0.5) E[design_iℓ]
                        - 2 Σ_i W_ik (ω̄_ik/2) ((design_v_ik) E[design_iℓ] - v_kℓ E[design_iℓ]²)]
+
+    Common-error guard (MD §13.1): E[s⁻¹] is the single IG-mean term, not
+    the spurious μ⁻¹+λ⁻¹ expansion; it is the *precision* 1/s that is IG,
+    not s itself.
     """
     units = E_design.shape[0]
     kappa = mu_v.shape[0]
@@ -218,7 +249,9 @@ def pg_update_v(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma,
     lam = wbar / 2.0                                  # PG-CAVI: 2*lam = wbar at tilt optimum
     W = sample_weights
     E_v = mu_v
-    prior_precision = xp.full_like(mu_v, 1.0 / (b_v ** 2))
+    # Bayesian-Lasso adaptive prior precision E[s_kℓ⁻¹] = 1/(b_v · ω_kℓ).
+    omega_v = xp.sqrt(xp.maximum(mu_v ** 2 + sigma_v_diag, 1e-12))
+    prior_precision = 1.0 / (b_v * omega_v + 1e-12)
     min_chunk = _min_chunk(units)
     has_aux = _has_aux(X_aux)
 
@@ -356,21 +389,22 @@ def pg_update_gamma(E_design, mu_v, mu_gamma, Sigma_gamma, sigma_gamma_param,
 # =========================================================================
 # pg_Lsup — supervised contribution to ELBO (BEFORE × rw).
 # =========================================================================
-def pg_Lsup(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma,
+def pg_Lsup(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma, Sigma_gamma,
             X_aux, y, c, wbar, sample_weights, row_chunk):
     """Returns (Lsup_raw, row_chunk_used). Caller multiplies by effective_rw.
 
       L_sup = Σ_ik W_ik [ (y_ik - 0.5) E[A_ik]  -  (ω̄_ik/2) E[A²_ik]
                           + (ω̄_ik/2) c²_ik  -  c_ik/2  +  log σ(c_ik) ]
 
-    At the c-tilt optimum (after pg_tilt), c² = E[A²] and the last three
-    terms collapse to log σ(c) - c/2 (JJ form). Keep the full form for
-    monotonicity-debugging when the tilt is slightly stale.
+    E[A²] uses the *full* second moment (MD §10 / PDF A.15) — same as
+    pg_tilt — so that at the c-tilt optimum c² = E[A²] and the JJ residual
+    `(ω̄/2)(E[A²] - c²)` vanishes exactly (MD §13.2).
     """
     units = E_design.shape[0]
     y_exp = y if y.ndim > 1 else y[:, None]
     lam = wbar / 2.0
     E_v_sq = mu_v ** 2 + sigma_v_diag
+    sigma_v_diag_T = sigma_v_diag.T
     min_chunk = _min_chunk(units)
     has_aux = _has_aux(X_aux)
 
@@ -384,7 +418,23 @@ def pg_Lsup(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma,
             E_A_c = E_design_c @ mu_v.T
             if has_aux:
                 E_A_c = E_A_c + X_aux[i0:i1] @ mu_gamma.T
-            E_A_sq_c = E_A_c ** 2 + Var_design_c @ E_v_sq.T
+            # Match pg_tilt's full second moment.
+            E_A_sq_c = (
+                E_A_c ** 2
+                + Var_design_c @ E_v_sq.T
+                + xp.square(E_design_c) @ sigma_v_diag_T
+            )
+            if has_aux:
+                X_aux_c = X_aux[i0:i1]
+                aux_var_c = xp.zeros((i1 - i0, mu_v.shape[0]))
+                for k in range(mu_v.shape[0]):
+                    aux_var_c_k = xp.sum(
+                        (X_aux_c @ Sigma_gamma[k]) * X_aux_c, axis=1)
+                    if USE_JAX:
+                        aux_var_c = aux_var_c.at[:, k].set(aux_var_c_k)
+                    else:
+                        aux_var_c[:, k] = aux_var_c_k
+                E_A_sq_c = E_A_sq_c + aux_var_c
 
             lam_c = lam[i0:i1]
             W_c = sample_weights[i0:i1]
