@@ -37,10 +37,11 @@ def _fit_nmf(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, K: int, seed: 
 
 def _fit_schpf(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, K: int, seed: int):
     from schpf import scHPF
-    m = scHPF(nfactors=K, random_state=seed)
-    m.fit(X_train_sp)
+    np.random.seed(seed)            # scHPF uses np.random internally; no random_state arg
+    m = scHPF(nfactors=K)
+    m.fit(X_train_sp.tocoo())       # scHPF expects COO (uses .col attribute)
     H_tr = np.asarray(m.cell_score(), dtype=np.float32)         # (n_tr, K)
-    H_te = np.asarray(m.project(X_test_sp).cell_score(), dtype=np.float32)
+    H_te = np.asarray(m.project(X_test_sp.tocoo()).cell_score(), dtype=np.float32)
     beta = np.asarray(m.gene_score()).T                          # (K, p)
     return H_tr, H_te, beta
 

@@ -29,18 +29,19 @@ def run(truth_idx: int = 0, K: int = 8) -> dict:
         m = run_drgp(str(p), mode="unmasked", K=K, inner_seed=0,
                      out_dir=str(sub), regression_weight=rw, max_iter=2000,
                      early_stopping="none", verbose=True)
-        # Use the IN-SAMPLE training integrated AUC. Held-out AUC has an inductive
-        # transfer flaw at high rw (theta_tr shaped by R_quad ≠ Poisson-only theta_te),
-        # documented in MEMORY:feedback_drgp_theta_label_leak. Training AUC is the
-        # clean engagement signal: rw=0 → chance, rw=15 → high (overfit is fine).
-        results[rw] = m["cell_auc_integrated_train"]
-        print(f"  rw={rw:>5}  train-integrated AUC = {m['cell_auc_integrated_train']:.4f}"
-              f"   held-out integrated = {m['cell_auc_integrated']:.4f}"
-              f"   held-out posthoc = {m['cell_auc_posthoc']:.4f}")
+        # Gate on Theta-only train AUC — measures whether (β, υ) carry label-
+        # discriminative signal without γ absorbing it. cell_auc_integrated_train
+        # is blind to γ-memorization at high rw (γ alone can achieve high AUC);
+        # cell_auc_theta_only_train measures the factor-level engagement directly.
+        results[rw] = m["cell_auc_theta_only_train"]
+        print(f"  rw={rw:>5}  theta-only train = {m['cell_auc_theta_only_train']:.4f}"
+              f"   integrated train = {m['cell_auc_integrated_train']:.4f}"
+              f"   theta-only held-out = {m['cell_auc_theta_only']:.4f}"
+              f"   consistent held-out = {m['cell_auc_consistent']:.4f}")
     gap = results[config.REGRESSION_WEIGHT] - results[0.0]
-    print(f"\n  gap (train-integrated AUC, rw=15 - rw=0) = {gap:+.4f}")
+    print(f"\n  gap (theta-only train AUC, rw=15 - rw=0) = {gap:+.4f}")
     assert results[0.0] <= config.RW_ENGAGEMENT_RW0_AUC_MAX, \
-        f"rw=0 train-integrated AUC {results[0.0]:.3f} > {config.RW_ENGAGEMENT_RW0_AUC_MAX}"
+        f"rw=0 theta-only train AUC {results[0.0]:.3f} > {config.RW_ENGAGEMENT_RW0_AUC_MAX}"
     assert gap >= config.RW_ENGAGEMENT_GAP_MIN, \
         f"rw gap {gap:+.3f} < {config.RW_ENGAGEMENT_GAP_MIN}"
     (base / "gate.json").write_text(json.dumps(

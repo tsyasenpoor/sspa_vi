@@ -2337,8 +2337,9 @@ class CAVI:
 
         When ``supervised=True`` (default): matches the training regime,
         including the PG-CAVI supervised quadratic regularization
-        (0.5 * wbar @ E_v_sq) on the Gamma rate (notes §3.2). Use this when
-        treating fold-in as part of the same supervised inference loop.
+        (`ω̄ @ E_v_sq`, i.e. 2× the bare θ² coefficient — same KL-optimal
+        Gamma projection used in `pg_R_correction`). Use this when treating
+        fold-in as part of the same supervised inference loop.
 
         When ``supervised=False``: Poisson-only fold-in. The supervised
         quadratic (which shapes test θ via the trained υ even without y_new)
@@ -2407,9 +2408,9 @@ class CAVI:
                 c_new = xp.sqrt(xp.maximum(E_A_sq, 1e-12))
                 wbar_new = omega_bar(c_new)                  # (n_new, kappa)
 
-                # Quadratic regularization: R_quad_coeff = 0.5 * wbar @ E_v_sq
-                # (PG-CAVI factor: 0.5 from notes §3.2).
-                R_quad = 0.5 * wbar_new @ E_v_sq             # (n_new, K)
+                # Quadratic regularization: R_quad = ω̄ @ E_v_sq = 2·R_q
+                # (ELBO-stationary Gamma projection — matches pg_R_correction).
+                R_quad = wbar_new @ E_v_sq                   # (n_new, K)
 
                 # Solve quadratic: b^2 - b_poisson*b - R_quad*a_theta = 0
                 c_quad = R_quad

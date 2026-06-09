@@ -64,7 +64,7 @@ CAVI_MAX_ITER = 3000
 CAVI_CHECK_FREQ = 5
 CAVI_TOL = 0.001
 CAVI_V_WARMUP = 50
-EARLY_STOPPING = "elbo"   # Heldout-LL plateaus before supervision engages; ELBO catches divergence under high rw.
+EARLY_STOPPING = "heldout_ll"   # Reverted: elbo restore path picks best_reg_params (γ-memorization spike) when no validation; heldout_ll is the principled choice once R_quad is fixed.
 
 # ---- Classifier knobs ---------------------------------------------------
 import numpy as np
@@ -83,8 +83,8 @@ GATE_RHIGH_MAX = 0.03
 GATE_N_TRUTHS = 3                # average over truths {0, 1, 2}
 
 # ---- Phase A rw-engagement gate -----------------------------------------
-RW_ENGAGEMENT_RW0_AUC_MAX = 0.60       # train-integrated AUC at rw=0; chance + gamma-init offset
-RW_ENGAGEMENT_GAP_MIN = 0.20           # train-integrated AUC gap rw=15 vs rw=0; supervision flowing
+RW_ENGAGEMENT_RW0_AUC_MAX = 0.55       # Theta-only train AUC at rw=0 (γ excluded); pure factor signal at chance
+RW_ENGAGEMENT_GAP_MIN = 0.10           # Theta-only train AUC gap rw=15 vs rw=0; factor-level supervision
 
 # ---- NB parameterization (filled by T3) ---------------------------------
 # Either "size" (negative_binomial(n=sigma_mat_mean, p=...)) or "dispersion"

@@ -34,11 +34,17 @@ def run(K: int = 8, truths: list[int] | None = None) -> dict:
                                out_dir=str(sub / "nmf"))
             schpf_m = run_unsup(str(h5), method="schpf", K=K, inner_seed=0,
                                 out_dir=str(sub / "schpf"))
+            # DRGP: regime-consistent head (Poisson-only theta_tr_pois + LR scored
+            # on Poisson-only theta_te) — apples-to-apples with the unsup methods,
+            # which fit and score their LR head in a single non-supervised regime.
+            drgp_auc = drgp_m["cell_auc_consistent"]
             best_unsup = max(nmf_m["cell_auc_integrated"], schpf_m["cell_auc_integrated"])
-            gap = drgp_m["cell_auc_integrated"] - best_unsup
+            gap = drgp_auc - best_unsup
             gaps[r].append(gap)
-            print(f"  truth={t} r={r}: drgp={drgp_m['cell_auc_integrated']:.3f} "
-                  f"best_unsup={best_unsup:.3f}  gap={gap:+.3f}")
+            print(f"  truth={t} r={r}: drgp(consistent)={drgp_auc:.3f} "
+                  f"best_unsup={best_unsup:.3f}  gap={gap:+.3f}  "
+                  f"[drgp-integrated={drgp_m['cell_auc_integrated']:.3f}, "
+                  f"drgp-theta-only={drgp_m['cell_auc_theta_only']:.3f}]")
     summary = {r: float(np.mean(gs)) for r, gs in gaps.items()}
     print(f"\n  mean gap per r: {summary}")
     assert summary[0.05] >= config.GATE_RLOW_MIN, \

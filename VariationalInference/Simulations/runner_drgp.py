@@ -88,18 +88,35 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         verbose=verbose,
     )
 
+    # Poisson-only fold-in theta for BOTH train and test cells. theta_tr_pois is
+    # the regime-consistent training theta (no R_quad/R_lin) — used to fit the
+    # regime-consistent posthoc head so the head is applied to and trained on
+    # the same theta regime.
     theta_te = np.asarray(
         model.transform(X_te, n_iter=20, supervised=False)["E_theta"])
-    theta_tr = np.asarray(model.E_theta)
+    theta_tr_pois = np.asarray(
+        model.transform(X_tr, n_iter=20, supervised=False)["E_theta"])
+    theta_tr = np.asarray(model.E_theta)                # supervised-corrected E[theta]
     mu_v = np.asarray(model.mu_v)                       # (kappa, K)
-    A_int_te = _integrated_logit(theta_te, mu_v, intercept_aux_te, np.asarray(model.mu_gamma))
-    A_int_tr = _integrated_logit(theta_tr, mu_v, intercept_aux_tr, np.asarray(model.mu_gamma))
+    mu_gamma = np.asarray(model.mu_gamma)
+
+    # Integrated logit WITH gamma (held-out, for §7.5 calibration vs LR baselines).
+    A_int_te = _integrated_logit(theta_te, mu_v, intercept_aux_te, mu_gamma)
+    A_int_tr = _integrated_logit(theta_tr, mu_v, intercept_aux_tr, mu_gamma)
     cell_auc_integrated = float(roc_auc_score(y_te, A_int_te))
-    # In-sample training integrated AUC — used by verify_rw_engagement to gate
-    # supervision engagement without the inductive transfer flaw (theta_tr is the
-    # supervision-shaped scale that mu_v was calibrated against).
     cell_auc_integrated_train = float(roc_auc_score(y_tr, A_int_tr))
 
+    # Theta-only logit (γ contribution excluded) — measures whether (β, υ) carry
+    # discriminative signal independent of the γ intercept absorbing labels.
+    # This is the engagement-gate metric: γ-memorization is invisible to it.
+    A_theta_only_te = (theta_te @ mu_v.T).ravel().astype(np.float32)
+    A_theta_only_tr = (theta_tr @ mu_v.T).ravel().astype(np.float32)
+    cell_auc_theta_only = float(roc_auc_score(y_te, A_theta_only_te))
+    cell_auc_theta_only_train = float(roc_auc_score(y_tr, A_theta_only_tr))
+
+    # Posthoc head fit on the SUPERVISED theta_tr (matches the LR baselines pattern
+    # for §7.5 — both heads ingest the joint-fit cell scores). Has the supervised vs
+    # Poisson-only regime mismatch when scored on theta_te.
     head = LogisticRegressionCV(
         Cs=config.LR_C_GRID, cv=config.LR_CV_FOLDS, penalty="l1",
         solver="saga", max_iter=config.LR_MAX_ITER, scoring="roc_auc",
@@ -109,6 +126,17 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
     cell_auc_posthoc = float(roc_auc_score(y_te, posthoc_pred))
     cell_auc_posthoc_train = float(roc_auc_score(y_tr, head.predict_proba(theta_tr)[:, 1]))
 
+    # Regime-consistent posthoc head: fit on Poisson-only theta_tr_pois, score on
+    # Poisson-only theta_te. Removes the supervised-vs-Poisson regime mismatch
+    # without paying for per-fold refits (which don't fix it anyway).
+    head_consistent = LogisticRegressionCV(
+        Cs=config.LR_C_GRID, cv=config.LR_CV_FOLDS, penalty="l1",
+        solver="saga", max_iter=config.LR_MAX_ITER, scoring="roc_auc",
+        n_jobs=1,
+    ).fit(theta_tr_pois, y_tr)
+    proba_consistent = head_consistent.predict_proba(theta_te)[:, 1]
+    cell_auc_consistent = float(roc_auc_score(y_te, proba_consistent))
+
     y_pred = (A_int_te > 0).astype(int)
     metrics = {
         "method": method, "mode": mode, "K": int(K),
@@ -116,8 +144,11 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         "regression_weight": float(rw),
         "cell_auc_integrated": cell_auc_integrated,
         "cell_auc_integrated_train": cell_auc_integrated_train,
+        "cell_auc_theta_only": cell_auc_theta_only,
+        "cell_auc_theta_only_train": cell_auc_theta_only_train,
         "cell_auc_posthoc": cell_auc_posthoc,
         "cell_auc_posthoc_train": cell_auc_posthoc_train,
+        "cell_auc_consistent": cell_auc_consistent,
         "cell_f1": float(f1_score(y_te, y_pred)),
         "cell_acc": float(accuracy_score(y_te, y_pred)),
         "n_train": int(len(tr_idx)), "n_test": int(len(te_idx)),
