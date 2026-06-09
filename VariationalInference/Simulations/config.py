@@ -63,7 +63,7 @@ CAVI_C = 0.3
 CAVI_MAX_ITER = 3000
 CAVI_CHECK_FREQ = 5
 CAVI_TOL = 0.001
-CAVI_V_WARMUP = 50
+CAVI_V_WARMUP = 10   # Must be << regression-stop patience (~20 iters); otherwise Reg never moves before the stopper fires and best_reg checkpoint is the pre-supervision state. Found 2026-06-09 via truth-2 diagnostic.
 EARLY_STOPPING = "heldout_ll"   # Reverted: elbo restore path picks best_reg_params (γ-memorization spike) when no validation; heldout_ll is the principled choice once R_quad is fixed.
 
 # ---- Classifier knobs ---------------------------------------------------
