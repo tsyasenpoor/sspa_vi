@@ -131,17 +131,26 @@ def pg_R_correction(E_design, mu_v, sigma_v_diag, mu_gamma, X_aux, wbar,
           + ω̄_ik (E[design_i]^T v_k + x_aux_i^T γ_k) v_kℓ
           - ω̄_ik E[design_iℓ] v²_kℓ
       ]
+      The −E[design_iℓ]·v_kℓ² self-cancellation uses mu_v² (not E[v²]) on
+      purpose: it removes the diagonal of the cross term 2θ·v·E[R_-ℓ]
+      where E[R_-ℓ] is built from mu_v. Var[v] enters only via R_quad's
+      E[v²], where it belongs.
 
     R_quad (rate-shift coefficient on a_design):
-      R_quad_{iℓ} = effective_rw · 0.5 · Σ_k W_ik ω̄_ik E[v²_kℓ]
+      R_quad_{iℓ} = effective_rw · Σ_k W_ik ω̄_ik E[v²_kℓ]
 
-    Per PG_CAVI_implementation_notes.md §3.2 the 0.5 is load-bearing —
-    if you start from a JJ checkpoint and only swap `lam → wbar/2`
-    without keeping this 0.5, the self-term is 2× too large.
-
-    The design's b-rate update solves the quadratic
-        b² - (b_Poisson + R_lin) b - R_quad · a = 0
-    so the supervised correction sits inside both b_base and disc.
+    Derivation (ELBO stationarity, NOT mode-matching). The PG-augmented log
+    q*(θ_iℓ) ∝ (a_full−1)·log θ − b_full·θ − R_q·θ² with R_q = (ω̄/2)·E[v²]
+    (true coefficient on θ² from −(ω/2)·A²). Fixing the Gamma shape at
+    a_full and zeroing ∂L/∂b' for q = Gamma(a_full, b') gives
+        b'² − b_full·b' − 2·R_q·(a+1) = 0
+    so the discriminant is b_full² + 8·R_q·(a+1). The consumer solves
+        b² − b_base·b − R_quad·a = 0  ⇒  disc = b_base² + 4·R_quad·a
+    which requires R_quad = 2·R_q = ω̄·E[v²]. The earlier 0.5·ω̄·E[v²] form
+    halved the quadratic brake on b_θ; on small data b_base² dominates so
+    the bug was invisible, but at 10⁵⁺ cell scale b_θ floors and E[θ]
+    diverges. The JJ predecessor (commit 0429d77) had R_quad = 2λ·E[v²] =
+    ω̄·E[v²]; this matches.
     """
     units = E_design.shape[0]
     y_exp = y if y.ndim > 1 else y[:, None]
@@ -166,7 +175,10 @@ def pg_R_correction(E_design, mu_v, sigma_v_diag, mu_gamma, X_aux, wbar,
             R_lin_c = -(W_c * (y_exp[i0:i1] - 0.5)) @ mu_v        # (chunk, K)
             R_lin_c = R_lin_c + (W_wbar_c * design_v_c) @ mu_v
             R_lin_c = R_lin_c - E_design_c * (W_wbar_c @ E_v_sq_col)
-            R_quad_c = 0.5 * W_wbar_c @ E_v_sq                    # (chunk, K)
+            # R_quad = ω̄·E[v²]  (= 2·R_q where R_q is the true θ² coef in
+            # log q*). Factor 2 absorbs ∂²/∂b'² of E[θ²] = a(a+1)/b'² in
+            # the ELBO-stationarity solve; see docstring above.
+            R_quad_c = W_wbar_c @ E_v_sq                          # (chunk, K)
 
             R_lin_chunks.append(R_lin_c * effective_rw)
             R_quad_chunks.append(R_quad_c * effective_rw)

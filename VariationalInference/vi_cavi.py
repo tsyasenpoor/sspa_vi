@@ -1299,6 +1299,9 @@ class CAVI:
         Solves the quadratic for b_theta in one step:
             b^2 - b_base*b - c_quad*a_theta = 0
             b = (b_base + sqrt(b_base^2 + 4*c_quad*a_theta)) / 2
+        derived from ∂L/∂b'=0 for q(θ_iℓ)=Gamma(a_full,b') against the PG-
+        augmented log q* (see vi_pg_kernel.pg_R_correction docstring). The
+        c_quad here is `ω̄·E[v²]`, i.e. 2× the bare θ² coefficient in log q*.
         which is always positive (given c_quad >= 0, guaranteed by wbar >= 0).
 
         Row-chunked when regression is active to avoid multiple full (n, K)
