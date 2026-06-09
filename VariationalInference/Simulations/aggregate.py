@@ -40,6 +40,7 @@ def bottleneck_join(tau: float = 0.5) -> pd.DataFrame:
     """For each (method, mode, condition, truth, inner_seed), recovery-hit-rate x cell-AUC."""
     df = pd.read_parquet(config.SIM_ROOT / "metrics.parquet")
     cos = df[df["metric_kind"] == "matched_cosine_per_l"]
+    cos = cos[cos["l_or_path_idx"] >= 1]                 # exclude decoy (ℓ=0) from hit-rate
     grouped = cos.groupby(
         ["method", "mode", "truth_idx", "h2", "r", "K", "inner_seed"]
     )["value"].agg(lambda s: float((np.asarray(s) > tau).mean())).rename("hit_rate").reset_index()

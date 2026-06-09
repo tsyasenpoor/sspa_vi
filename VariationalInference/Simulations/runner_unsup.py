@@ -87,6 +87,7 @@ def run(h5ad_path: str, method: str, K: int, inner_seed: int, out_dir: str) -> d
         Cs=config.LR_C_GRID, cv=config.LR_CV_FOLDS, penalty="l1",
         solver="saga", max_iter=config.LR_MAX_ITER, scoring="roc_auc", n_jobs=1,
     ).fit(Htr_std, y_tr)
+    logit = head.decision_function(Hte_std)
     proba = head.predict_proba(Hte_std)[:, 1]
     cell_auc = float(roc_auc_score(y_te, proba))
     y_pred = (proba > 0.5).astype(int)
@@ -101,8 +102,8 @@ def run(h5ad_path: str, method: str, K: int, inner_seed: int, out_dir: str) -> d
         "n_train": int(len(tr_idx)), "n_test": int(len(te_idx)),
     }
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
-    pd.DataFrame({"cell_idx": te_idx, "y_true": y_te, "A_integrated": proba,
-                  "A_posthoc": proba}).to_parquet(out / "fold_predictions.parquet")
+    pd.DataFrame({"cell_idx": te_idx, "y_true": y_te, "A_integrated": logit,
+                  "A_posthoc": logit, "proba": proba}).to_parquet(out / "fold_predictions.parquet")
     with gzip.open(out / "result.pkl.gz", "wb") as f:
         pickle.dump(dict(H_train=H_tr, H_test=H_te, beta=beta,
                          beta_LR_std=head.coef_.ravel(),

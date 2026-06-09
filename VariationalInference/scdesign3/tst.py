@@ -24,7 +24,7 @@ if str(parent_dir) not in sys.path:
 from VariationalInference.scdesign3 import ScDesign3Simulator
 
 INPUT_FILE = "/labs/Aguiar/SSPA_BRAY/BRay/BRAY_FileTransfer/Covid19/control_adata.h5ad"
-OUTPUT_DIR = Path("./scdesign3_covid19_8kcells_10kgenes").resolve()
+OUTPUT_DIR = Path("./scdesign3_covid19_cellTypeMarginal_8kcells_10kgenes").resolve()
 
 simulator = ScDesign3Simulator(
     r_executable="/home/FCAM/tyasenpoor/miniconda3/envs/bray_cpu/bin/Rscript",
@@ -44,6 +44,7 @@ result = simulator.simulate(
     n_cells=8000, n_genes=10000,
     celltype_column="majorType",
     family="nb", copula="gaussian",
+    mu_formula="majorType",
     return_model=True,           # ensure marginal_models.rds is written when running fresh
     extract_only=extract_only,
 )

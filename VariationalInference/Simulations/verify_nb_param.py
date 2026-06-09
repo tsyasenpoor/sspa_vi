@@ -82,6 +82,21 @@ def run(n_genes_check: int = 200, seed: int = 0) -> str:
     config.SIM_ROOT.mkdir(parents=True, exist_ok=True)
     (config.SIM_ROOT / "nb_param_gate.json").write_text(json.dumps(
         {"winner": winner, "details": results}, indent=2))
+
+    # Overlap diagnostic — carrier sets should not heavily land on NaN-dispersion genes
+    try:
+        from .truths import draw_truth
+        nan_genes = set(np.flatnonzero(np.isnan(sg).all(axis=1)).tolist())
+        for t_idx in range(config.G_TRUTH):
+            t = draw_truth(t_idx)
+            overlaps = []
+            for l in range(config.L_COLS):
+                S = set(t["S"][l].tolist())
+                overlaps.append(len(S & nan_genes))
+            print(f"  truth {t_idx} carrier ∩ NaN-dispersion (per ℓ): {overlaps}")
+    except Exception as e:
+        print(f"  carrier/NaN overlap diagnostic skipped: {e}")
+
     return winner
 
 

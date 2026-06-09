@@ -58,51 +58,16 @@ from .truths import load_truth
 
 
 def _build_A_draw(truth: dict, draw_seed: int) -> np.ndarray:
-    """Build A (n_cells × L_cols) under §3.4 with a single (D, pi, b, patient_assign) draw.
-
-    Self-contained — does not re-use dataset.py because we run this BEFORE dataset.py
-    exists in the pipeline order. Returns (theta_star - theta_base)/bbar in L_cols."""
+    """Build A (n_cells x L_cols) using the SAME composition+activity functions as dataset.py
+    so the calibration A matches the generation A."""
+    from .dataset import patient_composition, activity
     rng = np.random.default_rng(draw_seed)
     meta = pd.read_csv(config.BASELINE_META_CSV, index_col=0)
     types = meta["majorType"].map(config.TYPE_TO_INT).to_numpy()
-    N = len(types)
-    G = config.N_PATIENTS
-    # Balanced D
-    D = np.zeros(G, dtype=np.int8); D[: G // 2] = 1; rng.shuffle(D)
-    # Composition
-    pi_global = np.bincount(types, minlength=config.T) / N
-    alpha = config.DIRICHLET_A0 * pi_global
-    pi_g = rng.dirichlet(alpha, size=G)                # (G, T)
-    # Greedy assignment
-    quota = np.round(pi_g * (N / G)).astype(int)
-    quota[:, -1] += (N // G) - quota.sum(axis=1)       # tie-up
-    pat = np.full(N, -1, dtype=np.int32)
-    cells_by_type = {t: rng.permutation(np.flatnonzero(types == t)).tolist()
-                     for t in range(config.T)}
-    for g in range(G):
-        for t in range(config.T):
-            take = quota[g, t]
-            if take <= 0: continue
-            cells = cells_by_type[t][:take]
-            del cells_by_type[t][:take]
-            pat[cells] = g
-    # Any orphan cells (rounding) -> stuff into the smallest patient
-    orphans = np.flatnonzero(pat < 0)
-    if orphans.size:
-        for c in orphans:
-            counts = np.bincount(pat[pat >= 0], minlength=G)
-            pat[c] = int(np.argmin(counts))
-    # Activity
-    L = config.L_COLS
-    A = np.zeros((N, L), dtype=np.float64)
-    bbar = config.ALPHA_B / config.LAMBDA_B            # mean of Gamma(α, λ) shape/rate
-    for l in range(L):
-        T_l = set(truth["T_ell"][l].tolist())
-        responder = np.isin(types, list(T_l))
-        case_resp = (D[pat] == 1) & responder
-        b = rng.gamma(config.ALPHA_B, 1.0 / config.LAMBDA_B, size=case_resp.sum())
-        A[case_resp, l] = b / bbar
-    return A
+    g_i, D = patient_composition(types, rng)
+    theta_star = activity(truth, types, g_i, D, rng)
+    # A is the activation deviation — exact match to dataset's perturb_and_sample's A_dev
+    return (theta_star - config.THETA_BASE).astype(np.float64)
 
 
 def compute_ss_pert(truth_idx: int, n_A_draws: int = 5, seed: int = 0) -> float:

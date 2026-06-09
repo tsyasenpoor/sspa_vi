@@ -27,9 +27,13 @@ def _build_pathway_mask(mask_M: np.ndarray, mode: str, K: int) -> np.ndarray | N
     raise ValueError(mode)
 
 
-def _integrated_logit(theta: np.ndarray, mu_v: np.ndarray) -> np.ndarray:
-    """A_i = theta_i * mu_v.T (single-label collapse - mu_v is (kappa, K)). Take first col."""
+def _integrated_logit(theta: np.ndarray, mu_v: np.ndarray,
+                      X_aux: np.ndarray | None = None,
+                      mu_gamma: np.ndarray | None = None) -> np.ndarray:
+    """A_i = theta_i * mu_v.T + X_aux_i * mu_gamma.T (single-label collapse)."""
     A = theta @ mu_v.T                                  # (n, kappa=1)
+    if X_aux is not None and mu_gamma is not None:
+        A = A + X_aux @ mu_gamma.T
     return np.asarray(A).ravel().astype(np.float32)
 
 
@@ -68,8 +72,11 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         pathway_mask=pathway_mask,
         n_pathway_factors=n_pathway,
     )
+    intercept_aux_tr = np.ones((X_tr.shape[0], 1), dtype=np.float32)
+    intercept_aux_te = np.ones((X_te.shape[0], 1), dtype=np.float32)
     model.fit(
         X_tr, y_tr,
+        X_aux_train=intercept_aux_tr,
         max_iter=max_iter or config.CAVI_MAX_ITER,
         check_freq=config.CAVI_CHECK_FREQ,
         tol=config.CAVI_TOL,
@@ -80,11 +87,11 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         verbose=False,
     )
 
-    theta_te = model.transform(X_te, n_iter=20)
+    theta_te = model.transform(X_te, n_iter=20, supervised=False)
     theta_tr = np.asarray(model.E_theta)
     mu_v = np.asarray(model.mu_v)                       # (kappa, K)
-    A_int_te = _integrated_logit(theta_te, mu_v)
-    A_int_tr = _integrated_logit(theta_tr, mu_v)
+    A_int_te = _integrated_logit(theta_te, mu_v, intercept_aux_te, np.asarray(model.mu_gamma))
+    A_int_tr = _integrated_logit(theta_tr, mu_v, intercept_aux_tr, np.asarray(model.mu_gamma))
     cell_auc_integrated = float(roc_auc_score(y_te, A_int_te))
 
     head = LogisticRegressionCV(

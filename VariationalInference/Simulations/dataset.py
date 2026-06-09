@@ -21,7 +21,8 @@ def patient_composition(types: np.ndarray, rng: np.random.Generator
     cells_per_patient = N // G
     quota = np.floor(pi_g * cells_per_patient).astype(int)
     deficit = cells_per_patient - quota.sum(axis=1)
-    for g in range(G):
+    patient_order = rng.permutation(G)
+    for g in patient_order:
         if deficit[g]:
             # Distribute leftover slots to the type whose floor-rounding most undershot
             residuals = pi_g[g] * cells_per_patient - quota[g]
@@ -32,7 +33,7 @@ def patient_composition(types: np.ndarray, rng: np.random.Generator
     g_i = np.full(N, -1, dtype=np.int32)
     by_type = {t: rng.permutation(np.flatnonzero(types == t)).tolist()
                for t in range(config.T)}
-    for g in range(G):
+    for g in patient_order:
         for t in range(config.T):
             k = int(quota[g, t])
             if k <= 0:
@@ -66,16 +67,22 @@ def activity(truth: dict, types: np.ndarray, g_i: np.ndarray, D: np.ndarray,
 
 def _per_gene_size(sigma_mat_gene_by_cell: np.ndarray) -> np.ndarray:
     """Collapse sigma_mat to per-gene NB size, applying the rule from verify_nb_param.
-    NaN sigmas (Phase A.2 found 835 all-NaN genes) get the median of valid sigmas
-    so NB sampling still produces finite draws on those genes."""
+    Reads NB_SIZE_FROM_SIGMA from the gate json at runtime if available, else falls back
+    to config (which T3 wrote in)."""
+    import json
+    gate_path = config.SIM_ROOT / "nb_param_gate.json"
+    if gate_path.exists():
+        rule = json.loads(gate_path.read_text())["winner"]
+    else:
+        rule = config.NB_SIZE_FROM_SIGMA
     mean_per_gene = np.nanmean(sigma_mat_gene_by_cell, axis=1)
     median_valid = float(np.nanmedian(mean_per_gene))
     mean_per_gene = np.where(np.isnan(mean_per_gene), median_valid, mean_per_gene)
-    if config.NB_SIZE_FROM_SIGMA == "size":
+    if rule == "size":
         return mean_per_gene
-    if config.NB_SIZE_FROM_SIGMA == "dispersion":
+    if rule == "dispersion":
         return 1.0 / np.maximum(mean_per_gene, 1e-6)
-    raise RuntimeError("config.NB_SIZE_FROM_SIGMA unset — run verify_nb_param first")
+    raise RuntimeError(f"Unknown NB rule: {rule}")
 
 
 def perturb_and_sample(mu_cell_by_gene: np.ndarray, size_per_gene: np.ndarray,
@@ -137,6 +144,7 @@ def liability_label(theta_star: np.ndarray, v_star: np.ndarray, h2: float,
 
 from .truths import load_truth
 from .calibrate import load_delta
+from ._runner_utils import _hash_to_int32
 import scipy.sparse as sp
 
 
@@ -164,7 +172,7 @@ def build_dataset(truth_idx: int, h2: float, r: float, inner_seed: int,
     types = cache["types"]
     truth = load_truth(truth_idx)
     delta = load_delta(truth_idx, r)
-    rng = np.random.default_rng(np.uint32(hash(("dataset", truth_idx, h2, r, inner_seed)) & 0xFFFFFFFF))
+    rng = np.random.default_rng(_hash_to_int32("dataset", truth_idx, h2, r, inner_seed))
 
     g_i, D = patient_composition(types, rng)
     theta_star = activity(truth, types, g_i, D, rng)

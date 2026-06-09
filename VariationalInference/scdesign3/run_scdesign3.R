@@ -377,8 +377,15 @@ if (!is.null(config$pseudotime_column) && config$pseudotime_column != "" && conf
     cat("mu_formula:", mu_formula, "\n")
 } else {
     pseudotime_col <- NULL
-    mu_formula <- "1"  # Intercept only
-    cat("No pseudotime, using intercept-only model\n")
+    # Honor explicit config$mu_formula even without pseudotime — needed for
+    # cell-type-conditional baselines (e.g. "majorType"). Falls back to "1".
+    if (!is.null(config$mu_formula) && nchar(config$mu_formula) > 0) {
+        mu_formula <- config$mu_formula
+        cat("No pseudotime; using configured mu_formula:", mu_formula, "\n")
+    } else {
+        mu_formula <- "1"  # Intercept only
+        cat("No pseudotime, using intercept-only model\n")
+    }
 }
 
 # Handle spatial coordinates if provided
