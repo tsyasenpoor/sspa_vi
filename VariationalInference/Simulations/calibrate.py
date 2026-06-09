@@ -38,13 +38,19 @@ def _load_counts_and_types():
 
 
 def compute_ss_type() -> float:
-    """Use ss_type_from_baseline on simulated_counts.csv because scDesign3 was fit
-    intercept-only (mu_formula='1'), so mu_mat has no cell-type variance; the
-    realized counts carry the type structure via the copula. Per-type averaging
-    over ~1300 cells/type makes the per-cell noise negligible vs between-type
-    structure (we're measuring the SS of TYPE-MEANS, not of cells)."""
-    counts, types = _load_counts_and_types()
-    val = float(ss_type_from_baseline(counts, types))
+    """Compute ss_type from scDesign3's fitted means (mu_mat) — the design's original
+    intent (§4 of the implementation design). Requires a scDesign3 fit with cell-type
+    in the marginal (mu_formula contains majorType); otherwise mu has no type variance
+    and the SS collapses to numerical noise. Verified by the premise check before this
+    switch (see /labs/Aguiar/SSPA_BRAY/scdesign3_covid19_cellTypeMarginal_8kcells_10kgenes)."""
+    import h5py
+    with h5py.File(config.NB_PARAMS_H5, "r") as f:
+        mu = np.asarray(f["mu_mat"], dtype=np.float64)
+    meta = pd.read_csv(config.BASELINE_META_CSV, index_col=0)
+    types = meta["majorType"].map(config.TYPE_TO_INT).to_numpy()
+    N = len(types)
+    mu_gc = mu if mu.shape[1] == N else mu.T          # ensure genes × cells
+    val = float(ss_type_from_means(mu_gc, types))
     config.SIM_ROOT.mkdir(parents=True, exist_ok=True)
     (config.SIM_ROOT / "ss_type.json").write_text(json.dumps({"ss_type": val}, indent=2))
     return val

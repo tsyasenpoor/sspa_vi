@@ -39,7 +39,8 @@ def _integrated_logit(theta: np.ndarray, mu_v: np.ndarray,
 
 def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         out_dir: str, regression_weight: float | None = None,
-        max_iter: int | None = None) -> dict:
+        max_iter: int | None = None, early_stopping: str | None = None,
+        verbose: bool = False) -> dict:
     A = ad.read_h5ad(h5ad_path)
     truth_idx = int(A.uns["truth_idx"]); h2 = float(A.uns["h2"]); r = float(A.uns["r"])
     method = f"drgp_{mode}"
@@ -81,18 +82,23 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         check_freq=config.CAVI_CHECK_FREQ,
         tol=config.CAVI_TOL,
         v_warmup=config.CAVI_V_WARMUP,
-        early_stopping=config.EARLY_STOPPING,
+        early_stopping=early_stopping or config.EARLY_STOPPING,
         n_patients=len(np.unique(patient_ids[tr_idx])),
         patient_ids=patient_ids[tr_idx],
-        verbose=False,
+        verbose=verbose,
     )
 
-    theta_te = model.transform(X_te, n_iter=20, supervised=False)
+    theta_te = np.asarray(
+        model.transform(X_te, n_iter=20, supervised=False)["E_theta"])
     theta_tr = np.asarray(model.E_theta)
     mu_v = np.asarray(model.mu_v)                       # (kappa, K)
     A_int_te = _integrated_logit(theta_te, mu_v, intercept_aux_te, np.asarray(model.mu_gamma))
     A_int_tr = _integrated_logit(theta_tr, mu_v, intercept_aux_tr, np.asarray(model.mu_gamma))
     cell_auc_integrated = float(roc_auc_score(y_te, A_int_te))
+    # In-sample training integrated AUC — used by verify_rw_engagement to gate
+    # supervision engagement without the inductive transfer flaw (theta_tr is the
+    # supervision-shaped scale that mu_v was calibrated against).
+    cell_auc_integrated_train = float(roc_auc_score(y_tr, A_int_tr))
 
     head = LogisticRegressionCV(
         Cs=config.LR_C_GRID, cv=config.LR_CV_FOLDS, penalty="l1",
@@ -101,6 +107,7 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
     ).fit(theta_tr, y_tr)
     posthoc_pred = head.predict_proba(theta_te)[:, 1]
     cell_auc_posthoc = float(roc_auc_score(y_te, posthoc_pred))
+    cell_auc_posthoc_train = float(roc_auc_score(y_tr, head.predict_proba(theta_tr)[:, 1]))
 
     y_pred = (A_int_te > 0).astype(int)
     metrics = {
@@ -108,7 +115,9 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         "truth_idx": truth_idx, "h2": h2, "r": r, "inner_seed": int(inner_seed),
         "regression_weight": float(rw),
         "cell_auc_integrated": cell_auc_integrated,
+        "cell_auc_integrated_train": cell_auc_integrated_train,
         "cell_auc_posthoc": cell_auc_posthoc,
+        "cell_auc_posthoc_train": cell_auc_posthoc_train,
         "cell_f1": float(f1_score(y_te, y_pred)),
         "cell_acc": float(accuracy_score(y_te, y_pred)),
         "n_train": int(len(tr_idx)), "n_test": int(len(te_idx)),
@@ -121,8 +130,13 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         "theta_norm_te": np.linalg.norm(theta_te, axis=1),
     }).to_parquet(out / "fold_predictions.parquet")
 
-    payload = dict(mu_beta=np.asarray(model.mu_beta), mu_v=mu_v,
-                   rho=np.asarray(getattr(model, "rho", np.zeros(0))),
+    # E_beta is the posterior mean of beta (p, K); r_beta is the spike-slab
+    # inclusion prob (p, K), only present when use_spike_slab=True (mode != masked).
+    # We keep the result-pickle keys as `mu_beta`/`rho` so evaluate.py reads stay stable.
+    rho = (np.asarray(model.r_beta) if getattr(model, "use_spike_slab", False)
+           else np.zeros((0, 0), dtype=np.float32))
+    payload = dict(mu_beta=np.asarray(model.E_beta), mu_v=mu_v,
+                   rho=rho,
                    theta_tr=theta_tr.astype(np.float32),
                    theta_te=theta_te.astype(np.float32),
                    tr_idx=tr_idx, te_idx=te_idx,

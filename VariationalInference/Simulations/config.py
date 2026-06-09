@@ -9,7 +9,7 @@ from pathlib import Path
 
 # ---- Paths --------------------------------------------------------------
 REPO_ROOT = Path("/labs/Aguiar/SSPA_BRAY")
-SCDESIGN3_DIR = REPO_ROOT / "scdesign3_covid19_8kcells_10kgenes"
+SCDESIGN3_DIR = REPO_ROOT / "scdesign3_covid19_cellTypeMarginal_8kcells_10kgenes"
 NB_PARAMS_H5 = SCDESIGN3_DIR / "nb_params.h5"
 BASELINE_COUNTS_CSV = SCDESIGN3_DIR / "simulated_counts.csv"
 BASELINE_META_CSV = SCDESIGN3_DIR / "simulated_metadata.csv"
@@ -64,7 +64,7 @@ CAVI_MAX_ITER = 3000
 CAVI_CHECK_FREQ = 5
 CAVI_TOL = 0.001
 CAVI_V_WARMUP = 50
-EARLY_STOPPING = "heldout_ll"
+EARLY_STOPPING = "elbo"   # Heldout-LL plateaus before supervision engages; ELBO catches divergence under high rw.
 
 # ---- Classifier knobs ---------------------------------------------------
 import numpy as np
@@ -83,8 +83,8 @@ GATE_RHIGH_MAX = 0.03
 GATE_N_TRUTHS = 3                # average over truths {0, 1, 2}
 
 # ---- Phase A rw-engagement gate -----------------------------------------
-RW_ENGAGEMENT_RW0_AUC_MAX = 0.52       # cell_auc_integrated[rw=0] must be ~chance
-RW_ENGAGEMENT_GAP_MIN = 0.05           # cell_auc[rw=15] - cell_auc[rw=0]
+RW_ENGAGEMENT_RW0_AUC_MAX = 0.60       # train-integrated AUC at rw=0; chance + gamma-init offset
+RW_ENGAGEMENT_GAP_MIN = 0.20           # train-integrated AUC gap rw=15 vs rw=0; supervision flowing
 
 # ---- NB parameterization (filled by T3) ---------------------------------
 # Either "size" (negative_binomial(n=sigma_mat_mean, p=...)) or "dispersion"
