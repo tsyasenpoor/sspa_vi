@@ -23,7 +23,17 @@ TYPE_TO_INT = {t: i for i, t in enumerate(CELL_TYPES)}
 # ---- Generator constants ------------------------------------------------
 N_CELLS = 8000
 N_GENES = 10000
-N_PATIENTS = 40                  # G; balanced 20/20
+N_PATIENTS = 80                  # G; 100 cells each. v2: patient-inherited labels (see
+                                 # docs/.../2026-06-11-DRGP-sim-v2-patient-label-design.md)
+CARRIER_RATE = 0.5               # P(K_{g,l}=1) per-program carrier; factorization-signal knob,
+                                 # independent of h2 and of label prevalence.
+# Within-type perturbation fraction rho: fraction of a carrier patient's responder cells that
+# actually carry signal for a program. Swept; delta calibrated at the headline rho only, so
+# lower rho genuinely dilutes total signal.
+PERTURB_FRAC_VALUES = [0.1, 0.3, 0.6]
+PERTURB_FRAC_HEADLINE = 0.3
+LIABILITY_FORM = "probit"        # probit Gaussian-liability: exact variance partition, no chi calib
+TARGET_PREVALENCE = 0.5          # P(D_g=1); enforced by tau = median(ell_g) at every h2
 KAPPA_PATH = 2                   # iota_path
 KAPPA_DENOVO = 2                 # iota_denovo
 IOTA = KAPPA_PATH + KAPPA_DENOVO  # = 4 causal programs
@@ -48,15 +58,31 @@ KAPPA_VALUES = [8, 10, 14]
 INNER_SEED_GRID = 0              # single seed across grid; inner-seed only at stability
 INNER_SEEDS_STABILITY = list(range(10))
 
-HEADLINE_CELL = dict(h2=0.3, r=0.15, K=8)
-STABILITY_CELL = dict(h2=0.5, r=0.15, K=10)
+HEADLINE_CELL = dict(h2=0.3, r=0.15, K=8, rho=PERTURB_FRAC_HEADLINE)
+STABILITY_CELL = dict(h2=0.5, r=0.15, K=10, rho=PERTURB_FRAC_HEADLINE)
+# rho 1-D sweep at the headline (h2,r,K) — the "fewer cells carry signal" axis.
+RHO_SENSITIVITY_CELLS = [dict(h2=0.3, r=0.15, K=8, rho=rho) for rho in PERTURB_FRAC_VALUES]
 RW_SENSITIVITY_CELLS = [
-    dict(h2=0.3, r=0.15, K=8),    # headline
-    dict(h2=0.1, r=0.15, K=8),    # low-h2 corner
+    dict(h2=0.3, r=0.15, K=8, rho=PERTURB_FRAC_HEADLINE),    # headline
+    dict(h2=0.1, r=0.15, K=8, rho=PERTURB_FRAC_HEADLINE),    # low-h2 corner
 ]
 RW_SENSITIVITY_VALUES = [5.0, 15.0, 50.0]
 
 # ---- CAVI knobs (locked per design §8) ----------------------------------
+# PG-VI fix (2026-06-10): the supervised update is taken at the derivation's
+# natural weight 1 (DRGP_VI_full_derivation.md Eq 8.1-8.2), NOT the nnz/n
+# tempering that floored b_theta and diverged theta at scale; and b_v is held
+# fixed (no in-loop _calibrate_b_v, which on un-settled theta floors b_v and
+# freezes v). In 'one' mode REGRESSION_WEIGHT below is inert. See
+# docs/PLAN_A_normalized_design_FUTURE_WORK.md for the full arc.
+SUPERVISED_UPDATE_WEIGHT = "one"   # 'one' = weight 1 (fixed); 'rw' = old broken nnz/n tempering
+CALIBRATE_B_V = False              # keep b_v fixed at CAVI_B_V (no in-loop calibration)
+CAVI_B_V = 1.0
+# Plan A (2026-06-10): L1-normalized regression design s=θ/‖θ‖₁. The rw sweep on
+# the raw design showed NO weight recovers programs (matched_cosine flat ~0.05 for
+# rw∈{1,5,20,50}; high rw only memorizes train→1.0 / test→chance). Normalized design
+# severs the magnitude channel so supervision shapes simplex DIRECTION = recovery.
+REGRESSION_DESIGN = "normalized"   # 'normalized' | 'raw'
 REGRESSION_WEIGHT = 15.0
 CAVI_A = 0.3
 CAVI_C = 0.3
@@ -64,7 +90,7 @@ CAVI_MAX_ITER = 3000
 CAVI_CHECK_FREQ = 5
 CAVI_TOL = 0.001
 CAVI_V_WARMUP = 10   # Must be << regression-stop patience (~20 iters); otherwise Reg never moves before the stopper fires and best_reg checkpoint is the pre-supervision state. Found 2026-06-09 via truth-2 diagnostic.
-EARLY_STOPPING = "heldout_ll"   # Reverted: elbo restore path picks best_reg_params (γ-memorization spike) when no validation; heldout_ll is the principled choice once R_quad is fixed.
+EARLY_STOPPING = "elbo"   # 2026-06-10: the runner passes no validation set, so 'heldout_ll' fell back to monitoring TRAINING Reg (patience 15) and, at weight-1 where Reg is non-monotone during the 200-iter ramp, fired at iter ~30 and restored the pre-supervision best_reg checkpoint (theta-only AUC ~chance, cosine ~0). 'elbo' now: (a) ELBO is the monotone objective (Fix 3), label-leak-free; (b) restore is mode-aware so 'elbo' keeps the final converged state instead of best_reg; (c) convergence-stop is blocked until v_warmup+ramp_iters so supervision fully engages.
 
 # ---- Classifier knobs ---------------------------------------------------
 import numpy as np
@@ -73,7 +99,8 @@ LR_CV_FOLDS = 3
 LR_MAX_ITER = 2000
 
 # ---- Split knobs --------------------------------------------------------
-K_FOLD_GRID = 1                  # single 32/8 patient split on grid
+N_TEST_PATIENTS = N_PATIENTS // 5   # 16 of 80 held out; used by every runner
+K_FOLD_GRID = 1                  # single 64/16 patient split on grid
 K_FOLD_STABILITY = 5
 
 # ---- Crossover gate thresholds (Phase B) --------------------------------

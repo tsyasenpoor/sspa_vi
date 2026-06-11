@@ -217,6 +217,88 @@ def pg_R_correction(E_design, mu_v, sigma_v_diag, mu_gamma, X_aux, wbar,
 
 
 # =========================================================================
+# pg_R_correction_normalized — Plan A (Route A): θ-rate on the L1-normalized
+# design s = θ/T, T = ‖θ‖₁. The logit is A_ik = s_i·v_k + x_aux_i·γ_k, so θ
+# enters A only through the simplex; the supervised rate-shift uses the
+# chain-rule sensitivity G_ikℓ = ∂A_ik/∂θ_iℓ = (v_kℓ − P_ik)/T_i in place of
+# v_kℓ (P_ik = Σ_m s_im v_km = the program logit). Gauss–Newton curvature
+# (drop the indefinite ∂²A residual term) ⇒ R_quad ≥ 0 structurally, no floor.
+#
+# Mirrors pg_R_correction's μ²-vs-(μ²+σ²) split EXACTLY (the only correct one):
+#   R_lin self-cancel term: mean-square (μ_v−P)²/T²   (σ_v² cancels here)
+#   R_quad:                 full  ((μ_v−P)²+σ_v²)/T²
+#
+# No (chunk,κ,K) tensor: for any per-k coefficient c_ik,
+#   Σ_k c_ik G_ikℓ = [ (c @ v)_iℓ − rowsum_k(c·P)_i ] / T_i.
+#
+# Derivation + GN/Fisher justification: docs/PLAN_A_normalized_design_FUTURE_WORK.md.
+# =========================================================================
+def pg_R_correction_normalized(E_theta, mu_v, sigma_v_diag, mu_gamma, X_aux,
+                               wbar, y, sample_weights, effective_rw, row_chunk):
+    """Returns (R_lin, R_quad, row_chunk_used). Each (units, K), already × effective_rw.
+
+    E_theta is the RAW E[θ] loadings (units, K); T, s, P are formed internally.
+    """
+    units = E_theta.shape[0]
+    kappa, K = mu_v.shape
+    y_exp = y if y.ndim > 1 else y[:, None]
+    v_sq_mean = mu_v ** 2                       # (κ, K) — mean-square (R_lin self + R_quad mean part)
+    min_chunk = _min_chunk(units)
+    has_aux = _has_aux(X_aux)
+
+    R_lin_chunks = []
+    R_quad_chunks = []
+    i0 = 0
+    while i0 < units:
+        i1 = min(i0 + row_chunk, units)
+        try:
+            E_th_c = E_theta[i0:i1]                                   # (m, K)
+            T_c = xp.maximum(E_th_c.sum(axis=1, keepdims=True), 1e-8)  # (m, 1)
+            s_c = E_th_c / T_c                                        # (m, K)
+            P_c = s_c @ mu_v.T                                        # (m, κ) program logit
+            A_c = P_c
+            if has_aux:
+                A_c = A_c + X_aux[i0:i1] @ mu_gamma.T                 # (m, κ) full logit
+            W_c = sample_weights[i0:i1]
+            W_wbar_c = W_c * wbar[i0:i1]                              # (m, κ)
+            u1_c = W_c * (y_exp[i0:i1] - 0.5)                         # (m, κ)
+
+            # Linear-in-G terms (term1 −κ·G + term2 +ω̄·A·G), via the matmul identity.
+            cvterm = -u1_c + W_wbar_c * A_c                          # (m, κ)
+            R_lin_lin_c = (
+                cvterm @ mu_v
+                - xp.sum(cvterm * P_c, axis=1, keepdims=True)
+            ) / T_c                                                  # (m, K)
+
+            # Mean-square Σ_k W ω̄ (v−P)² / T²  =  [Σ_k m v² − 2 Σ_k (mP) v + Σ_k m P²]/T²
+            mP_c = W_wbar_c * P_c                                     # (m, κ)
+            msq_mean = (
+                W_wbar_c @ v_sq_mean
+                - 2.0 * (mP_c @ mu_v)
+                + xp.sum(W_wbar_c * P_c ** 2, axis=1, keepdims=True)
+            ) / (T_c ** 2)                                           # (m, K)
+
+            # R_lin self-cancellation term: − θ̄ · mean-square(G)  (μ² only)
+            R_lin_c = R_lin_lin_c - E_th_c * msq_mean
+
+            # R_quad = full E[G²] = mean-square part + σ_v² part, all / T²
+            R_quad_c = msq_mean + (W_wbar_c @ sigma_v_diag) / (T_c ** 2)
+
+            R_lin_chunks.append(R_lin_c * effective_rw)
+            R_quad_chunks.append(R_quad_c * effective_rw)
+            i0 = i1
+        except Exception as exc:
+            if _is_oom_error(exc) and row_chunk > min_chunk:
+                row_chunk = max(min_chunk, row_chunk // 2)
+                continue
+            raise
+
+    R_lin = xp.concatenate(R_lin_chunks, axis=0) if len(R_lin_chunks) > 1 else R_lin_chunks[0]
+    R_quad = xp.concatenate(R_quad_chunks, axis=0) if len(R_quad_chunks) > 1 else R_quad_chunks[0]
+    return R_lin, R_quad, row_chunk
+
+
+# =========================================================================
 # pg_update_v — υ posterior (diagonal Gaussian, Laplace-Lasso prior).
 # =========================================================================
 def pg_update_v(E_design, Var_design, mu_v, sigma_v_diag, mu_gamma,

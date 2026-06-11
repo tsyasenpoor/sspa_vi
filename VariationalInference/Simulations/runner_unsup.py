@@ -10,8 +10,10 @@ from sklearn.decomposition import NMF
 from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 from . import config
-from ._runner_utils import derive_seeds, patient_grouped_split
+from ._runner_utils import (derive_seeds, patient_grouped_split,
+                            pseudobulk_mean, patient_liability)
 from .projection import poisson_foldin_solve, nmf_nnls_project, standardize_factors
+from scipy.stats import spearmanr
 
 
 def _libnorm_log1p(X: sp.csr_matrix, target: float | None = None) -> np.ndarray:
@@ -32,7 +34,8 @@ def _fit_nmf(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, K: int, seed: 
     H_tr = m.fit_transform(Xtr)              # (n_tr, K)
     W = m.components_                        # (K, p)
     H_te = nmf_nnls_project(Xte, W)
-    return H_tr, H_te, W
+    projector = lambda Xsp: nmf_nnls_project(_libnorm_log1p(Xsp), W)
+    return H_tr, H_te, W, projector
 
 
 def _fit_schpf(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, K: int, seed: int):
@@ -43,7 +46,8 @@ def _fit_schpf(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, K: int, seed
     H_tr = np.asarray(m.cell_score(), dtype=np.float32)         # (n_tr, K)
     H_te = np.asarray(m.project(X_test_sp.tocoo()).cell_score(), dtype=np.float32)
     beta = np.asarray(m.gene_score()).T                          # (K, p)
-    return H_tr, H_te, beta
+    projector = lambda Xsp: np.asarray(m.project(Xsp.tocoo()).cell_score(), dtype=np.float32)
+    return H_tr, H_te, beta, projector
 
 
 def _fit_spectra(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, mask_M: np.ndarray,
@@ -58,7 +62,8 @@ def _fit_spectra(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, mask_M: np
                       dtype=np.float64)                          # (K, p)
     H_tr = poisson_foldin_solve(np.asarray(X_train_sp.toarray(), dtype=np.float32), beta)
     H_te = poisson_foldin_solve(np.asarray(X_test_sp.toarray(), dtype=np.float32), beta)
-    return H_tr, H_te, beta
+    projector = lambda Xsp: poisson_foldin_solve(np.asarray(Xsp.toarray(), dtype=np.float32), beta)
+    return H_tr, H_te, beta, projector
 
 
 def run(h5ad_path: str, method: str, K: int, inner_seed: int, out_dir: str) -> dict:
@@ -72,16 +77,16 @@ def run(h5ad_path: str, method: str, K: int, inner_seed: int, out_dir: str) -> d
     X = A.X.tocsr() if sp.issparse(A.X) else sp.csr_matrix(A.X)
     y = A.obs["y"].to_numpy().astype(np.float32)
     patient_ids = A.obs["patient_id"].to_numpy()
-    tr_idx, te_idx = patient_grouped_split(patient_ids, n_test_patients=8,
+    tr_idx, te_idx = patient_grouped_split(patient_ids, n_test_patients=config.N_TEST_PATIENTS,
                                            seed=seeds["split_seed"])
     X_tr, X_te = X[tr_idx], X[te_idx]; y_tr, y_te = y[tr_idx], y[te_idx]
 
     if method == "nmf":
-        H_tr, H_te, beta = _fit_nmf(X_tr, X_te, K, seeds["fit_seed"])
+        H_tr, H_te, beta, projector = _fit_nmf(X_tr, X_te, K, seeds["fit_seed"])
     elif method == "schpf":
-        H_tr, H_te, beta = _fit_schpf(X_tr, X_te, K, seeds["fit_seed"])
+        H_tr, H_te, beta, projector = _fit_schpf(X_tr, X_te, K, seeds["fit_seed"])
     else:
-        H_tr, H_te, beta = _fit_spectra(X_tr, X_te, A.uns["mask_M"], K, seeds["fit_seed"])
+        H_tr, H_te, beta, projector = _fit_spectra(X_tr, X_te, A.uns["mask_M"], K, seeds["fit_seed"])
 
     Htr_std, Hte_std, mean_tr, sd_tr = standardize_factors(H_tr, H_te)
     head = LogisticRegressionCV(
@@ -93,11 +98,31 @@ def run(h5ad_path: str, method: str, K: int, inner_seed: int, out_dir: str) -> d
     cell_auc = float(roc_auc_score(y_te, proba))
     y_pred = (proba > 0.5).astype(int)
 
+    # ---- Patient pseudo-bulk: mean raw counts -> same projector -> standardize -> head ----
+    Xpb_tr, ypb_tr, _ = pseudobulk_mean(X, patient_ids, tr_idx, y)
+    Xpb_te, ypb_te, pid_te = pseudobulk_mean(X, patient_ids, te_idx, y)
+    Hpb_tr = np.asarray(projector(sp.csr_matrix(Xpb_tr)), dtype=np.float32)
+    Hpb_te = np.asarray(projector(sp.csr_matrix(Xpb_te)), dtype=np.float32)
+    Hpb_tr_std, Hpb_te_std, _, _ = standardize_factors(Hpb_tr, Hpb_te)
+    pat_head = LogisticRegressionCV(
+        Cs=config.LR_C_GRID, cv=min(config.LR_CV_FOLDS, 3), penalty="l1",
+        solver="saga", max_iter=config.LR_MAX_ITER, scoring="roc_auc", n_jobs=1,
+    ).fit(Hpb_tr_std, ypb_tr)
+    pat_logit = pat_head.decision_function(Hpb_te_std)
+    pat_proba = pat_head.predict_proba(Hpb_te_std)[:, 1]
+    pat_auc = (float(roc_auc_score(ypb_te, pat_proba))
+               if len(np.unique(ypb_te)) == 2 else float("nan"))
+    liab_pb_te = patient_liability(pid_te, np.asarray(A.uns["liability_patient"]))
+    pat_spearman = float(spearmanr(pat_logit, liab_pb_te).correlation)
+
     metrics = {
         "method": f"{method}_lr", "mode": "lr", "K": int(K),
-        "truth_idx": truth_idx, "h2": h2, "r": r, "inner_seed": int(inner_seed),
+        "truth_idx": truth_idx, "h2": h2, "r": r, "rho": float(A.uns.get("rho", -1.0)),
+        "inner_seed": int(inner_seed),
         "cell_auc_integrated": cell_auc,
         "cell_auc_posthoc": cell_auc,         # head IS the only logit
+        "patient_auc_integrated": pat_auc, "patient_auc_posthoc": pat_auc,
+        "patient_spearman_liability": pat_spearman,
         "cell_f1": float(f1_score(y_te, y_pred)),
         "cell_acc": float(accuracy_score(y_te, y_pred)),
         "n_train": int(len(tr_idx)), "n_test": int(len(te_idx)),

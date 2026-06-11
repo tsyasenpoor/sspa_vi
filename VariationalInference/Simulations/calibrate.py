@@ -65,13 +65,14 @@ from .truths import load_truth
 
 def _build_A_draw(truth: dict, draw_seed: int) -> np.ndarray:
     """Build A (n_cells x L_cols) using the SAME composition+activity functions as dataset.py
-    so the calibration A matches the generation A."""
+    so the calibration A matches the generation A. Calibrated at the headline perturbation
+    fraction (PERTURB_FRAC_HEADLINE); lower rho at run time then genuinely dilutes signal."""
     from .dataset import patient_composition, activity
     rng = np.random.default_rng(draw_seed)
     meta = pd.read_csv(config.BASELINE_META_CSV, index_col=0)
     types = meta["majorType"].map(config.TYPE_TO_INT).to_numpy()
-    g_i, D = patient_composition(types, rng)
-    theta_star = activity(truth, types, g_i, D, rng)
+    g_i, K = patient_composition(types, rng)
+    theta_star = activity(truth, types, g_i, K, rng, perturb_frac=config.PERTURB_FRAC_HEADLINE)
     # A is the activation deviation — exact match to dataset's perturb_and_sample's A_dev
     return (theta_star - config.THETA_BASE).astype(np.float64)
 

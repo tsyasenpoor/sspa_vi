@@ -11,7 +11,8 @@ try:
         expit as _expit, backend_info,
     )
     from .vi_pg_kernel import (
-        pg_tilt, pg_R_correction, pg_update_v, pg_update_gamma, pg_Lsup,
+        pg_tilt, pg_R_correction, pg_R_correction_normalized,
+        pg_update_v, pg_update_gamma, pg_Lsup,
     )
 except ImportError:
     from jax_backend import (
@@ -21,7 +22,8 @@ except ImportError:
         expit as _expit, backend_info,
     )
     from vi_pg_kernel import (  # type: ignore[no-redef]
-        pg_tilt, pg_R_correction, pg_update_v, pg_update_gamma, pg_Lsup,
+        pg_tilt, pg_R_correction, pg_R_correction_normalized,
+        pg_update_v, pg_update_gamma, pg_Lsup,
     )
 
 if USE_JAX:
@@ -400,6 +402,9 @@ class CAVI:
         nnz_chunk_size: int = 1_000_000,
         alpha_pi: float = 1.0,
         beta_pi_scale: Optional[float] = 5.0,
+        supervised_update_weight: str = "rw",
+        calibrate_b_v: bool = True,
+        regression_design: str = "raw",
         **_ignored,
     ):
         self.K = n_factors
@@ -410,6 +415,25 @@ class CAVI:
         self.b_v = b_v
         self.sigma_gamma = sigma_gamma
         self.regression_weight = regression_weight
+        # Weight applied to the supervised correction in the PARAMETER UPDATES
+        # (θ rate-shift R_lin/R_quad, υ, γ data terms) and the ELBO L_sup term.
+        #   "rw"  -> auto-scaled regression_weight (= nnz/n); current behavior.
+        #   "one" -> natural weight 1, as in DRGP_VI_full_derivation.md Eq 8.1-8.2
+        #            (no tempering anywhere in the derivation) and the JJ predecessor.
+        # Experiment: at COVID/large scale, "rw" makes R_lin overwhelm b_poisson and
+        # floors b_theta -> θ diverges. "one" tests the derivation-faithful update.
+        self._sup_update_weight = supervised_update_weight
+        self._sup_w = float(regression_weight)  # finalized in fit() after auto-scale
+        # When False, skip the in-loop data-precision calibration of b_v and keep
+        # it fixed at the CLI value (avoids the init-θ miscalibration that freezes
+        # v when there is no Poisson warmup). See Plan A "Fix 2".
+        self._calibrate_bv_enabled = calibrate_b_v
+        # Regression design (Plan A). "raw": logit A = θ·v + aux (θ doubles as
+        # Poisson loading + regression design — scale-coupled). "normalized":
+        # A = s·v + aux with s = θ/‖θ‖₁ on the simplex, so supervision shapes
+        # program DIRECTION not magnitude (severs the memorization/divergence
+        # channel). See docs/PLAN_A_normalized_design_FUTURE_WORK.md.
+        self._regression_design_mode = regression_design
         self.use_class_weights = use_class_weights
 
         self.use_intercept = use_intercept
@@ -1336,19 +1360,35 @@ class CAVI:
         # See vi_pg_kernel.py docstring for the tempering rationale (sLDA / supervised
         # PF up-weighting; power-posterior likelihood for O(np)-vs-O(nκ) balance).
         E_theta_full = self.a_theta / self.b_theta
-        effective_rw = ramp * self.regression_weight
-        R_lin, R_quad, self._row_chunk = pg_R_correction(
-            E_design=E_theta_full,
-            mu_v=self.mu_v,
-            sigma_v_diag=self.sigma_v_diag,
-            mu_gamma=self.mu_gamma,
-            X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
-            wbar=self.wbar,
-            y=y,
-            sample_weights=self._sample_weights,
-            effective_rw=effective_rw,
-            row_chunk=self._row_chunk,
-        )
+        effective_rw = ramp * self._sup_w
+        if self._regression_design_mode == "normalized":
+            # Plan A: θ-rate on the simplex design s=θ/T via the chain-rule
+            # sensitivity G=(v−P)/T (forms s/T/P from raw θ internally).
+            R_lin, R_quad, self._row_chunk = pg_R_correction_normalized(
+                E_theta=E_theta_full,
+                mu_v=self.mu_v,
+                sigma_v_diag=self.sigma_v_diag,
+                mu_gamma=self.mu_gamma,
+                X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
+                wbar=self.wbar,
+                y=y,
+                sample_weights=self._sample_weights,
+                effective_rw=effective_rw,
+                row_chunk=self._row_chunk,
+            )
+        else:
+            R_lin, R_quad, self._row_chunk = pg_R_correction(
+                E_design=E_theta_full,
+                mu_v=self.mu_v,
+                sigma_v_diag=self.sigma_v_diag,
+                mu_gamma=self.mu_gamma,
+                X_aux=X_aux if self.p_aux > 0 else xp.zeros((self.n, 0)),
+                wbar=self.wbar,
+                y=y,
+                sample_weights=self._sample_weights,
+                effective_rw=effective_rw,
+                row_chunk=self._row_chunk,
+            )
 
         # --- solve quadratic b² - (b_Poisson + R_lin) b - R_quad · a = 0 in chunks ---
         min_chunk = max(1024, self.n // 256)
@@ -1396,10 +1436,33 @@ class CAVI:
         # Floor to prevent E[xi] explosion from tiny bp + tiny E[theta] sums
         self.b_xi = xp.maximum(self.b_xi, 1e-6)
 
+    def _apply_regression_design(self, E_theta, Var_theta):
+        """Map (E[θ], Var[θ]) to the regression design used in the logit.
+
+        'raw' → identity. 'normalized' → simplex s = θ/T with
+        Var(s) ≈ Var(θ)/T² (literal θ→s, T frozen; the (1−s)²/cross-factor
+        terms are dropped — see Plan A doc caveat). Shared by training callers
+        and the eval/predict paths so train and test use the SAME design.
+        """
+        if self._regression_design_mode == "normalized":
+            T = xp.maximum(E_theta.sum(axis=1, keepdims=True), 1e-8)
+            return E_theta / T, Var_theta / (T ** 2)
+        return E_theta, Var_theta
+
+    def _regression_design(self):
+        """(E_design, Var_design) for the supervised head from the training θ.
+
+        Single source so the tilt, υ, γ, and L_sup paths cannot drift. The
+        θ-rate path does NOT use this — it calls pg_R_correction_normalized with
+        raw θ and forms s/T/P (simplex Jacobian G=(v−P)/T) internally.
+        """
+        E_theta = self.a_theta / self.b_theta
+        Var_theta = E_theta / self.b_theta
+        return self._apply_regression_design(E_theta, Var_theta)
+
     def _update_omega(self, X_aux):
         """PG augmentation tilt — delegates to pg_tilt (rw-independent at count 1)."""
-        E_theta_full = self.a_theta / self.b_theta
-        Var_theta_full = E_theta_full / self.b_theta
+        E_theta_full, Var_theta_full = self._regression_design()
         self.c_pg, self.wbar, self._row_chunk = pg_tilt(
             E_design=E_theta_full,
             Var_design=Var_theta_full,
@@ -1413,9 +1476,8 @@ class CAVI:
 
     def _update_v(self, y, X_aux, iteration=0, ramp=1.0):
         """υ posterior — delegates to pg_update_v (data terms × effective_rw)."""
-        E_theta_full = self.a_theta / self.b_theta
-        Var_theta_full = E_theta_full / self.b_theta
-        effective_rw = ramp * self.regression_weight
+        E_theta_full, Var_theta_full = self._regression_design()
+        effective_rw = ramp * self._sup_w
         self.mu_v, self.sigma_v_diag, self._row_chunk = pg_update_v(
             E_design=E_theta_full,
             Var_design=Var_theta_full,
@@ -1437,8 +1499,8 @@ class CAVI:
         """γ posterior — delegates to pg_update_gamma (data terms × effective_rw)."""
         if self.p_aux == 0:
             return
-        E_theta_full = self.a_theta / self.b_theta
-        effective_rw = ramp * self.regression_weight
+        E_theta_full, _ = self._regression_design()
+        effective_rw = ramp * self._sup_w
         self.mu_gamma, self.Sigma_gamma, self._row_chunk = pg_update_gamma(
             E_design=E_theta_full,
             mu_v=self.mu_v,
@@ -1460,7 +1522,7 @@ class CAVI:
     # ELBO
     # =================================================================
 
-    def _compute_elbo(self, X_dense, y, X_aux):
+    def _compute_elbo(self, X_dense, y, X_aux, ramp=1.0):
         """Compute ELBO = E[log p] - E[log q].
 
         Row-chunked for all theta-related (n, K) terms to avoid
@@ -1497,11 +1559,13 @@ class CAVI:
         elbo = poisson_ll
 
         # === Supervised LL (tempered ELBO) — delegated to pg_Lsup ===
-        # ELBO is the tempered objective L = E[log p(X|θ,β)] + rw·E[log p(y|θ,υ,γ)]
-        # + log-priors - entropy. pg_Lsup returns the raw L_sup; we multiply by rw.
-        # (ELBO uses full rw, not ramp·rw — the ramp is a warmup device for updates.)
-        E_theta_full = self.a_theta / self.b_theta
-        Var_theta_full = E_theta_full / self.b_theta
+        # ELBO is the tempered objective L = E[log p(X|θ,β)] + (ramp·rw)·E[log p(y|θ,υ,γ)]
+        # + log-priors - entropy. pg_Lsup returns the raw L_sup; we multiply by ramp·rw.
+        # (Fix 3: ELBO uses the SAME ramp·rw weight the updates use, so the printed
+        #  ELBO is exactly the objective being ascended — otherwise the onset of
+        #  regression at full rw injects a spurious drop and breaks the monotonicity
+        #  detector during the ramp. ramp is 0 during Poisson warmup → L_sup off.)
+        E_theta_full, Var_theta_full = self._regression_design()
         regression_ll_raw, self._row_chunk = pg_Lsup(
             E_design=E_theta_full,
             Var_design=Var_theta_full,
@@ -1517,7 +1581,7 @@ class CAVI:
             row_chunk=self._row_chunk,
         )
         regression_ll = float(regression_ll_raw)
-        rw = self.regression_weight
+        rw = ramp * self._sup_w
         elbo += rw * regression_ll
 
         # === θ prior (flat rate = E_xi * E_theta) — chunked, kept inline ===
@@ -1803,6 +1867,21 @@ class CAVI:
                 print(f"  regression_weight auto-scaled: {rw_old:.4f} * "
                       f"nnz/n={self._nnz}/{self.n} = {self.regression_weight:.1f}")
 
+        # Resolve the weight actually used in updates + ELBO L_sup (see __init__).
+        #   "one" -> 1.0 (derivation weight); "rw" -> auto-scaled nnz/n (old);
+        #   <float> -> that absolute weight (for the bounded-rw sweep).
+        _sw = self._sup_update_weight
+        if _sw == "one":
+            self._sup_w = 1.0
+        elif _sw == "rw":
+            self._sup_w = self.regression_weight
+        else:
+            self._sup_w = float(_sw)
+        if verbose:
+            print(f"  supervised update-weight mode: '{self._sup_update_weight}' "
+                  f"-> updates & ELBO L_sup use weight {self._sup_w:.4g} "
+                  f"(regression_weight={self.regression_weight:.4g})")
+
         # Recompute class weights at patient level when patient_ids given
         if patient_ids is not None and self.use_class_weights:
             patient_ids_arr = np.asarray(patient_ids)
@@ -1998,9 +2077,18 @@ class CAVI:
             # During v_warmup, run Poisson-only theta (no regression correction).
             # After warmup, linearly ramp regression influence over 50 iterations.
             ramp_iters = 200
+            # ramp is 0 during the Poisson-only warmup (t < v_warmup); the ELBO's
+            # L_sup term is then weighted ramp·rw = 0, matching the Poisson-only
+            # updates so the printed ELBO stays the ascended objective (Fix 3).
+            ramp = 0.0
             if t == v_warmup:
-                self._calibrate_b_v(y, X_aux, v_crossover=2.0)
-                # Re-init sigma_v_diag to match new b_v
+                # _calibrate_b_v measures data precision from the CURRENT E[θ]; if
+                # called before θ has settled (e.g. v_warmup=0, init-scale θ) it
+                # massively overestimates precision and floors b_v, freezing v.
+                # Gate it so no-warmup runs can keep b_v fixed at the CLI value.
+                if self._calibrate_bv_enabled:
+                    self._calibrate_b_v(y, X_aux, v_crossover=2.0)
+                # Re-init sigma_v_diag to match b_v (calibrated or fixed)
                 self.sigma_v_diag = xp.full_like(self.sigma_v_diag, self.b_v ** 2)
             if t >= v_warmup:
                 ramp = min(1.0, (t - v_warmup + 1) / ramp_iters)
@@ -2097,7 +2185,7 @@ class CAVI:
 
             # 6. Compute ELBO
             if t % check_freq == 0:
-                elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux)
+                elbo, pois_ll, reg_ll = self._compute_elbo(X_dense, y, X_aux, ramp=ramp)
 
             if t % check_freq == 0:
                 self.elbo_history_.append((t, elbo, pois_ll, reg_ll))
@@ -2271,7 +2359,10 @@ class CAVI:
                     # peak-to-peak amplitude bounded. Robust to CAVI oscillation
                     # where consecutive pct_changes alternate sign.
                     window = 6  # ~30 iters of history at check_freq=5
-                    if len(pct_changes) >= window and t >= 30:
+                    # Never converge-stop before the regression ramp completes —
+                    # otherwise the (Poisson-dominated) ELBO can plateau mid-ramp
+                    # and stop before supervision has engaged (weight-1 sims).
+                    if len(pct_changes) >= window and t >= max(30, v_warmup + ramp_iters):
                         recent = pct_changes[-window:]
                         mean_abs = abs(sum(recent) / window)
                         ptp = max(recent) - min(recent)
@@ -2303,8 +2394,15 @@ class CAVI:
             if best_params is not None:
                 print(f"Best HO-LL: {best_holl:.4f}")
 
-        # Restore best checkpoint (skip when early stopping is disabled)
-        if early_stopping != 'none':
+        # Restore best checkpoint (skip when early stopping is disabled).
+        # Mode-aware: only the held-out-LL path (with a validation set) and its
+        # no-val training-Reg fallback restore an earlier checkpoint. In 'elbo'
+        # mode we KEEP the final converged state: the ELBO is the monotone
+        # objective (Fix 3), so the final iterate is the best, and best_reg_params
+        # is a pre-supervision checkpoint at weight 1 (raw training Reg peaks
+        # before the ramp engages, then drifts) — restoring it would discard all
+        # supervision. See sim-harness diagnosis 2026-06-10.
+        if early_stopping == 'heldout_ll':
             if best_holl_params is not None:
                 if verbose:
                     print(f"Restoring best HO-LL checkpoint (iter {best_holl_iter}, "
@@ -2315,7 +2413,8 @@ class CAVI:
                     print(f"Restoring best regression checkpoint (iter {best_reg_iter})")
                 self._restore(best_reg_params)
         elif verbose:
-            print("Early stopping disabled -- keeping final parameters.")
+            print(f"early_stopping={early_stopping!r}: keeping final converged "
+                  f"parameters (no checkpoint restore).")
 
         # Store final mask consistency diagnostic
         self.diagnostics_['eta_vs_counts'] = (
@@ -2483,6 +2582,9 @@ class CAVI:
             X_coo, n_val, n_iter, X_aux_new=X_aux_v_dev,
             supervised=False)
         E_theta_v = a_theta_v / b_theta_v
+        # Use the regression design (s=θ/T in normalized mode) so the theta-only
+        # / full logits match the design the head was trained on.
+        E_theta_v, _ = self._apply_regression_design(E_theta_v, E_theta_v / b_theta_v)
         y_np = np.asarray(y_val, dtype=np.float32)
         if y_np.ndim == 1:
             y_np = y_np[:, None]
@@ -2543,11 +2645,14 @@ class CAVI:
         sv_2d   = self.sigma_v_diag
 
         E_theta = a_theta / b_theta
+        Var_theta = E_theta / b_theta
+        # Apply the regression design (s=θ/T in normalized mode) so the predicted
+        # logit A = s·v + aux matches training. Var(s) ≈ Var(θ)/T².
+        E_theta, Var_theta = self._apply_regression_design(E_theta, Var_theta)
         logits = E_theta @ mu_v_2d.T
         if self.p_aux > 0:
             logits = logits + X_aux_new @ self.mu_gamma.T
 
-        Var_theta = E_theta / b_theta
         E_v_sq = mu_v_2d ** 2 + sv_2d
         # Full second-moment decomposition of A (matches (A.15)).
         var_logits = Var_theta @ E_v_sq.T + xp.square(E_theta) @ sv_2d.T

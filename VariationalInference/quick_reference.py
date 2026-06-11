@@ -209,6 +209,33 @@ def parse_args() -> argparse.Namespace:
         help='Gaussian prior std for gamma (auxiliary effects)'
     )
     parser.add_argument(
+        '--no-calibrate-b-v',
+        action='store_true',
+        help="Disable the in-loop data-precision auto-calibration of b_v and keep "
+             "it fixed at --b-v. The calibration measures precision from the current "
+             "E[theta]; with no Poisson warmup (--v-warmup 0) it fires on init-scale "
+             "theta, floors b_v, and freezes v. Use with --v-warmup 0 to test "
+             "no-warmup viability without that artifact.")
+    parser.add_argument(
+        '--regression-design',
+        choices=['raw', 'normalized'],
+        default='raw',
+        help="Regression design (Plan A). 'raw': logit A=θ·v+aux (θ doubles as "
+             "Poisson loading + design, scale-coupled). 'normalized': A=s·v+aux with "
+             "s=θ/‖θ‖₁ on the simplex — supervision shapes program DIRECTION not "
+             "magnitude (severs the memorization/divergence channel).")
+    parser.add_argument(
+        '--supervised-update-weight',
+        choices=['rw', 'one'],
+        default='rw',
+        help="Weight on the supervised correction in the PARAMETER UPDATES "
+             "(theta rate-shift R_lin/R_quad, v, gamma) and the ELBO L_sup. "
+             "'rw' (default) = auto-scaled regression_weight (=nnz/n); "
+             "'one' = natural weight 1 per DRGP_VI_full_derivation.md Eq 8.1-8.2 "
+             "(no tempering in the derivation). Use 'one' to test whether the "
+             "nnz/n multiplier on the per-cell theta rate is what floors b_theta "
+             "and diverges theta at scale.")
+    parser.add_argument(
         '--regression-weight',
         type=float,
         default=1.0,
@@ -1133,6 +1160,9 @@ def main():
         b_v=args.b_v,
         sigma_gamma=args.sigma_gamma,
         regression_weight=args.regression_weight,
+        supervised_update_weight=args.supervised_update_weight,
+        calibrate_b_v=not args.no_calibrate_b_v,
+        regression_design=args.regression_design,
         use_intercept=not args.no_intercept,
         random_state=args.seed,
         mode=args.mode,

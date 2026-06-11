@@ -26,14 +26,15 @@ def _calibrate(args):
 def _generate(args):
     from .dataset import write_dataset
     p = write_dataset(args.truth_idx, args.h2, args.r, args.inner_seed,
-                      is_stability=args.is_stability)
+                      rho=args.rho, is_stability=args.is_stability)
     print(f"  wrote {p}")
 
 
 def _run_drgp(args):
     from .runner_drgp import run
     run(args.h5ad, args.mode, args.K, args.inner_seed, args.out_dir,
-        regression_weight=args.regression_weight)
+        regression_weight=args.regression_weight, sup_weight=args.sup_weight,
+        verbose=args.verbose)
 
 
 def _run_unsup(args):
@@ -97,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_g.add_argument("--truth-idx", type=int, required=True)
     p_g.add_argument("--h2", type=float, required=True)
     p_g.add_argument("--r", type=float, required=True)
+    p_g.add_argument("--rho", type=float, default=None,
+                     help="Within-type perturbation fraction; default config.PERTURB_FRAC_HEADLINE.")
     p_g.add_argument("--inner-seed", type=int, default=0)
     p_g.add_argument("--is-stability", action="store_true")
     p_g.set_defaults(func=_generate)
@@ -108,6 +111,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_d.add_argument("--inner-seed", type=int, default=0)
     p_d.add_argument("--out-dir", required=True)
     p_d.add_argument("--regression-weight", type=float, default=None)
+    p_d.add_argument("--sup-weight", default=None,
+                     help="Override supervised update weight: 'one', 'rw', or a float "
+                          "(absolute weight). Default uses config.SUPERVISED_UPDATE_WEIGHT.")
+    p_d.add_argument("--verbose", action="store_true")
     p_d.set_defaults(func=_run_drgp)
 
     p_u = sub.add_parser("run-unsup")

@@ -13,7 +13,9 @@ from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 from VariationalInference.vi_cavi import CAVI
 from . import config
-from ._runner_utils import derive_seeds, patient_grouped_split
+from ._runner_utils import (derive_seeds, patient_grouped_split,
+                            pseudobulk_mean, patient_liability)
+from scipy.stats import spearmanr
 
 
 def _build_pathway_mask(mask_M: np.ndarray, mode: str, K: int) -> np.ndarray | None:
@@ -40,6 +42,7 @@ def _integrated_logit(theta: np.ndarray, mu_v: np.ndarray,
 def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         out_dir: str, regression_weight: float | None = None,
         max_iter: int | None = None, early_stopping: str | None = None,
+        sup_weight: str | None = None,
         verbose: bool = False) -> dict:
     A = ad.read_h5ad(h5ad_path)
     truth_idx = int(A.uns["truth_idx"]); h2 = float(A.uns["h2"]); r = float(A.uns["r"])
@@ -51,7 +54,7 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
     X = A.X.tocsr() if sp.issparse(A.X) else sp.csr_matrix(A.X)
     y = A.obs["y"].to_numpy().astype(np.float32)
     patient_ids = A.obs["patient_id"].to_numpy()
-    n_test = max(1, int(round(config.N_PATIENTS / 5)))    # 8 patients
+    n_test = config.N_TEST_PATIENTS                       # 16 of 80 patients
     tr_idx, te_idx = patient_grouped_split(patient_ids, n_test_patients=n_test,
                                            seed=seeds["split_seed"])
     X_tr, X_te = X[tr_idx], X[te_idx]
@@ -65,8 +68,12 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
     rw = config.REGRESSION_WEIGHT if regression_weight is None else regression_weight
     model = CAVI(
         n_factors=K, a=config.CAVI_A, c=config.CAVI_C,
-        b_v=1.0, sigma_gamma=1.0,
+        b_v=config.CAVI_B_V, sigma_gamma=1.0,
         regression_weight=rw,
+        supervised_update_weight=(sup_weight if sup_weight is not None
+                                  else config.SUPERVISED_UPDATE_WEIGHT),
+        calibrate_b_v=config.CALIBRATE_B_V,
+        regression_design=config.REGRESSION_DESIGN,
         use_class_weights=True,
         random_state=seeds["fit_seed"],
         mode=mode,
@@ -100,17 +107,27 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
     mu_v = np.asarray(model.mu_v)                       # (kappa, K)
     mu_gamma = np.asarray(model.mu_gamma)
 
+    # Regression DESIGN: in 'normalized' mode the model's logit is on the simplex
+    # s=θ/‖θ‖₁ (Plan A), so all logits/heads below must use s, not raw θ. Raw θ is
+    # still saved (loadings) and used for theta_norm diagnostics. β-recovery metrics
+    # (evaluate.py) read mu_beta and are unaffected.
+    def _design(th):
+        if config.REGRESSION_DESIGN == "normalized":
+            return th / np.maximum(th.sum(axis=1, keepdims=True), 1e-8)
+        return th
+    s_te, s_tr, s_tr_pois = _design(theta_te), _design(theta_tr), _design(theta_tr_pois)
+
     # Integrated logit WITH gamma (held-out, for §7.5 calibration vs LR baselines).
-    A_int_te = _integrated_logit(theta_te, mu_v, intercept_aux_te, mu_gamma)
-    A_int_tr = _integrated_logit(theta_tr, mu_v, intercept_aux_tr, mu_gamma)
+    A_int_te = _integrated_logit(s_te, mu_v, intercept_aux_te, mu_gamma)
+    A_int_tr = _integrated_logit(s_tr, mu_v, intercept_aux_tr, mu_gamma)
     cell_auc_integrated = float(roc_auc_score(y_te, A_int_te))
     cell_auc_integrated_train = float(roc_auc_score(y_tr, A_int_tr))
 
     # Theta-only logit (γ contribution excluded) — measures whether (β, υ) carry
     # discriminative signal independent of the γ intercept absorbing labels.
     # This is the engagement-gate metric: γ-memorization is invisible to it.
-    A_theta_only_te = (theta_te @ mu_v.T).ravel().astype(np.float32)
-    A_theta_only_tr = (theta_tr @ mu_v.T).ravel().astype(np.float32)
+    A_theta_only_te = (s_te @ mu_v.T).ravel().astype(np.float32)
+    A_theta_only_tr = (s_tr @ mu_v.T).ravel().astype(np.float32)
     cell_auc_theta_only = float(roc_auc_score(y_te, A_theta_only_te))
     cell_auc_theta_only_train = float(roc_auc_score(y_tr, A_theta_only_tr))
 
@@ -121,26 +138,58 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         Cs=config.LR_C_GRID, cv=config.LR_CV_FOLDS, penalty="l1",
         solver="saga", max_iter=config.LR_MAX_ITER, scoring="roc_auc",
         n_jobs=1,
-    ).fit(theta_tr, y_tr)
-    posthoc_pred = head.predict_proba(theta_te)[:, 1]
+    ).fit(s_tr, y_tr)
+    posthoc_pred = head.predict_proba(s_te)[:, 1]
     cell_auc_posthoc = float(roc_auc_score(y_te, posthoc_pred))
-    cell_auc_posthoc_train = float(roc_auc_score(y_tr, head.predict_proba(theta_tr)[:, 1]))
+    cell_auc_posthoc_train = float(roc_auc_score(y_tr, head.predict_proba(s_tr)[:, 1]))
 
     # Regime-consistent posthoc head: fit on Poisson-only theta_tr_pois, score on
     # Poisson-only theta_te. Removes the supervised-vs-Poisson regime mismatch
-    # without paying for per-fold refits (which don't fix it anyway).
+    # without paying for per-fold refits (which don't fix it anyway). L2 (not L1)
+    # — when theta_tr_pois has weakly-discriminative axes (small theta variance
+    # along the disease direction), L1 zeroes all 8 coefs and returns chance AUC
+    # (observed on truth 2). L2 spreads weight and recovers the modest signal.
     head_consistent = LogisticRegressionCV(
-        Cs=config.LR_C_GRID, cv=config.LR_CV_FOLDS, penalty="l1",
-        solver="saga", max_iter=config.LR_MAX_ITER, scoring="roc_auc",
+        Cs=config.LR_C_GRID, cv=config.LR_CV_FOLDS, penalty="l2",
+        solver="lbfgs", max_iter=config.LR_MAX_ITER, scoring="roc_auc",
         n_jobs=1,
-    ).fit(theta_tr_pois, y_tr)
-    proba_consistent = head_consistent.predict_proba(theta_te)[:, 1]
+    ).fit(s_tr_pois, y_tr)
+    proba_consistent = head_consistent.predict_proba(s_te)[:, 1]
     cell_auc_consistent = float(roc_auc_score(y_te, proba_consistent))
+
+    # ---- Patient pseudo-bulk evaluation (v2 'better-handled' task) ----------------------
+    # Aggregate RAW counts to one mean profile per patient, Poisson-only fold-in -> theta_pb,
+    # then classify patients. h2 is the Bayes ceiling for this task. Reported alongside the
+    # cell-level (inherited-label) metrics; the contrast is the paper's argument.
+    Xpb_tr, ypb_tr, pid_tr = pseudobulk_mean(X, patient_ids, tr_idx, y)
+    Xpb_te, ypb_te, pid_te = pseudobulk_mean(X, patient_ids, te_idx, y)
+    th_pb_tr = np.asarray(model.transform(sp.csr_matrix(Xpb_tr), n_iter=20,
+                                          supervised=False)["E_theta"])
+    th_pb_te = np.asarray(model.transform(sp.csr_matrix(Xpb_te), n_iter=20,
+                                          supervised=False)["E_theta"])
+    s_pb_tr, s_pb_te = _design(th_pb_tr), _design(th_pb_te)
+    aux_pb_tr = np.ones((s_pb_tr.shape[0], 1), dtype=np.float32)
+    aux_pb_te = np.ones((s_pb_te.shape[0], 1), dtype=np.float32)
+    A_pb_te = _integrated_logit(s_pb_te, mu_v, aux_pb_te, mu_gamma)
+    pat_auc_integrated = (float(roc_auc_score(ypb_te, A_pb_te))
+                          if len(np.unique(ypb_te)) == 2 else float("nan"))
+    # Patient posthoc head (L2; tiny n_patients, weakly-discriminative axes).
+    pat_head = LogisticRegressionCV(
+        Cs=config.LR_C_GRID, cv=min(config.LR_CV_FOLDS, 3), penalty="l2",
+        solver="lbfgs", max_iter=config.LR_MAX_ITER, scoring="roc_auc", n_jobs=1,
+    ).fit(s_pb_tr, ypb_tr)
+    pat_posthoc_pred = pat_head.predict_proba(s_pb_te)[:, 1]
+    pat_auc_posthoc = (float(roc_auc_score(ypb_te, pat_posthoc_pred))
+                       if len(np.unique(ypb_te)) == 2 else float("nan"))
+    # Patient liability recovery: does the pseudo-bulk score track the true patient liability?
+    liab_pb_te = patient_liability(pid_te, np.asarray(A.uns["liability_patient"]))
+    pat_spearman_liability = float(spearmanr(A_pb_te, liab_pb_te).correlation)
 
     y_pred = (A_int_te > 0).astype(int)
     metrics = {
         "method": method, "mode": mode, "K": int(K),
-        "truth_idx": truth_idx, "h2": h2, "r": r, "inner_seed": int(inner_seed),
+        "truth_idx": truth_idx, "h2": h2, "r": r, "rho": float(A.uns.get("rho", -1.0)),
+        "inner_seed": int(inner_seed),
         "regression_weight": float(rw),
         "cell_auc_integrated": cell_auc_integrated,
         "cell_auc_integrated_train": cell_auc_integrated_train,
@@ -149,9 +198,13 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         "cell_auc_posthoc": cell_auc_posthoc,
         "cell_auc_posthoc_train": cell_auc_posthoc_train,
         "cell_auc_consistent": cell_auc_consistent,
+        "patient_auc_integrated": pat_auc_integrated,
+        "patient_auc_posthoc": pat_auc_posthoc,
+        "patient_spearman_liability": pat_spearman_liability,
         "cell_f1": float(f1_score(y_te, y_pred)),
         "cell_acc": float(accuracy_score(y_te, y_pred)),
         "n_train": int(len(tr_idx)), "n_test": int(len(te_idx)),
+        "n_train_patients": int(len(pid_tr)), "n_test_patients": int(len(pid_te)),
     }
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
 

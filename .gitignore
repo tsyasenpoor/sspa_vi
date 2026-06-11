@@ -415,3 +415,6 @@ VariationalInference/analysis-utils/gibbs_smoke_test.py
 VariationalInference/analysis-utils/gibbs_ibd_run.py
 VariationalInference/analysis-utils/svi_biorepo_run.py
 VariationalInference/analysis-utils/svi_ibd_run.py
+VariationalInference/comp/mesa_preprocess.py
+VariationalInference/comp/muster_mesa.py
+VariationalInference/comp/gene_space.py
