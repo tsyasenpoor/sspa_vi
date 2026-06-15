@@ -52,15 +52,22 @@ def _fit_schpf(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, K: int, seed
 
 def _fit_spectra(X_train_sp: sp.csr_matrix, X_test_sp: sp.csr_matrix, mask_M: np.ndarray,
                  K: int, seed: int):
-    from Spectra import Spectra as SpectraModel
-    gene_sets = {f"path_{k}": np.flatnonzero(mask_M[:, k]).tolist()
-                 for k in range(mask_M.shape[1])}
-    np.random.seed(seed)
-    m = SpectraModel(n_factors=K, gene_sets=gene_sets)
-    m.fit(X_train_sp.toarray() if sp.issparse(X_train_sp) else X_train_sp)
-    beta = np.asarray(getattr(m, "factors_genes", getattr(m, "beta", None)),
-                      dtype=np.float64)                          # (K, p)
-    H_tr = poisson_foldin_solve(np.asarray(X_train_sp.toarray(), dtype=np.float32), beta)
+    # Spectra API: Spectra.Spectra.SPECTRA_Model(X, labels, L, vocab, gs_dict, use_cell_types).
+    # use_cell_types=False => flat gs_dict {set: [gene_tokens]}, labels=None. factors are (L, p).
+    # No native OOD projection -> Poisson LS fold-in for test/pseudo-bulk (consistent projector).
+    from Spectra.Spectra import SPECTRA_Model
+    import torch
+    torch.manual_seed(seed); np.random.seed(seed)
+    p = X_train_sp.shape[1]
+    vocab = [str(i) for i in range(p)]
+    gs_dict = {f"path_{k}": [str(g) for g in np.flatnonzero(mask_M[:, k])]
+               for k in range(mask_M.shape[1])}
+    Xtr = np.asarray(X_train_sp.toarray(), dtype=np.float32)
+    m = SPECTRA_Model(X=Xtr, labels=None, L=K, vocab=vocab, gs_dict=gs_dict,
+                      use_cell_types=False)
+    m.train(X=Xtr, num_epochs=config.SPECTRA_EPOCHS, verbose=False)
+    beta = np.asarray(m.return_factors(), dtype=np.float64)      # (K, p)
+    H_tr = poisson_foldin_solve(Xtr, beta)
     H_te = poisson_foldin_solve(np.asarray(X_test_sp.toarray(), dtype=np.float32), beta)
     projector = lambda Xsp: poisson_foldin_solve(np.asarray(Xsp.toarray(), dtype=np.float32), beta)
     return H_tr, H_te, beta, projector

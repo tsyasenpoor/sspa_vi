@@ -97,6 +97,7 @@ import numpy as np
 LR_C_GRID = np.logspace(-4, 2, 11).tolist()
 LR_CV_FOLDS = 3
 LR_MAX_ITER = 2000
+SPECTRA_EPOCHS = 2000   # Spectra full-batch training epochs (CPU torch); baseline fit budget
 
 # ---- Split knobs --------------------------------------------------------
 N_TEST_PATIENTS = N_PATIENTS // 5   # 16 of 80 held out; used by every runner

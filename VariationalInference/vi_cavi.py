@@ -858,9 +858,23 @@ class CAVI:
             else:
                 mask_part = np.hstack([pm, np.zeros((self.p, npath - pm.shape[1]))])
             self.beta_mask[:, :npath] = mask_part
+            # Complementary masking (2026-06-14): exclude the free de-novo factors
+            # from the annotated-pathway genes. Without this, the free factors'
+            # large theta wins the multinomial phi allocation on pathway genes even
+            # with tiny beta, starving the pathway factors -> their theta collapses
+            # (~3 vs ~800 in pure masked) and beta is under-determined, so combined
+            # recovered pathways WORSE than masked (0.287 vs 0.399), violating the
+            # combined>=masked containment. Restricting free support to the pathway
+            # complement makes pathway-gene counts flow exclusively to the pathway
+            # factors (matching masked) while free factors model the de-novo/
+            # background complement. Uses mask_part (the pathways actually assigned
+            # to pathway factors) so any unmodeled pathway's genes stay available to
+            # the free factors -> no orphan genes.
+            pathway_union = mask_part.any(axis=1)             # (p,) genes owned by pathway factors
+            self.beta_mask[pathway_union, npath:] = 0.0       # free factors off pathway genes
             small_a = self.c * 0.01
             large_b = 100.0
-            for k in range(npath):
+            for k in range(self.K):
                 self.a_beta[:, k] = np.where(
                     self.beta_mask[:, k] > 0.5, self.a_beta[:, k], small_a)
                 self.b_beta[:, k] = np.where(
