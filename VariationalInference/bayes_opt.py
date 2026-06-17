@@ -101,6 +101,11 @@ DATASET_PRESETS = {
     'covid': {
         'n_factors': ('int', 500, 5000, 100),
     },
+    # Pseudo-bulk COVID: one row per patient (<=148 samples), so K must be tiny.
+    # The N_train//2 auto-guard further caps high based on the actual sample count.
+    'covid_bulk': {
+        'n_factors': ('int', 5, 50, 5),
+    },
 }
 
 
@@ -483,6 +488,9 @@ class HyperparameterOptimizer:
         fixed_params: Optional[Dict[str, Any]] = None,
         max_iter: int = 200,
         subsample_ratio: Optional[float] = None,
+        subsample_n_patients: Optional[int] = None,
+        subsample_seed: int = 0,
+        patient_column: Optional[str] = None,
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
         random_state: Optional[int] = None,
@@ -510,6 +518,9 @@ class HyperparameterOptimizer:
         self.fixed_params = fixed_params or {}
         self.max_iter = max_iter
         self.subsample_ratio = subsample_ratio
+        self.subsample_n_patients = subsample_n_patients
+        self.subsample_seed = subsample_seed
+        self.patient_column = patient_column
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.random_state = random_state
@@ -576,13 +587,29 @@ class HyperparameterOptimizer:
     def load_data(self):
         """Load and split data using DataLoader."""
         logger.info(f"Loading data from {self.data_path}...")
+        # Patient-level subsampling (single-cell configs): preload the same N-patient subset
+        # used by the production runs (subsample_adata, deterministic in subsample_seed).
+        preloaded = None
+        if self.subsample_n_patients is not None:
+            import anndata as _ad
+            from VariationalInference.create_subsamples import subsample_adata
+            logger.info("Preloading %s and subsampling to %d patients (seed=%d)",
+                        self.data_path, self.subsample_n_patients, self.subsample_seed)
+            _full = _ad.read_h5ad(self.data_path)
+            _full.var_names_make_unique()
+            preloaded = subsample_adata(_full, n_patients=self.subsample_n_patients,
+                                        subsample_seed=self.subsample_seed, verbose=True)
+            del _full
         loader = DataLoader(
             data_path=self.data_path,
             gene_annotation_path=self.gene_annotation_path,
             verbose=True,
+            adata=preloaded,
         )
         # Use first label column for stratification in multi-label case
         stratify_col = self.label_column[0] if isinstance(self.label_column, list) else self.label_column
+        # patient_column => patient-grouped split (no donor leakage); REQUIRED for single-cell
+        # so the val AUC used for model selection is not leakage-inflated.
         self.data = loader.load_and_preprocess(
             label_column=self.label_column,
             aux_columns=self.aux_columns,
@@ -592,6 +619,7 @@ class HyperparameterOptimizer:
             min_cells_expressing=0.001,
             random_state=self.random_state,
             train_subsample_ratio=self.subsample_ratio,
+            patient_column=self.patient_column,
         )
         X_train, X_aux_train, y_train = self.data['train']
         X_val, X_aux_val, y_val = self.data['val']
@@ -1005,9 +1033,18 @@ def parse_args(argv=None):
 
     # Dataset preset
     parser.add_argument(
-        '--dataset-preset', default=None, choices=['pbmc', 'simulation', 'emtab', 'covid'],
+        '--dataset-preset', default=None,
+        choices=['pbmc', 'simulation', 'emtab', 'covid', 'covid_bulk'],
         help='Dataset-specific search space preset'
     )
+    parser.add_argument('--subsample-n-patients', type=int, default=None,
+                        help='Subsample to N patients (single-cell configs; matches the '
+                             'production runs via subsample_adata).')
+    parser.add_argument('--subsample-seed', type=int, default=0,
+                        help='Deterministic seed for patient subsampling.')
+    parser.add_argument('--patient-column', default=None,
+                        help='Patient/sample id column for patient-grouped splitting '
+                             '(required for single-cell so val AUC is leakage-free).')
 
     # Mode / pathways
     parser.add_argument(
@@ -1124,6 +1161,9 @@ def main(argv=None):
         fixed_params=_parse_fixed_params(args.fixed_params),
         max_iter=args.max_iter,
         subsample_ratio=args.subsample_ratio,
+        subsample_n_patients=args.subsample_n_patients,
+        subsample_seed=args.subsample_seed,
+        patient_column=args.patient_column,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         random_state=args.seed,

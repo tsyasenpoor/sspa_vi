@@ -405,6 +405,10 @@ class CAVI:
         supervised_update_weight: str = "rw",
         calibrate_b_v: bool = True,
         regression_design: str = "raw",
+        pathway_prior_lambda: float = 0.0,   # default OFF: the soft inclusion prior is
+        # ineffective in this data-dominated regime (rho gives at most a ~2x tilt to phi,
+        # which theta dominates; recovery still washes out at iter 1 for any lambda -- see
+        # the pathway_init investigation). Kept as an opt-in experimental knob only.
         **_ignored,
     ):
         self.K = n_factors
@@ -446,6 +450,13 @@ class CAVI:
         self.n_pathway_factors = n_pathway_factors
         self.alpha_pi = alpha_pi
         self._beta_pi_scale = beta_pi_scale  # resolved to K in _initialize
+        # pathway_init soft prior: persistent pseudo-count (nats) added to the spike-and-slab
+        # inclusion log-odds for pathway carrier genes on the pathway factors EVERY iteration
+        # (Eq. A.6). Unlike the transient a_beta warm-start (overwritten by the first slab
+        # update), this survives because r_beta re-enters phi each sweep. lambda=0 -> unmasked;
+        # large lambda -> inclusion forced on pathway genes (approaches masked support).
+        self.pathway_prior_lambda = float(pathway_prior_lambda)
+        self._pathway_prior = None   # (p, K) pseudo-count matrix, built in _init_beta_mask
 
         if mode in ['masked', 'pathway_init'] and pathway_mask is None:
             raise ValueError(f"pathway_mask required for mode='{mode}'")
@@ -629,6 +640,15 @@ class CAVI:
             # provides some initial suppression in phi, preventing the
             # circular dependency where all genes bootstrap nonzero z_sum.
             self.r_beta = np.full((self.p, K), 0.5, dtype=np.float32)
+            # pathway_init soft prior: warm r_beta toward inclusion on pathway carriers /
+            # pathway factors at INIT, so phi routes their counts to the pathway factors from
+            # the first real iteration -- the gated (t>=ss_warmup), damped _update_r_beta
+            # nudge starts long after the slab has already washed out. Persisted thereafter
+            # via the log-odds pseudo-count in _update_r_beta.
+            if self._pathway_prior is not None:
+                r_hi = float(1.0 / (1.0 + np.exp(-self.pathway_prior_lambda)))
+                self.r_beta = np.where(self._pathway_prior > 0, r_hi,
+                                       self.r_beta).astype(np.float32)
             if self._active_beta is not None:
                 self.r_beta = np.where(self._active_beta, self.r_beta, 0.0)
             # Combined mode: pathway factors have deterministic r=mask (not learned)
@@ -847,6 +867,11 @@ class CAVI:
             self.a_beta = np.where(pw_indicator > 0.5,
                                    self.a_beta * boost, self.a_beta)
             self.beta_mask = None  # no enforcement during training
+            # Persistent soft prior: pseudo-count on the inclusion log-odds for pathway
+            # carriers on the pathway factors, re-applied every _update_r_beta sweep. This
+            # is the only channel that survives the data-dominated slab update (the a_beta
+            # warm-start above washes out after one iteration; see _update_r_beta).
+            self._pathway_prior = (pw_indicator * self.pathway_prior_lambda).astype(np.float32)
 
         elif self.mode == 'combined' and self.pathway_mask is not None:
             pm = self.pathway_mask.T
@@ -1318,6 +1343,11 @@ class CAVI:
         E_log_1mpi = digamma(self.b_pi) - digamma(self.a_pi + self.b_pi)    # (p,)
 
         log_odds = E_log_pi[:, None] - E_log_1mpi[:, None] + log_lik_on    # (p, K)
+        # pathway_init soft prior: persistent inclusion pseudo-count on pathway carriers /
+        # pathway factors (Eq. A.6). Survives the data-dominated slab update because it is
+        # re-applied here every sweep, unlike the transient a_beta warm-start.
+        if self._pathway_prior is not None:
+            log_odds = log_odds + xp.asarray(self._pathway_prior)
         log_odds = xp.clip(log_odds, -20.0, 20.0)
         self.r_beta = _expit(log_odds)
 

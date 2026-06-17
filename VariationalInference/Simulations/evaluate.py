@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, average_precision_score
 from scipy.stats import spearmanr
 import anndata as ad
 
@@ -48,6 +48,23 @@ def recovery_jaccard_oracle(beta_hat: np.ndarray, S_star: list[np.ndarray],
         inter = len(set(top.tolist()) & set(S_l.tolist()))
         union = size + size - inter
         out.append(inter / union if union > 0 else 0.0)
+    return out
+
+
+def recovery_support_auprc(beta_hat: np.ndarray, S_star: list[np.ndarray],
+                           assign: np.ndarray) -> list[float]:
+    """Scale-free membership recovery: rank genes by |beta_hat[:, assign[l]]|, label = in S_l,
+    score by average precision (AUPRC). Unlike the magnitude cosine -- which is dominated by the
+    coefficient-of-variation of the loadings on the carrier support and so rewards a flat profile
+    rather than recovery (see recovery_reframe.py) -- AUPRC depends only on the gene ranking and is
+    comparable across methods. Chance level is the support prevalence |S_l| / p."""
+    p = beta_hat.shape[0]
+    out = []
+    for l, S_l in enumerate(S_star):
+        lab = np.zeros(p, dtype=int)
+        lab[np.asarray(S_l)] = 1
+        score = np.abs(beta_hat[:, assign[l]])
+        out.append(float(average_precision_score(lab, score)) if lab.any() else float("nan"))
     return out
 
 
@@ -158,6 +175,18 @@ def run(result_dir: str, h5ad_path: str) -> dict:
     metrics_out["jaccard_oracle_per_l"] = jac_oracle
     if family == "drgp" and rho.size:
         metrics_out["jaccard_drgp_native_per_l"] = recovery_jaccard_drgp_native(rho, S_star, assign)
+
+    # Scale-free membership recovery, split into the annotated (pathway) block -- where masked/
+    # combined are handed S_l and recovery is by construction -- and the de novo block, the only
+    # non-circular discovery test. The magnitude cosine is retained above for backward
+    # compatibility but is a flatness artifact; prefer these for the recovery claim.
+    auprc = recovery_support_auprc(beta_hat, S_star, assign)
+    metrics_out["support_auprc_per_l"] = auprc
+    n_path = A.uns["mask_M"].shape[1]
+    annotated = [auprc[l] for l in range(1, n_path + 1)]
+    denovo = [auprc[l] for l in range(n_path + 1, L) if causal_mask[l]]
+    metrics_out["recovery_auprc_annotated"] = float(np.nanmean(annotated)) if annotated else float("nan")
+    metrics_out["recovery_auprc_denovo"] = float(np.nanmean(denovo)) if denovo else float("nan")
 
     if family == "drgp":
         rm = ranking_metrics(mu_v=payload["mu_v"].ravel(),

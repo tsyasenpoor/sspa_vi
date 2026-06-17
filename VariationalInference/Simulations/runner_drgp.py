@@ -18,6 +18,28 @@ from ._runner_utils import (derive_seeds, patient_grouped_split,
 from scipy.stats import spearmanr
 
 
+def _corrupt_mask(mask_M: np.ndarray, drop_frac: float, inject_frac: float,
+                  seed: int) -> np.ndarray:
+    """Pathway misspecification (study #5). Per pathway column: drop `drop_frac` of the true
+    carriers (false negatives) and inject `inject_frac * n_carriers` random non-carriers (false
+    positives). Returns a corrupted COPY -- the data, labels, and A.uns['mask_M'] used by
+    evaluate.py for ground-truth recovery are untouched, so only the prior the model sees changes."""
+    if drop_frac <= 0 and inject_frac <= 0:
+        return mask_M
+    rng = np.random.default_rng(seed)
+    M = mask_M.copy()
+    for k in range(M.shape[1]):
+        carriers = np.flatnonzero(M[:, k] == 1)
+        noncarriers = np.flatnonzero(M[:, k] == 0)
+        n_drop = int(round(drop_frac * len(carriers)))
+        if n_drop > 0:
+            M[rng.choice(carriers, size=n_drop, replace=False), k] = 0
+        n_inj = min(int(round(inject_frac * len(carriers))), len(noncarriers))
+        if n_inj > 0:
+            M[rng.choice(noncarriers, size=n_inj, replace=False), k] = 1
+    return M
+
+
 def _build_pathway_mask(mask_M: np.ndarray, mode: str, K: int) -> np.ndarray | None:
     """vi_cavi expects (n_pathways, n_genes)."""
     if mode == "unmasked":
@@ -42,7 +64,8 @@ def _integrated_logit(theta: np.ndarray, mu_v: np.ndarray,
 def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         out_dir: str, regression_weight: float | None = None,
         max_iter: int | None = None, early_stopping: str | None = None,
-        sup_weight: str | None = None,
+        sup_weight: str | None = None, mask_drop_frac: float = 0.0,
+        mask_inject_frac: float = 0.0,
         verbose: bool = False) -> dict:
     A = ad.read_h5ad(h5ad_path)
     truth_idx = int(A.uns["truth_idx"]); h2 = float(A.uns["h2"]); r = float(A.uns["r"])
@@ -60,7 +83,9 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
     X_tr, X_te = X[tr_idx], X[te_idx]
     y_tr, y_te = y[tr_idx], y[te_idx]
 
-    pathway_mask = _build_pathway_mask(A.uns["mask_M"], mode, K)
+    mask_used = _corrupt_mask(A.uns["mask_M"], mask_drop_frac, mask_inject_frac,
+                              seeds["fit_seed"] ^ 0x9E3779B9)
+    pathway_mask = _build_pathway_mask(mask_used, mode, K)
     n_pathway = None
     if mode == "combined":
         n_pathway = pathway_mask.shape[0]
@@ -191,6 +216,8 @@ def run(h5ad_path: str, mode: str, K: int, inner_seed: int,
         "truth_idx": truth_idx, "h2": h2, "r": r, "rho": float(A.uns.get("rho", -1.0)),
         "inner_seed": int(inner_seed),
         "regression_weight": float(rw),
+        "mask_drop_frac": float(mask_drop_frac),
+        "mask_inject_frac": float(mask_inject_frac),
         "cell_auc_integrated": cell_auc_integrated,
         "cell_auc_integrated_train": cell_auc_integrated_train,
         "cell_auc_theta_only": cell_auc_theta_only,

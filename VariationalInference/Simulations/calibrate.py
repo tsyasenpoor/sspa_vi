@@ -29,6 +29,29 @@ def ss_type_from_means(mu_gene_by_cell: np.ndarray, cell_type: np.ndarray,
     return float((nt[:, None] * C ** 2).sum())
 
 
+def ss_type_from_means_log1pmu(mu_gene_by_cell: np.ndarray, cell_type: np.ndarray) -> float:
+    """SS_type on log1p(mu0) -- the principled matched scale for r.
+
+    The additive perturbation log lambda = log mu0 + delta*sum_l u(theta*-base) lives on the
+    log scale, while the original ss_type_from_means uses log1p(library-normalized mu), a
+    different transform, so r mixed units. NOTE: the obvious fix -- SS on raw log mu0 -- is
+    degenerate here: mu0 is extremely sparse (median 0.019, 20% < 1e-3, many exact zeros), so
+    log mu0 is dominated by the floor on near-zero means (between-type SS ~1e3x larger; r(0.15)
+    -> ~1e-4). log1p(mu0) is finite at zero and is the count-level salience scale on which the
+    perturbation's count effect actually lands; on it the current r is essentially unchanged
+    (r=0.15 -> 0.131), so the existing datasets do NOT need regeneration -- relabel r instead."""
+    G, N = mu_gene_by_cell.shape
+    L = np.log1p(np.maximum(mu_gene_by_cell, 0.0))        # (G, N) finite at zero
+    T = int(cell_type.max()) + 1
+    onehot = np.zeros((N, T), dtype=np.float64)
+    onehot[np.arange(N), cell_type] = 1.0
+    nt = onehot.sum(axis=0)
+    mu_tj = (onehot.T @ L.T) / np.maximum(nt[:, None], 1.0)  # (T, G)
+    gene_mean = (nt @ mu_tj) / N                          # (G,)
+    C = mu_tj - gene_mean[None, :]                        # (T, G)
+    return float((nt[:, None] * C ** 2).sum())
+
+
 def _load_counts_and_types():
     counts_df = pd.read_csv(config.BASELINE_COUNTS_CSV, index_col=0)
     counts = sp.csr_matrix(counts_df.to_numpy(dtype=np.float64).T)   # cells×genes

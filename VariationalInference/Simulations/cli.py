@@ -34,12 +34,19 @@ def _run_drgp(args):
     from .runner_drgp import run
     run(args.h5ad, args.mode, args.K, args.inner_seed, args.out_dir,
         regression_weight=args.regression_weight, sup_weight=args.sup_weight,
+        mask_drop_frac=args.mask_drop_frac, mask_inject_frac=args.mask_inject_frac,
         verbose=args.verbose)
 
 
 def _run_unsup(args):
     from .runner_unsup import run
     run(args.h5ad, args.method, args.K, args.inner_seed, args.out_dir)
+
+
+def _run_cv(args):
+    from .runner_cv import run
+    run(args.h5ad, args.method, args.K, args.inner_seed, args.out_dir,
+        n_folds=args.n_folds, verbose=args.verbose)
 
 
 def _run_gene(args):
@@ -114,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_d.add_argument("--sup-weight", default=None,
                      help="Override supervised update weight: 'one', 'rw', or a float "
                           "(absolute weight). Default uses config.SUPERVISED_UPDATE_WEIGHT.")
+    p_d.add_argument("--mask-drop-frac", type=float, default=0.0,
+                     help="Pathway misspecification: fraction of true carriers to drop from the "
+                          "mask the model sees (false negatives). Data/eval unchanged.")
+    p_d.add_argument("--mask-inject-frac", type=float, default=0.0,
+                     help="Pathway misspecification: non-carriers to inject as a fraction of "
+                          "n_carriers (false positives).")
     p_d.add_argument("--verbose", action="store_true")
     p_d.set_defaults(func=_run_drgp)
 
@@ -124,6 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_u.add_argument("--inner-seed", type=int, default=0)
     p_u.add_argument("--out-dir", required=True)
     p_u.set_defaults(func=_run_unsup)
+
+    p_cv = sub.add_parser("run-cv", help="K-fold patient CV pooled patient AUC + DeLong CI (study #3)")
+    p_cv.add_argument("--h5ad", required=True)
+    p_cv.add_argument("--method", required=True,
+                      help="drgp_<mode> (unmasked/masked/pathway_init/combined) or nmf/schpf/spectra")
+    p_cv.add_argument("--K", type=int, required=True)
+    p_cv.add_argument("--inner-seed", type=int, default=0)
+    p_cv.add_argument("--out-dir", required=True)
+    p_cv.add_argument("--n-folds", type=int, default=5)
+    p_cv.add_argument("--verbose", action="store_true")
+    p_cv.set_defaults(func=_run_cv)
 
     p_gn = sub.add_parser("run-gene")
     p_gn.add_argument("--h5ad", required=True)
