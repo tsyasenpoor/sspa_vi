@@ -116,11 +116,21 @@ def run(h5ad_path: str, method: str, K: int, inner_seed: int, out_dir: str,
         Xpb_te, ypb_te, pid_te = pseudobulk_mean(X, pid, te_idx, y)
         Htr = np.asarray(proj(sp.csr_matrix(Xpb_tr)), dtype=np.float64)
         Hte = np.asarray(proj(sp.csr_matrix(Xpb_te)), dtype=np.float64)
-        mu = Htr.mean(0); sd = Htr.std(0); sd[sd < 1e-8] = 1.0
-        head = LogisticRegressionCV(Cs=config.LR_C_GRID, cv=min(config.LR_CV_FOLDS, 3),
-                                    penalty="l2", solver="lbfgs", max_iter=config.LR_MAX_ITER,
-                                    scoring="roc_auc", n_jobs=1).fit((Htr - mu) / sd, ypb_tr)
-        prob = head.predict_proba((Hte - mu) / sd)[:, 1]
+        # Head MATCHED to the single-split headline patient head (so CV vs single is apples-to-
+        # apples): DRGP -> L2 on the simplex design (proj already returns s=theta/||theta||_1,
+        # no standardization), as in runner_drgp.pat_head; baselines -> L1 on standardized
+        # factors, as in runner_unsup.pat_head.
+        if is_drgp:
+            head = LogisticRegressionCV(Cs=config.LR_C_GRID, cv=min(config.LR_CV_FOLDS, 3),
+                                        penalty="l2", solver="lbfgs", max_iter=config.LR_MAX_ITER,
+                                        scoring="roc_auc", n_jobs=1).fit(Htr, ypb_tr)
+            prob = head.predict_proba(Hte)[:, 1]
+        else:
+            mu = Htr.mean(0); sd = Htr.std(0); sd[sd < 1e-8] = 1.0
+            head = LogisticRegressionCV(Cs=config.LR_C_GRID, cv=min(config.LR_CV_FOLDS, 3),
+                                        penalty="l1", solver="saga", max_iter=config.LR_MAX_ITER,
+                                        scoring="roc_auc", n_jobs=1).fit((Htr - mu) / sd, ypb_tr)
+            prob = head.predict_proba((Hte - mu) / sd)[:, 1]
         pooled_prob.append(prob); pooled_y.append(ypb_te); pooled_pid.append(pid_te)
         if verbose:
             print(f"  fold {fi}: {len(te_idx)} cells / {len(pid_te)} patients held out")

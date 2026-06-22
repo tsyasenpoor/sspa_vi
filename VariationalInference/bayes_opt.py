@@ -498,6 +498,8 @@ class HyperparameterOptimizer:
         study_name: Optional[str] = None,
         max_n_factors: Optional[int] = None,
         convert_to_ensembl: bool = True,
+        storage: Optional[str] = None,
+        resume: bool = False,
     ):
         self.data_path = data_path
         # Normalise label_column to list for consistent handling
@@ -527,7 +529,20 @@ class HyperparameterOptimizer:
         self.output_dir = Path(output_dir)
         self.max_n_factors = max_n_factors
         self.convert_to_ensembl = convert_to_ensembl
-        self.study_name = study_name or f'vi_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
+        # Resumable optimization: persist the Optuna study to SQLite so a re-queued 48h
+        # window continues instead of restarting from zero (in-memory studies lose everything
+        # on timeout). Each config has its own output_dir => its own db => no cross-job contention.
+        self.resume = resume
+        if storage is None and resume:
+            storage = f"sqlite:///{self.output_dir / 'optuna_study.db'}"
+        self.storage = storage
+        # A persisted study needs a STABLE name across re-runs so resume reattaches to it.
+        if study_name:
+            self.study_name = study_name
+        elif self.storage:
+            self.study_name = 'vi_bayes_opt'
+        else:
+            self.study_name = f'vi_bayes_opt_{datetime.now():%Y%m%d_%H%M%S}'
 
         # Will be populated by load_data / load_pathways
         self.data = None
@@ -752,28 +767,61 @@ class HyperparameterOptimizer:
         )
         pruner = MedianPruner(n_startup_trials=5, n_warmup_steps=3)
 
+        # output dir must exist before the sqlite storage file is created
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         study = optuna.create_study(
             study_name=self.study_name,
             direction='maximize',
             sampler=sampler,
             pruner=pruner,
+            storage=self.storage,
+            load_if_exists=bool(self.storage),
         )
 
-        # Run optimization
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Run optimization. With persistent storage we target a TOTAL of n_trials across
+        # resumes: count already-finished trials and only run the remainder, so a re-queued
+        # window continues instead of restarting. Each trial is checkpointed (stable-named
+        # best_config) so a wall-clock kill still leaves usable hypers.
+        finished = sum(t.state.is_finished() for t in study.trials)
+        remaining = max(0, self.n_trials - finished) if self.storage else self.n_trials
         logger.info(
-            f"Starting VI Bayesian optimization: "
-            f"{self.n_trials} trials"
+            "Starting VI Bayesian optimization: target %d trials, %d already finished, "
+            "running %d more%s", self.n_trials, finished, remaining,
+            f" (storage={self.storage})" if self.storage else "",
         )
         t0 = time.time()
-        study.optimize(objective, n_trials=self.n_trials)
+        if remaining > 0:
+            cbs = [self._checkpoint] if self.storage else None
+            study.optimize(objective, n_trials=remaining, callbacks=cbs)
         elapsed = time.time() - t0
 
-        # Report results
-        self._report_results(study, elapsed)
-        self._save_results(study)
+        # Report + final (timestamped) results, only if at least one trial completed.
+        if any(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials):
+            self._report_results(study, elapsed)
+            self._save_results(study)
+        else:
+            logger.warning("No completed trials yet; skipping result save.")
+
+        # Completion marker: written only once the full trial budget is reached, so a
+        # re-queue wrapper can distinguish "done" from "killed mid-window with a checkpoint".
+        if self.storage:
+            finished = sum(t.state.is_finished() for t in study.trials)
+            if finished >= self.n_trials:
+                (self.output_dir / 'search_complete.txt').write_text(
+                    f"{finished} trials finished\n"
+                )
+                logger.info("Search complete: %d/%d trials.", finished, self.n_trials)
 
         return study
+
+    def _checkpoint(self, study, trial):
+        """Per-trial checkpoint (resumable runs only): overwrite stable-named best_config so
+        a timeout still leaves usable hypers and Part-3 can read the best-so-far."""
+        try:
+            if any(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials):
+                self._save_results(study, suffix='resumable')
+        except Exception as e:
+            logger.warning("checkpoint save failed: %s", e)
 
     def _report_results(self, study: optuna.Study, elapsed: float):
         """Print a summary of the optimization results."""
@@ -816,10 +864,15 @@ class HyperparameterOptimizer:
                 print(f"    {k}: {v}")
         print("=" * 70)
 
-    def _save_results(self, study: optuna.Study):
-        """Save optimization results to output directory."""
+    def _save_results(self, study: optuna.Study, suffix: Optional[str] = None):
+        """Save optimization results to output directory.
+
+        suffix : if given (e.g. 'resumable'), filenames use it as a STABLE tag and overwrite
+        each checkpoint; otherwise a fresh timestamp tags the final artifacts.
+        """
         best = study.best_trial
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        tag = suffix or timestamp
 
         # Save best params as JSON
         results = {
@@ -842,7 +895,7 @@ class HyperparameterOptimizer:
             'timestamp': timestamp,
         }
 
-        json_path = self.output_dir / f'best_params_vi_{timestamp}.json'
+        json_path = self.output_dir / f'best_params_vi_{tag}.json'
         with open(json_path, 'w') as f:
             json.dump(results, f, indent=2, default=str)
         logger.info(f"Best params saved to {json_path}")
@@ -850,7 +903,7 @@ class HyperparameterOptimizer:
         # Save all trials as CSV
         try:
             df = study.trials_dataframe()
-            csv_path = self.output_dir / f'all_trials_vi_{timestamp}.csv'
+            csv_path = self.output_dir / f'all_trials_vi_{tag}.csv'
             df.to_csv(csv_path, index=False)
             logger.info(f"All trials saved to {csv_path}")
         except Exception as e:
@@ -867,7 +920,7 @@ class HyperparameterOptimizer:
             best_config_dict['n_factors'] = 50
         best_config_dict.setdefault('max_iter', self.max_iter)
 
-        config_path = self.output_dir / f'best_config_vi_{timestamp}.json'
+        config_path = self.output_dir / f'best_config_vi_{tag}.json'
         with open(config_path, 'w') as f:
             json.dump(best_config_dict, f, indent=2)
         logger.info(f"Best config saved to {config_path}")
@@ -1089,6 +1142,17 @@ def parse_args(argv=None):
     parser.add_argument('--output-dir', default='./bayes_opt_results', help='Output directory')
     parser.add_argument('--seed', type=int, default=None, help='Random seed')
 
+    # Resumable optimization (persist study; survive 48h walls; re-queue to finish)
+    parser.add_argument('--resume', action='store_true',
+                        help='Persist the Optuna study to SQLite under --output-dir and resume '
+                             'on restart, targeting a TOTAL of --n-trials across windows. '
+                             'Checkpoints best_config after every trial; writes search_complete.txt when done.')
+    parser.add_argument('--storage', default=None,
+                        help='Explicit Optuna storage URL (e.g. sqlite:///path/study.db). '
+                             'Overrides the auto path implied by --resume.')
+    parser.add_argument('--study-name', default=None,
+                        help='Optuna study name (stable name required for resume; defaults to vi_bayes_opt).')
+
     # Gene ID conversion
     parser.add_argument(
         '--convert-to-ensembl', type=lambda x: x.lower() in ('true', '1', 'yes'), 
@@ -1170,6 +1234,9 @@ def main(argv=None):
         output_dir=args.output_dir,
         max_n_factors=args.max_n_factors,
         convert_to_ensembl=args.convert_to_ensembl,
+        storage=args.storage,
+        resume=args.resume,
+        study_name=args.study_name,
     )
 
     study = optimizer.run()

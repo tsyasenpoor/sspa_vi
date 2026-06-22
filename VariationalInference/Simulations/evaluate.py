@@ -68,6 +68,31 @@ def recovery_support_auprc(beta_hat: np.ndarray, S_star: list[np.ndarray],
     return out
 
 
+_CELL_TYPES = ["B", "CD4", "CD8", "Mono", "myeloid cells", "NK"]
+
+
+def activity_recovery_spearman(theta_hat: np.ndarray, theta_star: np.ndarray,
+                               cell_type_int: np.ndarray, T_ell: list[set],
+                               assign: np.ndarray, idx: np.ndarray | None = None) -> list[float]:
+    """|Spearman(theta_hat[:,k(l)], theta_star[:,l])| on responder cells (type in T_l), per program l.
+
+    Complements the |beta|-AUPRC gene-set metric: a program can be real in theta (activity tracks
+    the planted theta_star) yet invisible in |beta|-ranking when beta absorbs baseline expression.
+    theta_hat is indexed in `idx` order (e.g. train cells); theta_star is full (n, L)."""
+    if idx is None:
+        idx = np.arange(theta_hat.shape[0])
+    out = []
+    for l in range(len(assign)):
+        k = int(assign[l])
+        resp = np.array([i for i, c in enumerate(idx) if cell_type_int[c] in T_ell[l]])
+        if resp.size > 10:
+            xh = theta_hat[resp, k]; xs = theta_star[idx[resp], l]
+            if np.std(xs) > 1e-9 and np.std(xh) > 1e-9:
+                out.append(abs(float(spearmanr(xh, xs).correlation))); continue
+        out.append(float("nan"))
+    return out
+
+
 def recovery_jaccard_drgp_native(rho: np.ndarray, S_star: list[np.ndarray],
                                  assign: np.ndarray, thresh: float = 0.5) -> list[float]:
     if rho.size == 0:
@@ -187,6 +212,20 @@ def run(result_dir: str, h5ad_path: str) -> dict:
     denovo = [auprc[l] for l in range(n_path + 1, L) if causal_mask[l]]
     metrics_out["recovery_auprc_annotated"] = float(np.nanmean(annotated)) if annotated else float("nan")
     metrics_out["recovery_auprc_denovo"] = float(np.nanmean(denovo)) if denovo else float("nan")
+
+    # Activity recovery (Spearman theta_hat vs theta_star on responder cells) — the complementary
+    # read that distinguishes a magnitude-projection artifact from genuine non-recovery.
+    if family == "drgp" and "theta_tr" in payload and "theta_star" in A.uns:
+        ct_int = np.array([_CELL_TYPES.index(c) for c in A.obs["cell_type"].to_numpy()])
+        T_map = [set(np.asarray(A.uns["T_ell"][str(l)]).tolist()) for l in range(L)]
+        sp = activity_recovery_spearman(np.asarray(payload["theta_tr"]),
+                                        np.asarray(A.uns["theta_star"]), ct_int, T_map,
+                                        assign, payload.get("tr_idx"))
+        metrics_out["activity_spearman_per_l"] = sp
+        ann_s = [sp[l] for l in range(1, n_path + 1)]
+        dn_s = [sp[l] for l in range(n_path + 1, L) if causal_mask[l]]
+        metrics_out["activity_spearman_annotated"] = float(np.nanmean(ann_s)) if ann_s else float("nan")
+        metrics_out["activity_spearman_denovo"] = float(np.nanmean(dn_s)) if dn_s else float("nan")
 
     if family == "drgp":
         rm = ranking_metrics(mu_v=payload["mu_v"].ravel(),

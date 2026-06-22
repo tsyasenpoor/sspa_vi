@@ -9,7 +9,9 @@ from pathlib import Path
 
 # ---- Paths --------------------------------------------------------------
 REPO_ROOT = Path("/labs/Aguiar/SSPA_BRAY")
-SCDESIGN3_DIR = REPO_ROOT / "scdesign3_covid19_cellTypeMarginal_8kcells_10kgenes"
+# scDesign3 baseline was moved under data/Simulations/SCDesign3/ (2026-06-17) to keep the
+# repo root clean; this is the only copy of nb_params.h5 / the fitted marginals.
+SCDESIGN3_DIR = REPO_ROOT / "data" / "Simulations" / "SCDesign3" / "scdesign3_covid19_cellTypeMarginal_8kcells_10kgenes"
 NB_PARAMS_H5 = SCDESIGN3_DIR / "nb_params.h5"
 BASELINE_COUNTS_CSV = SCDESIGN3_DIR / "simulated_counts.csv"
 BASELINE_META_CSV = SCDESIGN3_DIR / "simulated_metadata.csv"
