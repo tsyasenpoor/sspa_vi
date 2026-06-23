@@ -149,9 +149,11 @@ def main():
     indices = np.arange(n_cells_model)
     test_ratio = 1.0 - args.train_ratio - args.val_ratio
 
-    if "sampleID" in df.columns:
+    _pat_col = "sampleID" if "sampleID" in df.columns else (
+        "subject_id" if "subject_id" in df.columns else None)
+    if _pat_col is not None:
         # Patient-grouped split: no donor leakage
-        patient_ids = df["sampleID"].values.astype(str)
+        patient_ids = df[_pat_col].values.astype(str)
         unique_patients = np.unique(patient_ids)
         train_pat, temp_pat = train_test_split(
             unique_patients, test_size=(args.val_ratio + test_ratio),

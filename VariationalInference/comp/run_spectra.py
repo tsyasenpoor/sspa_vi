@@ -28,7 +28,11 @@ import scipy.sparse as sp
 import Spectra
 
 
-META_COLS = ["sex", "comorbidity", "severity", "outcome", "cell_type"]
+META_COLS = ["sex", "comorbidity", "severity", "outcome", "cell_type",
+             # GTEx WB experimental arm metadata (kept out of the gene matrix)
+             "heart_disease", "subject_id",
+             "sex_female", "race_indian", "race_asian", "race_black", "race_missing",
+             "age", "BMI", "smoking", "MHHTN", "MHT2D"]
 
 
 def parse_args():

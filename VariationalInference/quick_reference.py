@@ -227,14 +227,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--supervised-update-weight',
         choices=['rw', 'one'],
-        default='rw',
+        default='one',
         help="Weight on the supervised correction in the PARAMETER UPDATES "
              "(theta rate-shift R_lin/R_quad, v, gamma) and the ELBO L_sup. "
-             "'rw' (default) = auto-scaled regression_weight (=nnz/n); "
-             "'one' = natural weight 1 per DRGP_VI_full_derivation.md Eq 8.1-8.2 "
-             "(no tempering in the derivation). Use 'one' to test whether the "
-             "nnz/n multiplier on the per-cell theta rate is what floors b_theta "
-             "and diverges theta at scale.")
+             "'one' (DEFAULT) = natural weight 1 per DRGP_VI_full_derivation.md Eq 8.1-8.2 "
+             "(no tempering in the derivation). 'rw' = LEGACY auto-scaled by nnz/n; "
+             "DIVERGES on dense/bulk data (nnz/n large -> theta/gamma blow up, ELBO "
+             "sawtooth) -- use only to reproduce old results or for the bounded-rw sweep.")
     parser.add_argument(
         '--regression-weight',
         type=float,

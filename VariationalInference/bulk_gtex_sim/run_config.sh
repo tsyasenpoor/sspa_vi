@@ -12,13 +12,14 @@
 set -eo pipefail
 
 # defaults
-NSIM=2000; NGENES=0; SIMSEED=0; EFFECT=3.0; TSEED=0; KFIT=15; RW=1.0; GAMMA=0.0
+NSIM=2000; NGENES=0; SIMSEED=0; EFFECT=3.0; TSEED=0; KFIT=15; RW=1.0; GAMMA=0.0; ISEED=0
 OUTROOT=data/Simulations/bulk_gtex_v1
 PRS=""                                   # optional .npy of z-scored PRS (len=n_sim)
 while [ $# -gt 0 ]; do case "$1" in
   --n-sim) NSIM=$2; shift 2;; --n-genes) NGENES=$2; shift 2;; --sim-seed) SIMSEED=$2; shift 2;;
   --effect) EFFECT=$2; shift 2;; --truth-seed) TSEED=$2; shift 2;; --k-fit) KFIT=$2; shift 2;;
   --rw) RW=$2; shift 2;; --gamma-prs) GAMMA=$2; shift 2;; --out-root) OUTROOT=$2; shift 2;;
+  --inner-seed) ISEED=$2; shift 2;;      # label draw + fit init (for replicate error bars)
   --prs) PRS=$2; shift 2;; *) echo "unknown arg $1"; exit 1;; esac; done
 
 ROOT=/labs/Aguiar/SSPA_BRAY
@@ -37,7 +38,7 @@ if [ ! -s "$X0" ]; then
 else echo "[X0] reuse $X0"; fi
 
 # per-config dir
-CFG=$OUTROOT/cfg_e${EFFECT}_t${TSEED}_k${KFIT}_rw${RW}_g${GAMMA}_s${SIMSEED}
+CFG=$OUTROOT/cfg_e${EFFECT}_t${TSEED}_k${KFIT}_rw${RW}_g${GAMMA}_s${SIMSEED}_i${ISEED}
 mkdir -p "$CFG"
 
 conda activate jax_gpu; export PYTHONPATH=$ROOT/BRay
@@ -49,14 +50,15 @@ $RS $SCR/inject_thindiff.R --x0 "$X0" --beta "$CFG/beta_coef.tsv.gz" \
 # 4-5. labels + emit
 PRSARG=""; [ -n "$PRS" ] && PRSARG="--prs $PRS"
 python $SCR/make_labels.py --truth "$CFG/truth.npz" --out-dir "$CFG" \
-    --prevalence 0.26 --gamma-prs $GAMMA $PRSARG
-AUXARG=""; awk "BEGIN{exit !($GAMMA!=0)}" && AUXARG="--aux-columns PRS"
+    --prevalence 0.26 --gamma-prs $GAMMA --label-seed $ISEED $PRSARG
+# PRS is a model covariate whenever --prs is given OR gamma!=0 (incl. gamma*=0 negative control)
+AUXARG=""; { [ -n "$PRS" ] || awk "BEGIN{exit !($GAMMA!=0)}"; } && AUXARG="--aux-columns PRS"
 python $SCR/emit_dataset.py --injected "$CFG/X_injected.tsv.gz" --labels "$CFG/labels.npz" \
     --out "$CFG/simulated/ds.csv.gz"
 # 6. DRGP fit
 python -u $ROOT/BRay/VariationalInference/quick_reference.py --data "$CFG/simulated/ds.csv.gz" \
     --label-column heart_disease $AUXARG --mode unmasked --n-factors $KFIT --max-iter 3000 \
-    --tol 0.001 --regression-weight $RW --early-stopping elbo --seed 0 --output-dir "$CFG/drgp_fit"
+    --tol 0.001 --regression-weight $RW --early-stopping elbo --seed $ISEED --output-dir "$CFG/drgp_fit"
 # 7. recovery
 python $SCR/check_recovery.py --fit-dir "$CFG/drgp_fit" --truth "$CFG/truth.npz" \
     | tee "$CFG/recovery.txt"

@@ -25,17 +25,18 @@ def main():
     X.index.name = "sample_id"
 
     lab = np.load(args.labels, allow_pickle=True)
-    y, prs, gamma_prs = lab["y"], lab["prs"], float(lab["gamma_prs"])
+    y, prs = lab["y"], lab["prs"]
+    prs_present = bool(lab["prs_present"]) if "prs_present" in lab else float(lab["gamma_prs"]) != 0.0
     assert X.shape[0] == len(y), f"{X.shape[0]} samples != {len(y)} labels"
 
     X[args.label_name] = y.astype(int)
-    if gamma_prs != 0.0:                        # only attach PRS aux when it's an active covariate
+    if prs_present:                            # PRS is a covariate (incl. gamma*=0 negative control)
         X["PRS"] = prs.astype(float)
 
     X.to_csv(args.out, compression="gzip")
     n_gene = Xg.shape[0]
     print(f"dataset: {X.shape[0]} samples x {n_gene} genes | label '{args.label_name}' "
-          f"prevalence={y.mean():.3f} | PRS aux={'yes' if gamma_prs != 0 else 'no'}", flush=True)
+          f"prevalence={y.mean():.3f} | PRS aux={'yes' if prs_present else 'no'}", flush=True)
     print(f"DONE -> {args.out}", flush=True)
 
 

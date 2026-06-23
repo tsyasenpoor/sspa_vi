@@ -6,7 +6,7 @@ import scipy.sparse as sp
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.linear_model import LogisticRegression
-from sklearn.decomposition import NMF
+from sklearn.decomposition import NMF, PCA
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
 import joblib
 
@@ -30,6 +30,10 @@ _CLASSIFIERS = {
     "mflr":  lambda: make_pipeline(StandardScaler(), LogisticRegression()),
     "mflrl": lambda: make_pipeline(StandardScaler(), LogisticRegression(penalty="l1", solver="saga")),
     "mflrr": lambda: make_pipeline(StandardScaler(), LogisticRegression(penalty="l2")),
+    # pc variants: PCA on log1p(counts) -> LR. Reducer handled separately (like mf).
+    "pclr":  lambda: make_pipeline(StandardScaler(), LogisticRegression()),
+    "pclrl": lambda: make_pipeline(StandardScaler(), LogisticRegression(penalty="l1", solver="saga")),
+    "pclrr": lambda: make_pipeline(StandardScaler(), LogisticRegression(penalty="l2")),
 }
 
 
@@ -41,7 +45,7 @@ def train_alg(
     Parameters
     ----------
     algorithm : str
-        One of: svm, lr, lrl, lrr, mflr, mflrl, mflrr.
+        One of: svm, lr, lrl, lrr, mflr, mflrl, mflrr, pclr, pclrl, pclrr.
     x_data_train : array-like
         Gene expression matrix (n_cells, n_genes). Accepts numpy, scipy sparse, or torch tensor.
     x_aux_data_train : array-like
@@ -67,10 +71,16 @@ def train_alg(
     if algorithm not in _CLASSIFIERS:
         raise ValueError(f"Unknown algorithm '{algorithm}'. Choose from: {list(_CLASSIFIERS.keys())}")
 
+    # Second return slot ("nmf_obj") holds the fitted dimensionality reducer
+    # for both mf* (NMF on raw counts) and pc* (PCA on log1p counts).
     nmf_obj = None
     if algorithm.startswith("mf"):
         nmf_obj = NMF(n_components=latent_dim)
         X_latent = nmf_obj.fit_transform(X_gex)
+        X_train = np.concatenate((X_latent, X_aux), axis=1)
+    elif algorithm.startswith("pc"):
+        nmf_obj = PCA(n_components=latent_dim)
+        X_latent = nmf_obj.fit_transform(np.log1p(X_gex))
         X_train = np.concatenate((X_latent, X_aux), axis=1)
     else:
         X_train = np.concatenate((X_gex, X_aux), axis=1)
@@ -128,6 +138,14 @@ def eval_alg(
             print(f"  WARNING: No training NMF provided for {algorithm}; re-fitting on test data.")
             nmf_new = NMF(n_components=latent_dim)
             X_latent = nmf_new.fit_transform(X_gex)
+        X_test = np.concatenate((X_latent, X_aux), axis=1)
+    elif algorithm.startswith("pc"):
+        if nmf is not None:
+            X_latent = nmf.transform(np.log1p(X_gex))
+        else:
+            print(f"  WARNING: No training PCA provided for {algorithm}; re-fitting on test data.")
+            pca_new = PCA(n_components=latent_dim)
+            X_latent = pca_new.fit_transform(np.log1p(X_gex))
         X_test = np.concatenate((X_latent, X_aux), axis=1)
     else:
         X_test = np.concatenate((X_gex, X_aux), axis=1)

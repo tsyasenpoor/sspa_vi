@@ -27,7 +27,11 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score,
 import json
 from datetime import datetime
 
-META_COLS = ["sex", "comorbidity", "severity", "outcome", "cell_type", "sampleID", "disease"]
+META_COLS = ["sex", "comorbidity", "severity", "outcome", "cell_type", "sampleID", "disease",
+             # GTEx WB experimental arm (one sample/subject; heart_disease label, subject_id grouping)
+             "heart_disease", "subject_id",
+             "sex_female", "race_indian", "race_asian", "race_black", "race_missing",
+             "age", "BMI", "smoking", "MHHTN", "MHT2D"]
 
 
 def parse_args():
@@ -112,9 +116,11 @@ def main():
     indices = np.arange(n)
     test_ratio = 1.0 - args.train_ratio - args.val_ratio
 
-    if "sampleID" in df.columns:
+    _pat_col = "sampleID" if "sampleID" in df.columns else (
+        "subject_id" if "subject_id" in df.columns else None)
+    if _pat_col is not None:
         # Patient-grouped split: no donor leakage
-        patient_ids = df["sampleID"].values.astype(str)
+        patient_ids = df[_pat_col].values.astype(str)
         unique_patients = np.unique(patient_ids)
         train_pat, temp_pat = train_test_split(
             unique_patients, test_size=(args.val_ratio + test_ratio),

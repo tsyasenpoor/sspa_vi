@@ -402,7 +402,7 @@ class CAVI:
         nnz_chunk_size: int = 1_000_000,
         alpha_pi: float = 1.0,
         beta_pi_scale: Optional[float] = 5.0,
-        supervised_update_weight: str = "rw",
+        supervised_update_weight: str = "one",
         calibrate_b_v: bool = True,
         regression_design: str = "raw",
         pathway_prior_lambda: float = 0.0,   # default OFF: the soft inclusion prior is
@@ -421,11 +421,12 @@ class CAVI:
         self.regression_weight = regression_weight
         # Weight applied to the supervised correction in the PARAMETER UPDATES
         # (θ rate-shift R_lin/R_quad, υ, γ data terms) and the ELBO L_sup term.
-        #   "rw"  -> auto-scaled regression_weight (= nnz/n); current behavior.
-        #   "one" -> natural weight 1, as in DRGP_VI_full_derivation.md Eq 8.1-8.2
+        #   "one" -> natural weight 1 (DEFAULT), as in DRGP_VI_full_derivation.md Eq 8.1-8.2
         #            (no tempering anywhere in the derivation) and the JJ predecessor.
-        # Experiment: at COVID/large scale, "rw" makes R_lin overwhelm b_poisson and
-        # floors b_theta -> θ diverges. "one" tests the derivation-faithful update.
+        #   "rw"  -> LEGACY: auto-scaled regression_weight (= nnz/n). DIVERGES on dense/large
+        #            data: R_lin overwhelms b_poisson and floors b_theta -> θ/γ blow up
+        #            (verified on bulk GTEx WB, nnz/n=4868: ELBO sawtooth, γ->±100, train AUC
+        #            ~chance). Kept only for the bounded-rw sweep / reproducing old results.
         self._sup_update_weight = supervised_update_weight
         self._sup_w = float(regression_weight)  # finalized in fit() after auto-scale
         # When False, skip the in-loop data-precision calibration of b_v and keep
