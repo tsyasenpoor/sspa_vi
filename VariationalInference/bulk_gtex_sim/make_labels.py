@@ -3,6 +3,14 @@
 
 y_i ~ Bernoulli(g(alpha + theta*_i . upsilon* + PRS_i * gamma_prs + xaux_i . gamma_aux))
 
+NOTE (2026-06-24, design ref): this is a LOGISTIC GLM (the model's OWN head) calibrated to
+prevalence only -- chosen so gamma* is exactly recoverable (the genetic-attribution test). The
+single-cell arm instead uses a PROBIT LIABILITY-THRESHOLD model with an explicit h^2 knob, so the
+two arms differ in their label model. This logistic head is NOT fully separable (Bernoulli draw =>
+real overlap; empirical AUC ceiling ~0.77), but separability is set implicitly by |upsilon|, not a
+swept h^2 dial. Kept as-is per user; see memory project_gtex_bulk_simulation for the 3 future
+options (the cleanest unification = logistic + h^2-style calibration of the program-signal scale).
+
 - theta*, upsilon* come from make_truth (only disease-relevant programs have nonzero upsilon*).
 - PRS enters ONLY here (label), never expression. Sampled from an empirical/N(0,1) distribution
   INDEPENDENT of the samples (per the design: the per-subject PRS link is biologically vacuous in

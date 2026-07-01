@@ -1,10 +1,10 @@
 """Build per-patient pseudo-bulk h5ads from the single-cell COVID atlas.
 
-The source X is log-normalized (not raw counts), so pseudo-bulk = per-patient MEAN of the
-log-normalized profile -- the same value scale the cell-level CAVI already consumes, keeping
-single vs bulk consistent. Patient subsets match the cell-level runs exactly via
-subsample_adata(n_patients=N, subsample_seed=0). One row per patient; labels/aux are the
-patient-level values (constant within patient under inherited labels).
+The source X is RAW COUNTS, so pseudo-bulk = per-patient SUM of the per-cell counts -- the
+Poisson-correct aggregation (analogous to a real bulk RNA-seq library; library-size differences
+across patients are handled by the hierarchical theta scaling). Patient subsets match the
+cell-level runs exactly via subsample_adata(n_patients=N, subsample_seed=0). One row per patient;
+labels/aux are the patient-level values (constant within patient under inherited labels).
 
 Output: data/covid_pseudobulk/bulk_covid_{N}p_seed0.h5ad for N in {50, 100, 148}.
 """
@@ -43,9 +43,8 @@ for N in N_VALUES:
     ridx = pd.Series(np.arange(P), index=uniq).loc[sids].to_numpy()
     D = sp.csr_matrix((np.ones(ncell, np.float32), (ridx, np.arange(ncell))), shape=(P, ncell))
     cells_per = np.asarray(D.sum(1)).ravel()
-    Dn = sp.diags(1.0 / cells_per) @ D                       # row-normalized -> mean
     X = sub.X.tocsr() if sp.issparse(sub.X) else sp.csr_matrix(sub.X)
-    bulk = (Dn @ X).toarray().astype(np.float32)             # (P, genes) dense mean profile
+    bulk = (D @ X).toarray().astype(np.float32)              # (P, genes) summed-count profile
 
     first = sub.obs.groupby(PATIENT_COL, sort=False).first().reindex(uniq)
     obs = pd.DataFrame({c: first[c].to_numpy() for c in PATIENT_OBS if c in first.columns})
@@ -57,7 +56,11 @@ for N in N_VALUES:
     out = OUT / f"bulk_covid_{N}p_seed0.h5ad"
     B.write_h5ad(out, compression="gzip")
     sev = obs["CoVID-19 severity"].value_counts().to_dict()
+    libsize = bulk.sum(1)
     print(f"N={N}: {P} patients x {B.n_vars} genes -> {out.name}  "
-          f"cells/patient {cells_per.min():.0f}-{cells_per.max():.0f}  severity={sev}", flush=True)
+          f"cells/patient {cells_per.min():.0f}-{cells_per.max():.0f}  "
+          f"total-counts/patient {libsize.min():.3e}-{libsize.max():.3e}  "
+          f"max-entry {bulk.max():.0f}  all_integer={bool(np.allclose(bulk, np.round(bulk)))}  "
+          f"severity={sev}", flush=True)
 
 print("DONE", flush=True)

@@ -9,13 +9,15 @@ from pathlib import Path
 
 # ---- Paths --------------------------------------------------------------
 REPO_ROOT = Path("/labs/Aguiar/SSPA_BRAY")
-# scDesign3 baseline was moved under data/Simulations/SCDesign3/ (2026-06-17) to keep the
-# repo root clean; this is the only copy of nb_params.h5 / the fitted marginals.
-SCDESIGN3_DIR = REPO_ROOT / "data" / "Simulations" / "SCDesign3" / "scdesign3_covid19_cellTypeMarginal_8kcells_10kgenes"
+# scDesign3 baseline regenerated from RAW COUNTS on 2026-06-24 at the repo root
+# (cellTypeMarginal NB fit on COVID controls); this dir holds nb_params.h5 / fitted marginals.
+# The prior data/Simulations/SCDesign3/ copies were archived to _archive_sim_prev_2026-06-24/.
+SCDESIGN3_DIR = REPO_ROOT / "scdesign3_covid19_cellTypeMarginal_8kcells_10kgenes"
 NB_PARAMS_H5 = SCDESIGN3_DIR / "nb_params.h5"
 BASELINE_COUNTS_CSV = SCDESIGN3_DIR / "simulated_counts.csv"
 BASELINE_META_CSV = SCDESIGN3_DIR / "simulated_metadata.csv"
-SIM_ROOT = REPO_ROOT / "data" / "Simulations" / "sim_flat_v1"
+# Fresh output root for the count-base regen (old sim_flat_v1 archived 2026-06-24).
+SIM_ROOT = REPO_ROOT / "data" / "Simulations" / "sim_flat_v2"
 
 # ---- Cell-type vocabulary (order matches majorType labels) ---------------
 CELL_TYPES = ["B", "CD4", "CD8", "Mono", "myeloid cells", "NK"]   # T = 6

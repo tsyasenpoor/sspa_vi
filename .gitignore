@@ -418,3 +418,14 @@ VariationalInference/analysis-utils/svi_ibd_run.py
 VariationalInference/comp/mesa_preprocess.py
 VariationalInference/comp/muster_mesa.py
 VariationalInference/comp/gene_space.py
+VariationalInference/bulk_gtex_sim/smoke_v2.sh
+VariationalInference/comp/h5ad_to_npz.py
+VariationalInference/comp/fit_schpf_seed.py
+VariationalInference/comp/materialize_covid_subsample.py
+VariationalInference/comp/run_schpf_baselines.py
+VariationalInference/comp/run_spectra_baselines.py
+VariationalInference/comp/run_spectra.py
+VariationalInference/comp/export_split.py
+VariationalInference/bulk_gtex_sim/bulk_spectra.py
+VariationalInference/analysis-utils/make_poster_figures.py
+VariationalInference/build_pseudobulk_covid.py

@@ -134,6 +134,12 @@ def parse_args() -> argparse.Namespace:
         help='GMT file for pathway definitions (used in masked/pathway_init/combined modes)'
     )
     parser.add_argument(
+        '--pathway-genes-ensembl',
+        action='store_true',
+        help='GMT gene members are already Ensembl IDs (e.g. synthetic sim pathways); skip the '
+             'symbol->Ensembl conversion so they match Ensembl expression columns directly.'
+    )
+    parser.add_argument(
         '--pathway-min-genes',
         type=int,
         default=0,
@@ -628,9 +634,11 @@ def _run_sc_pipeline(args, label_columns):
         valid_gene_list = [g for g in gene_list if isinstance(g, str) and g]
         n_ensg = sum(1 for g in valid_gene_list if g.startswith('ENSG'))
         genes_are_ensembl = (n_ensg > len(valid_gene_list) * 0.5) if valid_gene_list else False
+        # If the GMT already lists Ensembl IDs, don't convert (would map ENSG-as-symbol -> None).
+        convert_pw = False if args.pathway_genes_ensembl else genes_are_ensembl
         pathway_mat, pathway_names_raw, pathway_genes = load_pathways(
             gmt_path=args.pathway_file,
-            convert_to_ensembl=genes_are_ensembl,
+            convert_to_ensembl=convert_pw,
             species='human',
             gene_filter=valid_gene_list,
             min_genes=args.pathway_min_genes,
@@ -1004,7 +1012,9 @@ def main():
 
         n_ensg = sum(1 for g in valid_gene_list if g.startswith('ENSG'))
         genes_are_ensembl = n_ensg > len(valid_gene_list) * 0.5 if len(valid_gene_list) > 0 else False
-        convert_flag = genes_are_ensembl
+        # If the GMT already lists Ensembl IDs (e.g. synthetic sim pathways), skip conversion so
+        # they match the Ensembl expression columns directly (else ENSG-as-symbol -> None -> 0 pathways).
+        convert_flag = False if args.pathway_genes_ensembl else genes_are_ensembl
         print(f"  Gene ID format: {'Ensembl' if genes_are_ensembl else 'Symbol'} "
               f"({n_ensg}/{len(valid_gene_list)} ENSG prefix among valid IDs)")
         print(f"  convert_to_ensembl = {convert_flag}")
@@ -1383,11 +1393,20 @@ def main():
             _probs_k = _probs_val_all
         _probs_k = np.clip(_probs_k, 1e-7, 1 - 1e-7)
         _logits_k = np.log(_probs_k / (1 - _probs_k))
-        _lr = _PlattLR(C=1e10, solver='lbfgs', max_iter=1000)
-        _lr.fit(_logits_k.reshape(-1, 1), _y_val_2d[:, k])
-        cal = {'method': 'platt', 'a': float(_lr.coef_[0, 0]), 'b': float(_lr.intercept_[0])}
-        calibrators[lname] = cal
-        print(f"Platt calibrator [{lname}]: a={cal['a']:.4f}, b={cal['b']:.4f}")
+        if len(np.unique(_y_val_2d[:, k])) < 2:
+            # Val fold for this outcome is single-class (e.g. a rare label like Outcome with 0
+            # positives in a small fold) -> Platt fit is undefined and would raise. Fall back to
+            # identity calibration (a=1, b=0 -> uncalibrated logits pass through) rather than
+            # crashing the whole multi-outcome run; other outcomes still calibrate normally.
+            cal = {'method': 'platt', 'a': 1.0, 'b': 0.0}
+            calibrators[lname] = cal
+            print(f"Platt calibrator [{lname}]: val single-class -> identity (a=1, b=0)")
+        else:
+            _lr = _PlattLR(C=1e10, solver='lbfgs', max_iter=1000)
+            _lr.fit(_logits_k.reshape(-1, 1), _y_val_2d[:, k])
+            cal = {'method': 'platt', 'a': float(_lr.coef_[0, 0]), 'b': float(_lr.intercept_[0])}
+            calibrators[lname] = cal
+            print(f"Platt calibrator [{lname}]: a={cal['a']:.4f}, b={cal['b']:.4f}")
 
     # =========================================================================
     # STEP 7: Evaluate on Test Set

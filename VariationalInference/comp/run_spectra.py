@@ -50,6 +50,9 @@ def parse_args():
                    help="Lambda: weight of graph vs expression loss")
     p.add_argument("--num-epochs", type=int, default=10000,
                    help="Training epochs")
+    p.add_argument("--n-hvg", type=int, default=2000,
+                   help="Restrict to top-N highly-variable genes before fitting (0 = all genes). "
+                        "Spectra's standard setup; required for tractability at scale.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -156,7 +159,14 @@ def main():
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
 
-    # Mark all genes as highly variable (pre-filtered to 2000 genes)
+    # Restrict to top-N highly-variable genes (Spectra's standard operating point).
+    # Fitting on all ~16k genes is ~8x slower per epoch (18s/it -> hours per portion,
+    # infeasible at 148p) AND not how Spectra is meant to be run. cell_scores stay
+    # (n_cells x L) so downstream alignment with the per-cell metadata is unaffected.
+    if args.n_hvg and adata.n_vars > args.n_hvg:
+        sc.pp.highly_variable_genes(adata, n_top_genes=args.n_hvg, flavor="seurat")
+        adata = adata[:, adata.var["highly_variable"]].copy()
+        print(f"    HVG-subset to {adata.n_vars} genes")
     adata.var["highly_variable"] = True
 
     # ------------------------------------------------------------------

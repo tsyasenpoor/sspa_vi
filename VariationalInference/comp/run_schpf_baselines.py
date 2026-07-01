@@ -51,6 +51,10 @@ def parse_args():
     p.add_argument("--output-dir", "-o", default="./results/schpf_baselines",
                    help="Output directory")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split-file", default=None,
+                   help="JSON {patient_split:{id:fold}} from export_split.py. When set, "
+                        "overrides the internal train_test_split so this method uses the "
+                        "EXACT partition the DRGP single-cell runs used.")
     p.add_argument("--split-seed", type=int, default=0,
                    help="Seed for train/val/test splitting (deterministic). "
                         "Decoupled from --seed so the same split can be reused "
@@ -151,7 +155,19 @@ def main():
 
     _pat_col = "sampleID" if "sampleID" in df.columns else (
         "subject_id" if "subject_id" in df.columns else None)
-    if _pat_col is not None:
+    if args.split_file is not None:
+        # Canonical split: reuse the EXACT DRGP partition (see export_split.py).
+        from split_utils import load_patient_split, indices_from_split
+        if _pat_col is None:
+            raise ValueError("--split-file requires a patient column (sampleID/subject_id) in metadata")
+        ps = load_patient_split(args.split_file)
+        train_idx, val_idx, test_idx, n_dropped = indices_from_split(df[_pat_col].values, ps)
+        if n_dropped:
+            print(f"    [split-file] dropped {n_dropped} cells whose patient is not in the split")
+        print(f"    [split-file] {args.split_file}: "
+              f"{sum(v=='train' for v in ps.values())}/{sum(v=='val' for v in ps.values())}/"
+              f"{sum(v=='test' for v in ps.values())} patients (train/val/test)")
+    elif _pat_col is not None:
         # Patient-grouped split: no donor leakage
         patient_ids = df[_pat_col].values.astype(str)
         unique_patients = np.unique(patient_ids)
